@@ -48,3 +48,14 @@ The test corpus in testdata/ is written against these decisions. Conventions for
 40. `main` checked (E5002) only when the root package is `main`; capabilities distinct; no variadics.
 41. Imports: clean relative paths; local name = package clause name unless aliased.
 42. `Clock` has no methods; fincrt needs a `Clock` type for main injection.
+
+## Scope checker decisions (M2a)
+43. Slices are tracked by where their memory lives: slices of global arrays are depth 0; `buf[:]` of a local carries the local's depth (`return buf[:]` → E3002).
+44. Each parameter is its own region at caller level: returning a parameter (or derived value) is allowed; storing one param into memory reached via another (`p.f = q`) or `&local` through a receiver is E3002.
+45. Resource-constructor calls tie the result only to their arguments (this is how the S3 exemption extends to user code).
+46. Consuming a borrowed Linear (total-func param, receiver, match binding, non-Go literal capture) is E3003.
+47. After `defer x.Close()` / `defer cancel()`, explicit closes and later uses remain allowed; double close without defer is E3003.
+48. Immediately-called literals are summarised (consume / borrow / E3005 if closed on some paths only); stored literals only borrow Linear captures.
+49. A Linear struct is tracked as one unit. E3004 covers `_ = x`, `_` in `:=`/`=`, Linear-valued expression statements and match-arm expressions.
+50. Error-path refinement recognises only bare `err != nil` / `err == nil`. `panic` ends a path without leak checks.
+51. Pass order: scope, then totality; the pipeline stops at the first pass reporting errors.
