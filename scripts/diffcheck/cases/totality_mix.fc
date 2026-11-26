@@ -1,0 +1,255 @@
+// Totality checker edge cases (diff-check-totality): heap and local loop
+// bounds, copy/formatUint, nested loops, match joins, T3 midpoints, method
+// and literal recursion, function values and effects.
+package main
+
+type Inner struct {
+	n   usize
+	buf [8]u8
+}
+
+type Box struct {
+	in   Inner
+	lim  usize
+	data []u8
+	p    *Inner
+}
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+var glim usize
+
+func touch(b *Box) {
+	b.lim = 0
+}
+
+func heapBound(b *Box, s []Box) usize {
+	t := usize(0)
+	for i := usize(0); i < b.lim; i++ {
+		t++
+	}
+	for i := usize(0); i < b.lim; i++ {
+		touch(b)
+	}
+	for i := usize(0); i < b.p.n; i++ {
+		b.in.n = 1
+	}
+	for i := usize(0); i < b.p.n; i++ {
+		s[0].in = Inner{n: 3}
+	}
+	for i := usize(0); i < glim; i++ {
+		t = t + 1
+	}
+	for i := usize(0); i < glim; i++ {
+		_ = copy(b.data, b.data)
+	}
+	for i := usize(0); i < len(b.data); i++ {
+		b.data[i] = 0
+	}
+	for i := usize(0); i < len(b.data); i++ {
+		b.data = b.data[1:]
+	}
+	var buf [20]u8
+	for i := usize(0); i < b.in.n; i++ {
+		n, _ := formatUint(u64(i), buf[:])
+		t += n
+	}
+	return t
+}
+
+func localBound(x Box) usize {
+	t := usize(0)
+	for i := usize(0); i < x.lim; i++ {
+		x.in.n = 2
+	}
+	for i := usize(0); i < x.in.n; i++ {
+		x.in.buf[0] = 1
+	}
+	for i := usize(0); i < x.in.n; i++ {
+		x.in = Inner{n: 0}
+	}
+	for i := u8(250); i <= 255; i++ {
+		t++
+	}
+	for i := u8(250); i < 255; i += 3 {
+		t++
+	}
+	for i := i8(-100); i >= -128; i-- {
+		t++
+	}
+	for i := i8(-100); i > -126; i -= 2 {
+		t++
+	}
+	for i := i8(-100); i > -128; i -= 2 {
+		t++
+	}
+	for i := i32(10); i >= 0; i -= 1 {
+		t++
+	}
+	p := &t
+	for i := usize(0); i < 3; i++ {
+		*p = 1
+	}
+	return t
+}
+
+func shapes(sh Shape, n u32) u32 {
+	k := n
+	match sh {
+		Shape.Circle(r) -> {
+			k = r
+		}
+		Shape.Rect(w, h) -> {
+			k = w + h
+		}
+		Shape.Empty -> {
+			return 0
+		}
+	}
+	return k
+}
+
+func search(xs []u32, v u32) usize {
+	lo := usize(0)
+	hi := len(xs)
+	for lo < hi decreases(hi - lo) {
+		mid := lo + (hi-lo)/2
+		if xs[mid] < v {
+			lo = mid + 1
+		} else if xs[mid] > v {
+			hi = mid
+		} else {
+			return mid
+		}
+	}
+	for lo < hi decreases(hi - lo) {
+		mid := (lo + hi) / 2
+		if xs[mid] < v {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	for lo < hi decreases(hi - lo) {
+		mid := lo + ((hi - lo) >> 1)
+		if xs[mid] < v {
+			lo = mid + 1
+			continue
+		}
+		hi = mid
+	}
+	n := len(xs)
+	for n > 0 decreases(n) {
+		n--
+		for j := usize(0); j < n; j++ {
+			if xs[j] == v {
+				break
+			}
+		}
+	}
+	return lo
+}
+
+func shrink(b []u8, k usize) usize {
+	rem := b
+	t := usize(0)
+	for len(rem) > 0 {
+		n := k
+		if n == 0 || n > len(rem) {
+			return t
+		}
+		rem = rem[n:]
+		t++
+	}
+	for len(rem) != 0 {
+		if rem[0] == 1 {
+			rem = rem[:len(rem)-1]
+		} else {
+			rem = rem[1:len(rem)]
+		}
+	}
+	for len(rem) >= 1 {
+		if rem[0] == 1 {
+			rem = rem[1:]
+		}
+	}
+	return t
+}
+
+type Walker struct {
+	depth usize
+}
+
+func (w *Walker) down(n u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		return n
+	}
+	return w.up(n+1, dp-1)
+}
+
+func (w *Walker) up(n u32, dp usize) u32 decreases(dp) {
+	if dp < 2 {
+		return n
+	}
+	return w.down(n, dp/2) + w.down(n, dp>>1) + w.down(n, dp-2)
+}
+
+func badUp(n u32, dp usize) u32 decreases(dp) {
+	if dp > 0 && n > 0 {
+		return badUp(n-1, dp-1)
+	}
+	return badUp(n, dp-1)
+}
+
+func apply(f func(x u32) u32, x u32) u32 {
+	return f(x)
+}
+
+func viaValue(x u32, d usize) u32 decreases(d) {
+	if d == 0 {
+		return x
+	}
+	return apply(viaValue2, x)
+}
+
+func viaValue2(x u32) u32 {
+	return viaValue(x, 3)
+}
+
+func lits(n u32) u32 {
+	g := func(k u32) u32 {
+		for {
+			if k == 0 {
+				break
+			}
+		}
+		return k
+	}
+	return g(n)
+}
+
+driver func side() u32 {
+	return 1
+}
+
+func eff() u32 {
+	d := func() u32 {
+		return side()
+	}
+	return d()
+}
+
+driver func main(io Stdio) error {
+	t := func() u32 {
+		driver for {
+			break
+		}
+		return side()
+	}
+	_ = t
+	return nil
+}

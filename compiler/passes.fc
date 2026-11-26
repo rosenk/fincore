@@ -7,7 +7,8 @@ package main
 
 // Pass bits for --passes=<pass>[,<pass>].
 const (
-	PassScope = 1
+	PassScope    = 1
+	PassTotality = 2
 )
 
 var passTypesOnly bool // --passes=types: stop after the type checker
@@ -17,6 +18,9 @@ var passOnly u32       // 0 = all passes, else the selected pass bits
 func passBit(name []byte) u32 {
 	if bytesEqual(name, strBytes("scope")) {
 		return PassScope
+	}
+	if bytesEqual(name, strBytes("totality")) {
+		return PassTotality
 	}
 	return 0
 }
@@ -61,6 +65,12 @@ func runPasses() {
 	}
 	if passEnabled(PassScope) {
 		scopeCheck()
+		if diags.count > 0 || semaFull {
+			return
+		}
+	}
+	if passEnabled(PassTotality) {
+		totalityProgram()
 		if diags.count > 0 || semaFull {
 			return
 		}
