@@ -1,0 +1,1199 @@
+// lexer.fc — total lexer for FinCore (spec section 2), a port of
+// bootstrap/internal/lexer.
+//
+// Go-style semicolon insertion (spec 2.2): when a newline (or EOF, or a
+// block comment spanning a newline) follows an identifier, a literal,
+// true/false/nil, break/continue/return, ++/-- or a closing ')' ']' '}', a
+// SEMICOLON token (semi = SemiNewline / SemiEOF) is produced.
+//
+// Lexical errors never abort scanning: each produces an ILLEGAL token that
+// records the reason (errKind), the diagnostic position and the offending
+// byte; the message is rendered on demand by lexErrMessage. Identifiers are
+// ASCII-only; non-ASCII bytes are allowed only in strings and comments.
+//
+// Totality: every loop is a T1 counting loop whose bound is a local copy of
+// the source length (each iteration consumes at least one byte or exits).
+package main
+
+// Token kinds.
+const (
+	TkIllegal = 0
+	TkEOF     = 1
+	TkIdent   = 2
+	TkInt     = 3
+	TkString  = 4
+	TkChar    = 5
+
+	// keywords (TkKeywordFirst..TkKeywordLast)
+	TkPackage   = 10
+	TkImport    = 11
+	TkConst     = 12
+	TkType      = 13
+	TkVar       = 14
+	TkFunc      = 15
+	TkDriver    = 16
+	TkComptime  = 17
+	TkScope     = 18
+	TkFor       = 19
+	TkIf        = 20
+	TkElse      = 21
+	TkReturn    = 22
+	TkBreak     = 23
+	TkContinue  = 24
+	TkDefer     = 25
+	TkStruct    = 26
+	TkEnum      = 27
+	TkMatch     = 28
+	TkTrue      = 29
+	TkFalse     = 30
+	TkNil       = 31
+	TkAny       = 32
+	TkDecreases = 33
+
+	// operators and punctuation
+	TkAdd       = 40 // +
+	TkSub       = 41 // -
+	TkMul       = 42 // *
+	TkQuo       = 43 // /
+	TkRem       = 44 // %
+	TkAnd       = 45 // &
+	TkOr        = 46 // |
+	TkXor       = 47 // ^
+	TkShl       = 48 // <<
+	TkShr       = 49 // >>
+	TkEql       = 50 // ==
+	TkNeq       = 51 // !=
+	TkLss       = 52 // <
+	TkLeq       = 53 // <=
+	TkGtr       = 54 // >
+	TkGeq       = 55 // >=
+	TkLAnd      = 56 // &&
+	TkLOr       = 57 // ||
+	TkNot       = 58 // !
+	TkAssign    = 59 // =
+	TkDefine    = 60 // :=
+	TkAddAssign = 61 // +=
+	TkSubAssign = 62 // -=
+	TkMulAssign = 63 // *=
+	TkQuoAssign = 64 // /=
+	TkInc       = 65 // ++
+	TkDec       = 66 // --
+	TkLParen    = 67 // (
+	TkRParen    = 68 // )
+	TkLBrack    = 69 // [
+	TkRBrack    = 70 // ]
+	TkLBrace    = 71 // {
+	TkRBrace    = 72 // }
+	TkComma     = 73 // ,
+	TkPeriod    = 74 // .
+	TkColon     = 75 // :
+	TkSemicolon = 76 // ;
+	TkArrow     = 77 // ->
+	TkEllipsis  = 78 // ...
+)
+
+// Lexical error reasons (Token.errKind of ILLEGAL tokens).
+const (
+	LexErrNone          = 0
+	LexErrUntermComment = 1  // E1002 unterminated block comment
+	LexErrBadUTF8       = 2  // E1001 invalid UTF-8 byte 0x%02X
+	LexErrBadChar       = 3  // E1001 invalid character ...
+	LexErrBadInt        = 4  // E1001 (message from checkIntLit)
+	LexErrUntermString  = 5  // E1002 unterminated string literal
+	LexErrBadEscape     = 6  // E1001 invalid escape sequence \%c
+	LexErrBadHexEscape  = 7  // E1001 invalid \x escape
+	LexErrUntermChar    = 8  // E1002 unterminated char literal
+	LexErrEmptyChar     = 9  // E1001 empty char literal
+	LexErrCharMultiByte = 10 // E1001 char literal must be a single byte
+	LexErrCharLen       = 11 // E1001 char literal must contain exactly one byte
+)
+
+// Escape decoding results.
+const (
+	EscOK      = 0
+	EscEOF     = 1
+	EscNewline = 2
+	EscInvalid = 3
+	EscBadHex  = 4
+)
+
+// Integer literal check results (checkIntLit).
+const (
+	IntOK         = 0
+	IntNoDigits   = 1
+	IntLeadZero   = 2
+	IntUnderscore = 3
+	IntBadDigit   = 4
+	IntOverflow   = 5
+)
+
+func isKeyword(k u8) bool {
+	return k >= TkPackage && k <= TkDecreases
+}
+
+// kindString returns the source spelling of keywords and operators and the
+// class name of other kinds (lexer.Kind.String in finc0).
+func kindString(k u8) string {
+	if k == TkIllegal {
+		return "ILLEGAL"
+	}
+	if k == TkEOF {
+		return "EOF"
+	}
+	if k == TkIdent {
+		return "IDENT"
+	}
+	if k == TkInt {
+		return "INT"
+	}
+	if k == TkString {
+		return "STRING"
+	}
+	if k == TkChar {
+		return "CHAR"
+	}
+	if k < TkAdd {
+		return keywordString(k)
+	}
+	return operatorString(k)
+}
+
+func keywordString(k u8) string {
+	if k == TkPackage {
+		return "package"
+	}
+	if k == TkImport {
+		return "import"
+	}
+	if k == TkConst {
+		return "const"
+	}
+	if k == TkType {
+		return "type"
+	}
+	if k == TkVar {
+		return "var"
+	}
+	if k == TkFunc {
+		return "func"
+	}
+	if k == TkDriver {
+		return "driver"
+	}
+	if k == TkComptime {
+		return "comptime"
+	}
+	if k == TkScope {
+		return "scope"
+	}
+	if k == TkFor {
+		return "for"
+	}
+	if k == TkIf {
+		return "if"
+	}
+	if k == TkElse {
+		return "else"
+	}
+	if k == TkReturn {
+		return "return"
+	}
+	if k == TkBreak {
+		return "break"
+	}
+	if k == TkContinue {
+		return "continue"
+	}
+	if k == TkDefer {
+		return "defer"
+	}
+	if k == TkStruct {
+		return "struct"
+	}
+	if k == TkEnum {
+		return "enum"
+	}
+	if k == TkMatch {
+		return "match"
+	}
+	if k == TkTrue {
+		return "true"
+	}
+	if k == TkFalse {
+		return "false"
+	}
+	if k == TkNil {
+		return "nil"
+	}
+	if k == TkAny {
+		return "any"
+	}
+	if k == TkDecreases {
+		return "decreases"
+	}
+	return "Kind(?)"
+}
+
+func operatorString(k u8) string {
+	if k == TkAdd {
+		return "+"
+	}
+	if k == TkSub {
+		return "-"
+	}
+	if k == TkMul {
+		return "*"
+	}
+	if k == TkQuo {
+		return "/"
+	}
+	if k == TkRem {
+		return "%"
+	}
+	if k == TkAnd {
+		return "&"
+	}
+	if k == TkOr {
+		return "|"
+	}
+	if k == TkXor {
+		return "^"
+	}
+	if k == TkShl {
+		return "<<"
+	}
+	if k == TkShr {
+		return ">>"
+	}
+	if k == TkEql {
+		return "=="
+	}
+	if k == TkNeq {
+		return "!="
+	}
+	if k == TkLss {
+		return "<"
+	}
+	if k == TkLeq {
+		return "<="
+	}
+	if k == TkGtr {
+		return ">"
+	}
+	if k == TkGeq {
+		return ">="
+	}
+	if k == TkLAnd {
+		return "&&"
+	}
+	if k == TkLOr {
+		return "||"
+	}
+	if k == TkNot {
+		return "!"
+	}
+	if k == TkAssign {
+		return "="
+	}
+	if k == TkDefine {
+		return ":="
+	}
+	if k == TkAddAssign {
+		return "+="
+	}
+	if k == TkSubAssign {
+		return "-="
+	}
+	if k == TkMulAssign {
+		return "*="
+	}
+	if k == TkQuoAssign {
+		return "/="
+	}
+	if k == TkInc {
+		return "++"
+	}
+	if k == TkDec {
+		return "--"
+	}
+	if k == TkLParen {
+		return "("
+	}
+	if k == TkRParen {
+		return ")"
+	}
+	if k == TkLBrack {
+		return "["
+	}
+	if k == TkRBrack {
+		return "]"
+	}
+	if k == TkLBrace {
+		return "{"
+	}
+	if k == TkRBrace {
+		return "}"
+	}
+	if k == TkComma {
+		return ","
+	}
+	if k == TkPeriod {
+		return "."
+	}
+	if k == TkColon {
+		return ":"
+	}
+	if k == TkSemicolon {
+		return ";"
+	}
+	if k == TkArrow {
+		return "->"
+	}
+	if k == TkEllipsis {
+		return "..."
+	}
+	return "Kind(?)"
+}
+
+// lookupKeyword maps an identifier spelling to its keyword kind, or TkIdent.
+func lookupKeyword(w []byte) u8 {
+	n := len(w)
+	if n < 2 || n > 9 {
+		return TkIdent
+	}
+	c := w[0]
+	if c < 'a' || c > 'v' {
+		return TkIdent
+	}
+	for k := u8(TkPackage); k < TkDecreases+1; k++ {
+		if bytesEqual(w, strBytes(keywordString(k))) {
+			return k
+		}
+	}
+	return TkIdent
+}
+
+// describeToken renders t for error messages, Go style ("newline", "EOF",
+// "identifier x", "'{'"); text is the token's source spelling.
+func describeToken(o *OutBuf, t Token, text []byte) {
+	k := t.kind
+	if k == TkSemicolon {
+		if t.semi == SemiNewline {
+			o.putStr("newline")
+		} else if t.semi == SemiEOF {
+			o.putStr("EOF")
+		} else {
+			o.putStr("';'")
+		}
+		return
+	}
+	if k == TkEOF {
+		o.putStr("EOF")
+		return
+	}
+	if k == TkIdent {
+		o.putStr("identifier ")
+		o.putBytes(text)
+		return
+	}
+	if k == TkInt {
+		o.putStr("integer literal ")
+		o.putBytes(text)
+		return
+	}
+	if k == TkString {
+		o.putStr("string literal ")
+		o.putBytes(text)
+		return
+	}
+	if k == TkChar {
+		o.putStr("char literal ")
+		o.putBytes(text)
+		return
+	}
+	if k == TkIllegal {
+		o.putStr("invalid token")
+		return
+	}
+	if isKeyword(k) {
+		o.putStr("keyword ")
+		o.putStr(kindString(k))
+		return
+	}
+	o.putByte('\'')
+	o.putStr(kindString(k))
+	o.putByte('\'')
+}
+
+func isLetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
+func isHex(c byte) bool {
+	return isDigit(c) || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func hexVal(c byte) byte {
+	if isDigit(c) {
+		return c - '0'
+	}
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 10
+	}
+	return c - 'A' + 10
+}
+
+// checkIntLit validates and decodes an integer literal (decimal, 0x hex,
+// 0b binary, '_' separators between digits), like finc0's lexer.ParseInt.
+// It returns the value, a status (Int*), and for IntBadDigit the offending
+// byte and the base.
+func checkIntLit(lit []byte) (u64, u8, byte, u64) {
+	n := len(lit)
+	base := u64(10)
+	ds := usize(0)
+	if n >= 2 && lit[0] == '0' && (lit[1] == 'x' || lit[1] == 'X') {
+		base = 16
+		ds = 2
+	} else if n >= 2 && lit[0] == '0' && (lit[1] == 'b' || lit[1] == 'B') {
+		base = 2
+		ds = 2
+	}
+	if ds >= n {
+		return 0, IntNoDigits, 0, base
+	}
+	if base == 10 && n-ds > 1 && lit[ds] == '0' {
+		return 0, IntLeadZero, 0, base
+	}
+	v := u64(0)
+	prevDigit := false
+	for i := ds; i < n; i++ {
+		c := lit[i]
+		if c == '_' {
+			if !prevDigit && !(i == ds && base != 10) {
+				return 0, IntUnderscore, 0, base
+			}
+			if i+1 >= n || lit[i+1] == '_' {
+				return 0, IntUnderscore, 0, base
+			}
+			prevDigit = false
+			continue
+		}
+		d := u64(99)
+		if isDigit(c) {
+			d = u64(c - '0')
+		} else if c >= 'a' && c <= 'f' {
+			d = u64(c-'a') + 10
+		} else if c >= 'A' && c <= 'F' {
+			d = u64(c-'A') + 10
+		}
+		if d >= base {
+			return 0, IntBadDigit, c, base
+		}
+		if v > (0xFFFF_FFFF_FFFF_FFFF-d)/base {
+			return 0, IntOverflow, 0, base
+		}
+		v = v*base + d
+		prevDigit = true
+	}
+	return v, IntOK, 0, base
+}
+
+// putIntLitError writes the finc0 message for a malformed integer literal.
+func putIntLitError(o *OutBuf, lit []byte) {
+	_, st, c, base := checkIntLit(lit)
+	if st == IntBadDigit {
+		o.putStr("invalid digit ")
+		putQuotedByte(o, c)
+		o.putStr(" in base-")
+		o.putUint(base)
+		o.putStr(" literal ")
+		putQuoted(o, lit)
+		return
+	}
+	if st == IntOverflow {
+		o.putStr("integer literal ")
+		putQuoted(o, lit)
+		o.putStr(" overflows u64")
+		return
+	}
+	o.putStr("invalid integer literal ")
+	putQuoted(o, lit)
+	if st == IntNoDigits {
+		o.putStr(": no digits")
+	} else if st == IntLeadZero {
+		o.putStr(": leading zero (octal literals are not supported)")
+	} else {
+		o.putStr(": '_' must separate digits")
+	}
+}
+
+// lexErrCode returns the diagnostic code of an ILLEGAL token.
+func lexErrCode(t Token) u32 {
+	k := t.errKind
+	if k == LexErrUntermComment || k == LexErrUntermString || k == LexErrUntermChar {
+		return E1002
+	}
+	return E1001
+}
+
+// putLexError writes the message of an ILLEGAL token; text is its spelling.
+func putLexError(o *OutBuf, t Token, text []byte) {
+	k := t.errKind
+	if k == LexErrUntermComment {
+		o.putStr("unterminated block comment")
+	} else if k == LexErrBadUTF8 {
+		o.putStr("invalid UTF-8 byte 0x")
+		o.putHex(u64(t.errByte), 2, true)
+	} else if k == LexErrBadChar {
+		o.putStr("invalid character ")
+		r := t.val
+		if r >= 0x20 && r < 0x7F {
+			putQuotedByte(o, byte(r))
+			o.putStr(" (U+")
+			putHexMin(o, r, 4)
+			o.putByte(')')
+		} else {
+			o.putStr("U+")
+			putHexMin(o, r, 4)
+		}
+	} else if k == LexErrBadInt {
+		putIntLitError(o, text)
+	} else if k == LexErrUntermString {
+		o.putStr("unterminated string literal")
+	} else if k == LexErrBadEscape {
+		o.putStr("invalid escape sequence \\")
+		putCharVerb(o, t.errByte)
+	} else if k == LexErrBadHexEscape {
+		o.putStr("invalid \\x escape: need exactly two hex digits")
+	} else if k == LexErrUntermChar {
+		o.putStr("unterminated char literal")
+	} else if k == LexErrEmptyChar {
+		o.putStr("empty char literal")
+	} else if k == LexErrCharMultiByte {
+		o.putStr("char literal must be a single byte (ASCII character or escape)")
+	} else if k == LexErrCharLen {
+		o.putStr("char literal must contain exactly one byte")
+	} else {
+		o.putStr("invalid token")
+	}
+}
+
+// decodeEscapeAt decodes the escape sequence of a VALID literal whose
+// backslash is at raw[i]; it returns the byte and the sequence length.
+func decodeEscapeAt(raw []byte, i usize) (byte, usize) {
+	n := len(raw)
+	if i+1 >= n {
+		return 0, 1
+	}
+	c := raw[i+1]
+	if c == 'n' {
+		return '\n', 2
+	}
+	if c == 'r' {
+		return '\r', 2
+	}
+	if c == 't' {
+		return '\t', 2
+	}
+	if c == 'x' && i+3 < n {
+		return (hexVal(raw[i+2]) << 4) | hexVal(raw[i+3]), 4
+	}
+	return c, 2
+}
+
+// decodeStringLit writes the decoded contents of a valid STRING literal
+// (spelling raw, including the quotes) into o.
+func decodeStringLit(o *OutBuf, raw []byte) {
+	n := len(raw)
+	if n < 2 {
+		return
+	}
+	end := n - 1
+	i := usize(1)
+	for g := usize(0); g < n; g++ {
+		if i >= end {
+			break
+		}
+		if raw[i] == '\\' {
+			b, w := decodeEscapeAt(raw, i)
+			o.putByte(b)
+			i += w
+		} else {
+			o.putByte(raw[i])
+			i++
+		}
+	}
+}
+
+// stringLitEmpty reports whether a valid STRING literal decodes to "".
+func stringLitEmpty(raw []byte) bool {
+	return len(raw) <= 2
+}
+
+// ---------------------------------------------------------------------------
+// Lexer
+
+type Lexer struct {
+	src        []byte
+	n          usize
+	off        usize
+	line       u32
+	lineStart  usize
+	insertSemi bool
+}
+
+// newLexer creates a lexer over one file; a UTF-8 BOM is skipped.
+func newLexer(src []byte) Lexer {
+	var l Lexer
+	l.src = src
+	l.n = len(src)
+	l.line = 1
+	if l.n >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
+		l.off = 3
+		l.lineStart = 3
+	}
+	return l
+}
+
+func (l *Lexer) col() u32 {
+	return u32(l.off-l.lineStart) + 1
+}
+
+func (l *Lexer) peekByte(k usize) byte {
+	if l.off+k < l.n {
+		return l.src[l.off+k]
+	}
+	return 0
+}
+
+// advance consumes one byte, tracking newlines.
+func (l *Lexer) advance() {
+	if l.off < l.n {
+		if l.src[l.off] == '\n' {
+			l.line++
+			l.lineStart = l.off + 1
+		}
+		l.off++
+	}
+}
+
+// advanceTo consumes bytes up to (excluding) offset target.
+func (l *Lexer) advanceTo(target usize) {
+	if target <= l.off {
+		return
+	}
+	cnt := target - l.off
+	for k := usize(0); k < cnt; k++ {
+		l.advance()
+	}
+}
+
+// tokAt makes a zero-length token at the given position.
+func tokAt(kind u8, off usize, line u32, col u32) Token {
+	var t Token
+	t.kind = kind
+	t.off = u32(off)
+	t.end = u32(off)
+	t.line = line
+	t.col = col
+	t.eline = line
+	t.ecol = col
+	return t
+}
+
+// finishTok sets the end of t to the current position.
+func (l *Lexer) finishTok(t Token) Token {
+	t.end = u32(l.off)
+	t.eline = l.line
+	t.ecol = l.col()
+	return t
+}
+
+// illegal returns an ILLEGAL token spanning start..current whose
+// diagnostic is at the token start.
+func (l *Lexer) illegal(start Token, reason u8) Token {
+	t := l.finishTok(start)
+	t.kind = TkIllegal
+	t.errKind = reason
+	t.errLine = start.line
+	t.errCol = start.col
+	l.insertSemi = false
+	return t
+}
+
+// illegalAt is illegal with the diagnostic at an explicit position.
+func (l *Lexer) illegalAt(start Token, reason u8, line u32, col u32, b byte) Token {
+	t := l.illegal(start, reason)
+	t.errLine = line
+	t.errCol = col
+	t.errByte = b
+	return t
+}
+
+// nextToken returns the next token.
+func (l *Lexer) nextToken() Token {
+	lim := l.n + 1
+	for g := usize(0); g < lim; g++ {
+		if l.off >= l.n {
+			t := tokAt(TkEOF, l.off, l.line, l.col())
+			if l.insertSemi {
+				l.insertSemi = false
+				t.kind = TkSemicolon
+				t.semi = SemiEOF
+			}
+			return t
+		}
+		c := l.src[l.off]
+		if c == '\n' {
+			if l.insertSemi {
+				t := tokAt(TkSemicolon, l.off, l.line, l.col())
+				t.semi = SemiNewline
+				l.advance()
+				l.insertSemi = false
+				return t
+			}
+			l.advance()
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\r' {
+			l.advance()
+			continue
+		}
+		if c == '/' && l.peekByte(1) == '/' {
+			l.skipLineComment()
+			continue
+		}
+		if c == '/' && l.peekByte(1) == '*' {
+			start := tokAt(TkIllegal, l.off, l.line, l.col())
+			l.advance()
+			l.advance()
+			sawNewline, closed := l.skipBlockComment()
+			if !closed {
+				return l.illegal(start, LexErrUntermComment)
+			}
+			if sawNewline && l.insertSemi {
+				l.insertSemi = false
+				start.kind = TkSemicolon
+				start.semi = SemiNewline
+				return start
+			}
+			continue
+		}
+		return l.scan()
+	}
+	return tokAt(TkEOF, l.off, l.line, l.col())
+}
+
+func (l *Lexer) skipLineComment() {
+	lim := l.n
+	for g := usize(0); g < lim; g++ {
+		if l.off >= l.n || l.src[l.off] == '\n' {
+			return
+		}
+		l.advance()
+	}
+}
+
+// skipBlockComment consumes the body of a block comment after "/*". It
+// returns whether a newline was seen and whether "*/" was found.
+func (l *Lexer) skipBlockComment() (bool, bool) {
+	sawNewline := false
+	lim := l.n
+	for g := usize(0); g < lim; g++ {
+		if l.off >= l.n {
+			return sawNewline, false
+		}
+		if l.src[l.off] == '*' && l.peekByte(1) == '/' {
+			l.advance()
+			l.advance()
+			return sawNewline, true
+		}
+		if l.src[l.off] == '\n' {
+			sawNewline = true
+		}
+		l.advance()
+	}
+	return sawNewline, false
+}
+
+// scan lexes one token starting at a non-blank, non-comment byte.
+func (l *Lexer) scan() Token {
+	start := tokAt(TkIllegal, l.off, l.line, l.col())
+	c := l.src[l.off]
+	if isLetter(c) {
+		l.skipWord()
+		t := l.finishTok(start)
+		k := lookupKeyword(l.src[start.off:l.off])
+		t.kind = k
+		l.insertSemi = k == TkIdent || k == TkTrue || k == TkFalse || k == TkNil || k == TkBreak || k == TkContinue || k == TkReturn
+		return t
+	}
+	if isDigit(c) {
+		l.skipWord()
+		t := l.finishTok(start)
+		v, st, _, _ := checkIntLit(l.src[start.off:l.off])
+		if st != IntOK {
+			return l.illegal(start, LexErrBadInt)
+		}
+		t.kind = TkInt
+		t.val = v
+		l.insertSemi = true
+		return t
+	}
+	if c == '"' {
+		return l.scanString(start)
+	}
+	if c == '\'' {
+		return l.scanChar(start)
+	}
+	return l.scanOperator(start)
+}
+
+// skipWord consumes a maximal run of letters and digits.
+func (l *Lexer) skipWord() {
+	lim := l.n
+	for g := usize(0); g < lim; g++ {
+		if l.off >= l.n {
+			return
+		}
+		c := l.src[l.off]
+		if !isLetter(c) && !isDigit(c) {
+			return
+		}
+		l.advance()
+	}
+}
+
+// opKind classifies the operator at the current offset; it returns the kind
+// (TkIllegal if none) and its size in bytes.
+func (l *Lexer) opKind() (u8, usize) {
+	c := l.src[l.off]
+	n1 := l.peekByte(1)
+	n2 := l.peekByte(2)
+	if c == '+' {
+		if n1 == '+' {
+			return TkInc, 2
+		}
+		if n1 == '=' {
+			return TkAddAssign, 2
+		}
+		return TkAdd, 1
+	}
+	if c == '-' {
+		if n1 == '-' {
+			return TkDec, 2
+		}
+		if n1 == '=' {
+			return TkSubAssign, 2
+		}
+		if n1 == '>' {
+			return TkArrow, 2
+		}
+		return TkSub, 1
+	}
+	if c == '*' {
+		if n1 == '=' {
+			return TkMulAssign, 2
+		}
+		return TkMul, 1
+	}
+	if c == '/' {
+		if n1 == '=' {
+			return TkQuoAssign, 2
+		}
+		return TkQuo, 1
+	}
+	if c == '%' {
+		return TkRem, 1
+	}
+	if c == '&' {
+		if n1 == '&' {
+			return TkLAnd, 2
+		}
+		return TkAnd, 1
+	}
+	if c == '|' {
+		if n1 == '|' {
+			return TkLOr, 2
+		}
+		return TkOr, 1
+	}
+	if c == '^' {
+		return TkXor, 1
+	}
+	if c == '<' {
+		if n1 == '<' {
+			return TkShl, 2
+		}
+		if n1 == '=' {
+			return TkLeq, 2
+		}
+		return TkLss, 1
+	}
+	if c == '>' {
+		if n1 == '>' {
+			return TkShr, 2
+		}
+		if n1 == '=' {
+			return TkGeq, 2
+		}
+		return TkGtr, 1
+	}
+	if c == '=' {
+		if n1 == '=' {
+			return TkEql, 2
+		}
+		return TkAssign, 1
+	}
+	if c == '!' {
+		if n1 == '=' {
+			return TkNeq, 2
+		}
+		return TkNot, 1
+	}
+	if c == ':' {
+		if n1 == '=' {
+			return TkDefine, 2
+		}
+		return TkColon, 1
+	}
+	if c == '(' {
+		return TkLParen, 1
+	}
+	if c == ')' {
+		return TkRParen, 1
+	}
+	if c == '[' {
+		return TkLBrack, 1
+	}
+	if c == ']' {
+		return TkRBrack, 1
+	}
+	if c == '{' {
+		return TkLBrace, 1
+	}
+	if c == '}' {
+		return TkRBrace, 1
+	}
+	if c == ',' {
+		return TkComma, 1
+	}
+	if c == ';' {
+		return TkSemicolon, 1
+	}
+	if c == '.' {
+		if n1 == '.' && n2 == '.' {
+			return TkEllipsis, 3
+		}
+		return TkPeriod, 1
+	}
+	return TkIllegal, 1
+}
+
+func (l *Lexer) scanOperator(start Token) Token {
+	k, size := l.opKind()
+	if k == TkIllegal {
+		c := l.src[l.off]
+		r, w := decodeRune(l.src, l.off)
+		l.advanceTo(l.off + w)
+		if r == RuneError && w <= 1 {
+			t := l.illegal(start, LexErrBadUTF8)
+			t.errByte = c
+			return t
+		}
+		t := l.illegal(start, LexErrBadChar)
+		t.val = u64(r)
+		return t
+	}
+	l.advanceTo(l.off + size)
+	t := l.finishTok(start)
+	t.kind = k
+	l.insertSemi = k == TkRParen || k == TkRBrack || k == TkRBrace || k == TkInc || k == TkDec
+	return t
+}
+
+// escape scans one escape sequence starting at the backslash. It returns
+// the status (Esc*), the decoded byte and the offending byte.
+func (l *Lexer) escape(quote byte) (u8, byte, byte) {
+	l.advance() // backslash
+	if l.off >= l.n {
+		return EscEOF, 0, 0
+	}
+	c := l.src[l.off]
+	if c == 'n' {
+		l.advance()
+		return EscOK, '\n', 0
+	}
+	if c == 'r' {
+		l.advance()
+		return EscOK, '\r', 0
+	}
+	if c == 't' {
+		l.advance()
+		return EscOK, '\t', 0
+	}
+	if c == '\\' {
+		l.advance()
+		return EscOK, '\\', 0
+	}
+	if c == '"' || c == '\'' {
+		if c != quote {
+			return EscInvalid, 0, c
+		}
+		l.advance()
+		return EscOK, c, 0
+	}
+	if c == 'x' {
+		l.advance()
+		h1 := l.peekByte(0)
+		h2 := l.peekByte(1)
+		if !isHex(h1) || !isHex(h2) {
+			return EscBadHex, 0, 0
+		}
+		l.advance()
+		l.advance()
+		return EscOK, (hexVal(h1) << 4) | hexVal(h2), 0
+	}
+	if c == '\n' {
+		return EscNewline, 0, 0
+	}
+	return EscInvalid, 0, c
+}
+
+func (l *Lexer) scanString(start Token) Token {
+	l.advance() // opening quote
+	badKind := u8(LexErrNone)
+	badLine := u32(0)
+	badCol := u32(0)
+	badByte := byte(0)
+	closed := false
+	lim := l.n
+	for g := usize(0); g < lim; g++ {
+		if l.off >= l.n || l.src[l.off] == '\n' {
+			return l.illegal(start, LexErrUntermString)
+		}
+		c := l.src[l.off]
+		if c == '"' {
+			l.advance()
+			closed = true
+			break
+		}
+		if c == '\\' {
+			pl := l.line
+			pc := l.col()
+			st, _, bb := l.escape('"')
+			if st == EscEOF || st == EscNewline {
+				return l.illegal(start, LexErrUntermString)
+			}
+			if st != EscOK && badKind == LexErrNone {
+				badLine = pl
+				badCol = pc
+				badByte = bb
+				if st == EscBadHex {
+					badKind = LexErrBadHexEscape
+				} else {
+					badKind = LexErrBadEscape
+				}
+			}
+			continue
+		}
+		l.advance()
+	}
+	if !closed {
+		return l.illegal(start, LexErrUntermString)
+	}
+	if badKind != LexErrNone {
+		return l.illegalAt(start, badKind, badLine, badCol, badByte)
+	}
+	l.insertSemi = true
+	t := l.finishTok(start)
+	t.kind = TkString
+	return t
+}
+
+func (l *Lexer) scanChar(start Token) Token {
+	l.advance() // opening quote
+	if l.off >= l.n || l.src[l.off] == '\n' {
+		return l.illegal(start, LexErrUntermChar)
+	}
+	c := l.src[l.off]
+	v := byte(0)
+	if c == '\'' {
+		l.advance()
+		return l.illegal(start, LexErrEmptyChar)
+	} else if c == '\\' {
+		pl := l.line
+		pc := l.col()
+		st, b, bb := l.escape('\'')
+		if st == EscEOF || st == EscNewline {
+			return l.illegal(start, LexErrUntermChar)
+		}
+		if st == EscBadHex {
+			l.skipCharRest()
+			return l.illegalAt(start, LexErrBadHexEscape, pl, pc, bb)
+		}
+		if st == EscInvalid {
+			l.skipCharRest()
+			return l.illegalAt(start, LexErrBadEscape, pl, pc, bb)
+		}
+		v = b
+	} else if c >= 0x80 {
+		l.skipCharRest()
+		return l.illegal(start, LexErrCharMultiByte)
+	} else {
+		v = c
+		l.advance()
+	}
+	if l.off >= l.n || l.src[l.off] == '\n' {
+		return l.illegal(start, LexErrUntermChar)
+	}
+	if l.src[l.off] != '\'' {
+		l.skipCharRest()
+		return l.illegal(start, LexErrCharLen)
+	}
+	l.advance()
+	l.insertSemi = true
+	t := l.finishTok(start)
+	t.kind = TkChar
+	t.val = u64(v)
+	return t
+}
+
+// skipCharRest skips to just past the closing quote on the same line, if any.
+func (l *Lexer) skipCharRest() {
+	n := l.n
+	for i := l.off; i < n; i++ {
+		if l.src[i] == '\n' {
+			return
+		}
+		if l.src[i] == '\'' {
+			l.advanceTo(i + 1)
+			return
+		}
+	}
+}
+
+// tokenize scans a whole file into ta. The token list always ends with
+// EOF. It returns false if the token arena overflowed.
+func tokenize(l *Lexer, ta *TokenArena) bool {
+	ta.count = 0
+	ta.full = false
+	lim := l.n + 2
+	for g := usize(0); g < lim; g++ {
+		t := l.nextToken()
+		if ta.count >= MaxTokens {
+			ta.full = true
+			return false
+		}
+		ta.items[ta.count] = t
+		ta.count++
+		if t.kind == TkEOF {
+			return true
+		}
+	}
+	return false
+}

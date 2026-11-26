@@ -1,0 +1,450 @@
+// main.fc — the finc command-line driver (spec 9.6).
+//
+//	finc parse [--dump-ast] <file.fc | dir>
+//	finc check | build | run | test   (not implemented yet: M7)
+//
+// `parse` mirrors `finc0 parse`: all `.fc` files of a directory (sorted by
+// name) are parsed as one package; syntax errors are printed to stderr in
+// the spec 11 format, one per failing file, in file order; with
+// --dump-ast the AST is printed to stdout in finc0's dump format.
+//
+// The driver layer is the only place that touches capabilities (FS, Env,
+// Stdio). The arenas are package-level Value variables; the driver takes
+// their addresses and passes them to the total phases (lexer, parser,
+// dump) through Scoped helper structs that live in its own frame.
+package main
+
+const (
+	MaxPathBytes = 4096
+)
+
+// Package-level arenas (Value types only, rule S1).
+var sources SourceArena
+var tokens TokenArena
+var nodes NodeArena
+var listStack ListStack
+var outBuf OutBuf
+var errBuf OutBuf
+var tmpBuf OutBuf
+var fileNames [MaxFiles]string
+
+func strEq(a string, b string) bool {
+	return bytesEqual(strBytes(a), strBytes(b))
+}
+
+// cleanJoin writes filepath.Join(dir, name) (Go's lexical Clean of
+// dir + "/" + name) into dst and returns its length (0 on overflow).
+func cleanJoin(dir []byte, name []byte, dst []byte) usize {
+	var in [MaxPathBytes]byte
+	nd := len(dir)
+	nn := len(name)
+	if nd+nn+1 > MaxPathBytes {
+		return 0
+	}
+	k := copy(in[:], dir)
+	in[k] = '/'
+	k++
+	k += copy(in[k:], name)
+	return cleanPath(in[:k], dst)
+}
+
+// cleanPath implements Go's path.Clean on bytes; it returns the length
+// written to dst (0 if dst is too small).
+func cleanPath(src []byte, dst []byte) usize {
+	n := len(src)
+	room := len(dst)
+	if n == 0 {
+		if room == 0 {
+			return 0
+		}
+		dst[0] = '.'
+		return 1
+	}
+	if room < n+1 {
+		return 0
+	}
+	rooted := src[0] == '/'
+	w := usize(0)
+	r := usize(0)
+	dotdot := usize(0)
+	if rooted {
+		dst[0] = '/'
+		w = 1
+		r = 1
+		dotdot = 1
+	}
+	for g := usize(0); g < n; g++ {
+		if r >= n {
+			break
+		}
+		if src[r] == '/' {
+			r++
+		} else if src[r] == '.' && (r+1 == n || src[r+1] == '/') {
+			r++
+		} else if src[r] == '.' && src[r+1] == '.' && (r+2 == n || src[r+2] == '/') {
+			r += 2
+			if w > dotdot {
+				w--
+				for h := usize(0); h < n; h++ {
+					if w <= dotdot || dst[w] == '/' {
+						break
+					}
+					w--
+				}
+			} else if !rooted {
+				if w > 0 {
+					dst[w] = '/'
+					w++
+				}
+				dst[w] = '.'
+				dst[w+1] = '.'
+				w += 2
+				dotdot = w
+			}
+		} else {
+			if rooted && w != 1 || !rooted && w != 0 {
+				dst[w] = '/'
+				w++
+			}
+			for h := usize(0); h < n; h++ {
+				if r >= n || src[r] == '/' {
+					break
+				}
+				dst[w] = src[r]
+				w++
+				r++
+			}
+		}
+	}
+	if w == 0 {
+		dst[0] = '.'
+		return 1
+	}
+	return w
+}
+
+// ---------------------------------------------------------------------------
+// output helpers (driver layer)
+
+driver func flushErr(io Stdio) error {
+	eb := &errBuf
+	if errBuf.len == 0 {
+		return nil
+	}
+	err := io.WriteStderr(errBuf.data[:errBuf.len])
+	eb.reset()
+	return err
+}
+
+driver func say(io Stdio, toStderr bool, s string) error {
+	if toStderr {
+		return io.WriteStderr(strBytes(s))
+	}
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func usage(io Stdio, toStderr bool) error {
+	if err := say(io, toStderr, "usage: finc1 <command> [arguments]\n\n"); err != nil {
+		return err
+	}
+	if err := say(io, toStderr, "  finc1 parse [--dump-ast] <file.fc | dir>\n      parse sources and optionally dump the AST\n"); err != nil {
+		return err
+	}
+	if err := say(io, toStderr, "  finc1 check [--comptime-fuel=N] <file.fc | dir>\n      type, scope and totality check\n"); err != nil {
+		return err
+	}
+	if err := say(io, toStderr, "  finc1 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n      compile to a Go program and binary\n"); err != nil {
+		return err
+	}
+	if err := say(io, toStderr, "  finc1 run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n      build and run\n"); err != nil {
+		return err
+	}
+	return say(io, toStderr, "  finc1 test <dir>\n      run conformance tests in a directory\n")
+}
+
+// ioFail reports "finc1: <what> <path>: <reason>" for an I/O error.
+driver func ioFail(io Stdio, what string, path string, err error) error {
+	eb := &errBuf
+	eb.reset()
+	eb.putStr("finc1: ")
+	eb.putStr(what)
+	eb.putStr(path)
+	eb.putStr(": ")
+	if err == ErrNotFound {
+		eb.putStr("no such file or directory")
+	} else if err == ErrArenaFull {
+		eb.putStr("compiler capacity exceeded")
+	} else {
+		eb.putStr("I/O error")
+	}
+	eb.putByte('\n')
+	if e := flushErr(io); e != nil {
+		return e
+	}
+	return err
+}
+
+// capacityFail reports an exhausted compiler arena.
+driver func capacityFail(io Stdio, path string, what string) error {
+	eb := &errBuf
+	eb.reset()
+	eb.putStr("finc1: ")
+	eb.putStr(path)
+	eb.putStr(": compiler capacity exceeded (")
+	eb.putStr(what)
+	eb.putStr(")\n")
+	if e := flushErr(io); e != nil {
+		return e
+	}
+	return ErrArenaFull
+}
+
+// ---------------------------------------------------------------------------
+// main
+
+driver func main(fs FS, env Env, io Stdio, exec Exec) error {
+	eb := &errBuf
+	argc := env.ArgsCount()
+	if argc < 2 {
+		if err := usage(io, true); err != nil {
+			return err
+		}
+		return ErrParse
+	}
+	cmd := env.Arg(1)
+	if strEq(cmd, "-h") || strEq(cmd, "--help") || strEq(cmd, "help") {
+		return usage(io, false)
+	}
+	if strEq(cmd, "parse") {
+		return runParse(fs, env, io)
+	}
+	if strEq(cmd, "check") || strEq(cmd, "build") || strEq(cmd, "run") || strEq(cmd, "test") {
+		eb.reset()
+		eb.putStr("finc1 ")
+		eb.putStr(cmd)
+		eb.putStr(": not implemented\n")
+		if err := flushErr(io); err != nil {
+			return err
+		}
+		return ErrExec
+	}
+	eb.reset()
+	eb.putStr("finc1: unknown command ")
+	putQuoted(eb, strBytes(cmd))
+	eb.putByte('\n')
+	if err := flushErr(io); err != nil {
+		return err
+	}
+	if err := usage(io, true); err != nil {
+		return err
+	}
+	return ErrParse
+}
+
+driver func parseUsage(io Stdio) error {
+	if err := say(io, true, "usage: finc1 parse [--dump-ast] <file.fc | dir>\n  -dump-ast\n    \tprint the AST\n"); err != nil {
+		return err
+	}
+	return ErrParse
+}
+
+// runParse implements `parse [--dump-ast] <file.fc | dir>` (Go flag
+// syntax: -dump-ast / --dump-ast[=true|false] before the operand).
+driver func runParse(fs FS, env Env, io Stdio) error {
+	eb := &errBuf
+	argc := env.ArgsCount()
+	dump := false
+	operand := ""
+	nops := usize(0)
+	flagsDone := false
+	for i := usize(2); i < argc; i++ {
+		a := env.Arg(i)
+		ab := strBytes(a)
+		isFlag := !flagsDone && nops == 0 && len(ab) > 1 && ab[0] == '-'
+		if isFlag && strEq(a, "--") {
+			flagsDone = true
+		} else if isFlag {
+			if strEq(a, "-dump-ast") || strEq(a, "--dump-ast") || strEq(a, "-dump-ast=true") || strEq(a, "--dump-ast=true") {
+				dump = true
+			} else if strEq(a, "-dump-ast=false") || strEq(a, "--dump-ast=false") {
+				dump = false
+			} else {
+				eb.reset()
+				eb.putStr("flag provided but not defined: ")
+				eb.putStr(a)
+				eb.putByte('\n')
+				if err := flushErr(io); err != nil {
+					return err
+				}
+				return parseUsage(io)
+			}
+		} else {
+			operand = a
+			nops++
+		}
+	}
+	if nops != 1 {
+		return parseUsage(io)
+	}
+	return parsePackage(fs, io, operand, dump)
+}
+
+// parsePackage parses a file or all `.fc` files of a directory as one
+// package, then prints the diagnostics or (optionally) the AST dump.
+driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
+	eb := &errBuf
+	ob := &outBuf
+	sources.used = 0
+	sources.nfiles = 0
+	eb.reset()
+	nfiles := usize(0)
+	single := !fs.IsDir(path)
+	if !single {
+		n, err := fs.ListSourceFiles(path, fileNames[:])
+		if err != nil {
+			return ioFail(io, "open ", path, err)
+		}
+		if n == 0 {
+			eb.reset()
+			eb.putStr("finc1: ")
+			eb.putStr(path)
+			eb.putStr(": no .fc files in directory\n")
+			if e := flushErr(io); e != nil {
+				return e
+			}
+			return ErrNotFound
+		}
+		var pb [MaxPathBytes]byte
+		for i := usize(0); i < n; i++ {
+			k := cleanJoin(strBytes(path), strBytes(fileNames[i]), pb[:])
+			if k == 0 {
+				return capacityFail(io, path, "path too long")
+			}
+			sources.files[i].path = bytesToStr(pb[:k])
+		}
+		nfiles = n
+	} else {
+		sources.files[0].path = path
+		nfiles = 1
+	}
+	sources.nfiles = nfiles
+
+	ndiag := usize(0)
+	nincluded := usize(0)
+	firstIncluded := usize(0)
+	pkgName := ""
+	tp := &tokens
+	np := &nodes
+	for i := usize(0); i < nfiles; i++ {
+		fpath := sources.files[i].path
+		st := sources.used
+		n, err := fs.ReadFileInto(fpath, sources.bytes[st:])
+		if err != nil {
+			if single && err == ErrNotFound {
+				return ioFail(io, "stat ", fpath, err)
+			}
+			return ioFail(io, "open ", fpath, err)
+		}
+		sources.files[i].start = st
+		sources.files[i].size = n
+		sources.files[i].root = 0
+		sources.files[i].ok = false
+		sources.used = st + n
+
+		lx := newLexer(sources.bytes[st : st+n])
+		lp := &lx
+		if !tokenize(lp, tp) {
+			return capacityFail(io, fpath, "tokens")
+		}
+
+		nodeMark := nodes.count
+		listMark := nodes.nlist
+		diagMark := errBuf.len
+		p := Parser{
+			toks: tp,
+			na:   np,
+			ls:   &listStack,
+			diag: eb,
+			src:  sources.bytes[:],
+			fsrc: sources.bytes[st : st+n],
+			base: u32(st),
+			file: u16(i),
+			path: fpath,
+			ntok: tokens.count,
+		}
+		pp := &p
+		root := pp.run()
+		if nodes.full || listStack.full || errBuf.full {
+			errBuf.len = diagMark
+			return capacityFail(io, fpath, "AST nodes")
+		}
+		if root == 0 {
+			nodes.count = nodeMark
+			nodes.nlist = listMark
+			listStack.top = 0
+			ndiag++
+			continue
+		}
+		np.assignIDs(root, WalkDepth)
+
+		// All files of a package must share its package clause.
+		pkgID := nodes.items[usize(root)].a
+		pk := nodes.items[usize(pkgID)]
+		pkgText := sources.bytes[usize(pk.tOff) : usize(pk.tOff)+usize(pk.tLen)]
+		if nincluded == 0 {
+			pkgName = bytesToStr(pkgText)
+			firstIncluded = i
+		} else if !bytesEqual(pkgText, strBytes(pkgName)) {
+			diagHeader(eb, fpath, pk.sLine, pk.sCol, E1001)
+			eb.putStr("package ")
+			eb.putBytes(pkgText)
+			eb.putStr("; expected package ")
+			eb.putStr(pkgName)
+			eb.putStr(" (from ")
+			eb.putStr(sources.files[firstIncluded].path)
+			eb.putStr(")")
+			diagEnd(eb)
+			ndiag++
+			continue
+		}
+		sources.files[i].root = root
+		sources.files[i].ok = true
+		nincluded++
+	}
+
+	if ndiag > 0 {
+		if err := flushErr(io); err != nil {
+			return err
+		}
+		return ErrParse
+	}
+	if !dump {
+		return nil
+	}
+
+	ob.reset()
+	ob.putStr("Package ")
+	ob.putStr(pkgName)
+	ob.putStr(" (")
+	ob.putUint(u64(nincluded))
+	ob.putStr(" files)\n")
+	if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+		return err
+	}
+	d := Dumper{na: np, sa: &sources, src: sources.bytes[:], out: ob, tmp: &tmpBuf}
+	dp := &d
+	for i := usize(0); i < nfiles; i++ {
+		if !sources.files[i].ok {
+			continue
+		}
+		ob.reset()
+		dp.dumpNode(sources.files[i].root, 0, WalkDepth)
+		if outBuf.full {
+			return capacityFail(io, sources.files[i].path, "output buffer")
+		}
+		if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+			return err
+		}
+	}
+	return nil
+}

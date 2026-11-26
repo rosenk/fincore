@@ -1,0 +1,1889 @@
+// parser.fc — total recursive-descent parser for FinCore (spec section 3),
+// a faithful port of bootstrap/internal/parser/parser.go.
+//
+// Termination (spec 6.2):
+//   - every loop is a T1 counting loop bounded by the token count of the
+//     file (each iteration consumes at least one token or exits);
+//   - the mutually recursive parse functions form one call-graph SCC; each
+//     of them carries `decreases(depth)`, starts with the guard
+//     `if depth == 0 { return ... }` and passes `depth - 1` on every call
+//     inside the SCC (rule T3). The top-level functions (parseFile,
+//     topDecl, funcDecl, typeDecl, importDecl, ...) are not recursive and
+//     start the measure at ParseDepth.
+//
+// Error handling: like finc0, the parser stops at the first error of a file
+// and reports exactly one diagnostic. Instead of unwinding, the first error
+// is written to the diagnostic buffer, `failed` is set and the current
+// token becomes a sticky ILLEGAL token: every loop exits on `failed`, every
+// expectation fails silently, so the remaining calls unwind in O(stack)
+// steps without changing the diagnostic. finc0 reports the same first
+// error because both parsers execute identically up to that point.
+//
+// Nesting: finc0 bounds nesting with a counter (MaxNesting = 1000,
+// incremented in parseType, stmt, expr and prefix unary). The same counter
+// is kept here so that "nesting too deep" is reported at the same token.
+// The decreases budget ParseDepth is far larger than the number of frames
+// reachable within MaxNesting levels, so ErrMaxDepth exhaustion is
+// unreachable in practice; if it ever happens it is reported with the same
+// E1001 message.
+package main
+
+const (
+	MaxNesting = 1000
+	ParseDepth = 65_536
+	WalkDepth  = MaxNodes + 1 // tree depth never exceeds the node count
+)
+
+type Pos struct {
+	line u32
+	col  u32
+}
+
+type Parser struct {
+	toks    *TokenArena
+	na      *NodeArena
+	ls      *ListStack
+	diag    *OutBuf
+	src     []byte // all source bytes (node text spans are absolute)
+	fsrc    []byte // bytes of this file (token offsets are relative)
+	base    u32    // offset of this file in src
+	file    u16
+	path    string
+	ntok    usize
+	pos     usize
+	tok     Token
+	prevEnd Pos
+	exprLev int // < 0: in a control clause (no struct literals)
+	nest    usize
+	failed  bool
+}
+
+// ---------------------------------------------------------------------------
+// entry point
+
+// run parses the tokens of one file and returns its File node, or 0 after
+// a syntax error (the diagnostic has been written to p.diag).
+func (p *Parser) run() u32 {
+	p.pos = 0
+	p.failed = false
+	p.nest = 0
+	p.exprLev = 0
+	p.prevEnd = Pos{line: 0, col: 0}
+	if p.ntok == 0 {
+		return 0
+	}
+	p.tok = p.toks.items[0]
+	if p.tok.kind == TkIllegal {
+		p.failLex()
+	}
+	f := p.parseFile()
+	if p.failed {
+		return 0
+	}
+	return f
+}
+
+// ---------------------------------------------------------------------------
+// token handling
+
+func (p *Parser) next() {
+	if p.failed {
+		return
+	}
+	p.prevEnd = Pos{line: p.tok.eline, col: p.tok.ecol}
+	if p.pos+1 < p.ntok {
+		p.pos++
+	}
+	p.tok = p.toks.items[p.pos]
+	if p.tok.kind == TkIllegal {
+		p.failLex()
+	}
+}
+
+func (p *Parser) peek(k usize) Token {
+	i := p.pos + k
+	if i >= p.ntok {
+		i = p.ntok - 1
+	}
+	return p.toks.items[i]
+}
+
+func (p *Parser) tokText(t Token) []byte {
+	return p.fsrc[usize(t.off):usize(t.end)]
+}
+
+// tokIs reports whether the current token is the identifier `word`.
+func (p *Parser) tokIs(word string) bool {
+	return p.tok.kind == TkIdent && bytesEqual(p.tokText(p.tok), strBytes(word))
+}
+
+func (p *Parser) start() Pos {
+	return Pos{line: p.tok.line, col: p.tok.col}
+}
+
+func (p *Parser) explicitSemi() bool {
+	return p.tok.kind == TkSemicolon && p.tok.semi == SemiExplicit
+}
+
+func (p *Parser) newlineSemi() bool {
+	return p.tok.kind == TkSemicolon && p.tok.semi == SemiNewline
+}
+
+// ---------------------------------------------------------------------------
+// diagnostics (first error wins)
+
+// errBegin starts a diagnostic at line:col unless one was already
+// reported; the caller writes the message and calls errEnd.
+func (p *Parser) errBegin(line u32, col u32, code u32) bool {
+	if p.failed {
+		return false
+	}
+	diagHeader(p.diag, p.path, line, col, code)
+	return true
+}
+
+func (p *Parser) errEnd() {
+	diagEnd(p.diag)
+	p.failed = true
+	p.tok.kind = TkIllegal
+}
+
+func (p *Parser) describe(t Token) {
+	describeToken(p.diag, t, p.tokText(t))
+}
+
+// failLex reports the ILLEGAL current token.
+func (p *Parser) failLex() {
+	t := p.tok
+	if !p.errBegin(t.errLine, t.errCol, lexErrCode(t)) {
+		return
+	}
+	putLexError(p.diag, t, p.tokText(t))
+	p.errEnd()
+}
+
+// errorTok reports msg at the current token.
+func (p *Parser) errorTok(msg string) {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	p.diag.putStr(msg)
+	p.errEnd()
+}
+
+// errorNode reports msg at the start of node id.
+func (p *Parser) errorNode(id u32, msg string) {
+	n := p.na.items[usize(id)]
+	if !p.errBegin(n.sLine, n.sCol, E1001) {
+		return
+	}
+	p.diag.putStr(msg)
+	p.errEnd()
+}
+
+// errorExpected reports "expected <what>, found <tok>".
+func (p *Parser) errorExpected(what string) {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	p.diag.putStr("expected ")
+	p.diag.putStr(what)
+	p.diag.putStr(", found ")
+	p.describe(p.tok)
+	p.errEnd()
+}
+
+// errorUnexpected reports "unexpected <tok><rest>".
+func (p *Parser) errorUnexpected(rest string) {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	p.diag.putStr("unexpected ")
+	p.describe(p.tok)
+	p.diag.putStr(rest)
+	p.errEnd()
+}
+
+// errorAfter reports "unexpected <tok> after <context>; expected ';' or newline".
+func (p *Parser) errorAfter(context string) {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	p.diag.putStr("unexpected ")
+	p.describe(p.tok)
+	p.diag.putStr(" after ")
+	p.diag.putStr(context)
+	p.diag.putStr("; expected ';' or newline")
+	p.errEnd()
+}
+
+// errorNewlineBrace reports a '{' that was moved to the next line.
+func (p *Parser) errorNewlineBrace(what string) {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	p.diag.putStr("unexpected newline; the '{' of ")
+	p.diag.putStr(what)
+	p.diag.putStr(" must be on the same line")
+	p.errEnd()
+}
+
+// putNode writes the canonical source of a node into the diagnostic.
+func (p *Parser) putNode(id u32) {
+	pr := Printer{na: p.na, src: p.src, out: p.diag, indent: 0}
+	pp := &pr
+	pp.printNode(id, WalkDepth)
+}
+
+// tooDeep reports nesting overflow (counter or decreases budget).
+func (p *Parser) tooDeep() u32 {
+	if p.errBegin(p.tok.line, p.tok.col, E1001) {
+		p.diag.putStr("nesting too deep (limit ")
+		p.diag.putUint(MaxNesting)
+		p.diag.putStr(")")
+		p.errEnd()
+	}
+	return 0
+}
+
+func (p *Parser) enter() {
+	p.nest++
+	if p.nest > MaxNesting {
+		_ = p.tooDeep()
+	}
+}
+
+func (p *Parser) leave() {
+	if p.nest > 0 {
+		p.nest--
+	}
+}
+
+func (p *Parser) expect(k u8) {
+	if p.tok.kind != k {
+		if p.errBegin(p.tok.line, p.tok.col, E1001) {
+			p.diag.putStr("expected '")
+			p.diag.putStr(kindString(k))
+			p.diag.putStr("', found ")
+			p.describe(p.tok)
+			p.errEnd()
+		}
+	}
+	p.next()
+}
+
+// expectSemi requires a statement/declaration terminator, which may be
+// omitted before a closing ')' or '}'.
+func (p *Parser) expectSemi(context string) {
+	k := p.tok.kind
+	if k == TkSemicolon {
+		p.next()
+	} else if k != TkRParen && k != TkRBrace {
+		p.errorAfter(context)
+	}
+}
+
+func (p *Parser) expectFileSemi(context string) {
+	k := p.tok.kind
+	if k == TkSemicolon {
+		p.next()
+	} else if k != TkEOF {
+		p.errorAfter(context)
+	}
+}
+
+func (p *Parser) expectOpenBrace(what string) {
+	if p.tok.kind != TkLBrace {
+		if p.newlineSemi() {
+			p.errorNewlineBrace(what)
+		}
+		p.errorExpected("'{'")
+	}
+	p.next()
+}
+
+func (p *Parser) newlineBeforeBrace(what string) {
+	if p.newlineSemi() {
+		p.errorNewlineBrace(what)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// node construction
+
+func (p *Parser) mk(kind u8, s Pos) u32 {
+	return p.na.alloc(kind, p.file, s.line, s.col)
+}
+
+// finish sets the end of node id to the end of the last consumed token.
+func (p *Parser) finish(id u32) u32 {
+	p.na.items[usize(id)].eLine = p.prevEnd.line
+	p.na.items[usize(id)].eCol = p.prevEnd.col
+	return id
+}
+
+func (p *Parser) kindOf(id u32) u8 {
+	return p.na.items[usize(id)].kind
+}
+
+func (p *Parser) setA(id u32, x u32) {
+	p.na.items[usize(id)].a = x
+}
+
+func (p *Parser) setB(id u32, x u32) {
+	p.na.items[usize(id)].b = x
+}
+
+func (p *Parser) setC(id u32, x u32) {
+	p.na.items[usize(id)].c = x
+}
+
+func (p *Parser) setD(id u32, x u32) {
+	p.na.items[usize(id)].d = x
+}
+
+func (p *Parser) setE(id u32, x u32) {
+	p.na.items[usize(id)].e = x
+}
+
+func (p *Parser) setF(id u32, x u32) {
+	p.na.items[usize(id)].f = x
+}
+
+func (p *Parser) setOp(id u32, op u8) {
+	p.na.items[usize(id)].op = op
+}
+
+func (p *Parser) setFlag(id u32, f u8) {
+	p.na.items[usize(id)].flags = p.na.items[usize(id)].flags | f
+}
+
+// setL1 commits the list started at mark into slot l1 of id.
+func (p *Parser) setL1(id u32, mark usize) {
+	s, n := p.ls.commit(p.na, mark)
+	p.na.items[usize(id)].l1s = s
+	p.na.items[usize(id)].l1n = n
+}
+
+func (p *Parser) setL2(id u32, mark usize) {
+	s, n := p.ls.commit(p.na, mark)
+	p.na.items[usize(id)].l2s = s
+	p.na.items[usize(id)].l2n = n
+}
+
+// setText records the source spelling of token t as the text of id.
+func (p *Parser) setText(id u32, t Token) {
+	p.na.items[usize(id)].tOff = p.base + t.off
+	p.na.items[usize(id)].tLen = t.end - t.off
+}
+
+// ---------------------------------------------------------------------------
+// file level (not recursive)
+
+func (p *Parser) parseFile() u32 {
+	f := p.mk(NkFile, p.start())
+	if p.tok.kind != TkPackage {
+		if p.errBegin(p.tok.line, p.tok.col, E1001) {
+			p.diag.putStr("expected package clause, found ")
+			p.describe(p.tok)
+			p.errEnd()
+		}
+	}
+	p.next()
+	p.setA(f, p.ident())
+	p.expectFileSemi("package clause")
+	lim := p.ntok
+	imark := p.ls.top
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind != TkImport {
+			break
+		}
+		p.ls.push(p.importDecl())
+		p.expectFileSemi("import declaration")
+	}
+	p.setL1(f, imark)
+	dmark := p.ls.top
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind == TkEOF {
+			break
+		}
+		p.ls.push(p.topDecl())
+		p.expectFileSemi("declaration")
+	}
+	p.setL2(f, dmark)
+	return p.finish(f)
+}
+
+func (p *Parser) ident() u32 {
+	s := p.start()
+	if p.tok.kind != TkIdent {
+		p.errorExpected("identifier")
+	}
+	t := p.tok
+	p.next()
+	id := p.mk(NkIdent, s)
+	p.setText(id, t)
+	return p.finish(id)
+}
+
+// identListPush pushes `IDENT { "," IDENT }` onto the list stack.
+func (p *Parser) identListPush() {
+	p.ls.push(p.ident())
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind != TkComma {
+			break
+		}
+		p.next()
+		p.ls.push(p.ident())
+	}
+}
+
+func (p *Parser) importDecl() u32 {
+	d := p.mk(NkImportDecl, p.start())
+	p.expect(TkImport)
+	mark := p.ls.top
+	if p.tok.kind == TkLParen {
+		p.setFlag(d, Flag1)
+		p.next()
+		lim := p.ntok
+		for g := usize(0); g < lim; g++ {
+			if p.failed || p.tok.kind == TkRParen {
+				break
+			}
+			p.ls.push(p.importSpec())
+			p.expectSemi("import spec")
+		}
+		p.setL1(d, mark)
+		p.next()
+	} else {
+		p.ls.push(p.importSpec())
+		p.setL1(d, mark)
+	}
+	return p.finish(d)
+}
+
+func (p *Parser) importSpec() u32 {
+	s := p.mk(NkImportSpec, p.start())
+	if p.tok.kind == TkIdent {
+		p.setA(s, p.ident())
+	}
+	if p.tok.kind != TkString {
+		p.errorExpected("import path string")
+	}
+	path := p.basicLit()
+	p.setB(s, path)
+	if !p.failed {
+		n := p.na.items[usize(path)]
+		if n.tLen <= 2 {
+			p.errorNode(path, "empty import path")
+		}
+	}
+	return p.finish(s)
+}
+
+func (p *Parser) topDecl() u32 {
+	k := p.tok.kind
+	if k == TkConst {
+		return p.constDecl(ParseDepth)
+	}
+	if k == TkType {
+		return p.typeDecl()
+	}
+	if k == TkVar {
+		return p.varDecl(ParseDepth)
+	}
+	if k == TkFunc || k == TkDriver || k == TkComptime {
+		return p.funcDecl()
+	}
+	if k == TkImport {
+		p.errorTok("imports must appear before other declarations")
+		return 0
+	}
+	p.errorExpected("declaration (const, type, var or func)")
+	return 0
+}
+
+func (p *Parser) typeDecl() u32 {
+	d := p.mk(NkTypeDecl, p.start())
+	p.expect(TkType)
+	p.setA(d, p.ident())
+	if p.tok.kind == TkLBrack && p.looksLikeTypeParams() {
+		p.setB(d, p.typeParams(ParseDepth))
+	}
+	if p.tok.kind == TkAssign {
+		p.setFlag(d, Flag1)
+		p.next()
+	}
+	p.setC(d, p.parseType(ParseDepth))
+	return p.finish(d)
+}
+
+// looksLikeTypeParams decides `type A[N usize] ...` vs `type A [N]T`.
+func (p *Parser) looksLikeTypeParams() bool {
+	t1 := p.peek(1)
+	t2 := p.peek(2)
+	if t1.kind != TkIdent {
+		return false
+	}
+	return t2.kind == TkIdent || t2.kind == TkAny || t2.kind == TkComma
+}
+
+func (p *Parser) funcDecl() u32 {
+	d := p.mk(NkFuncDecl, p.start())
+	if p.tok.kind == TkDriver {
+		p.setOp(d, ModDriver)
+		p.next()
+	} else if p.tok.kind == TkComptime {
+		p.setOp(d, ModComptime)
+		p.next()
+	}
+	p.expect(TkFunc)
+	if p.tok.kind == TkLParen {
+		p.setA(d, p.receiver())
+	}
+	p.setB(d, p.ident())
+	if p.tok.kind == TkLBrack {
+		p.setC(d, p.typeParams(ParseDepth))
+	}
+	p.setD(d, p.signature(ParseDepth))
+	if p.tok.kind == TkDecreases {
+		p.setE(d, p.decreasesClause(ParseDepth))
+	}
+	if p.tok.kind != TkLBrace {
+		if p.newlineSemi() {
+			p.errorTok("unexpected newline; the '{' of a function body must be on the same line")
+		}
+		p.errorExpected("'{' (function body)")
+	}
+	p.setF(d, p.block(ParseDepth))
+	return p.finish(d)
+}
+
+func (p *Parser) receiver() u32 {
+	r := p.mk(NkReceiver, p.start())
+	p.expect(TkLParen)
+	p.setA(r, p.ident())
+	if p.tok.kind == TkMul {
+		p.setFlag(r, Flag1)
+		p.next()
+	}
+	p.setB(r, p.ident())
+	if p.tok.kind == TkLBrack {
+		p.next()
+		mark := p.ls.top
+		p.identListPush()
+		p.setL1(r, mark)
+		p.expect(TkRBrack)
+	}
+	p.expect(TkRParen)
+	return p.finish(r)
+}
+
+// ---------------------------------------------------------------------------
+// declarations usable as statements (part of the recursive SCC)
+
+func (p *Parser) constDecl(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	d := p.mk(NkConstDecl, p.start())
+	p.expect(TkConst)
+	mark := p.ls.top
+	if p.tok.kind == TkLParen {
+		p.setFlag(d, Flag1)
+		p.next()
+		lim := p.ntok
+		for g := usize(0); g < lim; g++ {
+			if p.failed || p.tok.kind == TkRParen {
+				break
+			}
+			p.ls.push(p.constSpec(depth - 1))
+			p.expectSemi("constant declaration")
+		}
+		p.setL1(d, mark)
+		p.next()
+	} else {
+		p.ls.push(p.constSpec(depth - 1))
+		p.setL1(d, mark)
+	}
+	return p.finish(d)
+}
+
+func (p *Parser) constSpec(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.mk(NkConstSpec, p.start())
+	p.setA(s, p.ident())
+	if p.tok.kind != TkAssign {
+		p.setB(s, p.parseType(depth-1))
+	}
+	if p.tok.kind != TkAssign {
+		if p.errBegin(p.tok.line, p.tok.col, E1001) {
+			p.diag.putStr("expected '=' in constant declaration, found ")
+			p.describe(p.tok)
+			p.diag.putStr(" (constants must be initialized)")
+			p.errEnd()
+		}
+	}
+	p.next()
+	p.setC(s, p.expr(depth-1))
+	return p.finish(s)
+}
+
+func (p *Parser) varDecl(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	d := p.mk(NkVarDecl, p.start())
+	p.expect(TkVar)
+	p.setA(d, p.ident())
+	if p.tok.kind == TkAssign {
+		p.next()
+		p.setC(d, p.expr(depth-1))
+	} else {
+		p.setB(d, p.parseType(depth-1))
+		if p.tok.kind == TkAssign {
+			p.next()
+			p.setC(d, p.expr(depth-1))
+		}
+	}
+	return p.finish(d)
+}
+
+func (p *Parser) typeParams(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	l := p.mk(NkTypeParamList, p.start())
+	p.expect(TkLBrack)
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed {
+			break
+		}
+		p.ls.push(p.typeParam(depth - 1))
+		if p.tok.kind != TkComma {
+			break
+		}
+		p.next()
+	}
+	p.setL1(l, mark)
+	p.expect(TkRBrack)
+	return p.finish(l)
+}
+
+func (p *Parser) typeParam(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	tp := p.mk(NkTypeParam, p.start())
+	mark := p.ls.top
+	p.identListPush()
+	p.setL1(tp, mark)
+	if p.tok.kind == TkAny {
+		s := p.start()
+		p.next()
+		a := p.mk(NkAnyType, s)
+		p.setA(tp, p.finish(a))
+	} else {
+		if !p.startsType() {
+			p.errorExpected("type constraint (any, usize or a type)")
+		}
+		p.setA(tp, p.parseType(depth-1))
+	}
+	return p.finish(tp)
+}
+
+func (p *Parser) signature(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	sig := p.mk(NkSignature, p.start())
+	p.expect(TkLParen)
+	p.exprLev++
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind == TkRParen {
+			break
+		}
+		p.ls.push(p.param(depth - 1))
+		if p.tok.kind != TkComma {
+			if p.tok.kind != TkRParen {
+				p.errorExpected("',' or ')' in parameter list")
+			}
+			break
+		}
+		p.next()
+	}
+	p.setL1(sig, mark)
+	n := p.na.items[usize(sig)]
+	cnt := usize(n.l1n)
+	for i := usize(0); i < cnt; i++ {
+		prm := p.na.listItem(n.l1s, i)
+		if hasFlag(p.na.items[usize(prm)], Flag1) && i != cnt-1 {
+			p.errorNode(prm, "can only use ... with final parameter")
+		}
+	}
+	p.exprLev--
+	p.expect(TkRParen)
+	if p.tok.kind == TkLParen {
+		p.setFlag(sig, Flag1)
+		p.next()
+		p.exprLev++
+		rmark := p.ls.top
+		for g := usize(0); g < lim; g++ {
+			if p.failed {
+				break
+			}
+			p.ls.push(p.parseType(depth - 1))
+			if p.tok.kind != TkComma {
+				break
+			}
+			p.next()
+		}
+		p.setL2(sig, rmark)
+		p.exprLev--
+		p.expect(TkRParen)
+	} else if p.startsType() {
+		rmark := p.ls.top
+		p.ls.push(p.parseType(depth - 1))
+		p.setL2(sig, rmark)
+	}
+	return p.finish(sig)
+}
+
+func (p *Parser) param(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	prm := p.mk(NkParam, p.start())
+	mark := p.ls.top
+	p.identListPush()
+	names := p.ls.top - mark
+	p.setL1(prm, mark)
+	if p.tok.kind == TkEllipsis {
+		if names != 1 {
+			p.errorTok("variadic parameter must have exactly one name")
+		}
+		p.setFlag(prm, Flag1)
+		p.next()
+	}
+	if !p.startsType() {
+		p.errorExpected("parameter type")
+	}
+	p.setA(prm, p.parseType(depth-1))
+	return p.finish(prm)
+}
+
+func (p *Parser) decreasesClause(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	d := p.mk(NkDecreasesClause, p.start())
+	p.expect(TkDecreases)
+	p.expect(TkLParen)
+	old := p.exprLev
+	p.exprLev = 0
+	p.setA(d, p.expr(depth-1))
+	p.exprLev = old
+	p.expect(TkRParen)
+	return p.finish(d)
+}
+
+// ---------------------------------------------------------------------------
+// types
+
+// startsType reports whether the current token can begin a Type.
+func (p *Parser) startsType() bool {
+	k := p.tok.kind
+	if k == TkIdent || k == TkLBrack || k == TkMul || k == TkStruct || k == TkEnum || k == TkFunc {
+		return true
+	}
+	if k == TkDriver {
+		return p.peek(1).kind == TkFunc
+	}
+	return false
+}
+
+func (p *Parser) isCodeKeyword() bool {
+	if !p.tokIs("Code") {
+		return false
+	}
+	k := p.peek(1).kind
+	return k == TkInt || k == TkIdent || k == TkLParen
+}
+
+func (p *Parser) isElKeyword() bool {
+	return p.tokIs("El") && p.peek(1).kind == TkLParen
+}
+
+func (p *Parser) parseType(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	p.enter()
+	t := p.typeBody(depth - 1)
+	p.leave()
+	return t
+}
+
+func (p *Parser) typeBody(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	k := p.tok.kind
+	if k == TkIdent {
+		if p.tokIs("Code") {
+			p.next()
+			old := p.exprLev
+			p.exprLev = -1
+			lvl := p.expr(depth - 1)
+			p.exprLev = old
+			ct := p.mk(NkCodeType, s)
+			p.setA(ct, lvl)
+			return p.finish(ct)
+		}
+		if p.isElKeyword() {
+			p.next()
+			p.expect(TkLParen)
+			old := p.exprLev
+			p.exprLev = 0
+			code := p.expr(depth - 1)
+			p.exprLev = old
+			p.expect(TkRParen)
+			et := p.mk(NkElType, s)
+			p.setA(et, code)
+			return p.finish(et)
+		}
+		return p.namedType(depth - 1)
+	}
+	if k == TkLBrack {
+		p.next()
+		if p.tok.kind == TkRBrack {
+			p.next()
+			elem := p.parseType(depth - 1)
+			st := p.mk(NkSliceType, s)
+			p.setA(st, elem)
+			return p.finish(st)
+		}
+		old := p.exprLev
+		p.exprLev = 0
+		n := p.expr(depth - 1)
+		p.exprLev = old
+		p.expect(TkRBrack)
+		elem := p.parseType(depth - 1)
+		at := p.mk(NkArrayType, s)
+		p.setA(at, n)
+		p.setB(at, elem)
+		return p.finish(at)
+	}
+	if k == TkMul {
+		p.next()
+		elem := p.parseType(depth - 1)
+		pt := p.mk(NkPointerType, s)
+		p.setA(pt, elem)
+		return p.finish(pt)
+	}
+	if k == TkStruct {
+		return p.structType(depth - 1)
+	}
+	if k == TkEnum {
+		return p.enumType(depth - 1)
+	}
+	if k == TkFunc || k == TkDriver {
+		return p.funcType(depth - 1)
+	}
+	if k == TkAny {
+		p.errorTok("'any' may only be used as a type parameter constraint")
+		return 0
+	}
+	p.errorExpected("type")
+	return 0
+}
+
+func (p *Parser) namedType(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	t := p.mk(NkNamedType, p.start())
+	name := p.ident()
+	if p.tok.kind == TkPeriod {
+		p.next()
+		p.setA(t, name)
+		name = p.ident()
+	}
+	p.setB(t, name)
+	if p.tok.kind == TkLBrack {
+		p.next()
+		old := p.exprLev
+		p.exprLev = 0
+		mark := p.ls.top
+		lim := p.ntok
+		for g := usize(0); g < lim; g++ {
+			if p.failed {
+				break
+			}
+			p.ls.push(p.typeOrExpr(depth - 1))
+			if p.tok.kind != TkComma {
+				break
+			}
+			p.next()
+		}
+		p.setL1(t, mark)
+		p.exprLev = old
+		p.expect(TkRBrack)
+	}
+	return p.finish(t)
+}
+
+// typeOrExpr parses a TypeOrExpr: tokens that can only start a type yield
+// a TypeExpr, everything else is an expression.
+func (p *Parser) typeOrExpr(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	k := p.tok.kind
+	isType := k == TkLBrack || k == TkMul || k == TkStruct || k == TkEnum || k == TkFunc
+	if k == TkDriver && p.peek(1).kind == TkFunc {
+		isType = true
+	}
+	if isType || p.isCodeKeyword() || p.isElKeyword() {
+		s := p.start()
+		t := p.parseType(depth - 1)
+		te := p.mk(NkTypeExpr, s)
+		p.setA(te, t)
+		return p.finish(te)
+	}
+	return p.expr(depth - 1)
+}
+
+func (p *Parser) structType(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	st := p.mk(NkStructType, p.start())
+	p.expect(TkStruct)
+	p.expectOpenBrace("struct")
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind == TkRBrace {
+			break
+		}
+		f := p.mk(NkFieldDecl, p.start())
+		nmark := p.ls.top
+		p.identListPush()
+		p.setL1(f, nmark)
+		if !p.startsType() {
+			p.errorExpected("field type")
+		}
+		p.setA(f, p.parseType(depth-1))
+		p.ls.push(p.finish(f))
+		p.expectSemi("field declaration")
+	}
+	p.setL1(st, mark)
+	p.next()
+	return p.finish(st)
+}
+
+func (p *Parser) enumType(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	et := p.mk(NkEnumType, p.start())
+	p.expect(TkEnum)
+	p.expectOpenBrace("enum")
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind == TkRBrace {
+			break
+		}
+		v := p.mk(NkVariant, p.start())
+		p.setA(v, p.ident())
+		if p.tok.kind == TkLParen {
+			p.setFlag(v, Flag1)
+			p.next()
+			pmark := p.ls.top
+			for h := usize(0); h < lim; h++ {
+				if p.failed {
+					break
+				}
+				p.ls.push(p.parseType(depth - 1))
+				if p.tok.kind != TkComma {
+					break
+				}
+				p.next()
+			}
+			p.setL1(v, pmark)
+			p.expect(TkRParen)
+		}
+		p.ls.push(p.finish(v))
+		p.expectSemi("enum variant")
+	}
+	p.setL1(et, mark)
+	p.next()
+	return p.finish(et)
+}
+
+func (p *Parser) funcType(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	ft := p.mk(NkFuncType, p.start())
+	if p.tok.kind == TkDriver {
+		p.setFlag(ft, Flag1)
+		p.next()
+	}
+	p.expect(TkFunc)
+	p.setA(ft, p.signature(depth-1))
+	return p.finish(ft)
+}
+
+// ---------------------------------------------------------------------------
+// statements
+
+func (p *Parser) block(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	b := p.mk(NkBlockStmt, p.start())
+	p.expectOpenBrace("block")
+	old := p.exprLev
+	p.exprLev = 0
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind == TkRBrace {
+			break
+		}
+		if p.tok.kind == TkEOF {
+			p.errorTok("unexpected EOF; expected '}'")
+			break
+		}
+		p.ls.push(p.stmt(depth - 1))
+		p.expectSemi("statement")
+	}
+	p.setL1(b, mark)
+	p.exprLev = old
+	p.next()
+	return p.finish(b)
+}
+
+func (p *Parser) stmt(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	p.enter()
+	s := p.stmtBody(depth - 1)
+	p.leave()
+	return s
+}
+
+func (p *Parser) stmtBody(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	k := p.tok.kind
+	if k == TkConst {
+		d := p.constDecl(depth - 1)
+		ds := p.mk(NkDeclStmt, s)
+		p.setA(ds, d)
+		return p.finish(ds)
+	}
+	if k == TkVar {
+		d := p.varDecl(depth - 1)
+		ds := p.mk(NkDeclStmt, s)
+		p.setA(ds, d)
+		return p.finish(ds)
+	}
+	if k == TkIf {
+		return p.ifStmt(depth - 1)
+	}
+	if k == TkMatch {
+		return p.matchStmt(depth - 1)
+	}
+	if k == TkFor {
+		return p.forStmt(depth - 1)
+	}
+	if k == TkDriver && p.peek(1).kind == TkFor {
+		return p.forStmt(depth - 1)
+	}
+	if k == TkScope {
+		return p.scopeStmt(depth - 1)
+	}
+	if k == TkDefer {
+		p.next()
+		x := p.expr(depth - 1)
+		ds := p.mk(NkDeferStmt, s)
+		p.setA(ds, x)
+		return p.finish(ds)
+	}
+	if k == TkReturn {
+		p.next()
+		r := p.mk(NkReturnStmt, s)
+		if p.tok.kind != TkSemicolon && p.tok.kind != TkRBrace {
+			mark := p.ls.top
+			_ = p.exprListPush(depth - 1)
+			p.setL1(r, mark)
+		}
+		return p.finish(r)
+	}
+	if k == TkBreak {
+		p.next()
+		return p.finish(p.mk(NkBreakStmt, s))
+	}
+	if k == TkContinue {
+		p.next()
+		return p.finish(p.mk(NkContinueStmt, s))
+	}
+	if k == TkLBrace {
+		return p.block(depth - 1)
+	}
+	if k == TkSemicolon {
+		p.errorUnexpected("; expected statement")
+		return 0
+	}
+	if k == TkType || k == TkImport || k == TkPackage || k == TkComptime {
+		p.errorUnexpected(" in statement position")
+		return 0
+	}
+	return p.simpleStmt(depth - 1)
+}
+
+func (p *Parser) simpleStmt(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	st, x := p.simpleStmtOrExpr(depth - 1)
+	if st != 0 {
+		return st
+	}
+	es := p.mk(NkExprStmt, s)
+	p.setA(es, x)
+	return p.finish(es)
+}
+
+// simpleStmtOrExpr parses a SimpleStmt. A bare expression is returned
+// unwrapped as the second result (the first is then 0).
+func (p *Parser) simpleStmtOrExpr(depth usize) (u32, u32) decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep(), 0
+	}
+	s := p.start()
+	lmark := p.ls.top
+	_ = p.exprListPush(depth - 1)
+	ls, ln := p.ls.commit(p.na, lmark)
+	if ln == 0 {
+		return 0, 0
+	}
+	k := p.tok.kind
+	if k == TkDefine {
+		m := usize(ln)
+		for i := usize(0); i < m; i++ {
+			e := p.na.listItem(ls, i)
+			if p.kindOf(e) != NkIdent {
+				n := p.na.items[usize(e)]
+				if p.errBegin(n.sLine, n.sCol, E1001) {
+					p.diag.putStr("non-name ")
+					p.putNode(e)
+					p.diag.putStr(" on left side of :=")
+					p.errEnd()
+				}
+				break
+			}
+		}
+		p.next()
+		d := p.mk(NkShortVarDecl, s)
+		p.na.items[usize(d)].l1s = ls
+		p.na.items[usize(d)].l1n = ln
+		rmark := p.ls.top
+		_ = p.exprListPush(depth - 1)
+		p.setL2(d, rmark)
+		return p.finish(d), 0
+	}
+	if k == TkAssign || k == TkAddAssign || k == TkSubAssign || k == TkMulAssign || k == TkQuoAssign {
+		op := u8(AsgAssign)
+		if k == TkAddAssign {
+			op = AsgAdd
+		} else if k == TkSubAssign {
+			op = AsgSub
+		} else if k == TkMulAssign {
+			op = AsgMul
+		} else if k == TkQuoAssign {
+			op = AsgQuo
+		}
+		opTok := p.tok
+		p.next()
+		a := p.mk(NkAssignStmt, s)
+		p.setOp(a, op)
+		p.na.items[usize(a)].l1s = ls
+		p.na.items[usize(a)].l1n = ln
+		rmark := p.ls.top
+		_ = p.exprListPush(depth - 1)
+		p.setL2(a, rmark)
+		rn := p.na.items[usize(a)].l2n
+		if op != AsgAssign && (ln != 1 || rn != 1) {
+			if p.errBegin(opTok.line, opTok.col, E1001) {
+				p.diag.putStr("assignment operator ")
+				p.diag.putStr(assignOpString(op))
+				p.diag.putStr(" requires single-valued expressions")
+				p.errEnd()
+			}
+		}
+		return p.finish(a), 0
+	}
+	if k == TkInc || k == TkDec {
+		if ln != 1 {
+			p.errorUnexpected(" after expression list")
+		}
+		id := p.mk(NkIncDecStmt, s)
+		if k == TkInc {
+			p.setFlag(id, Flag1)
+		}
+		p.next()
+		p.setA(id, p.na.listItem(ls, 0))
+		return p.finish(id), 0
+	}
+	if ln > 1 {
+		p.errorExpected("':=', '=' or assignment operator after expression list")
+	}
+	return 0, p.na.listItem(ls, 0)
+}
+
+// wrap turns the result of simpleStmtOrExpr into a statement.
+func (p *Parser) wrap(st u32, x u32) u32 {
+	if st != 0 {
+		return st
+	}
+	n := p.na.items[usize(x)]
+	es := p.mk(NkExprStmt, Pos{line: n.sLine, col: n.sCol})
+	p.setA(es, x)
+	return p.finish(es)
+}
+
+// condOf rejects a statement used as an if/for condition.
+func (p *Parser) condOf(st u32, x u32, what string) u32 {
+	if st != 0 {
+		n := p.na.items[usize(st)]
+		if p.errBegin(n.sLine, n.sCol, E1001) {
+			p.diag.putStr("cannot use ")
+			p.putNode(st)
+			p.diag.putStr(" as value in ")
+			p.diag.putStr(what)
+			p.diag.putStr(" condition")
+			p.errEnd()
+		}
+	}
+	return x
+}
+
+func (p *Parser) ifStmt(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.mk(NkIfStmt, p.start())
+	p.expect(TkIf)
+	old := p.exprLev
+	p.exprLev = -1
+	if p.tok.kind == TkLBrace {
+		p.errorTok("missing condition in if statement")
+	}
+	first, firstX := p.simpleStmtOrExpr(depth - 1)
+	if p.explicitSemi() {
+		p.setA(s, p.wrap(first, firstX))
+		p.next()
+		if p.tok.kind == TkLBrace {
+			p.errorTok("missing condition in if statement")
+		}
+		p.setB(s, p.expr(depth-1))
+	} else {
+		p.setB(s, p.condOf(first, firstX, "if"))
+	}
+	p.exprLev = old
+	p.newlineBeforeBrace("an if statement")
+	p.setC(s, p.block(depth-1))
+	if p.tok.kind == TkElse {
+		p.next()
+		if p.tok.kind == TkIf {
+			p.setD(s, p.ifStmt(depth-1))
+		} else if p.tok.kind == TkLBrace {
+			p.setD(s, p.block(depth-1))
+		} else {
+			p.errorExpected("'if' or '{' after else")
+		}
+	}
+	return p.finish(s)
+}
+
+func (p *Parser) forStmt(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	f := p.mk(NkForStmt, p.start())
+	if p.tok.kind == TkDriver {
+		p.setFlag(f, Flag1)
+		p.next()
+	}
+	p.expect(TkFor)
+	old := p.exprLev
+	p.exprLev = -1
+	if p.tok.kind != TkLBrace && p.tok.kind != TkDecreases {
+		first := u32(0)
+		firstX := u32(0)
+		if !p.explicitSemi() {
+			first, firstX = p.simpleStmtOrExpr(depth - 1)
+		}
+		if p.explicitSemi() {
+			p.setFlag(f, Flag2)
+			if first != 0 || firstX != 0 {
+				p.setA(f, p.wrap(first, firstX))
+			}
+			p.next()
+			if !p.explicitSemi() {
+				p.setB(f, p.expr(depth-1))
+			}
+			if !p.explicitSemi() {
+				p.newlineBeforeBrace("a for statement")
+				p.errorExpected("';' in for clause")
+			}
+			p.next()
+			if p.tok.kind != TkLBrace && p.tok.kind != TkDecreases {
+				post := p.simpleStmt(depth - 1)
+				p.setC(f, post)
+				if p.kindOf(post) == NkShortVarDecl {
+					p.errorNode(post, "cannot declare in post statement of for loop")
+				}
+			}
+		} else {
+			p.setB(f, p.condOf(first, firstX, "for"))
+		}
+	}
+	p.exprLev = old
+	if p.tok.kind == TkDecreases {
+		p.setD(f, p.decreasesClause(depth-1))
+	}
+	p.newlineBeforeBrace("a for statement")
+	p.setE(f, p.block(depth-1))
+	return p.finish(f)
+}
+
+func (p *Parser) scopeStmt(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.mk(NkScopeStmt, p.start())
+	p.expect(TkScope)
+	p.setA(s, p.ident())
+	p.expect(TkDefine)
+	old := p.exprLev
+	p.exprLev = -1
+	p.setB(s, p.expr(depth-1))
+	p.exprLev = old
+	p.newlineBeforeBrace("a scope statement")
+	p.setC(s, p.block(depth-1))
+	return p.finish(s)
+}
+
+func (p *Parser) matchStmt(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	m := p.mk(NkMatchStmt, p.start())
+	p.expect(TkMatch)
+	old := p.exprLev
+	p.exprLev = -1
+	p.setA(m, p.expr(depth-1))
+	p.exprLev = 0
+	p.expectOpenBrace("a match statement")
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind == TkRBrace {
+			break
+		}
+		p.ls.push(p.matchArm(depth - 1))
+		p.expectSemi("match arm")
+	}
+	p.setL1(m, mark)
+	p.next()
+	p.exprLev = old
+	return p.finish(m)
+}
+
+func (p *Parser) matchArm(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	a := p.mk(NkMatchArm, p.start())
+	p.setA(a, p.pattern(depth-1))
+	p.expect(TkArrow)
+	if p.tok.kind == TkLBrace {
+		p.setC(a, p.block(depth-1))
+	} else {
+		p.setB(a, p.expr(depth-1))
+	}
+	return p.finish(a)
+}
+
+func (p *Parser) pattern(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	k := p.tok.kind
+	if k == TkIdent {
+		if p.tokIs("_") {
+			p.next()
+			return p.finish(p.mk(NkWildcardPattern, s))
+		}
+		cp := p.mk(NkCtorPattern, s)
+		name := p.ident()
+		if p.tok.kind == TkPeriod {
+			p.next()
+			p.setA(cp, name)
+			name = p.ident()
+		}
+		p.setB(cp, name)
+		if p.tok.kind == TkLParen {
+			p.setFlag(cp, Flag1)
+			p.next()
+			mark := p.ls.top
+			p.identListPush()
+			p.setL1(cp, mark)
+			p.expect(TkRParen)
+		}
+		return p.finish(cp)
+	}
+	if k == TkInt || k == TkString || k == TkChar || k == TkTrue || k == TkFalse || k == TkNil {
+		lit := p.operand(depth - 1)
+		lp := p.mk(NkLiteralPattern, s)
+		p.setA(lp, lit)
+		return p.finish(lp)
+	}
+	p.errorExpected("pattern ('_', identifier, variant or literal)")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// expressions
+
+// exprListPush pushes `Expr { "," Expr }` onto the list stack.
+func (p *Parser) exprListPush(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	p.ls.push(p.expr(depth - 1))
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind != TkComma {
+			break
+		}
+		p.next()
+		p.ls.push(p.expr(depth - 1))
+	}
+	return 0
+}
+
+func (p *Parser) expr(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	p.enter()
+	x := p.binary(1, depth-1)
+	p.leave()
+	return x
+}
+
+// binOpOf maps a token kind to a binary operator; ok is false otherwise.
+func binOpOf(k u8) (u8, bool) {
+	if k == TkLOr {
+		return OpLOr, true
+	}
+	if k == TkLAnd {
+		return OpLAnd, true
+	}
+	if k == TkEql {
+		return OpEq, true
+	}
+	if k == TkNeq {
+		return OpNe, true
+	}
+	if k == TkLss {
+		return OpLt, true
+	}
+	if k == TkLeq {
+		return OpLe, true
+	}
+	if k == TkGtr {
+		return OpGt, true
+	}
+	if k == TkGeq {
+		return OpGe, true
+	}
+	if k == TkAdd {
+		return OpAdd, true
+	}
+	if k == TkSub {
+		return OpSub, true
+	}
+	if k == TkOr {
+		return OpOr, true
+	}
+	if k == TkXor {
+		return OpXor, true
+	}
+	if k == TkMul {
+		return OpMul, true
+	}
+	if k == TkQuo {
+		return OpDiv, true
+	}
+	if k == TkRem {
+		return OpRem, true
+	}
+	if k == TkAnd {
+		return OpAnd, true
+	}
+	if k == TkShl {
+		return OpShl, true
+	}
+	if k == TkShr {
+		return OpShr, true
+	}
+	return 0, false
+}
+
+// binary parses a left-associative chain of operators with precedence >= prec.
+func (p *Parser) binary(prec u8, depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	x := p.unary(depth - 1)
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		op, ok := binOpOf(p.tok.kind)
+		if !ok || binOpPrec(op) < prec {
+			return x
+		}
+		p.next()
+		y := p.binary(binOpPrec(op)+1, depth-1)
+		be := p.mk(NkBinaryExpr, s)
+		p.setOp(be, op)
+		p.setA(be, x)
+		p.setB(be, y)
+		x = p.finish(be)
+	}
+	return x
+}
+
+func (p *Parser) unary(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	k := p.tok.kind
+	op := u8(OpNot)
+	if k == TkNot {
+		op = OpNot
+	} else if k == TkSub {
+		op = OpNeg
+	} else if k == TkAnd {
+		op = OpAddr
+	} else if k == TkMul {
+		op = OpDeref
+	} else {
+		return p.postfix(depth - 1)
+	}
+	p.enter()
+	p.next()
+	x := p.unary(depth - 1)
+	p.leave()
+	u := p.mk(NkUnaryExpr, s)
+	p.setOp(u, op)
+	p.setA(u, x)
+	return p.finish(u)
+}
+
+func (p *Parser) postfix(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	x := p.operand(depth - 1)
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		k := p.tok.kind
+		if k == TkLParen {
+			p.next()
+			p.exprLev++
+			mark := p.ls.top
+			for h := usize(0); h < lim; h++ {
+				if p.failed || p.tok.kind == TkRParen {
+					break
+				}
+				p.ls.push(p.expr(depth - 1))
+				if p.tok.kind != TkComma {
+					if p.tok.kind != TkRParen {
+						p.errorExpected("',' or ')' in argument list")
+					}
+					break
+				}
+				p.next()
+			}
+			c := p.mk(NkCallExpr, s)
+			p.setL1(c, mark)
+			p.exprLev--
+			p.expect(TkRParen)
+			p.setA(c, x)
+			x = p.finish(c)
+		} else if k == TkLBrack {
+			p.next()
+			p.exprLev++
+			lo := u32(0)
+			if p.tok.kind != TkColon {
+				if p.tok.kind == TkRBrack {
+					p.errorExpected("index expression")
+				}
+				lo = p.expr(depth - 1)
+			}
+			if p.tok.kind == TkColon {
+				p.next()
+				hi := u32(0)
+				if p.tok.kind != TkRBrack {
+					hi = p.expr(depth - 1)
+				}
+				p.exprLev--
+				p.expect(TkRBrack)
+				se := p.mk(NkSliceExpr, s)
+				p.setA(se, x)
+				p.setB(se, lo)
+				p.setC(se, hi)
+				x = p.finish(se)
+			} else {
+				mark := p.ls.top
+				p.ls.push(lo)
+				for h := usize(0); h < lim; h++ {
+					if p.failed || p.tok.kind != TkComma {
+						break
+					}
+					p.next()
+					p.ls.push(p.expr(depth - 1))
+				}
+				ie := p.mk(NkIndexExpr, s)
+				p.setL1(ie, mark)
+				p.exprLev--
+				p.expect(TkRBrack)
+				p.setA(ie, x)
+				x = p.finish(ie)
+			}
+		} else if k == TkPeriod {
+			p.next()
+			sel := p.ident()
+			se := p.mk(NkSelectorExpr, s)
+			p.setA(se, x)
+			p.setB(se, sel)
+			x = p.finish(se)
+		} else if k == TkLBrace {
+			if p.exprLev < 0 || !p.isTypeName(x) {
+				return x
+			}
+			x = p.structLit(x, s, depth-1)
+		} else {
+			return x
+		}
+	}
+	return x
+}
+
+// isTypeName reports whether x can be the type of a struct literal:
+// T, pkg.T, T[...], pkg.T[...].
+func (p *Parser) isTypeName(x u32) bool {
+	k := p.kindOf(x)
+	if k == NkIdent {
+		return true
+	}
+	if k == NkSelectorExpr {
+		return p.kindOf(p.na.items[usize(x)].a) == NkIdent
+	}
+	if k == NkIndexExpr {
+		b := p.na.items[usize(x)].a
+		bk := p.kindOf(b)
+		if bk == NkIdent {
+			return true
+		}
+		if bk == NkSelectorExpr {
+			return p.kindOf(p.na.items[usize(b)].a) == NkIdent
+		}
+	}
+	return false
+}
+
+// structLit parses `{ fields }` after the type expression x, converting x
+// into the literal's NamedType (which keeps x's span).
+func (p *Parser) structLit(x u32, s Pos, depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	xn := p.na.items[usize(x)]
+	nt := p.mk(NkNamedType, Pos{line: xn.sLine, col: xn.sCol})
+	base := x
+	if xn.kind == NkIndexExpr {
+		base = xn.a
+		p.na.items[usize(nt)].l1s = xn.l1s
+		p.na.items[usize(nt)].l1n = xn.l1n
+	}
+	bn := p.na.items[usize(base)]
+	if bn.kind == NkIdent {
+		p.setB(nt, base)
+	} else if bn.kind == NkSelectorExpr {
+		p.setA(nt, bn.a)
+		p.setB(nt, bn.b)
+	}
+	p.na.items[usize(nt)].eLine = xn.eLine
+	p.na.items[usize(nt)].eCol = xn.eCol
+	p.expect(TkLBrace)
+	old := p.exprLev
+	p.exprLev = 0
+	sl := p.mk(NkStructLit, s)
+	p.setA(sl, nt)
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind == TkRBrace {
+			break
+		}
+		fs := p.start()
+		if p.tok.kind != TkIdent || p.peek(1).kind != TkColon {
+			p.errorExpected("field initializer 'name: value'")
+		}
+		fi := p.mk(NkFieldInit, fs)
+		p.setA(fi, p.ident())
+		p.expect(TkColon)
+		p.setB(fi, p.expr(depth-1))
+		p.ls.push(p.finish(fi))
+		if p.tok.kind != TkComma {
+			if p.tok.kind != TkRBrace {
+				if p.newlineSemi() {
+					p.errorTok("unexpected newline in struct literal; possibly missing comma or '}'")
+				}
+				p.errorExpected("',' or '}' in struct literal")
+			}
+			break
+		}
+		p.next()
+	}
+	p.setL1(sl, mark)
+	p.exprLev = old
+	p.expect(TkRBrace)
+	return p.finish(sl)
+}
+
+func (p *Parser) basicLit() u32 {
+	s := p.start()
+	t := p.tok
+	lit := p.mk(NkBasicLit, s)
+	p.setText(lit, t)
+	if t.kind == TkInt {
+		p.setOp(lit, LitInt)
+		p.na.items[usize(lit)].ival = t.val
+	} else if t.kind == TkString {
+		p.setOp(lit, LitString)
+	} else if t.kind == TkChar {
+		p.setOp(lit, LitChar)
+		p.na.items[usize(lit)].ival = t.val
+	} else {
+		p.errorExpected("literal")
+	}
+	p.next()
+	return p.finish(lit)
+}
+
+// operand parses a Primary.
+func (p *Parser) operand(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	k := p.tok.kind
+	if k == TkInt || k == TkString || k == TkChar {
+		return p.basicLit()
+	}
+	if k == TkTrue || k == TkFalse {
+		p.next()
+		b := p.mk(NkBoolLit, s)
+		if k == TkTrue {
+			p.setFlag(b, Flag1)
+		}
+		return p.finish(b)
+	}
+	if k == TkNil {
+		p.next()
+		return p.finish(p.mk(NkNilLit, s))
+	}
+	if k == TkIdent {
+		if p.isCodeKeyword() || p.isElKeyword() {
+			t := p.parseType(depth - 1)
+			te := p.mk(NkTypeExpr, s)
+			p.setA(te, t)
+			return p.finish(te)
+		}
+		return p.ident()
+	}
+	if k == TkLParen {
+		p.next()
+		p.exprLev++
+		x := p.expr(depth - 1)
+		p.exprLev--
+		p.expect(TkRParen)
+		pe := p.mk(NkParenExpr, s)
+		p.setA(pe, x)
+		return p.finish(pe)
+	}
+	if k == TkFunc || k == TkDriver {
+		if k == TkDriver && p.peek(1).kind != TkFunc {
+			p.errorTok("unexpected keyword driver; expected 'driver func' or 'driver for'")
+		}
+		drv := k == TkDriver
+		if drv {
+			p.next()
+		}
+		p.expect(TkFunc)
+		sig := p.signature(depth - 1)
+		if p.tok.kind == TkLBrace {
+			body := p.block(depth - 1)
+			fl := p.mk(NkFuncLit, s)
+			if drv {
+				p.setFlag(fl, Flag1)
+			}
+			p.setA(fl, sig)
+			p.setB(fl, body)
+			return p.finish(fl)
+		}
+		ft := p.mk(NkFuncType, s)
+		if drv {
+			p.setFlag(ft, Flag1)
+		}
+		p.setA(ft, sig)
+		ft = p.finish(ft)
+		te := p.mk(NkTypeExpr, s)
+		p.setA(te, ft)
+		return p.finish(te)
+	}
+	if k == TkLBrack || k == TkStruct || k == TkEnum {
+		t := p.parseType(depth - 1)
+		te := p.mk(NkTypeExpr, s)
+		p.setA(te, t)
+		return p.finish(te)
+	}
+	p.errorExpected("expression")
+	return 0
+}

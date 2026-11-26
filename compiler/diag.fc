@@ -1,0 +1,383 @@
+// diag.fc — diagnostics in the spec section 11 format
+//
+//	file.fc:line:col: error[E####]: message
+//
+// identical to finc0 (bootstrap/internal/diag). Lines and columns are
+// 1-based; columns count bytes. Diagnostics are written straight into an
+// OutBuf; the parser stops at the first error of each file, so at most one
+// diagnostic per file is produced and file order is the canonical order.
+//
+// This file also holds the byte-level text helpers shared by the lexer,
+// the AST dump and the printer: UTF-8 decoding and Go-compatible quoting
+// (strconv.Quote and the %q/%c verbs used by finc0's messages).
+package main
+
+// Diagnostic codes (spec section 11).
+const (
+	E1001 = 1001 // SYNTAX_ERROR
+	E1002 = 1002 // UNTERMINATED_LITERAL
+	E2001 = 2001 // UNDEFINED_SYMBOL
+	E2002 = 2002 // TYPE_MISMATCH
+	E2003 = 2003 // ARITY_MISMATCH
+	E2004 = 2004 // INVALID_NIL
+	E2005 = 2005 // UNINITIALIZED_SCOPED
+	E2006 = 2006 // IMPORT_CYCLE
+	E2010 = 2010 // UNIVERSE_LEVEL_MISMATCH
+	E2011 = 2011 // NON_PARAMETRIC_OP
+	E3001 = 3001 // GLOBAL_SCOPED_VAR
+	E3002 = 3002 // SCOPE_ESCAPE
+	E3003 = 3003 // USE_AFTER_MOVE
+	E3004 = 3004 // DISCARDED_LINEAR
+	E3005 = 3005 // LINEAR_RESOURCE_LEAK
+	E4001 = 4001 // COMPTIME_OUT_OF_FUEL
+	E4002 = 4002 // UNPROVEN_TERMINATION
+	E4003 = 4003 // ARRAY_BOUNDS_COMPTIME
+	E4004 = 4004 // MUTUAL_RECURSION_NO_MEASURE
+	E5001 = 5001 // DRIVER_CALL_IN_TOTAL
+	E5002 = 5002 // INVALID_MAIN_SIGNATURE
+)
+
+// codeName returns the symbolic name of a diagnostic code ("" if unknown).
+func codeName(code u32) string {
+	if code == E1001 {
+		return "SYNTAX_ERROR"
+	}
+	if code == E1002 {
+		return "UNTERMINATED_LITERAL"
+	}
+	if code == E2001 {
+		return "UNDEFINED_SYMBOL"
+	}
+	if code == E2002 {
+		return "TYPE_MISMATCH"
+	}
+	if code == E2003 {
+		return "ARITY_MISMATCH"
+	}
+	if code == E2004 {
+		return "INVALID_NIL"
+	}
+	if code == E2005 {
+		return "UNINITIALIZED_SCOPED"
+	}
+	if code == E2006 {
+		return "IMPORT_CYCLE"
+	}
+	if code == E2010 {
+		return "UNIVERSE_LEVEL_MISMATCH"
+	}
+	if code == E2011 {
+		return "NON_PARAMETRIC_OP"
+	}
+	if code == E3001 {
+		return "GLOBAL_SCOPED_VAR"
+	}
+	if code == E3002 {
+		return "SCOPE_ESCAPE"
+	}
+	if code == E3003 {
+		return "USE_AFTER_MOVE"
+	}
+	if code == E3004 {
+		return "DISCARDED_LINEAR"
+	}
+	if code == E3005 {
+		return "LINEAR_RESOURCE_LEAK"
+	}
+	if code == E4001 {
+		return "COMPTIME_OUT_OF_FUEL"
+	}
+	if code == E4002 {
+		return "UNPROVEN_TERMINATION"
+	}
+	if code == E4003 {
+		return "ARRAY_BOUNDS_COMPTIME"
+	}
+	if code == E4004 {
+		return "MUTUAL_RECURSION_NO_MEASURE"
+	}
+	if code == E5001 {
+		return "DRIVER_CALL_IN_TOTAL"
+	}
+	if code == E5002 {
+		return "INVALID_MAIN_SIGNATURE"
+	}
+	return ""
+}
+
+// diagHeader writes "path:line:col: error[E####]: ". The caller appends the
+// message and finishes the line with diagEnd.
+func diagHeader(o *OutBuf, path string, line u32, col u32, code u32) {
+	o.putStr(path)
+	o.putByte(':')
+	o.putUint(u64(line))
+	o.putByte(':')
+	o.putUint(u64(col))
+	o.putStr(": error[E")
+	putDecMin(o, u64(code), 4)
+	o.putStr("]: ")
+}
+
+// diagEnd terminates a diagnostic line.
+func diagEnd(o *OutBuf) {
+	o.putByte('\n')
+}
+
+// putDecMin writes v in decimal, zero-padded to at least `width` digits.
+func putDecMin(o *OutBuf, v u64, width usize) {
+	digits := usize(1)
+	t := v
+	for i := usize(0); i < 20; i++ {
+		if t < 10 {
+			break
+		}
+		t = t / 10
+		digits++
+	}
+	for i := digits; i < width; i++ {
+		o.putByte('0')
+	}
+	o.putUint(v)
+}
+
+// putHexMin writes v in upper-case hex with at least `width` digits (%0*X).
+func putHexMin(o *OutBuf, v u64, width usize) {
+	digits := usize(1)
+	t := v
+	for i := usize(0); i < 16; i++ {
+		if t < 16 {
+			break
+		}
+		t = t >> 4
+		digits++
+	}
+	if digits < width {
+		digits = width
+	}
+	o.putHex(v, digits, true)
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8
+
+const RuneError = 0xFFFD
+
+// decodeRune decodes the UTF-8 sequence starting at b[i] exactly like Go's
+// utf8.DecodeRune: it returns (RuneError, 1) for an invalid encoding and
+// (RuneError, 0) if i is past the end.
+func decodeRune(b []byte, i usize) (u32, usize) {
+	n := len(b)
+	if i >= n {
+		return RuneError, 0
+	}
+	p0 := b[i]
+	if p0 < 0x80 {
+		return u32(p0), 1
+	}
+	if p0 < 0xC2 || p0 > 0xF4 {
+		return RuneError, 1
+	}
+	size := usize(2)
+	lo := byte(0x80)
+	hi := byte(0xBF)
+	if p0 >= 0xE0 {
+		size = 3
+	}
+	if p0 >= 0xF0 {
+		size = 4
+	}
+	if p0 == 0xE0 {
+		lo = 0xA0
+	}
+	if p0 == 0xED {
+		hi = 0x9F
+	}
+	if p0 == 0xF0 {
+		lo = 0x90
+	}
+	if p0 == 0xF4 {
+		hi = 0x8F
+	}
+	if n-i < size {
+		return RuneError, 1
+	}
+	b1 := b[i+1]
+	if b1 < lo || b1 > hi {
+		return RuneError, 1
+	}
+	if size == 2 {
+		return (u32(p0&0x1F) << 6) | u32(b1&0x3F), 2
+	}
+	b2 := b[i+2]
+	if b2 < 0x80 || b2 > 0xBF {
+		return RuneError, 1
+	}
+	if size == 3 {
+		return (u32(p0&0x0F) << 12) | (u32(b1&0x3F) << 6) | u32(b2&0x3F), 3
+	}
+	b3 := b[i+3]
+	if b3 < 0x80 || b3 > 0xBF {
+		return RuneError, 1
+	}
+	return (u32(p0&0x07) << 18) | (u32(b1&0x3F) << 12) | (u32(b2&0x3F) << 6) | u32(b3&0x3F), 4
+}
+
+// putRune writes the UTF-8 encoding of r.
+func putRune(o *OutBuf, r u32) {
+	if r < 0x80 {
+		o.putByte(byte(r))
+		return
+	}
+	if r < 0x800 {
+		o.putByte(byte(0xC0 | (r >> 6)))
+		o.putByte(byte(0x80 | (r & 0x3F)))
+		return
+	}
+	if r < 0x10000 {
+		o.putByte(byte(0xE0 | (r >> 12)))
+		o.putByte(byte(0x80 | ((r >> 6) & 0x3F)))
+		o.putByte(byte(0x80 | (r & 0x3F)))
+		return
+	}
+	o.putByte(byte(0xF0 | (r >> 18)))
+	o.putByte(byte(0x80 | ((r >> 12) & 0x3F)))
+	o.putByte(byte(0x80 | ((r >> 6) & 0x3F)))
+	o.putByte(byte(0x80 | (r & 0x3F)))
+}
+
+// isPrintRune approximates Go's strconv.IsPrint for non-ASCII runes: Go
+// uses the full Unicode tables; we treat every assigned-looking rune as
+// printable except the common control, format, separator and private-use
+// ranges (see README, "known gaps").
+func isPrintRune(r u32) bool {
+	if r < 0x20 || r == 0x7F {
+		return false
+	}
+	if r < 0x7F {
+		return true
+	}
+	if r <= 0xA0 || r == 0xAD || r == 0x1680 || r == 0x180E || r == 0x3000 || r == 0xFEFF {
+		return false
+	}
+	if r >= 0x2000 && r <= 0x200F {
+		return false
+	}
+	if r >= 0x2028 && r <= 0x202F {
+		return false
+	}
+	if r >= 0x205F && r <= 0x206F {
+		return false
+	}
+	if r >= 0xD800 && r <= 0xF8FF {
+		return false
+	}
+	if r >= 0xFFF0 && r <= 0xFFFB {
+		return false
+	}
+	if r == 0xFFFE || r == 0xFFFF {
+		return false
+	}
+	if r >= 0xE0000 {
+		return false
+	}
+	return true
+}
+
+// putQuoted writes s quoted like Go's strconv.Quote.
+func putQuoted(o *OutBuf, s []byte) {
+	o.putByte('"')
+	n := len(s)
+	i := usize(0)
+	for g := usize(0); g < n; g++ {
+		if i >= n {
+			break
+		}
+		c := s[i]
+		if c >= 0x80 {
+			r, w := decodeRune(s, i)
+			if w <= 1 {
+				o.putStr("\\x")
+				o.putHex(u64(c), 2, false)
+				i++
+				continue
+			}
+			if isPrintRune(r) {
+				o.putBytes(s[i : i+w])
+			} else if r < 0x10000 {
+				o.putStr("\\u")
+				o.putHex(u64(r), 4, false)
+			} else {
+				o.putStr("\\U")
+				o.putHex(u64(r), 8, false)
+			}
+			i += w
+			continue
+		}
+		putEscapedASCII(o, c, '"')
+		i++
+	}
+	o.putByte('"')
+}
+
+// putEscapedASCII writes one ASCII byte the way strconv quoting does inside
+// a literal delimited by `quote`.
+func putEscapedASCII(o *OutBuf, c byte, quote byte) {
+	if c == quote || c == '\\' {
+		o.putByte('\\')
+		o.putByte(c)
+		return
+	}
+	if c >= 0x20 && c < 0x7F {
+		o.putByte(c)
+		return
+	}
+	if c == 7 {
+		o.putStr("\\a")
+		return
+	}
+	if c == 8 {
+		o.putStr("\\b")
+		return
+	}
+	if c == 12 {
+		o.putStr("\\f")
+		return
+	}
+	if c == '\n' {
+		o.putStr("\\n")
+		return
+	}
+	if c == '\r' {
+		o.putStr("\\r")
+		return
+	}
+	if c == '\t' {
+		o.putStr("\\t")
+		return
+	}
+	if c == 11 {
+		o.putStr("\\v")
+		return
+	}
+	o.putStr("\\x")
+	o.putHex(u64(c), 2, false)
+}
+
+// putQuotedByte writes c as Go's %q verb formats a byte value ('a').
+func putQuotedByte(o *OutBuf, c byte) {
+	o.putByte('\'')
+	if c < 0x80 {
+		putEscapedASCII(o, c, '\'')
+	} else if isPrintRune(u32(c)) {
+		putRune(o, u32(c))
+	} else {
+		o.putStr("\\u00")
+		o.putHex(u64(c), 2, false)
+	}
+	o.putByte('\'')
+}
+
+// putCharVerb writes c as Go's %c verb formats a byte (the rune U+00cc).
+func putCharVerb(o *OutBuf, c byte) {
+	putRune(o, u32(c))
+}

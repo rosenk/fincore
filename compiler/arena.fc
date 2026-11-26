@@ -1,0 +1,261 @@
+// arena.fc — fixed-capacity arenas of the self-hosted FinCore compiler
+// (spec 9.4). Every arena is a Value struct stored in a package-level `var`
+// (globals may not be Scoped or pointers, rule S1); `main` takes their
+// addresses and hands the pointers to Scoped helper structs (Parser,
+// Dumper). All capacities are checked on insertion; an overflowing arena
+// sets its sticky `full` flag instead of growing, and the driver reports
+// ErrArenaFull.
+//
+// IDs are u32 indices into the arenas; index 0 is reserved as "none".
+package main
+
+const (
+	MaxFiles       = 64
+	MaxSourceBytes = 4 * 1024 * 1024
+	MaxTokens      = 262_144
+	MaxNodes       = 131_072
+	MaxListItems   = 262_144
+	MaxOutputBytes = 8 * 1024 * 1024
+)
+
+// ---------------------------------------------------------------------------
+// SourceArena: the raw bytes of all source files, back to back. Node text
+// (identifier names, literal spellings) is a span into `bytes`.
+
+type SourceFile struct {
+	path  string
+	start usize // offset of the first byte in SourceArena.bytes
+	size  usize
+	root  u32 // File node, 0 if the file failed to parse
+	ok    bool
+}
+
+type SourceArena struct {
+	bytes  [MaxSourceBytes]byte
+	used   usize
+	files  [MaxFiles]SourceFile
+	nfiles usize
+}
+
+// ---------------------------------------------------------------------------
+// TokenArena: the tokens of the file currently being parsed (reset per file).
+
+// Semicolon flavours (Token.semi), mirroring finc0's Token.Lit for SEMICOLON.
+const (
+	SemiExplicit = 0 // ";"
+	SemiNewline  = 1 // inserted at a newline ("\n")
+	SemiEOF      = 2 // inserted at EOF ("")
+)
+
+type Token struct {
+	kind    u8
+	semi    u8 // SEMICOLON flavour
+	errKind u8 // ILLEGAL tokens: LexErr* reason
+	errByte u8 // ILLEGAL tokens: offending byte (escapes, UTF-8)
+	off     u32 // file-relative byte offset of the first byte
+	end     u32 // file-relative offset just past the last byte
+	line    u32
+	col     u32
+	eline   u32
+	ecol    u32
+	errLine u32 // ILLEGAL tokens: position of the diagnostic
+	errCol  u32
+	val     u64 // INT value, CHAR byte, or the rune of an invalid character
+}
+
+type TokenArena struct {
+	items [MaxTokens]Token
+	count usize
+	full  bool
+}
+
+// ---------------------------------------------------------------------------
+// NodeArena: all AST nodes of the package plus the flat child lists.
+//
+// A node has six single-child slots (a..f), two list slots (l1, l2) that
+// are ranges in `lists`, two flag bits, one small operator/modifier field
+// and a text span (absolute offset into SourceArena.bytes). The per-kind
+// meaning of the slots is documented in ast.fc (func layout).
+
+type Node struct {
+	kind  u8
+	flags u8
+	op    u8
+	file  u16
+	a     u32
+	b     u32
+	c     u32
+	d     u32
+	e     u32
+	f     u32
+	l1s   u32
+	l1n   u32
+	l2s   u32
+	l2n   u32
+	sLine u32
+	sCol  u32
+	eLine u32
+	eCol  u32
+	tOff  u32
+	tLen  u32
+	ival  u64
+	id    u32 // dense post-order NodeID (as in finc0), assigned per file
+}
+
+type NodeArena struct {
+	items  [MaxNodes]Node
+	count  usize // number of used slots, including the reserved slot 0
+	lists  [MaxListItems]u32
+	nlist  usize
+	lastID u32
+	full   bool
+}
+
+// alloc returns a fresh zeroed node of the given kind. On overflow it sets
+// `full` and returns the reserved index 0 (writes to it are harmless).
+func (na *NodeArena) alloc(kind u8, file u16, line u32, col u32) u32 {
+	if na.count == 0 {
+		na.count = 1
+	}
+	if na.count >= MaxNodes {
+		na.full = true
+		return 0
+	}
+	idx := na.count
+	na.count++
+	var n Node
+	n.kind = kind
+	n.file = file
+	n.sLine = line
+	n.sCol = col
+	n.eLine = line
+	n.eCol = col
+	na.items[idx] = n
+	return u32(idx)
+}
+
+// listItem returns element i of the list starting at start.
+func (na *NodeArena) listItem(start u32, i usize) u32 {
+	return na.lists[usize(start)+i]
+}
+
+// ---------------------------------------------------------------------------
+// ListStack: scratch stack used while a child list is being parsed. Lists
+// nest in LIFO order, so every list is pushed onto the stack and copied into
+// NodeArena.lists in one piece when it is complete.
+
+type ListStack struct {
+	items [MaxListItems]u32
+	top   usize
+	full  bool
+}
+
+func (ls *ListStack) push(x u32) {
+	if ls.top >= MaxListItems {
+		ls.full = true
+		return
+	}
+	ls.items[ls.top] = x
+	ls.top++
+}
+
+// commit moves items[mark:top] into na.lists and pops them. It returns the
+// start and length of the stored list.
+func (ls *ListStack) commit(na *NodeArena, mark usize) (u32, u32) {
+	if mark > ls.top {
+		return 0, 0
+	}
+	n := ls.top - mark
+	ls.top = mark
+	if n == 0 {
+		return 0, 0
+	}
+	if na.nlist+n > MaxListItems {
+		na.full = true
+		return 0, 0
+	}
+	start := na.nlist
+	for i := usize(0); i < n; i++ {
+		na.lists[start+i] = ls.items[mark+i]
+	}
+	na.nlist = start + n
+	return u32(start), u32(n)
+}
+
+// ---------------------------------------------------------------------------
+// OutBuf: a bounded output buffer (generated text, dumps, diagnostics).
+// Writes past the capacity are dropped and set `full`.
+
+type OutBuf struct {
+	data [MaxOutputBytes]byte
+	len  usize
+	full bool
+}
+
+func (o *OutBuf) reset() {
+	o.len = 0
+	o.full = false
+}
+
+func (o *OutBuf) putByte(c byte) {
+	if o.len >= MaxOutputBytes {
+		o.full = true
+		return
+	}
+	o.data[o.len] = c
+	o.len++
+}
+
+func (o *OutBuf) putBytes(b []byte) {
+	n := len(b)
+	if o.len+n > MaxOutputBytes {
+		o.full = true
+		return
+	}
+	k := copy(o.data[o.len:o.len+n], b)
+	o.len += k
+}
+
+func (o *OutBuf) putStr(s string) {
+	o.putBytes(strBytes(s))
+}
+
+// putUint writes v in decimal.
+func (o *OutBuf) putUint(v u64) {
+	var nb [24]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		o.full = true
+		return
+	}
+	o.putBytes(nb[:n])
+}
+
+// putSpaces writes n spaces.
+func (o *OutBuf) putSpaces(n usize) {
+	for i := usize(0); i < n; i++ {
+		o.putByte(' ')
+	}
+}
+
+// putTabs writes n tab characters.
+func (o *OutBuf) putTabs(n usize) {
+	for i := usize(0); i < n; i++ {
+		o.putByte('\t')
+	}
+}
+
+// putHex writes v as exactly `width` hex digits (upper or lower case).
+func (o *OutBuf) putHex(v u64, width usize, upper bool) {
+	for i := usize(0); i < width; i++ {
+		shift := u64((width - 1 - i) * 4)
+		d := byte((v >> shift) & 15)
+		if d < 10 {
+			o.putByte('0' + d)
+		} else if upper {
+			o.putByte('A' + d - 10)
+		} else {
+			o.putByte('a' + d - 10)
+		}
+	}
+}

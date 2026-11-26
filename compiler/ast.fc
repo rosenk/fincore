@@ -1,0 +1,1346 @@
+// ast.fc — AST node kinds over the NodeArena, NodeID assignment, the
+// `--dump-ast` printer and the canonical source printer (finc0's
+// bootstrap/internal/ast: ast.go, walk.go, dump.go, print.go).
+//
+// Node layout. Every node kind names its children with the slots of
+// arena.fc's Node (a..f single children, l1/l2 lists) in the declaration
+// order of the corresponding finc0 Go struct; `layout` is the single source
+// of truth for that order. It drives post-order NodeID assignment (finc0's
+// ast.Children order) and the dump (finc0's reflection order), so both
+// match finc0 exactly. Scalar fields live in `flags` (Flag1/Flag2), `op`,
+// the text span (tOff/tLen) and `ival`:
+//
+//	File            Path=<file path>   a Package  l1 Imports  l2 Decls
+//	ImportDecl      Flag1 Grouped      l1 Specs
+//	ImportSpec      a Name?  b Path
+//	ConstDecl       Flag1 Grouped      l1 Specs
+//	ConstSpec       a Name  b Type?  c Value
+//	TypeDecl        a Name  b TypeParams?  Flag1 Alias  c Type
+//	VarDecl         a Name  b Type?  c Value?
+//	FuncDecl        op Modifier  a Recv?  b Name  c TypeParams?  d Sig  e Decreases?  f Body
+//	Receiver        a Name  Flag1 Pointer  b TypeName  l1 TypeParams
+//	TypeParamList   l1 Params
+//	TypeParam       l1 Names  a Constraint
+//	Signature       l1 Params  l2 Results  Flag1 ResultParen
+//	Param           l1 Names  Flag1 Variadic  a Type
+//	DecreasesClause a Measure
+//	NamedType       a Pkg?  b Name  l1 Args
+//	ArrayType       a Len  b Elem        SliceType/PointerType  a Elem
+//	StructType      l1 Fields            FieldDecl  l1 Names  a Type
+//	EnumType        l1 Variants          Variant    a Name  Flag1 HasParens  l1 Payload
+//	FuncType        Flag1 Driver  a Sig  CodeType a Level  ElType a Code  AnyType
+//	BlockStmt       l1 Stmts             DeclStmt   a Decl
+//	ShortVarDecl    l1 Names  l2 Values  AssignStmt l1 LHS  op Op  l2 RHS
+//	IncDecStmt      a X  Flag1 Inc       ExprStmt   a X
+//	IfStmt          a Init?  b Cond  c Then  d Else?
+//	MatchStmt       a X  l1 Arms         MatchArm   a Pattern  b Expr?  c Block?
+//	WildcardPattern                      CtorPattern a Qual?  b Name  Flag1 HasParens  l1 Bindings
+//	LiteralPattern  a Lit
+//	ForStmt         Flag1 Driver  Flag2 ThreeClause  a Init?  b Cond?  c Post?  d Decreases?  e Body
+//	ScopeStmt       a Name  b Value  c Body
+//	DeferStmt       a X   ReturnStmt l1 Results   BreakStmt   ContinueStmt
+//	Ident           text = Name
+//	BasicLit        op Kind  text = Raw  ival = Int  (Str decoded from Raw)
+//	BoolLit         Flag1 Value          NilLit
+//	BinaryExpr      op Op  a X  b Y      UnaryExpr  op Op  a X   ParenExpr a X
+//	CallExpr        a Fun  l1 Args       IndexExpr  a X  l1 Indices
+//	SliceExpr       a X  b Lo?  c Hi?    SelectorExpr a X  b Sel
+//	FuncLit         Flag1 Driver  a Sig  b Body
+//	StructLit       a Type  l1 Fields    FieldInit  a Name  b Value
+//	TypeExpr        a Type
+package main
+
+// Node kinds.
+const (
+	NkFile            = 1
+	NkImportDecl      = 2
+	NkImportSpec      = 3
+	NkConstDecl       = 4
+	NkConstSpec       = 5
+	NkTypeDecl        = 6
+	NkVarDecl         = 7
+	NkFuncDecl        = 8
+	NkReceiver        = 9
+	NkTypeParamList   = 10
+	NkTypeParam       = 11
+	NkSignature       = 12
+	NkParam           = 13
+	NkDecreasesClause = 14
+
+	NkNamedType   = 20
+	NkArrayType   = 21
+	NkSliceType   = 22
+	NkPointerType = 23
+	NkStructType  = 24
+	NkFieldDecl   = 25
+	NkEnumType    = 26
+	NkVariant     = 27
+	NkFuncType    = 28
+	NkCodeType    = 29
+	NkElType      = 30
+	NkAnyType     = 31
+
+	NkBlockStmt       = 40
+	NkDeclStmt        = 41
+	NkShortVarDecl    = 42
+	NkAssignStmt      = 43
+	NkIncDecStmt      = 44
+	NkExprStmt        = 45
+	NkIfStmt          = 46
+	NkMatchStmt       = 47
+	NkMatchArm        = 48
+	NkWildcardPattern = 49
+	NkCtorPattern     = 50
+	NkLiteralPattern  = 51
+	NkForStmt         = 52
+	NkScopeStmt       = 53
+	NkDeferStmt       = 54
+	NkReturnStmt      = 55
+	NkBreakStmt       = 56
+	NkContinueStmt    = 57
+
+	NkIdent        = 60
+	NkBasicLit     = 61
+	NkBoolLit      = 62
+	NkNilLit       = 63
+	NkBinaryExpr   = 64
+	NkUnaryExpr    = 65
+	NkParenExpr    = 66
+	NkCallExpr     = 67
+	NkIndexExpr    = 68
+	NkSliceExpr    = 69
+	NkSelectorExpr = 70
+	NkFuncLit      = 71
+	NkStructLit    = 72
+	NkFieldInit    = 73
+	NkTypeExpr     = 74
+)
+
+// Node slots (see layout).
+const (
+	SlotNone = 0
+	SlotA    = 1
+	SlotB    = 2
+	SlotC    = 3
+	SlotD    = 4
+	SlotE    = 5
+	SlotF    = 6
+	SlotL1   = 7
+	SlotL2   = 8
+
+	MaxSlots = 8
+)
+
+// Flag bits of Node.flags.
+const (
+	Flag1 = 1
+	Flag2 = 2
+)
+
+// Function modifiers (FuncDecl op).
+const (
+	ModNone     = 0
+	ModDriver   = 1
+	ModComptime = 2
+)
+
+// Literal kinds (BasicLit op).
+const (
+	LitInt    = 0
+	LitString = 1
+	LitChar   = 2
+)
+
+// Assignment operators (AssignStmt op).
+const (
+	AsgAssign = 0
+	AsgAdd    = 1
+	AsgSub    = 2
+	AsgMul    = 3
+	AsgQuo    = 4
+)
+
+// Binary operators (BinaryExpr op), in finc0 order.
+const (
+	OpLOr  = 0
+	OpLAnd = 1
+	OpEq   = 2
+	OpNe   = 3
+	OpLt   = 4
+	OpLe   = 5
+	OpGt   = 6
+	OpGe   = 7
+	OpAdd  = 8
+	OpSub  = 9
+	OpOr   = 10
+	OpXor  = 11
+	OpMul  = 12
+	OpDiv  = 13
+	OpRem  = 14
+	OpAnd  = 15
+	OpShl  = 16
+	OpShr  = 17
+)
+
+// Unary operators (UnaryExpr op).
+const (
+	OpNot   = 0
+	OpNeg   = 1
+	OpAddr  = 2
+	OpDeref = 3
+)
+
+func binOpString(op u8) string {
+	if op == OpLOr {
+		return "||"
+	}
+	if op == OpLAnd {
+		return "&&"
+	}
+	if op == OpEq {
+		return "=="
+	}
+	if op == OpNe {
+		return "!="
+	}
+	if op == OpLt {
+		return "<"
+	}
+	if op == OpLe {
+		return "<="
+	}
+	if op == OpGt {
+		return ">"
+	}
+	if op == OpGe {
+		return ">="
+	}
+	if op == OpAdd {
+		return "+"
+	}
+	if op == OpSub {
+		return "-"
+	}
+	if op == OpOr {
+		return "|"
+	}
+	if op == OpXor {
+		return "^"
+	}
+	if op == OpMul {
+		return "*"
+	}
+	if op == OpDiv {
+		return "/"
+	}
+	if op == OpRem {
+		return "%"
+	}
+	if op == OpAnd {
+		return "&"
+	}
+	if op == OpShl {
+		return "<<"
+	}
+	return ">>"
+}
+
+// binOpPrec is the binding strength (1 = loosest) of a binary operator.
+func binOpPrec(op u8) u8 {
+	if op == OpLOr {
+		return 1
+	}
+	if op == OpLAnd {
+		return 2
+	}
+	if op == OpEq || op == OpNe {
+		return 3
+	}
+	if op >= OpLt && op <= OpGe {
+		return 4
+	}
+	if op >= OpAdd && op <= OpXor {
+		return 5
+	}
+	return 6
+}
+
+func unaryOpString(op u8) string {
+	if op == OpNot {
+		return "!"
+	}
+	if op == OpNeg {
+		return "-"
+	}
+	if op == OpAddr {
+		return "&"
+	}
+	return "*"
+}
+
+func assignOpString(op u8) string {
+	if op == AsgAdd {
+		return "+="
+	}
+	if op == AsgSub {
+		return "-="
+	}
+	if op == AsgMul {
+		return "*="
+	}
+	if op == AsgQuo {
+		return "/="
+	}
+	return "="
+}
+
+func litKindString(op u8) string {
+	if op == LitString {
+		return "string"
+	}
+	if op == LitChar {
+		return "char"
+	}
+	return "int"
+}
+
+// kindName returns the finc0 Go type name of a node kind.
+func kindName(k u8) string {
+	if k == NkFile {
+		return "File"
+	}
+	if k == NkImportDecl {
+		return "ImportDecl"
+	}
+	if k == NkImportSpec {
+		return "ImportSpec"
+	}
+	if k == NkConstDecl {
+		return "ConstDecl"
+	}
+	if k == NkConstSpec {
+		return "ConstSpec"
+	}
+	if k == NkTypeDecl {
+		return "TypeDecl"
+	}
+	if k == NkVarDecl {
+		return "VarDecl"
+	}
+	if k == NkFuncDecl {
+		return "FuncDecl"
+	}
+	if k == NkReceiver {
+		return "Receiver"
+	}
+	if k == NkTypeParamList {
+		return "TypeParamList"
+	}
+	if k == NkTypeParam {
+		return "TypeParam"
+	}
+	if k == NkSignature {
+		return "Signature"
+	}
+	if k == NkParam {
+		return "Param"
+	}
+	if k == NkDecreasesClause {
+		return "DecreasesClause"
+	}
+	if k == NkNamedType {
+		return "NamedType"
+	}
+	if k == NkArrayType {
+		return "ArrayType"
+	}
+	if k == NkSliceType {
+		return "SliceType"
+	}
+	if k == NkPointerType {
+		return "PointerType"
+	}
+	if k == NkStructType {
+		return "StructType"
+	}
+	if k == NkFieldDecl {
+		return "FieldDecl"
+	}
+	if k == NkEnumType {
+		return "EnumType"
+	}
+	if k == NkVariant {
+		return "Variant"
+	}
+	if k == NkFuncType {
+		return "FuncType"
+	}
+	if k == NkCodeType {
+		return "CodeType"
+	}
+	if k == NkElType {
+		return "ElType"
+	}
+	if k == NkAnyType {
+		return "AnyType"
+	}
+	if k == NkBlockStmt {
+		return "BlockStmt"
+	}
+	if k == NkDeclStmt {
+		return "DeclStmt"
+	}
+	if k == NkShortVarDecl {
+		return "ShortVarDecl"
+	}
+	if k == NkAssignStmt {
+		return "AssignStmt"
+	}
+	if k == NkIncDecStmt {
+		return "IncDecStmt"
+	}
+	if k == NkExprStmt {
+		return "ExprStmt"
+	}
+	if k == NkIfStmt {
+		return "IfStmt"
+	}
+	if k == NkMatchStmt {
+		return "MatchStmt"
+	}
+	if k == NkMatchArm {
+		return "MatchArm"
+	}
+	if k == NkWildcardPattern {
+		return "WildcardPattern"
+	}
+	if k == NkCtorPattern {
+		return "CtorPattern"
+	}
+	if k == NkLiteralPattern {
+		return "LiteralPattern"
+	}
+	if k == NkForStmt {
+		return "ForStmt"
+	}
+	if k == NkScopeStmt {
+		return "ScopeStmt"
+	}
+	if k == NkDeferStmt {
+		return "DeferStmt"
+	}
+	if k == NkReturnStmt {
+		return "ReturnStmt"
+	}
+	if k == NkBreakStmt {
+		return "BreakStmt"
+	}
+	if k == NkContinueStmt {
+		return "ContinueStmt"
+	}
+	if k == NkIdent {
+		return "Ident"
+	}
+	if k == NkBasicLit {
+		return "BasicLit"
+	}
+	if k == NkBoolLit {
+		return "BoolLit"
+	}
+	if k == NkNilLit {
+		return "NilLit"
+	}
+	if k == NkBinaryExpr {
+		return "BinaryExpr"
+	}
+	if k == NkUnaryExpr {
+		return "UnaryExpr"
+	}
+	if k == NkParenExpr {
+		return "ParenExpr"
+	}
+	if k == NkCallExpr {
+		return "CallExpr"
+	}
+	if k == NkIndexExpr {
+		return "IndexExpr"
+	}
+	if k == NkSliceExpr {
+		return "SliceExpr"
+	}
+	if k == NkSelectorExpr {
+		return "SelectorExpr"
+	}
+	if k == NkFuncLit {
+		return "FuncLit"
+	}
+	if k == NkStructLit {
+		return "StructLit"
+	}
+	if k == NkFieldInit {
+		return "FieldInit"
+	}
+	if k == NkTypeExpr {
+		return "TypeExpr"
+	}
+	return "Node?"
+}
+
+// layout returns the slot and field name of the i-th node-valued field of a
+// node kind (SlotNone past the last one).
+func layout(k u8, i usize) (u8, string) {
+	if k == NkFile {
+		return layout3(i, SlotA, "Package", SlotL1, "Imports", SlotL2, "Decls")
+	}
+	if k == NkImportDecl || k == NkConstDecl {
+		return layout1(i, SlotL1, "Specs")
+	}
+	if k == NkImportSpec {
+		return layout2(i, SlotA, "Name", SlotB, "Path")
+	}
+	if k == NkConstSpec {
+		return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
+	}
+	if k == NkTypeDecl {
+		return layout3(i, SlotA, "Name", SlotB, "TypeParams", SlotC, "Type")
+	}
+	if k == NkVarDecl {
+		return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
+	}
+	if k == NkFuncDecl {
+		if i < 3 {
+			return layout3(i, SlotA, "Recv", SlotB, "Name", SlotC, "TypeParams")
+		}
+		return layout3(i-3, SlotD, "Sig", SlotE, "Decreases", SlotF, "Body")
+	}
+	if k == NkReceiver {
+		return layout3(i, SlotA, "Name", SlotB, "TypeName", SlotL1, "TypeParams")
+	}
+	if k == NkTypeParamList {
+		return layout1(i, SlotL1, "Params")
+	}
+	if k == NkTypeParam {
+		return layout2(i, SlotL1, "Names", SlotA, "Constraint")
+	}
+	if k == NkSignature {
+		return layout2(i, SlotL1, "Params", SlotL2, "Results")
+	}
+	if k == NkParam {
+		return layout2(i, SlotL1, "Names", SlotA, "Type")
+	}
+	if k == NkDecreasesClause {
+		return layout1(i, SlotA, "Measure")
+	}
+	if k == NkNamedType {
+		return layout3(i, SlotA, "Pkg", SlotB, "Name", SlotL1, "Args")
+	}
+	if k == NkArrayType {
+		return layout2(i, SlotA, "Len", SlotB, "Elem")
+	}
+	if k == NkSliceType || k == NkPointerType {
+		return layout1(i, SlotA, "Elem")
+	}
+	if k == NkStructType {
+		return layout1(i, SlotL1, "Fields")
+	}
+	if k == NkFieldDecl {
+		return layout2(i, SlotL1, "Names", SlotA, "Type")
+	}
+	if k == NkEnumType {
+		return layout1(i, SlotL1, "Variants")
+	}
+	if k == NkVariant {
+		return layout2(i, SlotA, "Name", SlotL1, "Payload")
+	}
+	if k == NkFuncType {
+		return layout1(i, SlotA, "Sig")
+	}
+	if k == NkCodeType {
+		return layout1(i, SlotA, "Level")
+	}
+	if k == NkElType {
+		return layout1(i, SlotA, "Code")
+	}
+	if k == NkBlockStmt {
+		return layout1(i, SlotL1, "Stmts")
+	}
+	if k == NkDeclStmt {
+		return layout1(i, SlotA, "Decl")
+	}
+	if k == NkShortVarDecl {
+		return layout2(i, SlotL1, "Names", SlotL2, "Values")
+	}
+	if k == NkAssignStmt {
+		return layout2(i, SlotL1, "LHS", SlotL2, "RHS")
+	}
+	if k == NkIncDecStmt || k == NkExprStmt || k == NkDeferStmt || k == NkParenExpr || k == NkUnaryExpr {
+		return layout1(i, SlotA, "X")
+	}
+	if k == NkIfStmt {
+		if i < 2 {
+			return layout2(i, SlotA, "Init", SlotB, "Cond")
+		}
+		return layout2(i-2, SlotC, "Then", SlotD, "Else")
+	}
+	if k == NkMatchStmt {
+		return layout2(i, SlotA, "X", SlotL1, "Arms")
+	}
+	if k == NkMatchArm {
+		return layout3(i, SlotA, "Pattern", SlotB, "Expr", SlotC, "Block")
+	}
+	if k == NkCtorPattern {
+		return layout3(i, SlotA, "Qual", SlotB, "Name", SlotL1, "Bindings")
+	}
+	if k == NkLiteralPattern {
+		return layout1(i, SlotA, "Lit")
+	}
+	if k == NkForStmt {
+		if i < 3 {
+			return layout3(i, SlotA, "Init", SlotB, "Cond", SlotC, "Post")
+		}
+		return layout2(i-3, SlotD, "Decreases", SlotE, "Body")
+	}
+	if k == NkScopeStmt {
+		return layout3(i, SlotA, "Name", SlotB, "Value", SlotC, "Body")
+	}
+	if k == NkReturnStmt {
+		return layout1(i, SlotL1, "Results")
+	}
+	if k == NkBinaryExpr {
+		return layout2(i, SlotA, "X", SlotB, "Y")
+	}
+	if k == NkCallExpr {
+		return layout2(i, SlotA, "Fun", SlotL1, "Args")
+	}
+	if k == NkIndexExpr {
+		return layout2(i, SlotA, "X", SlotL1, "Indices")
+	}
+	if k == NkSliceExpr {
+		return layout3(i, SlotA, "X", SlotB, "Lo", SlotC, "Hi")
+	}
+	if k == NkSelectorExpr {
+		return layout2(i, SlotA, "X", SlotB, "Sel")
+	}
+	if k == NkFuncLit {
+		return layout2(i, SlotA, "Sig", SlotB, "Body")
+	}
+	if k == NkStructLit {
+		return layout2(i, SlotA, "Type", SlotL1, "Fields")
+	}
+	if k == NkFieldInit {
+		return layout2(i, SlotA, "Name", SlotB, "Value")
+	}
+	if k == NkTypeExpr {
+		return layout1(i, SlotA, "Type")
+	}
+	return SlotNone, ""
+}
+
+func layout1(i usize, s0 u8, n0 string) (u8, string) {
+	if i == 0 {
+		return s0, n0
+	}
+	return SlotNone, ""
+}
+
+func layout2(i usize, s0 u8, n0 string, s1 u8, n1 string) (u8, string) {
+	if i == 0 {
+		return s0, n0
+	}
+	if i == 1 {
+		return s1, n1
+	}
+	return SlotNone, ""
+}
+
+func layout3(i usize, s0 u8, n0 string, s1 u8, n1 string, s2 u8, n2 string) (u8, string) {
+	if i == 0 {
+		return s0, n0
+	}
+	if i == 1 {
+		return s1, n1
+	}
+	if i == 2 {
+		return s2, n2
+	}
+	return SlotNone, ""
+}
+
+// slotChild returns the single child stored in a slot (0 if none).
+func slotChild(n Node, slot u8) u32 {
+	if slot == SlotA {
+		return n.a
+	}
+	if slot == SlotB {
+		return n.b
+	}
+	if slot == SlotC {
+		return n.c
+	}
+	if slot == SlotD {
+		return n.d
+	}
+	if slot == SlotE {
+		return n.e
+	}
+	if slot == SlotF {
+		return n.f
+	}
+	return 0
+}
+
+// slotList returns the (start, length) of the list stored in a list slot.
+func slotList(n Node, slot u8) (u32, u32) {
+	if slot == SlotL1 {
+		return n.l1s, n.l1n
+	}
+	if slot == SlotL2 {
+		return n.l2s, n.l2n
+	}
+	return 0, 0
+}
+
+func hasFlag(n Node, f u8) bool {
+	return n.flags&f != 0
+}
+
+// ---------------------------------------------------------------------------
+// NodeID assignment: dense post-order numbering in layout order, shared
+// across the files of a package (finc0's parser.assignIDs).
+
+// assignIDs numbers the subtree rooted at id. The tree depth never exceeds
+// the number of nodes, so depth = MaxNodes + 1 is always sufficient.
+func (na *NodeArena) assignIDs(id u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	if id == 0 {
+		return
+	}
+	n := na.items[usize(id)]
+	for i := usize(0); i < MaxSlots; i++ {
+		slot, _ := layout(n.kind, i)
+		if slot == SlotNone {
+			break
+		}
+		if slot >= SlotL1 {
+			start, cnt := slotList(n, slot)
+			m := usize(cnt)
+			for j := usize(0); j < m; j++ {
+				na.assignIDs(na.listItem(start, j), depth-1)
+			}
+		} else {
+			na.assignIDs(slotChild(n, slot), depth-1)
+		}
+	}
+	na.lastID++
+	na.items[usize(id)].id = na.lastID
+}
+
+// ---------------------------------------------------------------------------
+// Dump (`parse --dump-ast`): byte-identical to finc0's ast.Dump. Each node
+// prints as `Kind #ID @line:col-line:col` plus its non-zero scalar fields,
+// followed by its node fields (empty and absent ones omitted).
+
+type Dumper struct {
+	na  *NodeArena
+	sa  *SourceArena // file paths
+	src []byte       // all source bytes (SourceArena.bytes)
+	out *OutBuf
+	tmp *OutBuf // scratch for decoded string literals
+}
+
+func (d *Dumper) text(n Node) []byte {
+	s := usize(n.tOff)
+	return d.src[s : s+usize(n.tLen)]
+}
+
+func (d *Dumper) flagScalar(n Node, f u8, name string) {
+	if hasFlag(n, f) {
+		d.out.putByte(' ')
+		d.out.putStr(name)
+		d.out.putStr("=true")
+	}
+}
+
+// scalars writes the header scalar fields of n in declaration order.
+func (d *Dumper) scalars(n Node) {
+	o := d.out
+	k := n.kind
+	if k == NkFile {
+		o.putStr(" Path=")
+		putQuoted(o, strBytes(d.sa.files[usize(n.file)].path))
+	} else if k == NkImportDecl || k == NkConstDecl {
+		d.flagScalar(n, Flag1, "Grouped")
+	} else if k == NkTypeDecl {
+		d.flagScalar(n, Flag1, "Alias")
+	} else if k == NkFuncDecl {
+		if n.op == ModDriver {
+			o.putStr(" Modifier=driver")
+		} else if n.op == ModComptime {
+			o.putStr(" Modifier=comptime")
+		}
+	} else if k == NkReceiver {
+		d.flagScalar(n, Flag1, "Pointer")
+	} else if k == NkSignature {
+		d.flagScalar(n, Flag1, "ResultParen")
+	} else if k == NkParam {
+		d.flagScalar(n, Flag1, "Variadic")
+	} else if k == NkVariant || k == NkCtorPattern {
+		d.flagScalar(n, Flag1, "HasParens")
+	} else if k == NkFuncType || k == NkFuncLit {
+		d.flagScalar(n, Flag1, "Driver")
+	} else if k == NkAssignStmt {
+		o.putStr(" Op=")
+		o.putStr(assignOpString(n.op))
+	} else if k == NkIncDecStmt {
+		d.flagScalar(n, Flag1, "Inc")
+	} else if k == NkForStmt {
+		d.flagScalar(n, Flag1, "Driver")
+		d.flagScalar(n, Flag2, "ThreeClause")
+	} else if k == NkIdent {
+		o.putStr(" Name=")
+		putQuoted(o, d.text(n))
+	} else if k == NkBasicLit {
+		o.putStr(" Kind=")
+		o.putStr(litKindString(n.op))
+		o.putStr(" Raw=")
+		putQuoted(o, d.text(n))
+		if n.ival != 0 {
+			o.putStr(" Int=")
+			o.putUint(n.ival)
+		}
+		if n.op == LitString && !stringLitEmpty(d.text(n)) {
+			t := d.tmp
+			t.reset()
+			decodeStringLit(t, d.text(n))
+			o.putStr(" Str=")
+			putQuoted(o, t.data[:t.len])
+		}
+	} else if k == NkBoolLit {
+		d.flagScalar(n, Flag1, "Value")
+	} else if k == NkBinaryExpr {
+		o.putStr(" Op=")
+		o.putStr(binOpString(n.op))
+	} else if k == NkUnaryExpr {
+		o.putStr(" Op=")
+		o.putStr(unaryOpString(n.op))
+	}
+}
+
+// dumpNode dumps the subtree rooted at id; the caller has already written any
+// "Field: " prefix on the current line.
+func (d *Dumper) dumpNode(id u32, indent usize, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	n := d.na.items[usize(id)]
+	o := d.out
+	o.putStr(kindName(n.kind))
+	o.putStr(" #")
+	o.putUint(u64(n.id))
+	o.putStr(" @")
+	o.putUint(u64(n.sLine))
+	o.putByte(':')
+	o.putUint(u64(n.sCol))
+	o.putByte('-')
+	o.putUint(u64(n.eLine))
+	o.putByte(':')
+	o.putUint(u64(n.eCol))
+	d.scalars(n)
+	o.putByte('\n')
+	for i := usize(0); i < MaxSlots; i++ {
+		slot, name := layout(n.kind, i)
+		if slot == SlotNone {
+			break
+		}
+		if slot >= SlotL1 {
+			start, cnt := slotList(n, slot)
+			m := usize(cnt)
+			if m > 0 {
+				o.putSpaces(2 * (indent + 1))
+				o.putStr(name)
+				o.putStr(":\n")
+				for j := usize(0); j < m; j++ {
+					o.putSpaces(2 * (indent + 2))
+					o.putStr("- ")
+					d.dumpNode(d.na.listItem(start, j), indent+2, depth-1)
+				}
+			}
+		} else {
+			c := slotChild(n, slot)
+			if c != 0 {
+				o.putSpaces(2 * (indent + 1))
+				o.putStr(name)
+				o.putStr(": ")
+				d.dumpNode(c, indent+1, depth-1)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Printer: canonical FinCore source of a subtree (finc0's ast.Format, used
+// in parser messages such as "non-name a.b on left side of :=").
+
+type Printer struct {
+	na     *NodeArena
+	src    []byte // all source bytes (SourceArena.bytes)
+	out    *OutBuf
+	indent usize
+}
+
+func (pr *Printer) text(n Node) []byte {
+	s := usize(n.tOff)
+	return pr.src[s : s+usize(n.tLen)]
+}
+
+func (pr *Printer) nl() {
+	pr.out.putByte('\n')
+	pr.out.putTabs(pr.indent)
+}
+
+// name writes the text of an Ident node.
+func (pr *Printer) name(id u32) {
+	pr.out.putBytes(pr.text(pr.na.items[usize(id)]))
+}
+
+// names writes a comma-separated identifier list.
+func (pr *Printer) names(start u32, cnt u32) {
+	m := usize(cnt)
+	for i := usize(0); i < m; i++ {
+		if i > 0 {
+			pr.out.putStr(", ")
+		}
+		pr.name(pr.na.listItem(start, i))
+	}
+}
+
+// printList prints the nodes of a list separated by sep; with lines set, each
+// element starts on a new line (nl) instead.
+func (pr *Printer) printList(start u32, cnt u32, sep string, lines bool, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	m := usize(cnt)
+	for i := usize(0); i < m; i++ {
+		if lines {
+			pr.nl()
+		} else if i > 0 {
+			pr.out.putStr(sep)
+		}
+		pr.printNode(pr.na.listItem(start, i), depth-1)
+	}
+}
+
+// printNode prints the subtree rooted at id (nothing for id 0).
+func (pr *Printer) printNode(id u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	if id == 0 {
+		return
+	}
+	n := pr.na.items[usize(id)]
+	o := pr.out
+	k := n.kind
+	if k == NkFile {
+		o.putStr("package ")
+		pr.name(n.a)
+		o.putStr("\n")
+		m := usize(n.l1n)
+		for i := usize(0); i < m; i++ {
+			o.putStr("\n")
+			pr.printNode(pr.na.listItem(n.l1s, i), depth-1)
+		}
+		m2 := usize(n.l2n)
+		for i := usize(0); i < m2; i++ {
+			o.putStr("\n")
+			pr.printNode(pr.na.listItem(n.l2s, i), depth-1)
+			o.putStr("\n")
+		}
+	} else if k == NkImportDecl || k == NkConstDecl {
+		if k == NkImportDecl {
+			o.putStr("import ")
+		} else {
+			o.putStr("const ")
+		}
+		if hasFlag(n, Flag1) {
+			o.putStr("(")
+			pr.indent++
+			pr.printList(n.l1s, n.l1n, "", true, depth-1)
+			pr.indent--
+			pr.nl()
+			o.putStr(")")
+		} else if n.l1n > 0 {
+			pr.printNode(pr.na.listItem(n.l1s, 0), depth-1)
+		}
+	} else if k == NkImportSpec {
+		if n.a != 0 {
+			pr.name(n.a)
+			o.putStr(" ")
+		}
+		pr.printNode(n.b, depth-1)
+	} else if k == NkConstSpec {
+		pr.name(n.a)
+		if n.b != 0 {
+			o.putStr(" ")
+			pr.printNode(n.b, depth-1)
+		}
+		o.putStr(" = ")
+		pr.printNode(n.c, depth-1)
+	} else if k == NkTypeDecl {
+		o.putStr("type ")
+		pr.name(n.a)
+		pr.printNode(n.b, depth-1)
+		if hasFlag(n, Flag1) {
+			o.putStr(" =")
+		}
+		o.putStr(" ")
+		pr.printNode(n.c, depth-1)
+	} else if k == NkVarDecl {
+		o.putStr("var ")
+		pr.name(n.a)
+		if n.b != 0 {
+			o.putStr(" ")
+			pr.printNode(n.b, depth-1)
+		}
+		if n.c != 0 {
+			o.putStr(" = ")
+			pr.printNode(n.c, depth-1)
+		}
+	} else if k == NkFuncDecl {
+		if n.op == ModDriver {
+			o.putStr("driver ")
+		} else if n.op == ModComptime {
+			o.putStr("comptime ")
+		}
+		o.putStr("func ")
+		if n.a != 0 {
+			pr.printNode(n.a, depth-1)
+			o.putStr(" ")
+		}
+		pr.name(n.b)
+		pr.printNode(n.c, depth-1)
+		pr.printNode(n.d, depth-1)
+		if n.e != 0 {
+			o.putStr(" ")
+			pr.printNode(n.e, depth-1)
+		}
+		o.putStr(" ")
+		pr.printNode(n.f, depth-1)
+	} else if k == NkReceiver {
+		o.putStr("(")
+		pr.name(n.a)
+		o.putStr(" ")
+		if hasFlag(n, Flag1) {
+			o.putStr("*")
+		}
+		pr.name(n.b)
+		if n.l1n > 0 {
+			o.putStr("[")
+			pr.names(n.l1s, n.l1n)
+			o.putStr("]")
+		}
+		o.putStr(")")
+	} else if k == NkTypeParamList {
+		o.putStr("[")
+		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+		o.putStr("]")
+	} else if k == NkTypeParam {
+		pr.names(n.l1s, n.l1n)
+		o.putStr(" ")
+		pr.printNode(n.a, depth-1)
+	} else if k == NkSignature {
+		o.putStr("(")
+		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+		o.putStr(")")
+		if n.l2n > 0 {
+			o.putStr(" ")
+			paren := hasFlag(n, Flag1) || n.l2n > 1
+			if paren {
+				o.putStr("(")
+			}
+			pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
+			if paren {
+				o.putStr(")")
+			}
+		}
+	} else if k == NkParam {
+		pr.names(n.l1s, n.l1n)
+		o.putStr(" ")
+		if hasFlag(n, Flag1) {
+			o.putStr("...")
+		}
+		pr.printNode(n.a, depth-1)
+	} else if k == NkDecreasesClause {
+		o.putStr("decreases(")
+		pr.printNode(n.a, depth-1)
+		o.putStr(")")
+	} else {
+		pr.printTypeOrStmt(n, depth-1)
+	}
+}
+
+// printTypeOrStmt prints type and statement nodes.
+func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	o := pr.out
+	k := n.kind
+	if k == NkNamedType {
+		if n.a != 0 {
+			pr.name(n.a)
+			o.putStr(".")
+		}
+		pr.name(n.b)
+		if n.l1n > 0 {
+			o.putStr("[")
+			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+			o.putStr("]")
+		}
+	} else if k == NkArrayType {
+		o.putStr("[")
+		pr.printNode(n.a, depth-1)
+		o.putStr("]")
+		pr.printNode(n.b, depth-1)
+	} else if k == NkSliceType {
+		o.putStr("[]")
+		pr.printNode(n.a, depth-1)
+	} else if k == NkPointerType {
+		o.putStr("*")
+		pr.printNode(n.a, depth-1)
+	} else if k == NkStructType || k == NkEnumType {
+		if k == NkStructType {
+			o.putStr("struct {")
+		} else {
+			o.putStr("enum {")
+		}
+		m := usize(n.l1n)
+		for i := usize(0); i < m; i++ {
+			if i > 0 {
+				o.putStr(";")
+			}
+			o.putStr(" ")
+			pr.printNode(pr.na.listItem(n.l1s, i), depth-1)
+		}
+		if m > 0 {
+			o.putStr(" ")
+		}
+		o.putStr("}")
+	} else if k == NkFieldDecl {
+		pr.names(n.l1s, n.l1n)
+		o.putStr(" ")
+		pr.printNode(n.a, depth-1)
+	} else if k == NkVariant {
+		pr.name(n.a)
+		if hasFlag(n, Flag1) {
+			o.putStr("(")
+			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+			o.putStr(")")
+		}
+	} else if k == NkFuncType {
+		if hasFlag(n, Flag1) {
+			o.putStr("driver ")
+		}
+		o.putStr("func")
+		pr.printNode(n.a, depth-1)
+	} else if k == NkCodeType {
+		o.putStr("Code ")
+		pr.printNode(n.a, depth-1)
+	} else if k == NkElType {
+		o.putStr("El(")
+		pr.printNode(n.a, depth-1)
+		o.putStr(")")
+	} else if k == NkAnyType {
+		o.putStr("any")
+	} else if k == NkBlockStmt {
+		o.putStr("{")
+		pr.indent++
+		pr.printList(n.l1s, n.l1n, "", true, depth-1)
+		pr.indent--
+		if n.l1n > 0 {
+			pr.nl()
+		}
+		o.putStr("}")
+	} else if k == NkDeclStmt || k == NkExprStmt || k == NkLiteralPattern || k == NkTypeExpr {
+		pr.printNode(n.a, depth-1)
+	} else if k == NkShortVarDecl {
+		pr.names(n.l1s, n.l1n)
+		o.putStr(" := ")
+		pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
+	} else if k == NkAssignStmt {
+		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+		o.putStr(" ")
+		o.putStr(assignOpString(n.op))
+		o.putStr(" ")
+		pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
+	} else if k == NkIncDecStmt {
+		pr.printNode(n.a, depth-1)
+		if hasFlag(n, Flag1) {
+			o.putStr("++")
+		} else {
+			o.putStr("--")
+		}
+	} else if k == NkIfStmt {
+		o.putStr("if ")
+		if n.a != 0 {
+			pr.printNode(n.a, depth-1)
+			o.putStr("; ")
+		}
+		pr.printNode(n.b, depth-1)
+		o.putStr(" ")
+		pr.printNode(n.c, depth-1)
+		if n.d != 0 {
+			o.putStr(" else ")
+			pr.printNode(n.d, depth-1)
+		}
+	} else if k == NkMatchStmt {
+		o.putStr("match ")
+		pr.printNode(n.a, depth-1)
+		o.putStr(" {")
+		pr.indent++
+		pr.printList(n.l1s, n.l1n, "", true, depth-1)
+		pr.indent--
+		pr.nl()
+		o.putStr("}")
+	} else if k == NkMatchArm {
+		pr.printNode(n.a, depth-1)
+		o.putStr(" -> ")
+		if n.c != 0 {
+			pr.printNode(n.c, depth-1)
+		} else {
+			pr.printNode(n.b, depth-1)
+		}
+	} else if k == NkWildcardPattern {
+		o.putStr("_")
+	} else if k == NkCtorPattern {
+		if n.a != 0 {
+			pr.name(n.a)
+			o.putStr(".")
+		}
+		pr.name(n.b)
+		if hasFlag(n, Flag1) {
+			o.putStr("(")
+			pr.names(n.l1s, n.l1n)
+			o.putStr(")")
+		}
+	} else if k == NkForStmt {
+		if hasFlag(n, Flag1) {
+			o.putStr("driver ")
+		}
+		o.putStr("for ")
+		if hasFlag(n, Flag2) {
+			pr.printNode(n.a, depth-1)
+			o.putStr("; ")
+			pr.printNode(n.b, depth-1)
+			o.putStr("; ")
+			pr.printNode(n.c, depth-1)
+			if n.c != 0 {
+				o.putStr(" ")
+			}
+		} else if n.b != 0 {
+			pr.printNode(n.b, depth-1)
+			o.putStr(" ")
+		}
+		if n.d != 0 {
+			pr.printNode(n.d, depth-1)
+			o.putStr(" ")
+		}
+		pr.printNode(n.e, depth-1)
+	} else if k == NkScopeStmt {
+		o.putStr("scope ")
+		pr.name(n.a)
+		o.putStr(" := ")
+		pr.printNode(n.b, depth-1)
+		o.putStr(" ")
+		pr.printNode(n.c, depth-1)
+	} else if k == NkDeferStmt {
+		o.putStr("defer ")
+		pr.printNode(n.a, depth-1)
+	} else if k == NkReturnStmt {
+		o.putStr("return")
+		if n.l1n > 0 {
+			o.putStr(" ")
+			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+		}
+	} else if k == NkBreakStmt {
+		o.putStr("break")
+	} else if k == NkContinueStmt {
+		o.putStr("continue")
+	} else {
+		pr.printExpr(n, depth-1)
+	}
+}
+
+// printExpr prints expression nodes.
+func (pr *Printer) printExpr(n Node, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	o := pr.out
+	k := n.kind
+	if k == NkIdent || k == NkBasicLit {
+		o.putBytes(pr.text(n))
+	} else if k == NkBoolLit {
+		if hasFlag(n, Flag1) {
+			o.putStr("true")
+		} else {
+			o.putStr("false")
+		}
+	} else if k == NkNilLit {
+		o.putStr("nil")
+	} else if k == NkBinaryExpr {
+		pr.printNode(n.a, depth-1)
+		o.putStr(" ")
+		o.putStr(binOpString(n.op))
+		o.putStr(" ")
+		pr.printNode(n.b, depth-1)
+	} else if k == NkUnaryExpr {
+		o.putStr(unaryOpString(n.op))
+		pr.printNode(n.a, depth-1)
+	} else if k == NkParenExpr {
+		o.putStr("(")
+		pr.printNode(n.a, depth-1)
+		o.putStr(")")
+	} else if k == NkCallExpr {
+		pr.printNode(n.a, depth-1)
+		o.putStr("(")
+		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+		o.putStr(")")
+	} else if k == NkIndexExpr {
+		pr.printNode(n.a, depth-1)
+		o.putStr("[")
+		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+		o.putStr("]")
+	} else if k == NkSliceExpr {
+		pr.printNode(n.a, depth-1)
+		o.putStr("[")
+		pr.printNode(n.b, depth-1)
+		o.putStr(":")
+		pr.printNode(n.c, depth-1)
+		o.putStr("]")
+	} else if k == NkSelectorExpr {
+		pr.printNode(n.a, depth-1)
+		o.putStr(".")
+		pr.name(n.b)
+	} else if k == NkFuncLit {
+		if hasFlag(n, Flag1) {
+			o.putStr("driver ")
+		}
+		o.putStr("func")
+		pr.printNode(n.a, depth-1)
+		o.putStr(" ")
+		pr.printNode(n.b, depth-1)
+	} else if k == NkStructLit {
+		pr.printNode(n.a, depth-1)
+		o.putStr("{")
+		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
+		o.putStr("}")
+	} else if k == NkFieldInit {
+		pr.name(n.a)
+		o.putStr(": ")
+		pr.printNode(n.b, depth-1)
+	}
+}
