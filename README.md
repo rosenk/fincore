@@ -57,7 +57,7 @@ fixed point: sha256(stage2.go) == sha256(stage3.go)
 | :--- | :--- | :--- |
 | M0 | Lexer, AST, parser (Go) — `finc0 parse` | ✅ |
 | M1 | Resolver, fuel-bounded comptime, type checker — `finc0 check` | ✅ |
-| M2 | Scope/linearity checker (S1–S5) and totality/effect checker (T1–T4) | 🚧 in progress |
+| M2 | Scope/linearity checker (S1–S5) and totality/effect checker (T1–T4) | ✅ |
 | M3 | Go runtime `runtime/fincrt` (interruptible I/O, structured concurrency, OS caps) | ✅ |
 | M4 | IR + deterministic Go codegen — `finc0 build/run/test` | 🚧 in progress |
 | M5 | `tcp_echo.fc` end-to-end (static and `--race`) | 🚧 in progress |
