@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"fincore/bootstrap/internal/ast"
+	"fincore/bootstrap/internal/diag"
 	"fincore/bootstrap/internal/types"
 )
 
@@ -64,8 +65,14 @@ func TestPassCorpusTypechecks(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(res.Diags) > 0 {
-				t.Fatalf("unexpected diagnostics:\n%v", res.Diags)
+			// Fail tests of the later passes may only report their
+			// marked diagnostics (from those passes, never from types).
+			diags := res.Diags
+			if strings.HasPrefix(in, "testdata/fail/") {
+				diags = unmarked(t, in, diags)
+			}
+			if len(diags) > 0 || res.Info == nil {
+				t.Fatalf("unexpected diagnostics:\n%v", diags)
 			}
 			assertComplete(t, res.Info)
 		})
@@ -195,4 +202,27 @@ func itoa(n int) string {
 			return s
 		}
 	}
+}
+
+// unmarked returns the diagnostics without a matching `// ERROR E####`
+// marker (same line and code) in the file at path.
+func unmarked(t *testing.T, path string, diags diag.List) diag.List {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{}
+	for i, line := range strings.Split(string(src), "\n") {
+		if m := markerRE.FindStringSubmatch(line); m != nil {
+			want[m[1]+"@"+itoa(i+1)] = true
+		}
+	}
+	var out diag.List
+	for _, d := range diags {
+		if !want[d.Code.String()+"@"+itoa(d.Span.Start.Line)] {
+			out = append(out, d)
+		}
+	}
+	return out
 }
