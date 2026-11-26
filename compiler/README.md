@@ -234,6 +234,41 @@ interpreter) save and restore the interpreter state. Frame variables live in
 `fvSym/fvSlot` ranges; a variable's cell is a heap slot and `&x` marks it so
 that a redeclaration allocates a fresh cell (finc0's map semantics).
 
+### Scope checker (scope.fc, linear.fc, passes.fc)
+
+Port of finc0's `scope` package (S2-S5: E3002-E3005; rules in
+`bootstrap/internal/scope/doc.go`). `passes.fc` holds `runPasses`, called by
+`checkPath` after `checkProgram` when there are no diagnostics; it runs the
+enabled passes in order and stops after the first one that reports
+anything (finc0's `check.Passes`). The hidden flag
+`check --passes=types|all|<pass>[,<pass>]` mirrors finc0's oracle flag
+(known passes: `scope`).
+
+- `scope.fc` (finc0 scope.go): `scopeCheck` checks every declaration with a
+  body in `funcs.order`. Origins (depth, region) are packed into a u64
+  (`depth << 32 | region SymID`). finc0's per-declaration maps (depth,
+  content, addr, fixed) are per-symbol arrays stamped with an epoch per
+  declaration; the value flows are a flat array; the content fixpoint is
+  bounded by the height of the origin lattice. The walker (`wStmt`,
+  `wExpr`, ...) runs twice (collect, check) with globals for depth, function
+  depth and mode. finc0's one-diagnostic-per-(code, position) map is a
+  scan of the recorded diagnostics (`scReport`).
+- `linear.fc` (finc0 linear.go): every function body (and each nested
+  literal body) is a flow record; flows nest LIFO, so their variables,
+  frames and loop contexts live on shared stacks with per-flow bases. An
+  abstract environment is an EnvID into `lnEnv` (dead flag + a range of
+  state bytes and tied error symbols), a mutable handle like finc0's
+  `*env`; the arena is reset per declaration (1 Mi envs, 4 Mi slots).
+  Owned/borrowed lists and assignment operands are passed on the `lnTmp`
+  scratch stack. Loop fixpoints keep finc0's 65-iteration cap.
+
+`make diff-check-scope` runs scripts/diffcheck with `-passes scope`:
+`finc0 check --passes=scope` vs `finc1 check --passes=scope` on the
+diff-check corpus and snippets plus the 60 cases of finc0's
+`scope_test.go` (wrapped like its `run` helper) and
+`scripts/diffcheck/cases/scope_edges.fc`. `make diff-check` passes
+`--passes=types` to both compilers.
+
 ### Semantic capacities
 
 | Arena | Capacity | `compiler/` (18k lines) |

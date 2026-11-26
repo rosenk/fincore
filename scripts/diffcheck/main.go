@@ -1,9 +1,11 @@
-// Command diffcheck compares `finc1 check` with the oracle
-// `finc0 check --passes=types` (load, resolve, type checking and comptime
-// evaluation only) on the corpus and on the source snippets embedded in
-// finc0's resolver, type checker and comptime unit tests.
+// Command diffcheck compares `finc1 check --passes=P` with the oracle
+// `finc0 check --passes=P` (default P = types: load, resolve, type checking
+// and comptime evaluation only) on the corpus and on the source snippets
+// embedded in finc0's resolver, type checker and comptime unit tests. With
+// -passes=scope (make diff-check-scope) the scope checker runs too, and the
+// snippets of finc0's scope unit tests are added.
 //
-//	go run ./scripts/diffcheck [-finc0 bin/finc0] [-finc1 bin/finc1] [-v] [-keep]
+//	go run ./scripts/diffcheck [-finc0 bin/finc0] [-finc1 bin/finc1] [-passes types|scope|all] [-v] [-keep]
 //
 // Corpus cases (run from the module root): examples/*.fc, testdata/pass
 // (files and package directories), testdata/fail/*.fc,
@@ -54,6 +56,7 @@ func main() {
 	keep := flag.Bool("keep", false, "keep temporary directories")
 	mutants := flag.Int("mutate", 0, "also check N random token-level mutants of every corpus file")
 	seed := flag.Int64("seed", 1, "mutation seed")
+	passes := flag.String("passes", "types", "passes to compare (--passes= value of both compilers: types, scope, all)")
 	flag.Parse()
 	abs0, _ := filepath.Abs(*finc0)
 	abs1, _ := filepath.Abs(*finc1)
@@ -71,6 +74,13 @@ func main() {
 		fatal(err)
 	}
 	cases = append(cases, snips...)
+	if *passes != "types" {
+		sc, err := scopeSnippetCases(tmp)
+		if err != nil {
+			fatal(err)
+		}
+		cases = append(cases, sc...)
+	}
 	if *mutants > 0 {
 		cases = append(cases, mutantCases(tmp, *mutants, *seed)...)
 	}
@@ -78,8 +88,9 @@ func main() {
 	match, mismatch := 0, 0
 	var failed []string
 	for _, c := range cases {
-		o0, e0, x0 := run(abs0, c.dir, append(append([]string{"check", "--passes=types"}, c.flags...), c.path))
-		o1, e1, x1 := run(abs1, c.dir, append(append([]string{"check"}, c.flags...), c.path))
+		pf := "--passes=" + *passes
+		o0, e0, x0 := run(abs0, c.dir, append(append([]string{"check", pf}, c.flags...), c.path))
+		o1, e1, x1 := run(abs1, c.dir, append(append([]string{"check", pf}, c.flags...), c.path))
 		e1 = stripRuntimeError(e1)
 		ok := o0 == o1 && e0 == e1 && (x0 == 0) == (x1 == 0)
 		if ok {
@@ -95,7 +106,7 @@ func main() {
 		fmt.Print(indent("finc0: ", e0+o0))
 		fmt.Print(indent("finc1: ", e1+o1))
 	}
-	fmt.Printf("diff-check: %d cases, %d match, %d mismatch\n", len(cases), match, mismatch)
+	fmt.Printf("diff-check (--passes=%s): %d cases, %d match, %d mismatch\n", *passes, len(cases), match, mismatch)
 	if mismatch > 0 {
 		os.Exit(1)
 	}
@@ -306,6 +317,41 @@ func snippetCases(tmp string) ([]tcase, error) {
 			})
 		}
 	}
+	return out, nil
+}
+
+// scopeSnippetCases extracts the sources of the scope checker's unit tests
+// (bootstrap/internal/scope/scope_test.go): the second string of every
+// {name, src, want} case literal, wrapped like the test's run helper.
+func scopeSnippetCases(tmp string) ([]tcase, error) {
+	const mainStub = "\ndriver func main(io Stdio) error {\n\treturn nil\n}\n"
+	var out []tcase
+	f := "bootstrap/internal/scope/scope_test.go"
+	fset := token.NewFileSet()
+	af, err := parser.ParseFile(fset, f, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	n := 0
+	ast.Inspect(af, func(nd ast.Node) bool {
+		cl, ok := nd.(*ast.CompositeLit)
+		if !ok || len(cl.Elts) != 3 {
+			return true
+		}
+		_, ok0 := strLit(cl.Elts[0])
+		src, ok1 := strLit(cl.Elts[1])
+		_, ok2 := strLit(cl.Elts[2])
+		if !ok0 || !ok1 || !ok2 {
+			return true
+		}
+		n++
+		root := filepath.Join(tmp, fmt.Sprintf("sc%03d", n))
+		_ = os.MkdirAll(root, 0o755)
+		_ = os.WriteFile(filepath.Join(root, "t.fc"), []byte("package main\n"+src+mainStub), 0o644)
+		label := fmt.Sprintf("%s:%d", f, fset.Position(cl.Pos()).Line)
+		out = append(out, tcase{name: label, dir: root, path: "t.fc"})
+		return true
+	})
 	return out, nil
 }
 
