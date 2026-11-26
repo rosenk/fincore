@@ -564,6 +564,19 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 			semaStats = true
 			continue
 		}
+		if bytesEqual(name, strBytes("passes")) && eq < len(ab) {
+			if !parsePasses(ab[eq+1:]) {
+				eb.reset()
+				eb.putStr("finc1 check: invalid --passes value ")
+				putQuoted(eb, ab[eq+1:])
+				eb.putStr(" (want types, all or a list of passes)\n")
+				if err := flushErr(io); err != nil {
+					return err
+				}
+				return ErrParse
+			}
+			continue
+		}
 		if !bytesEqual(name, strBytes("comptime-fuel")) {
 			eb.reset()
 			eb.putStr("flag provided but not defined: -")
@@ -671,6 +684,10 @@ driver func checkPath(fs FS, io Stdio, path string) error {
 		return ErrParse
 	}
 	checkProgram()
+	if semaFull || nodes.full {
+		return capacityFail(io, path, semaFullWhat)
+	}
+	runPasses()
 	if semaFull || nodes.full {
 		return capacityFail(io, path, semaFullWhat)
 	}

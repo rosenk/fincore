@@ -21,7 +21,10 @@ files (spec 9.5.6); there are no local imports.
 | `check_expr.fc` | Type checker part 2: expressions and calls (builtins, conversions, methods, capability methods, variants, generic instances, comptime folding) |
 | `check_stmt.fc` | Type checker part 3: statements, match patterns, terminating statements |
 | `comptime.fc` | Fuel-bounded comptime interpreter (the checker's evaluator) |
-| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`, `check [--comptime-fuel=N] <file.fc \| dir>` (the loader for local imports lives here); build/run/test print "not implemented" |
+| `totality.fc` | Totality checker part 1 (finc0's `totality`: totality.go, invariant.go, loops.go): pre-order program index, E5001 effects, root facts, loop invariance, T1, T2 setup |
+| `totality_flow.fc` | Totality checker part 2 (flow.go, T2/T3 walks): abstract states, bounds, the path-sensitive walker |
+| `totality_rec.fc` | Totality checker part 3 (recursion.go): call graph, iterative Tarjan, measures, E4002/E4004 |
+| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`, `check [--comptime-fuel=N] <file.fc \| dir>` (hidden flags `--stats`, `--passes=types\|all\|totality`; the loader for local imports lives here); build/run/test print "not implemented" |
 
 ## Architecture
 
@@ -125,6 +128,11 @@ is still available as `Node.id`).
 4. Diagnostics are collected in `diags` (sema.fc) and printed sorted by
    (file path, line, column, code, message) with exact duplicates removed,
    as `diag.List.Sort` does. `--comptime-fuel=N` sets `evalFuel`.
+5. If the type checker reported nothing, the semantic passes run in
+   order and the first pass with diagnostics stops the pipeline
+   (finc0's `check.Passes`): the scope pass, then `totalityProgram`
+   (totality*.fc). The hidden flag `--passes=types|all|<pass>[,<pass>]`
+   selects them like finc0's oracle flag.
 
 The later passes (scope, totality) must run only when `diags.count == 0`
 after step 3, and may then assume a well-typed program: every expression
@@ -234,6 +242,41 @@ interpreter) save and restore the interpreter state. Frame variables live in
 `fvSym/fvSlot` ranges; a variable's cell is a heap slot and `&x` marks it so
 that a redeclaration allocates a fresh cell (finc0's map semantics).
 
+### Scope checker (scope.fc, linear.fc, passes.fc)
+
+Port of finc0's `scope` package (S2-S5: E3002-E3005; rules in
+`bootstrap/internal/scope/doc.go`). `passes.fc` holds `runPasses`, called by
+`checkPath` after `checkProgram` when there are no diagnostics; it runs the
+enabled passes in order and stops after the first one that reports
+anything (finc0's `check.Passes`). The hidden flag
+`check --passes=types|all|<pass>[,<pass>]` mirrors finc0's oracle flag
+(known passes: `scope`).
+
+- `scope.fc` (finc0 scope.go): `scopeCheck` checks every declaration with a
+  body in `funcs.order`. Origins (depth, region) are packed into a u64
+  (`depth << 32 | region SymID`). finc0's per-declaration maps (depth,
+  content, addr, fixed) are per-symbol arrays stamped with an epoch per
+  declaration; the value flows are a flat array; the content fixpoint is
+  bounded by the height of the origin lattice. The walker (`wStmt`,
+  `wExpr`, ...) runs twice (collect, check) with globals for depth, function
+  depth and mode. finc0's one-diagnostic-per-(code, position) map is a
+  scan of the recorded diagnostics (`scReport`).
+- `linear.fc` (finc0 linear.go): every function body (and each nested
+  literal body) is a flow record; flows nest LIFO, so their variables,
+  frames and loop contexts live on shared stacks with per-flow bases. An
+  abstract environment is an EnvID into `lnEnv` (dead flag + a range of
+  state bytes and tied error symbols), a mutable handle like finc0's
+  `*env`; the arena is reset per declaration (1 Mi envs, 4 Mi slots).
+  Owned/borrowed lists and assignment operands are passed on the `lnTmp`
+  scratch stack. Loop fixpoints keep finc0's 65-iteration cap.
+
+`make diff-check-scope` runs scripts/diffcheck with `-passes scope`:
+`finc0 check --passes=scope` vs `finc1 check --passes=scope` on the
+diff-check corpus and snippets plus the 60 cases of finc0's
+`scope_test.go` (wrapped like its `run` helper) and
+`scripts/diffcheck/cases/scope_edges.fc`. `make diff-check` passes
+`--passes=types` to both compilers.
+
 ### Semantic capacities
 
 | Arena | Capacity | `compiler/` (18k lines) |
@@ -271,7 +314,46 @@ small fuel), and requires byte-identical stdout/stderr and the same
 success/failure status (finc1's generated `main` appends one
 `error: fincore: ...` line and always exits 1 on failure; that line is
 removed before comparing). `make diff-check-fuzz SEED=n` adds 20 random
-token-level mutants per source.
+token-level mutants per source. Both compilers get the same hidden
+`--passes` value (`types` by default). The finc0 totality unit-test
+snippets are part of the corpus.
+
+`make diff-check-totality` (`diffcheck -passes=totality`) compares types +
+totality on the same corpus plus about 20 copies of compiler/ with one
+recursion measure, loop or decreases clause broken each. With `-mutate N`
+every other mutant uses totality-oriented edits (loop conditions and
+steps, measure arithmetic, guards, decreases clauses, extra writes).
+
+### Totality checker (totality*.fc)
+
+A line-by-line port of finc0's `bootstrap/internal/totality` (the shapes
+are documented in its doc.go); the differences are representation only:
+
+- **Tree walks.** `buildTotIndex` numbers every package file in pre-order
+  once (`tord`, `tpos`, `tend`, and `tlit` = innermost enclosing FuncLit),
+  so each `ast.Inspect` of finc0 is a flat loop over `tord[tpos[n]:tend[n]]`
+  and `inspectBody` keeps the nodes with `tlit == fi.lit`.
+- **Root facts** (`&x`, array slicing, writes from literals) are
+  per-symbol flags computed in one pass: a local is only visible inside its
+  root function, so finc0's per-root maps collapse into one table.
+- **Loop reasons** are codes (`Why*`) rendered into the message at report
+  time.
+- **Abstract states** are handles into `tst`; their lower bounds and
+  variable bounds are regions of two pools (relocated on growth, reset per
+  analysed loop or function). A known variable has a presence entry, so
+  "known with no bounds" (finc0's map entry with empty slices) is kept.
+  Terms are (kind, value) pairs instead of finc0's strings; bounds values
+  live on a LIFO scratch stack.
+- **Callbacks** (`onCall`, `onAssign`, `onExit`) dispatch on `wMode`
+  (T2, T3, recursion).
+- **Call graph.** Value calls go to a hub node that has an edge to every
+  escaping function (same SCCs of the real nodes, linear edge count);
+  Tarjan is iterative with an explicit frame stack. Diagnostics are sorted
+  afterwards, so the visiting order does not matter.
+
+Capacities: `TotMaxStates = 262_144` states, `TotMaxLB`/`TotMaxBE =
+524_288` fact entries, `TotMaxBS = 262_144` bounds, per analysed loop or
+function; overflow is reported as capacity exceeded.
 
 ## Language subset used (conservative on purpose)
 

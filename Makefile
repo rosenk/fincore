@@ -9,7 +9,8 @@ SEED    ?= 1
 export CGO_ENABLED ?= 0
 
 .PHONY: all build finc0 test race vet fmt fmt-check lint parse-corpus check-corpus \
-        integration finc1 diff-parse diff-check diff-check-fuzz diff-build finc2 bootstrap ci clean help
+        integration finc1 diff-parse diff-check diff-check-scope diff-check-totality diff-check-all \
+        diff-check-fuzz diff-build finc2 bootstrap ci clean help
 
 all: vet test build ## vet, test and build finc0
 
@@ -69,8 +70,17 @@ diff-parse: finc1 ## finc0 vs finc1: byte-identical `parse --dump-ast` on the co
 	  cmp -s <($(FINC0) parse --dump-ast $$t 2>&1) <($(BIN)/finc1 parse --dump-ast $$t 2>&1) || { echo "DIFF: $$t"; exit 1; }; \
 	done; echo "diff-parse: ok"
 
-diff-check: finc1 ## finc0 check --passes=types vs finc1 check: identical diagnostics (corpus + unit-test snippets)
+diff-check: finc1 ## finc0 vs finc1 check --passes=types: identical diagnostics (corpus + unit-test snippets)
 	$(GO) run ./scripts/diffcheck
+
+diff-check-scope: finc1 ## finc0 check --passes=scope vs finc1 check --passes=scope (corpus + unit-test snippets incl. scope tests)
+	$(GO) run ./scripts/diffcheck -passes scope
+
+diff-check-totality: finc1 ## finc0 vs finc1 check --passes=totality: identical diagnostics (corpus, snippets, compiler mutants)
+	$(GO) run ./scripts/diffcheck -passes=totality
+
+diff-check-all: finc1 ## finc0 vs finc1 check (all passes)
+	$(GO) run ./scripts/diffcheck -passes=all
 
 diff-check-fuzz: finc1 ## diff-check plus 20 random mutants per corpus file (SEED=n)
 	$(GO) run ./scripts/diffcheck -mutate 20 -seed $(SEED)

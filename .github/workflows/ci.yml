@@ -30,5 +30,11 @@ jobs:
         run: make diff-parse
       - name: finc0 vs finc1 check differential
         run: make diff-check
+      - name: finc0 vs finc1 scope differential
+        run: make diff-check-scope
+      - name: finc0 vs finc1 totality differential
+        run: make diff-check-totality
+      - name: finc0 vs finc1 full check differential
+        run: make diff-check-all
       - name: integration
         run: make integration

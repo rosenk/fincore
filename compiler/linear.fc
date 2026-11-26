@@ -1,0 +1,1360 @@
+// linear.fc — the linearity analysis of the scope checker (port of
+// finc0's bootstrap/internal/scope/linear.go: S5, E3003, E3004, E3005).
+//
+// Mapping onto the arenas:
+//
+//   - A flow (the analysis of one function body; nested literal bodies get
+//     their own flow while the outer one is suspended) is a record in
+//     `lnFlows`. Flows nest strictly LIFO, so their variables, frames and
+//     loop contexts live on shared stacks (`lnVars`, `lnFrStart`/`lnFrVals`,
+//     `lnLoop*`) and each flow remembers where its part starts. A flow
+//     variable index is relative to the flow's first variable; lookups
+//     scan the (short) variable list of the flow.
+//   - An abstract environment (finc0's env: dead flag, one state byte and
+//     one tied error symbol per variable) is an EnvID into `lnEnv`; its
+//     states are a contiguous range of `lnEnv.st` / `lnEnv.tie`.
+//     Environments are mutable handles exactly like finc0's *env. The env
+//     arena is reset before every declaration; EnvID 0 is a dead
+//     environment of width 0 (used when the arena overflows).
+//   - The owned/borrowed symbol lists passed to `lnRun` and the target and
+//     value lists of `lnAssign` are ranges of the scratch stack `lnTmp`.
+package main
+
+const (
+	MaxLnVars      = 65_536
+	MaxLnFlows     = 8192
+	MaxLnFrames    = 262_144
+	MaxLnFrameVals = 262_144
+	MaxLnLoops     = 65_536
+	MaxLnTmp       = 262_144
+	MaxLnEnvs      = 1 << 20
+	MaxLnSlots     = 1 << 22
+
+	LnNoVar = 0xFFFF_FFFF
+
+	// Abstract states of a Linear variable (bit set).
+	StAbsent   = 1  // no resource (error path of a (Linear, error) result)
+	StLive     = 2  // owned, must be finalized
+	StPending  = 4  // owned and live iff the tied error is nil
+	StMoved    = 8  // ownership transferred
+	StConsumed = 16 // finalized (Close, ReleaseSlot, cancel())
+	StDeferred = 32 // finalized by a deferred call; still usable
+	StBorrowed = 64 // borrowed from the caller / enclosing function
+	StOwned    = 6  // StLive | StPending
+	StGone     = 24 // StMoved | StConsumed
+
+	// Consumption kinds.
+	KConsume = 0 // finalize
+	KMove    = 1 // transfer ownership
+	KDefer   = 2 // finalize at function exit
+)
+
+type LnFlow struct {
+	varS     usize // variables: lnVars[varS : varS+nvar]
+	nvar     usize
+	frBase   usize // first frame of the flow
+	fvBase   usize // first frame value of the flow
+	loopBase usize // first loop context of the flow
+	exits    u32   // EnvID
+}
+
+var lnFlows [MaxLnFlows]LnFlow
+var lnNFlows usize
+
+var lnVars [MaxLnVars]u32
+var lnSumm [MaxLnVars]bool // summarized (captures of an immediately called literal)
+var lnNVars usize
+
+var lnFrStart [MaxLnFrames]usize
+var lnNFrames usize
+var lnFrVals [MaxLnFrameVals]u32
+var lnNFrVals usize
+
+var lnLoopH [MaxLnLoops]usize // number of frames outside the loop body
+var lnLoopBrk [MaxLnLoops]u32
+var lnLoopCont [MaxLnLoops]u32
+var lnNLoops usize
+
+var lnTmp [MaxLnTmp]u32
+var lnNTmp usize
+
+type LnEnvArena struct {
+	off   [MaxLnEnvs]u32
+	n     [MaxLnEnvs]u32
+	dead  [MaxLnEnvs]bool
+	count usize
+	st    [MaxLnSlots]u8
+	tie   [MaxLnSlots]u32
+	used  usize
+}
+
+var lnEnv LnEnvArena
+
+func lnClr(st u8, m u8) u8 {
+	return st & (m ^ 255)
+}
+
+// ---------------------------------------------------------------------------
+// Environments
+
+func lnEnvReset() {
+	lnEnv.count = 1
+	lnEnv.used = 0
+	lnEnv.off[0] = 0
+	lnEnv.n[0] = 0
+	lnEnv.dead[0] = true
+}
+
+func lnNewEnv(n u32, dead bool) u32 {
+	if lnEnv.count >= MaxLnEnvs || lnEnv.used+usize(n) > MaxLnSlots {
+		setFull("linearity states")
+		return 0
+	}
+	id := lnEnv.count
+	lnEnv.count++
+	off := lnEnv.used
+	lnEnv.used += usize(n)
+	lnEnv.off[id] = u32(off)
+	lnEnv.n[id] = n
+	lnEnv.dead[id] = dead
+	m := usize(n)
+	for i := usize(0); i < m; i++ {
+		lnEnv.st[off+i] = 0
+		lnEnv.tie[off+i] = 0
+	}
+	return u32(id)
+}
+
+func lnIsDead(e u32) bool {
+	return lnEnv.dead[usize(e)]
+}
+
+func lnWidth(e u32) u32 {
+	return lnEnv.n[usize(e)]
+}
+
+func lnSt(e u32, i u32) u8 {
+	if i >= lnEnv.n[usize(e)] {
+		return 0
+	}
+	return lnEnv.st[usize(lnEnv.off[usize(e)])+usize(i)]
+}
+
+func lnTie(e u32, i u32) u32 {
+	if i >= lnEnv.n[usize(e)] {
+		return 0
+	}
+	return lnEnv.tie[usize(lnEnv.off[usize(e)])+usize(i)]
+}
+
+func lnSet(e u32, i u32, st u8, tie u32) {
+	if i >= lnEnv.n[usize(e)] {
+		return
+	}
+	k := usize(lnEnv.off[usize(e)]) + usize(i)
+	lnEnv.st[k] = st
+	lnEnv.tie[k] = tie
+}
+
+func lnDeadEnv(n u32) u32 {
+	return lnNewEnv(n, true)
+}
+
+func lnClone(e u32) u32 {
+	n := lnEnv.n[usize(e)]
+	r := lnNewEnv(n, lnEnv.dead[usize(e)])
+	if r == 0 {
+		return 0
+	}
+	src := usize(lnEnv.off[usize(e)])
+	dst := usize(lnEnv.off[usize(r)])
+	m := usize(n)
+	for i := usize(0); i < m; i++ {
+		lnEnv.st[dst+i] = lnEnv.st[src+i]
+		lnEnv.tie[dst+i] = lnEnv.tie[src+i]
+	}
+	return r
+}
+
+func lnJoin(a u32, b u32) u32 {
+	if lnIsDead(a) {
+		return lnClone(b)
+	}
+	if lnIsDead(b) {
+		return lnClone(a)
+	}
+	r := lnClone(a)
+	n := lnWidth(r)
+	for i := u32(0); i < n; i++ {
+		sa := lnSt(a, i)
+		sb := lnSt(b, i)
+		ta := lnTie(a, i)
+		tb := lnTie(b, i)
+		st := sa | sb
+		tie := ta
+		if sa&StPending == 0 {
+			tie = tb
+		} else if sb&StPending == 0 {
+			tie = ta
+		} else if ta != tb {
+			st = lnClr(st, StPending) | StLive
+			tie = 0
+		}
+		lnSet(r, i, st, tie)
+	}
+	return r
+}
+
+func lnEqual(a u32, b u32) bool {
+	if lnIsDead(a) != lnIsDead(b) || lnWidth(a) != lnWidth(b) {
+		return false
+	}
+	n := lnWidth(a)
+	for i := u32(0); i < n; i++ {
+		if lnSt(a, i) != lnSt(b, i) || lnTie(a, i) != lnTie(b, i) {
+			return false
+		}
+	}
+	return true
+}
+
+// lnUntie resolves the Pending states tied to s (s is being reassigned).
+func lnUntie(e u32, s u32) {
+	if s == 0 {
+		return
+	}
+	n := lnWidth(e)
+	for i := u32(0); i < n; i++ {
+		if lnTie(e, i) == s {
+			lnSet(e, i, lnClr(lnSt(e, i), StPending)|StLive, 0)
+		}
+	}
+}
+
+// lnRefine applies the knowledge errSym != nil (nonNil) or == nil.
+func lnRefine(e u32, errSym u32, nonNil bool) {
+	n := lnWidth(e)
+	for i := u32(0); i < n; i++ {
+		st := lnSt(e, i)
+		if lnTie(e, i) != errSym || st&StPending == 0 {
+			continue
+		}
+		if nonNil {
+			lnSet(e, i, lnClr(st, StPending)|StAbsent, 0)
+		} else {
+			lnSet(e, i, lnClr(st, StPending)|StLive, 0)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Flows, variables, frames
+
+func lnBegin() u32 {
+	if lnNFlows >= MaxLnFlows {
+		setFull("linearity flows")
+		return 0
+	}
+	if lnNFlows == 0 {
+		lnNFlows = 1
+	}
+	id := lnNFlows
+	lnNFlows++
+	var f LnFlow
+	f.varS = lnNVars
+	f.nvar = 0
+	f.frBase = lnNFrames
+	f.fvBase = lnNFrVals
+	f.loopBase = lnNLoops
+	f.exits = 0
+	lnFlows[id] = f
+	return u32(id)
+}
+
+func lnEnd(fl u32) {
+	if fl == 0 {
+		return
+	}
+	lnNVars = lnFlows[usize(fl)].varS
+	lnNFrames = lnFlows[usize(fl)].frBase
+	lnNFrVals = lnFlows[usize(fl)].fvBase
+	lnNLoops = lnFlows[usize(fl)].loopBase
+	lnNFlows = usize(fl)
+}
+
+func lnVarSym(fl u32, i u32) u32 {
+	return lnVars[lnFlows[usize(fl)].varS+usize(i)]
+}
+
+// lnIdx returns the index of s among the variables of flow fl, or LnNoVar.
+func lnIdx(fl u32, s u32) u32 {
+	if s == 0 {
+		return LnNoVar
+	}
+	st := lnFlows[usize(fl)].varS
+	n := lnFlows[usize(fl)].nvar
+	for i := usize(0); i < n; i++ {
+		if lnVars[st+i] == s {
+			return u32(i)
+		}
+	}
+	return LnNoVar
+}
+
+func lnAddVar(fl u32, s u32) u32 {
+	i := lnIdx(fl, s)
+	if i != LnNoVar {
+		return i
+	}
+	if lnNVars >= MaxLnVars {
+		setFull("linearity variables")
+		return 0
+	}
+	lnVars[lnNVars] = s
+	lnSumm[lnNVars] = false
+	lnNVars++
+	n := lnFlows[usize(fl)].nvar
+	lnFlows[usize(fl)].nvar = n + 1
+	return u32(n)
+}
+
+func lnPushFrame() {
+	if lnNFrames >= MaxLnFrames {
+		setFull("linearity frames")
+		return
+	}
+	lnFrStart[lnNFrames] = lnNFrVals
+	lnNFrames++
+}
+
+func lnPopFrame() {
+	if lnNFrames == 0 {
+		return
+	}
+	lnNFrames--
+	lnNFrVals = lnFrStart[lnNFrames]
+}
+
+func lnFrameAdd(i u32) {
+	if lnNFrVals >= MaxLnFrameVals {
+		setFull("linearity frames")
+		return
+	}
+	lnFrVals[lnNFrVals] = i
+	lnNFrVals++
+}
+
+func lnTmpPush(v u32) {
+	if lnNTmp >= MaxLnTmp {
+		setFull("linearity scratch")
+		return
+	}
+	lnTmp[lnNTmp] = v
+	lnNTmp++
+}
+
+// ---------------------------------------------------------------------------
+// Reporting
+
+// lnLeaks reports every owned variable of the frames from `height` on.
+func lnLeaks(fl u32, e u32, height usize) {
+	if height >= lnNFrames {
+		return
+	}
+	lo := lnFrStart[height]
+	hi := lnNFrVals
+	vs := lnFlows[usize(fl)].varS
+	for k := lo; k < hi; k++ {
+		i := lnFrVals[k]
+		if lnSt(e, i)&StOwned != 0 && !lnSumm[vs+usize(i)] {
+			lnLeak(fl, i)
+		}
+	}
+}
+
+func lnLeak(fl u32, i u32) {
+	s := lnVarSym(fl, i)
+	if scLeaked[usize(s)] {
+		return
+	}
+	scLeaked[usize(s)] = true
+	mreset()
+	ms("Linear resource ")
+	mname(symName(s))
+	ms(" (")
+	mtype(syms.items[usize(s)].typ)
+	ms(") is not closed, released or moved on every path")
+	scReport(E3005, syms.items[usize(s)].ident)
+}
+
+func lnGoneWord(st u8) string {
+	if st&StMoved != 0 {
+		return "moved"
+	}
+	return "closed/released"
+}
+
+// lnUse is a borrow of variable i at node at.
+func lnUse(fl u32, e u32, i u32, at u32) {
+	if lnIsDead(e) {
+		return
+	}
+	st := lnSt(e, i)
+	if st&StGone != 0 {
+		mreset()
+		ms("use of Linear resource ")
+		mname(symName(lnVarSym(fl, i)))
+		ms(" after it was ")
+		ms(lnGoneWord(st))
+		scReport(E3003, at)
+	}
+}
+
+// lnConsume finalizes, moves or defers the finalization of variable i.
+func lnConsume(fl u32, e u32, i u32, at u32, kind u8) {
+	if lnIsDead(e) {
+		return
+	}
+	st := lnSt(e, i)
+	name := symName(lnVarSym(fl, i))
+	if st&StGone != 0 && st&StDeferred == 0 {
+		mreset()
+		ms("use of Linear resource ")
+		mname(name)
+		ms(" after it was ")
+		ms(lnGoneWord(st))
+		scReport(E3003, at)
+	} else if st&StBorrowed != 0 {
+		mreset()
+		ms("borrowed Linear resource ")
+		mname(name)
+		ms(" cannot be closed or moved here (it is owned by the caller)")
+		scReport(E3003, at)
+	}
+	n := u8(0)
+	if kind == KDefer {
+		n = StDeferred
+	} else if st&StDeferred != 0 {
+		// Explicit finalization of a resource whose close is deferred:
+		// it stays usable until the deferred call runs.
+		n = StDeferred
+		if lnClr(st, StDeferred)&(StOwned|StAbsent) != 0 {
+			n = n | StConsumed
+		}
+	} else if kind == KMove {
+		n = StMoved
+	} else {
+		n = StConsumed
+	}
+	lnSet(e, i, n|(st&StBorrowed), 0)
+}
+
+// lnBind gives variable i a fresh owned value (tied to errSym if non-zero).
+func lnBind(e u32, i u32, errSym u32) {
+	if errSym != 0 {
+		lnSet(e, i, StPending, errSym)
+	} else {
+		lnSet(e, i, StLive, 0)
+	}
+	if lnNFrames == 0 {
+		return
+	}
+	lo := lnFrStart[lnNFrames-1]
+	hi := lnNFrVals
+	for k := lo; k < hi; k++ {
+		if lnFrVals[k] == i {
+			return
+		}
+	}
+	lnFrameAdd(i)
+}
+
+// lnLinVar returns the tracked Linear variable at the root of e (x, x.f,
+// x[i]), or LnNoVar.
+func lnLinVar(fl u32, e0 u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return LnNoVar
+	}
+	e := unparen(e0)
+	if e == 0 {
+		return LnNoVar
+	}
+	k := nkind(e)
+	if k == NkIdent {
+		s := scVarSym(e)
+		if s != 0 {
+			return lnIdx(fl, s)
+		}
+	} else if k == NkSelectorExpr {
+		sel := nsel[usize(e)]
+		if sel != 0 && selTab.items[usize(sel)].kind == SelField && !selTab.items[usize(sel)].indirect {
+			return lnLinVar(fl, na(e), dp-1)
+		}
+	} else if k == NkIndexExpr {
+		if scIsArray(ntype[usize(na(e))]) {
+			return lnLinVar(fl, na(e), dp-1)
+		}
+	}
+	return LnNoVar
+}
+
+// lnRootIdent returns the node at the root of a variable path.
+func lnRootIdent(e0 u32) u32 {
+	e := unparen(e0)
+	for g := usize(0); g < MaxNodes; g++ {
+		if e == 0 {
+			return e
+		}
+		k := nkind(e)
+		if k != NkSelectorExpr && k != NkIndexExpr {
+			return e
+		}
+		e = unparen(na(e))
+	}
+	return e
+}
+
+// lnLinArg reports the Linear variable an argument/rhs moves, or LnNoVar.
+func lnLinArg(fl u32, a u32) u32 {
+	i := lnLinVar(fl, a, SemaDepth)
+	if i != LnNoVar && isLinear(ntype[usize(a)]) {
+		return i
+	}
+	return LnNoVar
+}
+
+func lnIsPanic(x u32) bool {
+	call := unparen(x)
+	if call == 0 || nkind(call) != NkCallExpr {
+		return false
+	}
+	ci := ncall[usize(call)]
+	return ci != 0 && callTab.items[usize(ci)].kind == CallBuiltin && callTab.items[usize(ci)].builtin == BFPanic
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+
+func lnLinearity(fi u32) {
+	lnEnvReset()
+	lnNFlows = 0
+	lnNVars = 0
+	lnNFrames = 0
+	lnNFrVals = 0
+	lnNLoops = 0
+	lnNTmp = 0
+	fl := lnBegin()
+	if fl == 0 {
+		return
+	}
+	body := funcs.items[usize(fi)].body
+	lnCollectVars(fl, body, SemaDepth)
+	mark := lnNTmp
+	np := usize(funcs.items[usize(fi)].parN)
+	isDrv := funcs.items[usize(fi)].effect == EffDriver
+	if isDrv {
+		for i := usize(0); i < np; i++ {
+			p := scParamSym(fi, i)
+			if p != 0 && isLinear(syms.items[usize(p)].typ) {
+				lnTmpPush(p) // owned (decision 1)
+			}
+		}
+	}
+	mid := lnNTmp
+	rs := funcs.items[usize(fi)].recvSym
+	if rs != 0 && isLinear(syms.items[usize(rs)].typ) {
+		lnTmpPush(rs)
+	}
+	if !isDrv {
+		for i := usize(0); i < np; i++ {
+			p := scParamSym(fi, i)
+			if p != 0 && isLinear(syms.items[usize(p)].typ) {
+				lnTmpPush(p)
+			}
+		}
+	}
+	lnRun(fl, body, mark, mid, SemaDepth)
+	lnEnd(fl)
+}
+
+// lnCollectVars allocates the Linear variables declared in the subtree of
+// n (not in nested literals), in pre-order.
+func lnCollectVars(fl u32, n u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if n == 0 {
+		return
+	}
+	nd := nodes.items[usize(n)]
+	k := nd.kind
+	if k == NkFuncLit {
+		return
+	}
+	if k == NkShortVarDecl {
+		m := l1len(n)
+		for i := usize(0); i < m; i++ {
+			lnCollectId(fl, l1at(n, i))
+		}
+	} else if k == NkVarDecl {
+		lnCollectId(fl, na(n))
+	} else if k == NkCtorPattern {
+		m := l1len(n)
+		for i := usize(0); i < m; i++ {
+			lnCollectId(fl, l1at(n, i))
+		}
+	}
+	for i := usize(0); i < MaxSlots; i++ {
+		slot, _ := layout(k, i)
+		if slot == SlotNone {
+			break
+		}
+		if slot >= SlotL1 {
+			start, cnt := slotList(nd, slot)
+			m := usize(cnt)
+			for j := usize(0); j < m; j++ {
+				lnCollectVars(fl, nodes.lists[usize(start)+j], dp-1)
+			}
+		} else {
+			lnCollectVars(fl, slotChild(nd, slot), dp-1)
+		}
+	}
+}
+
+func lnCollectId(fl u32, id u32) {
+	s := scVarSym(id)
+	if s != 0 && defs[usize(id)] == s && isLinear(syms.items[usize(s)].typ) {
+		_ = lnAddVar(fl, s)
+	}
+}
+
+// lnRun analyses body with the owned symbols lnTmp[mark:mid] and the
+// borrowed symbols lnTmp[mid:] (popped here).
+func lnRun(fl u32, body u32, mark usize, mid usize, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		lnNTmp = mark
+		return
+	}
+	top := lnNTmp
+	lnPushFrame()
+	for k := mark; k < top; k++ {
+		lnFrameAdd(lnAddVar(fl, lnTmp[k]))
+	}
+	n := u32(lnFlows[usize(fl)].nvar)
+	e := lnNewEnv(n, false)
+	for k := mark; k < mid; k++ {
+		lnSet(e, lnIdx(fl, lnTmp[k]), StLive, 0)
+	}
+	for k := mid; k < top; k++ {
+		lnSet(e, lnIdx(fl, lnTmp[k]), StBorrowed, 0)
+	}
+	lnNTmp = mark
+	lnFlows[usize(fl)].exits = lnDeadEnv(n)
+	e = lnBlock(fl, body, e, dp-1)
+	if !lnIsDead(e) {
+		lnLeaks(fl, e, lnFlows[usize(fl)].frBase)
+		lnFlows[usize(fl)].exits = lnJoin(lnFlows[usize(fl)].exits, e)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Statements
+
+func lnBlock(fl u32, b u32, e0 u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return e0
+	}
+	if b == 0 {
+		return e0
+	}
+	e := e0
+	lnPushFrame()
+	n := l1len(b)
+	for i := usize(0); i < n; i++ {
+		if lnIsDead(e) {
+			break
+		}
+		e = lnStmt(fl, l1at(b, i), e, dp-1)
+	}
+	if !lnIsDead(e) {
+		lnLeaks(fl, e, lnNFrames-1)
+	}
+	lnPopFrame()
+	return e
+}
+
+func lnStmt(fl u32, s u32, e u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return e
+	}
+	if lnIsDead(e) || s == 0 {
+		return e
+	}
+	k := nkind(s)
+	if k == NkBlockStmt {
+		return lnBlock(fl, s, e, dp-1)
+	}
+	if k == NkDeclStmt {
+		d := na(s)
+		if nkind(d) == NkVarDecl && nc(d) != 0 {
+			mark := lnNTmp
+			lnTmpPush(na(d))
+			lnTmpPush(nc(d))
+			lnAssign(fl, e, mark, 1, mark+1, 1, dp-1)
+			lnNTmp = mark
+		}
+		return e
+	}
+	if k == NkShortVarDecl {
+		mark := lnNTmp
+		n := l1len(s)
+		for i := usize(0); i < n; i++ {
+			lnTmpPush(l1at(s, i))
+		}
+		nv := l2len(s)
+		for i := usize(0); i < nv; i++ {
+			lnTmpPush(l2at(s, i))
+		}
+		lnAssign(fl, e, mark, n, mark+n, nv, dp-1)
+		lnNTmp = mark
+		return e
+	}
+	if k == NkAssignStmt {
+		n := l1len(s)
+		nv := l2len(s)
+		if nop(s) != AsgAssign {
+			for i := usize(0); i < n; i++ {
+				lnExpr(fl, l1at(s, i), e, dp-1)
+			}
+			for i := usize(0); i < nv; i++ {
+				lnExpr(fl, l2at(s, i), e, dp-1)
+			}
+			return e
+		}
+		mark := lnNTmp
+		for i := usize(0); i < n; i++ {
+			lnTmpPush(l1at(s, i))
+		}
+		for i := usize(0); i < nv; i++ {
+			lnTmpPush(l2at(s, i))
+		}
+		lnAssign(fl, e, mark, n, mark+n, nv, dp-1)
+		lnNTmp = mark
+		return e
+	}
+	if k == NkIncDecStmt {
+		lnExpr(fl, na(s), e, dp-1)
+		return e
+	}
+	if k == NkExprStmt {
+		lnExpr(fl, na(s), e, dp-1)
+		if lnIsPanic(na(s)) {
+			return lnDeadEnv(lnWidth(e))
+		}
+		return e
+	}
+	if k == NkIfStmt {
+		return lnIf(fl, s, e, dp-1)
+	}
+	if k == NkMatchStmt {
+		return lnMatch(fl, s, e, dp-1)
+	}
+	if k == NkForStmt {
+		return lnLoop(fl, s, e, dp-1)
+	}
+	if k == NkScopeStmt {
+		lnExpr(fl, nb(s), e, dp-1)
+		return lnBlock(fl, nc(s), e, dp-1)
+	}
+	if k == NkDeferStmt {
+		x := unparen(na(s))
+		if x != 0 && nkind(x) == NkCallExpr {
+			lnCall(fl, x, e, true, dp-1)
+		} else {
+			lnExpr(fl, na(s), e, dp-1)
+		}
+		return e
+	}
+	if k == NkReturnStmt {
+		n := l1len(s)
+		for i := usize(0); i < n; i++ {
+			r := l1at(s, i)
+			vi := lnLinArg(fl, r)
+			if vi != LnNoVar {
+				lnConsume(fl, e, vi, lnRootIdent(r), KMove)
+			} else {
+				lnExpr(fl, r, e, dp-1)
+			}
+		}
+		lnLeaks(fl, e, lnFlows[usize(fl)].frBase)
+		lnFlows[usize(fl)].exits = lnJoin(lnFlows[usize(fl)].exits, e)
+		return lnDeadEnv(lnWidth(e))
+	}
+	if k == NkBreakStmt || k == NkContinueStmt {
+		if lnNLoops <= lnFlows[usize(fl)].loopBase {
+			return lnDeadEnv(lnWidth(e))
+		}
+		l := lnNLoops - 1
+		lnLeaks(fl, e, lnLoopH[l])
+		if k == NkBreakStmt {
+			lnLoopBrk[l] = lnJoin(lnLoopBrk[l], e)
+		} else {
+			lnLoopCont[l] = lnJoin(lnLoopCont[l], e)
+		}
+		return lnDeadEnv(lnWidth(e))
+	}
+	return e
+}
+
+func lnIf(fl u32, s u32, e0 u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return e0
+	}
+	lnPushFrame()
+	e := lnStmt(fl, na(s), e0, dp-1)
+	if !lnIsDead(e) {
+		cond := nb(s)
+		lnExpr(fl, cond, e, dp-1)
+		then := lnClone(e)
+		els := lnClone(e)
+		sym, nonNil, ok := lnNilTest(cond)
+		if ok {
+			lnRefine(then, sym, nonNil)
+			lnRefine(els, sym, !nonNil)
+		}
+		then = lnBlock(fl, nc(s), then, dp-1)
+		if nd(s) != 0 {
+			els = lnStmt(fl, nd(s), els, dp-1)
+		}
+		e = lnJoin(then, els)
+		if !lnIsDead(e) {
+			lnLeaks(fl, e, lnNFrames-1)
+		}
+	}
+	lnPopFrame()
+	return e
+}
+
+func lnMatch(fl u32, s u32, e u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return e
+	}
+	lnExpr(fl, na(s), e, dp-1)
+	n0 := lnWidth(e)
+	out := lnDeadEnv(n0)
+	n := l1len(s)
+	for i := usize(0); i < n; i++ {
+		arm := l1at(s, i)
+		a := lnClone(e)
+		lnPushFrame()
+		p := na(arm)
+		if p != 0 && nkind(p) == NkCtorPattern {
+			nbind := l1len(p)
+			for j := usize(0); j < nbind; j++ {
+				sym := scVarSym(l1at(p, j))
+				if sym != 0 {
+					vi := lnIdx(fl, sym)
+					if vi != LnNoVar {
+						lnSet(a, vi, StBorrowed, 0)
+					}
+				}
+			}
+		}
+		ae := nb(arm)
+		if ae != 0 {
+			lnExpr(fl, ae, a, dp-1)
+			if lnIsPanic(ae) {
+				a = lnDeadEnv(n0)
+			}
+		} else {
+			a = lnBlock(fl, nc(arm), a, dp-1)
+		}
+		lnPopFrame()
+		out = lnJoin(out, a)
+	}
+	if !lnExhaustive(s) {
+		out = lnJoin(out, e)
+	}
+	return out
+}
+
+func lnLoop(fl u32, s u32, e0 u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return e0
+	}
+	lnPushFrame() // init variables
+	e := lnStmt(fl, na(s), e0, dp-1)
+	if lnIsDead(e) {
+		lnPopFrame()
+		return e
+	}
+	if lnNLoops >= MaxLnLoops {
+		setFull("linearity loops")
+		lnPopFrame()
+		return e
+	}
+	n := lnWidth(e)
+	cond := nb(s)
+	post := nc(s)
+	head := e
+	l := lnNLoops
+	brk := u32(0)
+	for iter := usize(0); iter < 66; iter++ {
+		lnLoopH[l] = lnNFrames
+		lnLoopBrk[l] = lnDeadEnv(n)
+		lnLoopCont[l] = lnDeadEnv(n)
+		lnNLoops = l + 1
+		cur := lnClone(head)
+		if cond != 0 {
+			lnExpr(fl, cond, cur, dp-1)
+		}
+		end := lnBlock(fl, ne(s), lnClone(cur), dp-1)
+		lnNLoops = l
+		brk = lnLoopBrk[l]
+		next := lnJoin(end, lnLoopCont[l])
+		if post != 0 && !lnIsDead(next) {
+			next = lnStmt(fl, post, next, dp-1)
+		}
+		nh := lnJoin(head, next)
+		if lnEqual(nh, head) || iter > 64 {
+			break
+		}
+		head = nh
+	}
+	out := brk
+	if cond != 0 {
+		out = lnJoin(out, head)
+	}
+	if !lnIsDead(out) {
+		lnLeaks(fl, out, lnNFrames-1)
+	}
+	lnPopFrame()
+	return out
+}
+
+// lnNilTest recognizes `x != nil` (nonNil) and `x == nil`.
+func lnNilTest(cond u32) (u32, bool, bool) {
+	b := unparen(cond)
+	if b == 0 || nkind(b) != NkBinaryExpr || nop(b) != OpNe && nop(b) != OpEq {
+		return 0, false, false
+	}
+	x := unparen(na(b))
+	y := unparen(nb(b))
+	if x != 0 && nkind(x) == NkNilLit {
+		t := x
+		x = y
+		y = t
+	}
+	if x == 0 || y == 0 || nkind(x) != NkIdent || nkind(y) != NkNilLit {
+		return 0, false, false
+	}
+	s := scVarSym(x)
+	if s == 0 {
+		return 0, false, false
+	}
+	return s, nop(b) == OpNe, true
+}
+
+func lnExhaustive(s u32) bool {
+	n := l1len(s)
+	for i := usize(0); i < n; i++ {
+		p := na(l1at(s, i))
+		if p != 0 && nkind(p) == NkWildcardPattern {
+			return true
+		}
+	}
+	t := ntype[usize(na(s))]
+	if t == 0 {
+		return false
+	}
+	en := underlying(t)
+	if tk(en) != TCEnum || nvariants(en) == 0 {
+		return false
+	}
+	nv := nvariants(en)
+	for j := usize(0); j < nv; j++ {
+		name := variantName(en, j)
+		covered := false
+		for i := usize(0); i < n; i++ {
+			p := na(l1at(s, i))
+			if p != 0 && nkind(p) == NkCtorPattern && nvarEnum[usize(p)] != 0 &&
+				variantName(nvarEnum[usize(p)], usize(nvarIdx[usize(p)])) == name {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
+}
+
+// lnAssign handles `lhs = rhs`, `lhs := rhs` and `var x = v`; the targets
+// are lnTmp[lS:lS+lN], the values lnTmp[rS:rS+rN].
+func lnAssign(fl u32, e u32, lS usize, lN usize, rS usize, rN usize, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	// Right-hand sides: a Linear variable is moved.
+	for k := usize(0); k < rN; k++ {
+		r := lnTmp[rS+k]
+		vi := lnLinArg(fl, r)
+		if vi != LnNoVar {
+			lnConsume(fl, e, vi, lnRootIdent(r), KMove)
+		} else {
+			lnExpr(fl, r, e, dp-1)
+		}
+	}
+	// Error variable of a (Linear..., error) call result.
+	errSym := u32(0)
+	if rN == 1 && lN > 1 {
+		t := ntype[usize(lnTmp[rS])]
+		if t != 0 && tk(t) == TCTuple && tl1n(t) == lN && tl1(t, lN-1) == TyError {
+			last := lnTmp[lS+lN-1]
+			if nkind(last) == NkIdent {
+				errSym = scVarSym(last)
+			}
+		}
+	}
+	for k := usize(0); k < lN; k++ {
+		l := lnTmp[lS+k]
+		if nkind(l) == NkIdent {
+			s := scVarSym(l)
+			if s != 0 {
+				lnUntie(e, s)
+			}
+		}
+	}
+	for k := usize(0); k < lN; k++ {
+		l := lnTmp[lS+k]
+		if nkind(l) != NkIdent {
+			lnExpr(fl, l, e, dp-1) // x.f = ..., a[i] = ...: borrows the root
+			continue
+		}
+		s := scVarSym(l)
+		if s == 0 {
+			continue // `_` (E3004 reported by the walker)
+		}
+		i := lnIdx(fl, s)
+		if i == LnNoVar {
+			continue
+		}
+		if defs[usize(l)] != s && lnSt(e, i)&StOwned != 0 {
+			lnLeak(fl, i) // overwriting a live resource
+		}
+		tie := errSym
+		if k == lN-1 {
+			tie = 0
+		}
+		lnBind(e, i, tie)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+
+func lnExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if lnIsDead(e) || x == 0 {
+		return
+	}
+	k := nkind(x)
+	if k == NkIdent {
+		i := lnLinVar(fl, x, SemaDepth)
+		if i != LnNoVar {
+			lnUse(fl, e, i, x)
+		}
+	} else if k == NkParenExpr || k == NkUnaryExpr {
+		lnExpr(fl, na(x), e, dp-1)
+	} else if k == NkBinaryExpr {
+		lnExpr(fl, na(x), e, dp-1)
+		lnExpr(fl, nb(x), e, dp-1)
+	} else if k == NkSelectorExpr {
+		if nsel[usize(x)] != 0 {
+			lnExpr(fl, na(x), e, dp-1)
+		}
+	} else if k == NkIndexExpr {
+		lnExpr(fl, na(x), e, dp-1)
+		n := l1len(x)
+		for i := usize(0); i < n; i++ {
+			lnExpr(fl, l1at(x, i), e, dp-1)
+		}
+	} else if k == NkSliceExpr {
+		lnExpr(fl, na(x), e, dp-1)
+		lnExpr(fl, nb(x), e, dp-1)
+		lnExpr(fl, nc(x), e, dp-1)
+	} else if k == NkStructLit {
+		n := l1len(x)
+		for i := usize(0); i < n; i++ {
+			v := nb(l1at(x, i))
+			vi := lnLinArg(fl, v)
+			if vi != LnNoVar {
+				lnConsume(fl, e, vi, lnRootIdent(v), KMove)
+			} else {
+				lnExpr(fl, v, e, dp-1)
+			}
+		}
+	} else if k == NkCallExpr {
+		lnCall(fl, x, e, false, dp-1)
+	} else if k == NkFuncLit {
+		lnLit(fl, x, e, false, dp-1)
+	}
+}
+
+// lnCapAt is the node a capture of s by lit is reported at.
+func lnCapAt(lit u32, s u32) u32 {
+	id := scFirstRef(nb(lit), s, SemaDepth)
+	if id != 0 {
+		return id
+	}
+	return lit
+}
+
+// lnLit handles a function literal value: captured Linear variables are
+// moved into a Scope.Go task (goTask) or borrowed.
+func lnLit(fl u32, lit u32, e u32, goTask bool, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if nfunc[usize(lit)] != 0 {
+		c := litCapHead[usize(lit)]
+		for g := usize(0); g < MaxCells; g++ {
+			if c == 0 {
+				break
+			}
+			s := cellVal(c)
+			c = cellNext(c)
+			i := lnIdx(fl, s)
+			if i == LnNoVar {
+				continue
+			}
+			at := lnCapAt(lit, s)
+			if goTask {
+				lnConsume(fl, e, i, at, KMove)
+			} else {
+				lnUse(fl, e, i, at)
+			}
+		}
+	}
+	lnLitLinearity(lit, goTask, dp-1)
+}
+
+// lnPushParams pushes the Linear parameters of literal fi that are owned
+// (driver literals) or borrowed (total ones), selected by `owned`.
+func lnPushParams(fi u32, owned bool) {
+	isDrv := funcs.items[usize(fi)].effect == EffDriver
+	if isDrv != owned {
+		return
+	}
+	np := usize(funcs.items[usize(fi)].parN)
+	for i := usize(0); i < np; i++ {
+		p := scParamSym(fi, i)
+		if p != 0 && isLinear(syms.items[usize(p)].typ) {
+			lnTmpPush(p)
+		}
+	}
+}
+
+// lnLitLinearity analyses a function literal once; goTask: it is the task
+// of a Scope.Go call and owns its captured Linear variables.
+func lnLitLinearity(lit u32, goTask bool, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	fi := nfunc[usize(lit)]
+	if fi == 0 || scLitDone[usize(fi)] {
+		return
+	}
+	scLitDone[usize(fi)] = true
+	g := lnBegin()
+	if g == 0 {
+		return
+	}
+	lnCollectVars(g, nb(lit), SemaDepth)
+	mark := lnNTmp
+	lnPushParams(fi, true)
+	if goTask {
+		lnPushCaps(lit, 0)
+	}
+	mid := lnNTmp
+	lnPushParams(fi, false)
+	if !goTask {
+		lnPushCaps(lit, 0)
+	}
+	lnRun(g, nb(lit), mark, mid, dp-1)
+	lnEnd(g)
+}
+
+// lnPushCaps pushes the Linear captures of lit (fl == 0) or the captures
+// that are variables of flow fl.
+func lnPushCaps(lit u32, fl u32) {
+	c := litCapHead[usize(lit)]
+	for g := usize(0); g < MaxCells; g++ {
+		if c == 0 {
+			break
+		}
+		s := cellVal(c)
+		c = cellNext(c)
+		if fl == 0 {
+			if isLinear(syms.items[usize(s)].typ) {
+				lnTmpPush(s)
+			}
+		} else if lnIdx(fl, s) != LnNoVar {
+			lnTmpPush(s)
+		}
+	}
+}
+
+func lnCall(fl u32, x u32, e u32, deferred bool, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	ci := ncall[usize(x)]
+	nargs := l1len(x)
+	if ci == 0 {
+		lnExpr(fl, na(x), e, dp-1)
+		for k := usize(0); k < nargs; k++ {
+			lnExpr(fl, l1at(x, k), e, dp-1)
+		}
+		return
+	}
+	finalize := u8(KConsume)
+	move := u8(KMove)
+	if deferred {
+		finalize = KDefer
+		move = KDefer
+	}
+	c := callTab.items[usize(ci)]
+	fun := unparen(na(x))
+	funLit := fun != 0 && nkind(fun) == NkFuncLit
+	if c.kind == CallMethod || c.kind == CallBuiltinMeth {
+		i := lnLinVar(fl, c.recv, SemaDepth)
+		if c.consumesRecv && i != LnNoVar {
+			lnConsume(fl, e, i, lnRootIdent(c.recv), finalize)
+		} else {
+			lnExpr(fl, c.recv, e, dp-1)
+		}
+	} else if c.kind == CallValue {
+		if funLit {
+			lnInlineLit(fl, fun, e, deferred, dp-1)
+		} else {
+			i := lnLinVar(fl, na(x), SemaDepth)
+			if c.consumesRecv && i != LnNoVar {
+				lnConsume(fl, e, i, lnRootIdent(na(x)), finalize)
+			} else {
+				lnExpr(fl, na(x), e, dp-1)
+			}
+		}
+	} else if funLit {
+		lnInlineLit(fl, fun, e, deferred, dp-1)
+	}
+	owned := c.effect == EffDriver && (c.kind == CallFunc || c.kind == CallMethod || c.kind == CallValue)
+	isGo := c.kind == CallBuiltinMeth && c.method != 0 && meths.items[usize(c.method)].builtin == BMScopeGo
+	for k := usize(0); k < nargs; k++ {
+		a := l1at(x, k)
+		if isGo && k == 1 {
+			al := unparen(a)
+			if al != 0 && nkind(al) == NkFuncLit {
+				lnLit(fl, al, e, true, dp-1)
+				continue
+			}
+		}
+		i := lnLinArg(fl, a)
+		if i != LnNoVar {
+			if c.consumesArg0 && k == 0 {
+				lnConsume(fl, e, i, lnRootIdent(a), finalize)
+				continue
+			}
+			if owned {
+				lnConsume(fl, e, i, lnRootIdent(a), move)
+				continue
+			}
+		}
+		lnExpr(fl, a, e, dp-1)
+	}
+}
+
+// lnInlineLit handles an immediately called literal (`func() {...}()`,
+// also under defer). Its captured Linear variables are analysed as owned
+// by the literal: if every exit of the literal has finalized or moved one,
+// the call consumes it (deferred: DeferredClose); if no exit has, the call
+// only borrows it; otherwise the literal leaks it on some path (E3005).
+func lnInlineLit(fl u32, lit u32, e u32, deferred bool, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	fi := nfunc[usize(lit)]
+	if fi == 0 {
+		return
+	}
+	g := lnBegin()
+	if g == 0 {
+		return
+	}
+	lnCollectVars(g, nb(lit), SemaDepth)
+	// Captures that are variables of the outer flow are summarized.
+	c := litCapHead[usize(lit)]
+	for q := usize(0); q < MaxCells; q++ {
+		if c == 0 {
+			break
+		}
+		s := cellVal(c)
+		c = cellNext(c)
+		if lnIdx(fl, s) != LnNoVar {
+			gi := lnAddVar(g, s)
+			lnSumm[lnFlows[usize(g)].varS+usize(gi)] = true
+		}
+	}
+	mark := lnNTmp
+	lnPushParams(fi, true)
+	lnPushCaps(lit, fl)
+	mid := lnNTmp
+	lnPushParams(fi, false)
+	lnRun(g, nb(lit), mark, mid, dp-1)
+	kind := u8(KConsume)
+	if deferred {
+		kind = KDefer
+	}
+	ex := lnFlows[usize(g)].exits
+	c2 := litCapHead[usize(lit)]
+	for q := usize(0); q < MaxCells; q++ {
+		if c2 == 0 {
+			break
+		}
+		s := cellVal(c2)
+		c2 = cellNext(c2)
+		i := lnIdx(fl, s)
+		if i == LnNoVar {
+			continue
+		}
+		gi := lnIdx(g, s)
+		at := lnCapAt(lit, s)
+		st := lnSt(ex, gi)
+		if lnIsDead(ex) || lnClr(st, StOwned) == 0 {
+			lnUse(fl, e, i, at) // borrowed (or the literal never returns)
+		} else if st&StOwned == 0 {
+			lnConsume(fl, e, i, at, kind)
+		} else {
+			lnLeak(g, gi)
+			lnConsume(fl, e, i, at, kind)
+		}
+	}
+	lnEnd(g)
+}

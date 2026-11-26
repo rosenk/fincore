@@ -7,3 +7,4 @@ stage*.go
 /finc2
 /finc3
 /.stage/
+/.claude/

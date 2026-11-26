@@ -1,0 +1,78 @@
+// passes.fc — the semantic passes that run after the type checker (finc0's
+// check.Passes) and the hidden `check --passes=` selection flag.
+//
+// Passes run in order on a well-typed program (no diagnostics so far); the
+// pipeline stops after the first pass that reports diagnostics.
+package main
+
+// Pass bits for --passes=<pass>[,<pass>].
+const (
+	PassScope    = 1
+	PassTotality = 2
+)
+
+var passTypesOnly bool // --passes=types: stop after the type checker
+var passOnly u32       // 0 = all passes, else the selected pass bits
+
+// passBit returns the bit of a pass name (0 = unknown).
+func passBit(name []byte) u32 {
+	if bytesEqual(name, strBytes("scope")) {
+		return PassScope
+	}
+	if bytesEqual(name, strBytes("totality")) {
+		return PassTotality
+	}
+	return 0
+}
+
+// parsePasses applies the value of --passes=types|all|<pass>[,<pass>].
+func parsePasses(v []byte) bool {
+	if bytesEqual(v, strBytes("types")) {
+		passTypesOnly = true
+		passOnly = 0
+		return true
+	}
+	passTypesOnly = false
+	passOnly = 0
+	if bytesEqual(v, strBytes("all")) {
+		return true
+	}
+	n := len(v)
+	st := usize(0)
+	for i := usize(0); i < n+1; i++ {
+		if i < n && v[i] != ',' {
+			continue
+		}
+		b := passBit(v[st:i])
+		if b == 0 {
+			return false
+		}
+		passOnly = passOnly | b
+		st = i + 1
+	}
+	return true
+}
+
+func passEnabled(b u32) bool {
+	return !passTypesOnly && (passOnly == 0 || passOnly&b != 0)
+}
+
+// runPasses runs the enabled semantic passes in order and stops after the
+// first one that reports diagnostics.
+func runPasses() {
+	if diags.count > 0 {
+		return
+	}
+	if passEnabled(PassScope) {
+		scopeCheck()
+		if diags.count > 0 || semaFull {
+			return
+		}
+	}
+	if passEnabled(PassTotality) {
+		totalityProgram()
+		if diags.count > 0 || semaFull {
+			return
+		}
+	}
+}
