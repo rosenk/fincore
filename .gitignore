@@ -2,7 +2,7 @@
 /build/
 *.test
 stage*.go
-finc0
-finc1
-finc2
-finc3
+/finc0
+/finc1
+/finc2
+/finc3
