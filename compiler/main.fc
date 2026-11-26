@@ -1,7 +1,7 @@
 // main.fc — the finc command-line driver (spec 9.6).
 //
 //	finc parse [--dump-ast] <file.fc | dir>
-//	finc check | build | run | test   (not implemented yet: M7)
+//	finc check | build | run | test   (build/run/test: build.fc)
 //
 // `parse` mirrors `finc0 parse`: all `.fc` files of a directory (sorted by
 // name) are parsed as one package; syntax errors are printed to stderr in

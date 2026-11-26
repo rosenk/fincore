@@ -24,7 +24,11 @@ files (spec 9.5.6); there are no local imports.
 | `totality.fc` | Totality checker part 1 (finc0's `totality`: totality.go, invariant.go, loops.go): pre-order program index, E5001 effects, root facts, loop invariance, T1, T2 setup |
 | `totality_flow.fc` | Totality checker part 2 (flow.go, T2/T3 walks): abstract states, bounds, the path-sensitive walker |
 | `totality_rec.fc` | Totality checker part 3 (recursion.go): call graph, iterative Tarjan, measures, E4002/E4004 |
-| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`, `check [--comptime-fuel=N] <file.fc \| dir>` (hidden flags `--stats`, `--passes=types\|all\|totality`; the loader for local imports lives here); build/run/test print "not implemented" |
+| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`, `check [--comptime-fuel=N] <file.fc \| dir>` (hidden flags `--stats`, `--passes=types\|all\|totality`; the loader for local imports lives here); dispatches build/run/test to build.fc |
+| `codegen.fc` | Code generator part 1 (finc0's `ir` + `codegen/golang` gen.go, types.go, values.go): emission buffers, Go names, usage/scope/dead-code analyses, match arm lowering, monomorphization, types, constant values, declarations, entry point |
+| `codegen_expr.fc` | Code generator part 2 (expr.go): expressions and calls |
+| `codegen_stmt.fc` | Code generator part 3 (stmt.go): bodies, statements, scope barriers, labeled breaks, returns through scopes |
+| `build.fc` | `build`, `run`, `test` (finc0's build.go / test.go): temporary module, gofmt and `go build` via Exec, test conventions of testdata/README.md |
 
 ## Architecture
 
@@ -423,6 +427,49 @@ function; overflow is reported as capacity exceeded.
     extension) and unimplemented subcommands return `ErrExec`. How a
     returned error maps to the process exit status is up to the generated
     `main` (finc0 uses 1 for errors and 2 for usage).
+
+## Code generation and `finc1 build` (M7b)
+
+`cgGenerateGo` (codegen*.fc) is a function-by-function port of finc0's
+`ir.Lower` + `golang.Generate` over the semantic tables; there is no
+separate IR object. Emission appends to `cgBuf`; each finished top-level
+declaration moves to its section (`genTypes`, `genVars`, `genFuncs`), and
+`cgAssembleGo` writes header, imports and sections to `outBuf`. Where finc0
+builds a string and then decides on parentheses (`primary`, `unary`,
+`composite`, `convType`), the text is wrapped in place; where finc0
+evaluates parts in another order than it prints them (type arguments before
+an instance name, a for header's post before its condition, struct/enum
+literal fields before their type, AcquireSlot's pool before its context),
+the parts are rendered in evaluation order and rotated (`cgWrotate`), so
+temporaries, labels and monomorphized-instance discovery happen in
+finc0's order. Labels for `break` out of a match are inserted in front of
+the loop after its body. Return values evaluated before scope waits and the
+match scrutinee are kept on the `cgStash` stack. Capacities: 8 MiB per
+section (compiler/ needs about 0.5 MB), 4096 instances, 65_536 frames.
+
+Formatting: the raw text is written to `<tmp>/main.go` and formatted with
+`go run cmd/gofmt -w` (or `$FINC_GOFMT`) through Exec; gofmt and go/format
+print identically, so `--emit-go` output is byte-identical to finc0's. The
+build then writes `go.mod` (`replace fincore => <root>`, go version of the
+root go.mod), `zz_race.go` for `--race`, and runs `go build -C <tmp>` with
+workdir = module root (so mise-style shims resolve the toolchain), env
+`GOWORK=off GOFLAGS=-mod=mod CGO_ENABLED=0|1`. Root: `$FINCORE_ROOT`, else
+walk up from `$PWD` (FS has no Getwd), else from Arg(0). `$FINC_GO`
+overrides the go command.
+
+`make diff-build` (scripts/diffbuild) compares `finc0 build --emit-go` and
+`finc1 build --emit-go` on examples/, testdata/pass, testdata/integration,
+compiler/, scripts/diffbuild/cases (hand-written codegen edge cases) and
+the unit-test snippets of finc0 (library snippets get a trivial main).
+`make finc2` is the fixed-point smoke test (stage2.go == stage3.go).
+
+Differences from finc0: `run` cannot forward stdin or the child's exit
+status (Exec), so a failing program makes finc1 exit 1 with
+`error: fincore: exec failed`, and the child's stderr is printed after it
+exits. `test` runs pass programs through `/bin/sh -c 'exec "$0" >"$1"'`
+(Exec does not capture stdout), lists subdirectories with /bin/sh, runs
+`finc1 check`/`build` as subprocesses (Arg(0)) and prints no timings (no
+clock). Flag parsing covers the Go flag forms used in practice.
 
 ## Known gaps and differences from finc0
 
