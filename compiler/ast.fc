@@ -42,7 +42,8 @@
 //	Ident           text = Name
 //	BasicLit        op Kind  text = Raw  ival = Int  (Str decoded from Raw)
 //	BoolLit         Flag1 Value          NilLit
-//	BinaryExpr      op Op  a X  b Y      UnaryExpr  op Op  a X   ParenExpr a X
+//	BinaryExpr      op Op  a X  b Y  ival = OpPos (line<<32 | col)
+//	UnaryExpr       op Op  a X           ParenExpr  a X
 //	CallExpr        a Fun  l1 Args       IndexExpr  a X  l1 Indices
 //	SliceExpr       a X  b Lo?  c Hi?    SelectorExpr a X  b Sel
 //	FuncLit         Flag1 Driver  a Sig  b Body

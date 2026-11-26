@@ -1,0 +1,1897 @@
+// types.fc — the typed model (port of finc0's bootstrap/internal/types:
+// type.go, universe.go, info.go and the instantiation half of typexpr.go).
+//
+// Types live in a TypeArena indexed by TypeID (u32, 0 = no type). All
+// structural types (arrays, slices, pointers, structs, enums, signatures,
+// codes, const args, tuples) and generic instances (Named with an origin)
+// are hash-consed, so type identity (types.Identical) is TypeID equality.
+// Declared named types, type parameters and opaque resource types are
+// unique records. Child lists (fields, variants, params, type args, ...)
+// are ranges in TypeArena.lists.
+package main
+
+const (
+	MaxTypes     = 131_072
+	TypeBuckets  = 262_144 // power of two
+	MaxTypeLists = 1 << 20
+	MaxMethods   = 16_384
+	MaxInsts     = 8192
+	MaxPending   = 8192
+	MaxFuncs     = 65_536
+	MaxCalls     = 262_144
+	MaxSels      = 262_144
+)
+
+// Basic kinds (types.BasicKind) and the TypeIDs of the basic types
+// (TypeID = kind + 1; byte is u8).
+const (
+	BkInvalid       = 0
+	BkBool          = 1
+	BkU8            = 2
+	BkU16           = 3
+	BkU32           = 4
+	BkU64           = 5
+	BkI8            = 6
+	BkI16           = 7
+	BkI32           = 8
+	BkI64           = 9
+	BkInt           = 10
+	BkUsize         = 11
+	BkString        = 12
+	BkError         = 13
+	BkUntypedInt    = 14
+	BkUntypedChar   = 15
+	BkUntypedBool   = 16
+	BkUntypedString = 17
+	BkUntypedNil    = 18
+	NumBasic        = 19
+
+	TyInvalid       = 1
+	TyBool          = 2
+	TyU8            = 3
+	TyU16           = 4
+	TyU32           = 5
+	TyU64           = 6
+	TyI8            = 7
+	TyI16           = 8
+	TyI32           = 9
+	TyI64           = 10
+	TyInt           = 11
+	TyUsize         = 12
+	TyString        = 13
+	TyError         = 14
+	TyUntypedInt    = 15
+	TyUntypedChar   = 16
+	TyUntypedBool   = 17
+	TyUntypedString = 18
+	TyUntypedNil    = 19
+)
+
+// Type constructors (TypeRec.kind).
+const (
+	TCBasic     = 1
+	TCNamed     = 2
+	TCArray     = 3
+	TCSlice     = 4
+	TCPointer   = 5
+	TCStruct    = 6
+	TCEnum      = 7
+	TCSig       = 8
+	TCCode      = 9
+	TCTypeParam = 10
+	TCConstArg  = 11
+	TCTuple     = 12
+	TCOpaque    = 13
+)
+
+// Effects (types.Effect): Comptime < Total < Driver.
+const (
+	EffComptime = 0
+	EffTotal    = 1
+	EffDriver   = 2
+)
+
+// Value classes (spec 4.1).
+const (
+	ClassValue  = 0
+	ClassScoped = 1
+	ClassLinear = 2
+)
+
+// TypeRec fields by kind:
+//
+//	Basic      sub = BasicKind
+//	Named      n = NameID, c = declaring symbol, d = package, sub = builtin,
+//	           a = underlying (0 = not yet resolved), b = origin (instances),
+//	           l1 = type args (instances), l2 = type params (generic decls),
+//	           l3 = method IDs (ulists, valid when flag&2), flag&1 = class
+//	           cached in cls
+//	Array      n = len, b = len type parameter (0 = constant length), a = elem
+//	Slice      a = elem          Pointer  a = elem
+//	Struct     l1 = (name, type) pairs
+//	Enum       l1 = (name, payload start, payload len) triples (payloads in lists)
+//	Sig        sub = effect, flag&1 = variadic, l1 = params, l2 = results,
+//	           l3 = type params (generic functions)
+//	Code       n = level + 1 (0 = level-polymorphic `Code ?`)
+//	TypeParam  n = NameID, b = symbol, c = index, a = const type (0 = type param)
+//	ConstArg   n = value         Tuple  l1 = types
+//	Opaque     n = NameID, a = builtin
+type TypeRec struct {
+	kind u8
+	sub  u8
+	flag u8
+	cls  u8
+	a    u32
+	b    u32
+	c    u32
+	d    u32
+	n    u64
+	l1s  u32
+	l1n  u32
+	l2s  u32
+	l2n  u32
+	l3s  u32
+	l3n  u32
+}
+
+type TypeArena struct {
+	items   [MaxTypes]TypeRec
+	count   usize
+	buckets [TypeBuckets]u32
+	lists   [MaxTypeLists]u32
+	nlists  usize
+	stack   [MaxTypeLists]u32
+	top     usize
+}
+
+var typs TypeArena
+
+func tk(t u32) u8 {
+	return typs.items[usize(t)].kind
+}
+
+func tlist(s u32, i usize) u32 {
+	return typs.lists[usize(s)+i]
+}
+
+func tl1(t u32, i usize) u32 {
+	return typs.lists[usize(typs.items[usize(t)].l1s)+i]
+}
+
+func tl1n(t u32) usize {
+	return usize(typs.items[usize(t)].l1n)
+}
+
+func tl2(t u32, i usize) u32 {
+	return typs.lists[usize(typs.items[usize(t)].l2s)+i]
+}
+
+func tl2n(t u32) usize {
+	return usize(typs.items[usize(t)].l2n)
+}
+
+func tl3(t u32, i usize) u32 {
+	return typs.lists[usize(typs.items[usize(t)].l3s)+i]
+}
+
+func tl3n(t u32) usize {
+	return usize(typs.items[usize(t)].l3n)
+}
+
+func tpush(x u32) {
+	if typs.top >= MaxTypeLists {
+		setFull("type list stack")
+		return
+	}
+	typs.stack[typs.top] = x
+	typs.top++
+}
+
+func tmark() usize {
+	return typs.top
+}
+
+// tslice returns stack[a:b].
+func tslice(a usize, b usize) []u32 {
+	return typs.stack[a:b]
+}
+
+// tcommit copies xs into the list arena and returns its range.
+func tcommit(xs []u32) (u32, u32) {
+	n := len(xs)
+	if n == 0 {
+		return 0, 0
+	}
+	if typs.nlists == 0 {
+		typs.nlists = 1
+	}
+	if typs.nlists+n > MaxTypeLists {
+		setFull("type lists")
+		return 0, 0
+	}
+	st := typs.nlists
+	for i := usize(0); i < n; i++ {
+		typs.lists[st+i] = xs[i]
+	}
+	typs.nlists = st + n
+	return u32(st), u32(n)
+}
+
+// tcommitStack commits stack[mark:top] and pops it.
+func tcommitStack(mark usize) (u32, u32) {
+	top := typs.top
+	if mark >= top {
+		typs.top = mark
+		return 0, 0
+	}
+	s, n := tcommit(typs.stack[mark:top])
+	typs.top = mark
+	return s, n
+}
+
+func newTypeRec(r TypeRec) u32 {
+	if typs.count == 0 {
+		typs.count = 1
+	}
+	if typs.count >= MaxTypes {
+		setFull("types")
+		return TyInvalid
+	}
+	id := typs.count
+	typs.count++
+	typs.items[id] = r
+	return u32(id)
+}
+
+func mix(h u64, v u64) u64 {
+	x := (h ^ v) * 0x100000001B3
+	return x ^ (x >> 29)
+}
+
+func mixList(h u64, xs []u32) u64 {
+	x := mix(h, u64(len(xs)))
+	n := len(xs)
+	for i := usize(0); i < n; i++ {
+		x = mix(x, u64(xs[i]))
+	}
+	return x
+}
+
+// mixEnum hashes (name, payload...) triples by payload contents.
+func mixEnum(h u64, xs []u32) u64 {
+	x := mix(h, u64(len(xs)))
+	n := len(xs) / 3
+	for i := usize(0); i < n; i++ {
+		x = mix(x, u64(xs[3*i]))
+		x = mixList(x, typs.lists[usize(xs[3*i+1]):usize(xs[3*i+1])+usize(xs[3*i+2])])
+	}
+	return x
+}
+
+func u32sEqual(a []u32, b []u32) bool {
+	n := len(a)
+	if n != len(b) {
+		return false
+	}
+	for i := usize(0); i < n; i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func enumListsEqual(a []u32, b []u32) bool {
+	n := len(a)
+	if n != len(b) {
+		return false
+	}
+	m := n / 3
+	for i := usize(0); i < m; i++ {
+		if a[3*i] != b[3*i] {
+			return false
+		}
+		pa := typs.lists[usize(a[3*i+1]) : usize(a[3*i+1])+usize(a[3*i+2])]
+		pb := typs.lists[usize(b[3*i+1]) : usize(b[3*i+1])+usize(b[3*i+2])]
+		if !u32sEqual(pa, pb) {
+			return false
+		}
+	}
+	return true
+}
+
+func typeHash(r TypeRec, c1 []u32, c2 []u32, c3 []u32) usize {
+	h := mix(1469598103934665603, u64(r.kind))
+	h = mix(h, u64(r.b))
+	if r.kind == TCNamed {
+		h = mixList(h, c1)
+		return usize(h)
+	}
+	h = mix(h, u64(r.sub))
+	h = mix(h, u64(r.flag))
+	h = mix(h, u64(r.a))
+	h = mix(h, r.n)
+	if r.kind == TCEnum {
+		h = mixEnum(h, c1)
+	} else {
+		h = mixList(h, c1)
+	}
+	h = mixList(h, c2)
+	h = mixList(h, c3)
+	return usize(h)
+}
+
+func typeRecEq(id u32, r TypeRec, c1 []u32, c2 []u32, c3 []u32) bool {
+	x := typs.items[usize(id)]
+	if x.kind != r.kind || x.b != r.b {
+		return false
+	}
+	l1 := typs.lists[usize(x.l1s) : usize(x.l1s)+usize(x.l1n)]
+	if r.kind == TCNamed {
+		return u32sEqual(l1, c1)
+	}
+	if x.sub != r.sub || x.flag != r.flag || x.a != r.a || x.n != r.n {
+		return false
+	}
+	if r.kind == TCEnum {
+		if !enumListsEqual(l1, c1) {
+			return false
+		}
+	} else if !u32sEqual(l1, c1) {
+		return false
+	}
+	l2 := typs.lists[usize(x.l2s) : usize(x.l2s)+usize(x.l2n)]
+	l3 := typs.lists[usize(x.l3s) : usize(x.l3s)+usize(x.l3n)]
+	return u32sEqual(l2, c2) && u32sEqual(l3, c3)
+}
+
+// internType returns the canonical TypeID of r with child lists c1..c3
+// (copied into the list arena if the type is new) and whether it is new.
+func internType(r TypeRec, c1 []u32, c2 []u32, c3 []u32) (u32, bool) {
+	i := typeHash(r, c1, c2, c3) & (TypeBuckets - 1)
+	for step := usize(0); step < TypeBuckets; step++ {
+		id := typs.buckets[i]
+		if id == 0 {
+			nr := r
+			s1, n1 := tcommit(c1)
+			s2, n2 := tcommit(c2)
+			s3, n3 := tcommit(c3)
+			nr.l1s = s1
+			nr.l1n = n1
+			nr.l2s = s2
+			nr.l2n = n2
+			nr.l3s = s3
+			nr.l3n = n3
+			nid := newTypeRec(nr)
+			if nid != TyInvalid {
+				typs.buckets[i] = nid
+			}
+			return nid, true
+		}
+		if typeRecEq(id, r, c1, c2, c3) {
+			return id, false
+		}
+		i = (i + 1) & (TypeBuckets - 1)
+	}
+	setFull("type table")
+	return TyInvalid, false
+}
+
+func emptyU32() []u32 {
+	return typs.stack[0:0]
+}
+
+// ---------------------------------------------------------------------------
+// Constructors
+
+func initBasicTypes() {
+	typs.count = 1
+	for k := u8(0); k < NumBasic; k++ {
+		var r TypeRec
+		r.kind = TCBasic
+		r.sub = k
+		_ = newTypeRec(r)
+	}
+}
+
+func mkArray(n u64, lenParam u32, elem u32) u32 {
+	var r TypeRec
+	r.kind = TCArray
+	r.n = n
+	r.b = lenParam
+	r.a = elem
+	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
+	return t
+}
+
+func mkSlice(elem u32) u32 {
+	var r TypeRec
+	r.kind = TCSlice
+	r.a = elem
+	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
+	return t
+}
+
+func mkPointer(elem u32) u32 {
+	var r TypeRec
+	r.kind = TCPointer
+	r.a = elem
+	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
+	return t
+}
+
+// mkCode returns `Code level` (level < 0: level-polymorphic).
+func mkCode(level int) u32 {
+	var r TypeRec
+	r.kind = TCCode
+	if level >= 0 {
+		r.n = u64(level + 1)
+	}
+	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
+	return t
+}
+
+func codeLevel(t u32) int {
+	return int(typs.items[usize(t)].n) - 1
+}
+
+func mkConstArg(v u64) u32 {
+	var r TypeRec
+	r.kind = TCConstArg
+	r.n = v
+	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
+	return t
+}
+
+// mkStruct interns a struct from (name, type) pairs on the stack [mark:top].
+func mkStruct(mark usize) u32 {
+	var r TypeRec
+	r.kind = TCStruct
+	t, _ := internType(r, tslice(mark, typs.top), emptyU32(), emptyU32())
+	typs.top = mark
+	return t
+}
+
+// mkEnum interns an enum from (name, payS, payN) triples on the stack.
+func mkEnum(mark usize) u32 {
+	var r TypeRec
+	r.kind = TCEnum
+	t, _ := internType(r, tslice(mark, typs.top), emptyU32(), emptyU32())
+	typs.top = mark
+	return t
+}
+
+// mkSig interns a signature: params stack[m1:m2], results [m2:m3],
+// type params [m3:top].
+func mkSig(eff u8, variadic bool, m1 usize, m2 usize, m3 usize) u32 {
+	var r TypeRec
+	r.kind = TCSig
+	r.sub = eff
+	if variadic {
+		r.flag = 1
+	}
+	t, _ := internType(r, tslice(m1, m2), tslice(m2, m3), tslice(m3, typs.top))
+	typs.top = m1
+	return t
+}
+
+// mkSigLists interns a signature from committed lists.
+func mkSigLists(eff u8, variadic bool, ps []u32, rs []u32, tps []u32) u32 {
+	var r TypeRec
+	r.kind = TCSig
+	r.sub = eff
+	if variadic {
+		r.flag = 1
+	}
+	t, _ := internType(r, ps, rs, tps)
+	return t
+}
+
+func mkTuple(xs []u32) u32 {
+	var r TypeRec
+	r.kind = TCTuple
+	t, _ := internType(r, xs, emptyU32(), emptyU32())
+	return t
+}
+
+func newNamed(name u32, sym u32, pkg u32, builtin u8) u32 {
+	var r TypeRec
+	r.kind = TCNamed
+	r.n = u64(name)
+	r.c = sym
+	r.d = pkg
+	r.sub = builtin
+	return newTypeRec(r)
+}
+
+func newTypeParam(name u32, sym u32, index u32, constT u32) u32 {
+	var r TypeRec
+	r.kind = TCTypeParam
+	r.n = u64(name)
+	r.b = sym
+	r.c = index
+	r.a = constT
+	return newTypeRec(r)
+}
+
+func newOpaque(name u32, builtin u8) u32 {
+	var r TypeRec
+	r.kind = TCOpaque
+	r.n = u64(name)
+	r.a = u32(builtin)
+	return newTypeRec(r)
+}
+
+// ---------------------------------------------------------------------------
+// Accessors and predicates
+
+func underlying(t u32) u32 {
+	if t == 0 {
+		return 0
+	}
+	if tk(t) == TCNamed {
+		u := typs.items[usize(t)].a
+		if u == 0 {
+			return TyInvalid
+		}
+		return u
+	}
+	return t
+}
+
+func isInvalid(t u32) bool {
+	return t == 0 || t == TyInvalid
+}
+
+func basicKind(t u32) u8 {
+	if t == 0 {
+		return BkInvalid
+	}
+	u := underlying(t)
+	if tk(u) == TCBasic {
+		return typs.items[usize(u)].sub
+	}
+	return BkInvalid
+}
+
+func isInteger(t u32) bool {
+	k := basicKind(t)
+	return (k >= BkU8 && k <= BkUsize) || k == BkUntypedInt || k == BkUntypedChar
+}
+
+func isUnsigned(t u32) bool {
+	k := basicKind(t)
+	return k >= BkU8 && k <= BkU64 || k == BkUsize
+}
+
+func isUntyped(t u32) bool {
+	k := basicKind(t)
+	return k >= BkUntypedInt && k <= BkUntypedNil
+}
+
+func isBoolean(t u32) bool {
+	k := basicKind(t)
+	return k == BkBool || k == BkUntypedBool
+}
+
+func isString(t u32) bool {
+	k := basicKind(t)
+	return k == BkString || k == BkUntypedString
+}
+
+// intInfo returns bit width and signedness of an integer type.
+func intInfo(t u32) (u32, bool, bool) {
+	k := basicKind(t)
+	if k == BkU8 {
+		return 8, false, true
+	}
+	if k == BkU16 {
+		return 16, false, true
+	}
+	if k == BkU32 {
+		return 32, false, true
+	}
+	if k == BkU64 || k == BkUsize {
+		return 64, false, true
+	}
+	if k == BkI8 {
+		return 8, true, true
+	}
+	if k == BkI16 {
+		return 16, true, true
+	}
+	if k == BkI32 {
+		return 32, true, true
+	}
+	if k == BkI64 || k == BkInt {
+		return 64, true, true
+	}
+	return 0, false, false
+}
+
+func isPolyCode(t u32) bool {
+	return t != 0 && tk(t) == TCCode && typs.items[usize(t)].n == 0
+}
+
+// defaultOf returns the default type of an untyped type (types.Default).
+func defaultOf(t u32) u32 {
+	k := basicKind(t)
+	if k == BkUntypedInt {
+		return TyInt
+	}
+	if k == BkUntypedChar {
+		return TyU8
+	}
+	if k == BkUntypedBool {
+		return TyBool
+	}
+	if k == BkUntypedString {
+		return TyString
+	}
+	if isPolyCode(t) {
+		return mkCode(0)
+	}
+	return t
+}
+
+// derefType returns the element of a pointer type (and true), else t.
+func derefType(t u32) (u32, bool) {
+	if t != 0 && tk(t) == TCPointer {
+		return typs.items[usize(t)].a, true
+	}
+	return t, false
+}
+
+func isTypeParamT(t u32) bool {
+	return t != 0 && tk(t) == TCTypeParam
+}
+
+func tpIsConst(t u32) bool {
+	return typs.items[usize(t)].a != 0
+}
+
+func elemOf(t u32) u32 {
+	return typs.items[usize(t)].a
+}
+
+// Struct fields: pairs (name, type) in l1.
+func nfields(st u32) usize {
+	return tl1n(st) / 2
+}
+
+func fieldName(st u32, i usize) u32 {
+	return tl1(st, 2*i)
+}
+
+func fieldType(st u32, i usize) u32 {
+	return tl1(st, 2*i+1)
+}
+
+func fieldByName(st u32, name u32) (usize, bool) {
+	n := nfields(st)
+	for i := usize(0); i < n; i++ {
+		if fieldName(st, i) == name {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// Enum variants: triples (name, payload start, payload len) in l1.
+func nvariants(en u32) usize {
+	return tl1n(en) / 3
+}
+
+func variantName(en u32, i usize) u32 {
+	return tl1(en, 3*i)
+}
+
+func variantPayS(en u32, i usize) u32 {
+	return tl1(en, 3*i+1)
+}
+
+func variantPayN(en u32, i usize) usize {
+	return usize(tl1(en, 3*i+2))
+}
+
+func variantPay(en u32, i usize, j usize) u32 {
+	return tlist(variantPayS(en, i), j)
+}
+
+func variantByName(en u32, name u32) (usize, bool) {
+	n := nvariants(en)
+	for i := usize(0); i < n; i++ {
+		if variantName(en, i) == name {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// Signatures.
+func sigEffect(s u32) u8 {
+	return typs.items[usize(s)].sub
+}
+
+func sigVariadic(s u32) bool {
+	return typs.items[usize(s)].flag&1 != 0
+}
+
+func sigNParams(s u32) usize {
+	return tl1n(s)
+}
+
+func sigParam(s u32, i usize) u32 {
+	return tl1(s, i)
+}
+
+func sigNResults(s u32) usize {
+	return tl2n(s)
+}
+
+func sigResult(s u32, i usize) u32 {
+	return tl2(s, i)
+}
+
+func sigNTParams(s u32) usize {
+	return tl3n(s)
+}
+
+// sigResultType: 0 for no results, the result, or a Tuple.
+func sigResultType(s u32) u32 {
+	n := sigNResults(s)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		return sigResult(s, 0)
+	}
+	r := typs.items[usize(s)]
+	return mkTuple(typs.lists[usize(r.l2s) : usize(r.l2s)+usize(r.l2n)])
+}
+
+func sigParamsSlice(s u32) []u32 {
+	r := typs.items[usize(s)]
+	return typs.lists[usize(r.l1s) : usize(r.l1s)+usize(r.l1n)]
+}
+
+func sigResultsSlice(s u32) []u32 {
+	r := typs.items[usize(s)]
+	return typs.lists[usize(r.l2s) : usize(r.l2s)+usize(r.l2n)]
+}
+
+func l1Slice(t u32) []u32 {
+	r := typs.items[usize(t)]
+	return typs.lists[usize(r.l1s) : usize(r.l1s)+usize(r.l1n)]
+}
+
+func l2Slice(t u32) []u32 {
+	r := typs.items[usize(t)]
+	return typs.lists[usize(r.l2s) : usize(r.l2s)+usize(r.l2n)]
+}
+
+// Named types.
+func namedBuiltin(t u32) u8 {
+	return typs.items[usize(t)].sub
+}
+
+func namedOrigin(t u32) u32 {
+	return typs.items[usize(t)].b
+}
+
+func namedSym(t u32) u32 {
+	return typs.items[usize(t)].c
+}
+
+func isGenericNamed(t u32) bool {
+	return tk(t) == TCNamed && tl2n(t) > 0
+}
+
+// builtinOf returns the predeclared identity of a named type (origin for
+// instances), 0 if none.
+func builtinOf(t u32) u8 {
+	if t == 0 || tk(t) != TCNamed {
+		return 0
+	}
+	n := t
+	if namedOrigin(n) != 0 {
+		n = namedOrigin(n)
+	}
+	return namedBuiltin(n)
+}
+
+func isResource(t u32) bool {
+	b := builtinOf(t)
+	return b >= BTNet && b <= BTExec
+}
+
+func isCapability(t u32) bool {
+	b := builtinOf(t)
+	return b == BTNet || b == BTSignals || b == BTClock || b == BTFS || b == BTEnv || b == BTStdio || b == BTExec
+}
+
+// classOf computes the value class of t (types.ClassOf).
+func classOf(t u32, depth usize) u8 decreases(depth) {
+	if depth == 0 || t == 0 {
+		return ClassValue
+	}
+	k := tk(t)
+	if k == TCNamed {
+		if typs.items[usize(t)].flag&1 != 0 {
+			return typs.items[usize(t)].cls
+		}
+		u := typs.items[usize(t)].a
+		if u == 0 {
+			return ClassValue
+		}
+		typs.items[usize(t)].flag = typs.items[usize(t)].flag | 1
+		typs.items[usize(t)].cls = ClassValue
+		c := classOf(u, depth-1)
+		typs.items[usize(t)].cls = c
+		return c
+	}
+	if k == TCPointer || k == TCSig {
+		return ClassScoped
+	}
+	if k == TCArray || k == TCSlice {
+		return classOf(elemOf(t), depth-1)
+	}
+	c := u8(ClassValue)
+	if k == TCStruct {
+		n := nfields(t)
+		for i := usize(0); i < n; i++ {
+			x := classOf(fieldType(t, i), depth-1)
+			if x > c {
+				c = x
+			}
+		}
+	} else if k == TCEnum {
+		n := nvariants(t)
+		for i := usize(0); i < n; i++ {
+			m := variantPayN(t, i)
+			for j := usize(0); j < m; j++ {
+				x := classOf(variantPay(t, i, j), depth-1)
+				if x > c {
+					c = x
+				}
+			}
+		}
+	} else if k == TCTuple {
+		n := tl1n(t)
+		for i := usize(0); i < n; i++ {
+			x := classOf(tl1(t, i), depth-1)
+			if x > c {
+				c = x
+			}
+		}
+	}
+	return c
+}
+
+func classOfT(t u32) u8 {
+	return classOf(t, SemaDepth)
+}
+
+func isScoped(t u32) bool {
+	return classOfT(t) >= ClassScoped
+}
+
+func isLinear(t u32) bool {
+	return classOfT(t) == ClassLinear
+}
+
+func comparable(t u32, depth usize) bool decreases(depth) {
+	if depth == 0 || t == 0 {
+		return false
+	}
+	u := underlying(t)
+	k := tk(u)
+	if k == TCBasic {
+		b := typs.items[usize(u)].sub
+		return b != BkUntypedNil && b != BkInvalid
+	}
+	if k == TCPointer || k == TCCode {
+		return true
+	}
+	if k == TCArray {
+		return comparable(elemOf(u), depth-1)
+	}
+	if k == TCStruct {
+		n := nfields(u)
+		for i := usize(0); i < n; i++ {
+			if !comparable(fieldType(u, i), depth-1) {
+				return false
+			}
+		}
+		return true
+	}
+	if k == TCEnum {
+		n := nvariants(u)
+		for i := usize(0); i < n; i++ {
+			m := variantPayN(u, i)
+			for j := usize(0); j < m; j++ {
+				if !comparable(variantPay(u, i, j), depth-1) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func hasTypeParam(t u32, depth usize) bool decreases(depth) {
+	if depth == 0 || t == 0 {
+		return false
+	}
+	k := tk(t)
+	if k == TCTypeParam {
+		return true
+	}
+	if k == TCNamed || k == TCTuple {
+		n := tl1n(t)
+		for i := usize(0); i < n; i++ {
+			if hasTypeParam(tl1(t, i), depth-1) {
+				return true
+			}
+		}
+		return false
+	}
+	if k == TCArray {
+		return typs.items[usize(t)].b != 0 || hasTypeParam(elemOf(t), depth-1)
+	}
+	if k == TCSlice || k == TCPointer {
+		return hasTypeParam(elemOf(t), depth-1)
+	}
+	if k == TCStruct {
+		n := nfields(t)
+		for i := usize(0); i < n; i++ {
+			if hasTypeParam(fieldType(t, i), depth-1) {
+				return true
+			}
+		}
+		return false
+	}
+	if k == TCEnum {
+		n := nvariants(t)
+		for i := usize(0); i < n; i++ {
+			m := variantPayN(t, i)
+			for j := usize(0); j < m; j++ {
+				if hasTypeParam(variantPay(t, i, j), depth-1) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if k == TCSig {
+		n := tl1n(t)
+		for i := usize(0); i < n; i++ {
+			if hasTypeParam(tl1(t, i), depth-1) {
+				return true
+			}
+		}
+		m := tl2n(t)
+		for i := usize(0); i < m; i++ {
+			if hasTypeParam(tl2(t, i), depth-1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func anyTypeParam(xs []u32) bool {
+	n := len(xs)
+	for i := usize(0); i < n; i++ {
+		if hasTypeParam(xs[i], SemaDepth) {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Type strings (types.Type.String)
+
+func basicName(k u8) string {
+	if k == BkInvalid {
+		return "invalid type"
+	}
+	if k == BkUntypedInt {
+		return "untyped int"
+	}
+	if k == BkUntypedChar {
+		return "untyped char"
+	}
+	if k == BkUntypedBool {
+		return "untyped bool"
+	}
+	if k == BkUntypedString {
+		return "untyped string"
+	}
+	if k == BkUntypedNil {
+		return "untyped nil"
+	}
+	if k == BkError {
+		return "error"
+	}
+	if k == BkString {
+		return "string"
+	}
+	return builtinTypeName(k)
+}
+
+func putTypeList(o *OutBuf, xs []u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	n := len(xs)
+	for i := usize(0); i < n; i++ {
+		if i > 0 {
+			o.putStr(", ")
+		}
+		putType(o, xs[i], depth-1)
+	}
+}
+
+func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	if t == 0 {
+		o.putStr("<nil>")
+		return
+	}
+	r := typs.items[usize(t)]
+	k := r.kind
+	if k == TCBasic {
+		o.putStr(basicName(r.sub))
+	} else if k == TCNamed {
+		if r.d != 0 && len(strBytes(pkgs.items[usize(r.d)].path)) > 0 {
+			o.putBytes(nameBytes(pkgs.items[usize(r.d)].name))
+			o.putByte('.')
+		}
+		o.putBytes(nameBytes(u32(r.n)))
+		if r.l1n > 0 {
+			o.putByte('[')
+			putTypeList(o, l1Slice(t), depth-1)
+			o.putByte(']')
+		}
+	} else if k == TCArray {
+		o.putByte('[')
+		if r.b != 0 {
+			o.putBytes(nameBytes(u32(typs.items[usize(r.b)].n)))
+		} else {
+			o.putUint(r.n)
+		}
+		o.putByte(']')
+		putType(o, r.a, depth-1)
+	} else if k == TCSlice {
+		o.putStr("[]")
+		putType(o, r.a, depth-1)
+	} else if k == TCPointer {
+		o.putByte('*')
+		putType(o, r.a, depth-1)
+	} else if k == TCStruct {
+		o.putStr("struct{")
+		n := nfields(t)
+		for i := usize(0); i < n; i++ {
+			if i > 0 {
+				o.putStr("; ")
+			}
+			o.putBytes(nameBytes(fieldName(t, i)))
+			o.putByte(' ')
+			putType(o, fieldType(t, i), depth-1)
+		}
+		o.putByte('}')
+	} else if k == TCEnum {
+		o.putStr("enum{")
+		n := nvariants(t)
+		for i := usize(0); i < n; i++ {
+			if i > 0 {
+				o.putStr("; ")
+			}
+			o.putBytes(nameBytes(variantName(t, i)))
+			m := variantPayN(t, i)
+			if m > 0 {
+				o.putByte('(')
+				s := usize(variantPayS(t, i))
+				putTypeList(o, typs.lists[s:s+m], depth-1)
+				o.putByte(')')
+			}
+		}
+		o.putByte('}')
+	} else if k == TCSig {
+		if r.sub == EffDriver {
+			o.putStr("driver ")
+		} else if r.sub == EffComptime {
+			o.putStr("comptime ")
+		}
+		o.putStr("func(")
+		n := usize(r.l1n)
+		for i := usize(0); i < n; i++ {
+			if i > 0 {
+				o.putStr(", ")
+			}
+			if r.flag&1 != 0 && i == n-1 {
+				o.putStr("...")
+			}
+			putType(o, tl1(t, i), depth-1)
+		}
+		o.putByte(')')
+		m := usize(r.l2n)
+		if m == 1 {
+			o.putByte(' ')
+			putType(o, tl2(t, 0), depth-1)
+		} else if m > 1 {
+			o.putStr(" (")
+			putTypeList(o, l2Slice(t), depth-1)
+			o.putByte(')')
+		}
+	} else if k == TCCode {
+		if r.n == 0 {
+			o.putStr("Code ?")
+		} else {
+			o.putStr("Code ")
+			o.putUint(r.n - 1)
+		}
+	} else if k == TCTypeParam || k == TCOpaque {
+		o.putBytes(nameBytes(u32(r.n)))
+	} else if k == TCConstArg {
+		o.putUint(r.n)
+	} else if k == TCTuple {
+		o.putByte('(')
+		putTypeList(o, l1Slice(t), depth-1)
+		o.putByte(')')
+	}
+}
+
+// mtype writes a type into the diagnostic message.
+func mtype(t u32) {
+	o := &msgBuf
+	putType(o, t, SemaDepth)
+}
+
+// ---------------------------------------------------------------------------
+// Methods (types.Method) and builtin method IDs
+
+const (
+	BMNone               = 0
+	BMContextDone        = 1
+	BMContextErr         = 2
+	BMContextWithTimeout = 3
+	BMSignalsNotifyCtx   = 4
+	BMNetListenTCP       = 5
+	BMListenerAccept     = 6
+	BMListenerAddr       = 7
+	BMListenerClose      = 8
+	BMConnRead           = 9
+	BMConnWrite          = 10
+	BMConnCloseWrite     = 11
+	BMConnClose          = 12
+	BMScopeAcquireSlot   = 13
+	BMScopeReleaseSlot   = 14
+	BMScopeGo            = 15
+	BMScopeWaitTimeout   = 16
+	BMScopeWait          = 17
+	BMFSReadFileInto     = 18
+	BMFSWriteFile        = 19
+	BMFSIsDir            = 20
+	BMFSListSourceFiles  = 21
+	BMFSMkdirTemp        = 22
+	BMFSRemoveAll        = 23
+	BMEnvArgsCount       = 24
+	BMEnvArg             = 25
+	BMEnvGetEnv          = 26
+	BMStdioWriteStdout   = 27
+	BMStdioWriteStderr   = 28
+	BMExecRun            = 29
+)
+
+type Method struct {
+	name    u32
+	recv    u32 // origin receiver type (Named)
+	ptrRecv bool
+	builtin u8
+	rtpS    u32 // RecvTypeParams (type lists)
+	rtpN    u32
+	sig     u32 // signature without receiver (0 for the generic Scope methods)
+	sym     u32 // user methods
+	decl    u32
+}
+
+type MethodTable struct {
+	items [MaxMethods]Method
+	count usize
+}
+
+var meths MethodTable
+
+func newMethod(m Method) u32 {
+	if meths.count == 0 {
+		meths.count = 1
+	}
+	if meths.count >= MaxMethods {
+		setFull("methods")
+		return 0
+	}
+	id := meths.count
+	meths.count++
+	meths.items[id] = m
+	return u32(id)
+}
+
+func methodEffect(m u32) u8 {
+	s := meths.items[usize(m)].sig
+	if s != 0 {
+		return sigEffect(s)
+	}
+	return EffTotal
+}
+
+// ---------------------------------------------------------------------------
+// Predeclared named types and their methods (types/universe.go)
+
+var univNamed [NumBuiltins]u32
+var slotT u32
+
+func mkUnivNamed(b u8, under u32, class u8) u32 {
+	t := newNamed(internStr(builtinName(b)), builtinSym[usize(b)], 0, b)
+	typs.items[usize(t)].a = under
+	typs.items[usize(t)].cls = class
+	typs.items[usize(t)].flag = 1
+	univNamed[usize(b)] = t
+	return t
+}
+
+// addUnivMethod pushes one builtin method onto ustack (params/results are
+// on the type stack [m1:m2] / [m2:top]).
+func addUnivMethod(recv u8, name string, id u8, variadic bool, eff u8, m1 usize, m2 usize) {
+	sig := u32(0)
+	if id != BMScopeAcquireSlot && id != BMScopeReleaseSlot && id != BMScopeGo {
+		sig = mkSig(eff, variadic, m1, m2, typs.top)
+	} else {
+		typs.top = m1
+	}
+	var m Method
+	m.name = internStr(name)
+	m.recv = univNamed[usize(recv)]
+	m.builtin = id
+	m.sig = sig
+	upush(newMethod(m))
+}
+
+func setUnivMethods(recv u8, mark usize) {
+	s, n := ucommit(mark)
+	t := univNamed[usize(recv)]
+	typs.items[usize(t)].l3s = s
+	typs.items[usize(t)].l3n = n
+	typs.items[usize(t)].flag = typs.items[usize(t)].flag | 2
+}
+
+func initUnivTypes() {
+	duration := mkUnivNamed(BTDuration, TyU64, ClassValue)
+	signal := mkUnivNamed(BTSignal, TyU8, ClassValue)
+	sm := tmark()
+	tpush(internStr("Code"))
+	tpush(TyInt)
+	_ = mkUnivNamed(BTExitStatus, mkStruct(sm), ClassValue)
+	for b := u8(BTNet); b <= BTExec; b++ {
+		if b == BTNet || b == BTSignals || b == BTClock || b == BTContext || b == BTScope || b == BTFS || b == BTEnv || b == BTStdio || b == BTExec {
+			_ = mkUnivNamed(b, newOpaque(internStr(builtinName(b)), b), ClassScoped)
+		}
+	}
+	_ = mkUnivNamed(BTListener, newOpaque(internStr("Listener"), BTListener), ClassLinear)
+	_ = mkUnivNamed(BTConn, newOpaque(internStr("Conn"), BTConn), ClassLinear)
+	m0 := tmark()
+	_ = mkUnivNamed(BTCancelFunc, mkSig(EffTotal, false, m0, m0, m0), ClassLinear)
+	slot := mkUnivNamed(BTSlot, newOpaque(internStr("Slot"), BTSlot), ClassLinear)
+	slotT = newTypeParam(internStr("T"), 0, 0, 0)
+	sp := tmark()
+	tpush(slotT)
+	s2, n2 := tcommitStack(sp)
+	typs.items[usize(slot)].l2s = s2
+	typs.items[usize(slot)].l2n = n2
+	_ = mkUnivNamed(BTFieldCode, newOpaque(internStr("FieldCode"), BTFieldCode), ClassValue)
+
+	ctx := univNamed[BTContext]
+	bytesT := mkSlice(TyU8)
+	strs := mkSlice(TyString)
+	// Context
+	um := ustack.count
+	m := tmark()
+	tpush(TyBool)
+	addUnivMethod(BTContext, "Done", BMContextDone, false, EffTotal, m, m)
+	m = tmark()
+	tpush(TyError)
+	addUnivMethod(BTContext, "Err", BMContextErr, false, EffTotal, m, m)
+	m = tmark()
+	tpush(duration)
+	tpush(ctx)
+	addUnivMethod(BTContext, "WithTimeout", BMContextWithTimeout, false, EffTotal, m, m+1)
+	setUnivMethods(BTContext, um)
+	// Signals
+	um = ustack.count
+	m = tmark()
+	tpush(signal)
+	tpush(ctx)
+	tpush(univNamed[BTCancelFunc])
+	addUnivMethod(BTSignals, "NotifyContext", BMSignalsNotifyCtx, true, EffTotal, m, m+1)
+	setUnivMethods(BTSignals, um)
+	// Net
+	um = ustack.count
+	m = tmark()
+	tpush(TyString)
+	tpush(univNamed[BTListener])
+	tpush(TyError)
+	addUnivMethod(BTNet, "ListenTCP", BMNetListenTCP, false, EffTotal, m, m+1)
+	setUnivMethods(BTNet, um)
+	// Listener
+	um = ustack.count
+	m = tmark()
+	tpush(ctx)
+	tpush(univNamed[BTConn])
+	tpush(TyError)
+	addUnivMethod(BTListener, "Accept", BMListenerAccept, false, EffTotal, m, m+1)
+	m = tmark()
+	tpush(TyString)
+	addUnivMethod(BTListener, "Addr", BMListenerAddr, false, EffTotal, m, m)
+	m = tmark()
+	tpush(TyError)
+	addUnivMethod(BTListener, "Close", BMListenerClose, false, EffTotal, m, m)
+	setUnivMethods(BTListener, um)
+	// Conn
+	um = ustack.count
+	m = tmark()
+	tpush(ctx)
+	tpush(bytesT)
+	tpush(TyUsize)
+	tpush(TyError)
+	addUnivMethod(BTConn, "Read", BMConnRead, false, EffTotal, m, m+2)
+	m = tmark()
+	tpush(ctx)
+	tpush(bytesT)
+	tpush(TyUsize)
+	tpush(TyError)
+	addUnivMethod(BTConn, "Write", BMConnWrite, false, EffTotal, m, m+2)
+	m = tmark()
+	tpush(TyError)
+	addUnivMethod(BTConn, "CloseWrite", BMConnCloseWrite, false, EffTotal, m, m)
+	m = tmark()
+	tpush(TyError)
+	addUnivMethod(BTConn, "Close", BMConnClose, false, EffTotal, m, m)
+	setUnivMethods(BTConn, um)
+	// Scope
+	um = ustack.count
+	m = tmark()
+	addUnivMethod(BTScope, "AcquireSlot", BMScopeAcquireSlot, false, EffTotal, m, m)
+	addUnivMethod(BTScope, "ReleaseSlot", BMScopeReleaseSlot, false, EffTotal, m, m)
+	addUnivMethod(BTScope, "Go", BMScopeGo, false, EffTotal, m, m)
+	m = tmark()
+	tpush(duration)
+	tpush(TyBool)
+	addUnivMethod(BTScope, "WaitTimeout", BMScopeWaitTimeout, false, EffTotal, m, m+1)
+	m = tmark()
+	addUnivMethod(BTScope, "Wait", BMScopeWait, false, EffTotal, m, m)
+	setUnivMethods(BTScope, um)
+	// FS
+	um = ustack.count
+	m = tmark()
+	tpush(TyString)
+	tpush(bytesT)
+	tpush(TyUsize)
+	tpush(TyError)
+	addUnivMethod(BTFS, "ReadFileInto", BMFSReadFileInto, false, EffTotal, m, m+2)
+	m = tmark()
+	tpush(TyString)
+	tpush(bytesT)
+	tpush(TyError)
+	addUnivMethod(BTFS, "WriteFile", BMFSWriteFile, false, EffTotal, m, m+2)
+	m = tmark()
+	tpush(TyString)
+	tpush(TyBool)
+	addUnivMethod(BTFS, "IsDir", BMFSIsDir, false, EffTotal, m, m+1)
+	m = tmark()
+	tpush(TyString)
+	tpush(strs)
+	tpush(TyUsize)
+	tpush(TyError)
+	addUnivMethod(BTFS, "ListSourceFiles", BMFSListSourceFiles, false, EffTotal, m, m+2)
+	m = tmark()
+	tpush(TyString)
+	tpush(TyString)
+	tpush(TyError)
+	addUnivMethod(BTFS, "MkdirTemp", BMFSMkdirTemp, false, EffTotal, m, m+1)
+	m = tmark()
+	tpush(TyString)
+	tpush(TyError)
+	addUnivMethod(BTFS, "RemoveAll", BMFSRemoveAll, false, EffTotal, m, m+1)
+	setUnivMethods(BTFS, um)
+	// Env
+	um = ustack.count
+	m = tmark()
+	tpush(TyUsize)
+	addUnivMethod(BTEnv, "ArgsCount", BMEnvArgsCount, false, EffTotal, m, m)
+	m = tmark()
+	tpush(TyUsize)
+	tpush(TyString)
+	addUnivMethod(BTEnv, "Arg", BMEnvArg, false, EffTotal, m, m+1)
+	m = tmark()
+	tpush(TyString)
+	tpush(TyString)
+	tpush(TyBool)
+	addUnivMethod(BTEnv, "GetEnv", BMEnvGetEnv, false, EffTotal, m, m+1)
+	setUnivMethods(BTEnv, um)
+	// Stdio
+	um = ustack.count
+	m = tmark()
+	tpush(bytesT)
+	tpush(TyError)
+	addUnivMethod(BTStdio, "WriteStdout", BMStdioWriteStdout, false, EffTotal, m, m+1)
+	m = tmark()
+	tpush(bytesT)
+	tpush(TyError)
+	addUnivMethod(BTStdio, "WriteStderr", BMStdioWriteStderr, false, EffTotal, m, m+1)
+	setUnivMethods(BTStdio, um)
+	// Exec
+	um = ustack.count
+	m = tmark()
+	tpush(ctx)
+	tpush(TyString)
+	tpush(strs)
+	tpush(strs)
+	tpush(TyString)
+	tpush(bytesT)
+	tpush(univNamed[BTExitStatus])
+	tpush(TyUsize)
+	tpush(TyError)
+	addUnivMethod(BTExec, "Run", BMExecRun, false, EffDriver, m, m+6)
+	setUnivMethods(BTExec, um)
+}
+
+// predeclaredType returns the type of a predeclared type symbol (0 for
+// Code, El and anything that is not a type).
+func predeclaredType(b u8) u32 {
+	if b == BTByte {
+		return TyU8
+	}
+	if b >= BTBool && b <= BTUsize {
+		return u32(b) + 1 // BTBool..BTUsize line up with BkBool..BkUsize
+	}
+	if b == BTString {
+		return TyString
+	}
+	if b == BTError {
+		return TyError
+	}
+	if b == BTCode || b == BTEl {
+		return 0
+	}
+	return univNamed[usize(b)]
+}
+
+// ---------------------------------------------------------------------------
+// Typed model records (types.Info)
+
+// Expression kinds (types.ExprKind).
+const (
+	KNone        = 0
+	KValue       = 1
+	KVar         = 2
+	KConst       = 3
+	KType        = 4
+	KNoValue     = 5
+	KBuiltin     = 6
+	KFunc        = 7
+	KPackage     = 8
+	KVariantCtor = 9
+)
+
+// Call kinds (types.CallKind).
+const (
+	CallInvalid     = 0
+	CallFunc        = 1
+	CallMethod      = 2
+	CallBuiltinMeth = 3
+	CallBuiltin     = 4
+	CallConversion  = 5
+	CallVariant     = 6
+	CallValue       = 7
+)
+
+// Selection kinds (types.SelKind).
+const (
+	SelField   = 0
+	SelMethod  = 1
+	SelVariant = 2
+)
+
+// FuncInfo describes a function declaration, method or function literal.
+type FuncInfo struct {
+	sym       u32 // 0 for literals
+	decl      u32 // FuncDecl node (0 for literals)
+	lit       u32 // FuncLit node (0 for declarations)
+	outer     u32 // enclosing FuncInfo of a literal
+	effect    u8
+	sig       u32
+	method    u32
+	recvSym   u32
+	parS      u32 // parameter Ident nodes in order (ulists); symbol = defs[ident] (0 for `_`)
+	parN      u32
+	tpS       u32 // TypeParams (type lists)
+	tpN       u32
+	measure u32 // measure expression node (0 = none)
+	body      u32 // BlockStmt node
+	callH     u32 // calls in the body, source order (cells of CallExpr nodes)
+	callT     u32
+	litH      u32 // directly nested literals (cells of FuncInfo IDs)
+	litT      u32
+}
+
+type FuncTable struct {
+	items  [MaxFuncs]FuncInfo
+	count  usize
+	orderS u32 // Info.Funcs order (ulists), set by finish
+	orderN u32
+	main   u32
+}
+
+var funcs FuncTable
+
+func newFuncInfo(fi FuncInfo) u32 {
+	if funcs.count == 0 {
+		funcs.count = 1
+	}
+	if funcs.count >= MaxFuncs {
+		setFull("functions")
+		return 0
+	}
+	id := funcs.count
+	funcs.count++
+	funcs.items[id] = fi
+	return u32(id)
+}
+
+// Call describes a CallExpr (types.Call).
+type Call struct {
+	kind         u8
+	builtin      u8
+	effect       u8
+	folded       bool
+	resourceCtor bool
+	consumesRecv bool
+	consumesArg0 bool // ConsumesArgs == [0]
+	callee       u32  // function/method symbol, or the builtin's universe symbol
+	method       u32
+	recv         u32 // receiver expression node
+	recvType     u32
+	taS          u32 // TypeArgs (type lists)
+	taN          u32
+	sig          u32
+	conv         u32
+	variantType  u32 // enum type (as written) of CallVariant
+	variantEnum  u32 // its underlying Enum TypeID
+	variant      u32 // variant index
+}
+
+type CallTable struct {
+	items [MaxCalls]Call
+	count usize
+}
+
+var callTab CallTable
+
+// Selection describes a SelectorExpr x.f (types.Selection).
+type Selection struct {
+	kind     u8
+	indirect bool
+	recv     u32 // type of x (SelVariant: the enum type)
+	ctype    u32 // SelField: struct TypeID; SelVariant: underlying Enum TypeID
+	index    u32 // field or variant index
+	method   u32 // SelMethod
+}
+
+type SelTable struct {
+	items [MaxSels]Selection
+	count usize
+}
+
+var selTab SelTable
+
+// Instance is an instantiation of a generic function or type.
+type Inst struct {
+	sym     u32 // generic function/type symbol
+	named   u32 // instance type (0 for functions)
+	argS    u32 // type args (type lists)
+	argN    u32
+	sig     u32 // instantiated signature (functions)
+	generic bool
+}
+
+type InstTable struct {
+	items [MaxInsts]Inst
+	count usize
+}
+
+var insts InstTable
+
+// Per-node tables of the typed model.
+var ntype [MaxNodes]u32    // TypeOf
+var nmode [MaxNodes]u8     // KindOf (ExprKind)
+var nval [MaxNodes]u32     // ValueOf: value slot (0 = none)
+var ncall [MaxNodes]u32    // CallOf
+var nsel [MaxNodes]u32     // SelectionOf
+var ninst [MaxNodes]u32    // InstanceOf
+var nvarEnum [MaxNodes]u32 // VariantOf (CtorPattern): underlying Enum TypeID
+var nvarIdx [MaxNodes]u32  //   and variant index
+var nfunc [MaxNodes]u32    // FuncDecl/FuncLit -> FuncInfo
+
+// funcOfSym returns the FuncInfo of a function or method symbol.
+func funcOfSym(s u32) u32 {
+	if s == 0 || symKind(s) != SymFunc {
+		return 0
+	}
+	d := syms.items[usize(s)].decl
+	if d == 0 || nkind(d) != NkFuncDecl {
+		return 0
+	}
+	return nfunc[usize(d)]
+}
+
+// mfuncName writes FuncInfo.Name(): "f", "T.m" or "func literal".
+func mfuncName(fi u32) {
+	s := funcs.items[usize(fi)].sym
+	if s == 0 {
+		ms("func literal")
+		return
+	}
+	if syms.items[usize(s)].recvType != 0 {
+		mname(syms.items[usize(s)].recvType)
+		mbyte('.')
+	}
+	mname(syms.items[usize(s)].name)
+}
+
+// ---------------------------------------------------------------------------
+// Instantiation (typexpr.go: instantiate, completeInstance, subst)
+
+var pendOrigin [MaxPending]u32
+var pendInst [MaxPending]u32
+var npend usize
+
+// findInstRec finds the Info.InstanceList record of sym[args].
+func findInstRec(sym u32, args []u32) u32 {
+	n := insts.count
+	for i := usize(1); i < n; i++ {
+		if insts.items[i].sym == sym {
+			s := usize(insts.items[i].argS)
+			if u32sEqual(typs.lists[s:s+usize(insts.items[i].argN)], args) {
+				return u32(i)
+			}
+		}
+	}
+	return 0
+}
+
+func newInstRec(r Inst) u32 {
+	if insts.count == 0 {
+		insts.count = 1
+	}
+	if insts.count >= MaxInsts {
+		setFull("instances")
+		return 0
+	}
+	id := insts.count
+	insts.count++
+	insts.items[id] = r
+	return u32(id)
+}
+
+// instantiate returns the canonical instance origin[args]; node (if not 0)
+// records the instantiation in ninst.
+func instantiate(origin u32, args []u32, node u32, depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		setFull("recursion depth")
+		return TyInvalid
+	}
+	o := typs.items[usize(origin)]
+	var r TypeRec
+	r.kind = TCNamed
+	r.b = origin
+	r.n = o.n
+	r.c = o.c
+	r.d = o.d
+	r.sub = o.sub
+	if o.flag&1 != 0 && o.sub != 0 {
+		r.flag = 1
+		r.cls = o.cls
+	}
+	inst, isNew := internType(r, args, emptyU32(), emptyU32())
+	if inst == TyInvalid {
+		return TyInvalid
+	}
+	if isNew {
+		if typs.items[usize(origin)].a == 0 {
+			if npend >= MaxPending {
+				setFull("pending instances")
+			} else {
+				pendOrigin[npend] = origin
+				pendInst[npend] = inst
+				npend++
+			}
+		} else {
+			completeInstance(inst, depth-1)
+		}
+	}
+	ia := l1Slice(inst)
+	rec := findInstRec(o.c, ia)
+	if rec == 0 {
+		var ir Inst
+		ir.sym = o.c
+		ir.named = inst
+		ir.argS = typs.items[usize(inst)].l1s
+		ir.argN = typs.items[usize(inst)].l1n
+		ir.generic = anyTypeParam(ia)
+		rec = newInstRec(ir)
+	}
+	if node != 0 {
+		ninst[usize(node)] = rec
+	}
+	return inst
+}
+
+func completeInstance(inst u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	o := namedOrigin(inst)
+	u := typs.items[usize(o)].a
+	if u != 0 && tk(u) == TCOpaque {
+		typs.items[usize(inst)].a = u
+		return
+	}
+	ou := typs.items[usize(o)]
+	ti := typs.items[usize(inst)]
+	r := subst(u, ou.l2s, ou.l2n, ti.l1s, ti.l1n, depth-1)
+	typs.items[usize(inst)].a = r
+}
+
+// completePending completes the instances of origin created before its
+// underlying type was known.
+func completePending(origin u32) {
+	n := npend
+	for i := usize(0); i < n; i++ {
+		if pendOrigin[i] == origin {
+			pendOrigin[i] = 0
+			completeInstance(pendInst[i], SemaDepth)
+		}
+	}
+}
+
+// substLookup returns the binding of type parameter t (0 if unbound).
+func substLookup(t u32, tpS u32, tpN u32, argS u32, argN u32) u32 {
+	n := usize(tpN)
+	if usize(argN) < n {
+		n = usize(argN)
+	}
+	for i := usize(0); i < n; i++ {
+		if tlist(tpS, i) == t {
+			return tlist(argS, i)
+		}
+	}
+	return 0
+}
+
+// subst replaces the type parameters tps[i] by args[i] in t.
+func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		setFull("recursion depth")
+		return t
+	}
+	if t == 0 || tpN == 0 || argN == 0 {
+		return t
+	}
+	r := typs.items[usize(t)]
+	k := r.kind
+	if k == TCTypeParam {
+		b := substLookup(t, tpS, tpN, argS, argN)
+		if b != 0 {
+			return b
+		}
+		return t
+	}
+	if k == TCNamed {
+		if r.b == 0 {
+			return t
+		}
+		m := tmark()
+		n := usize(r.l1n)
+		changed := false
+		for i := usize(0); i < n; i++ {
+			a := tl1(t, i)
+			x := subst(a, tpS, tpN, argS, argN, depth-1)
+			if x != a {
+				changed = true
+			}
+			tpush(x)
+		}
+		if !changed {
+			typs.top = m
+			return t
+		}
+		s, cnt := tcommitStack(m)
+		return instantiate(r.b, typs.lists[usize(s):usize(s)+usize(cnt)], 0, depth-1)
+	}
+	if k == TCArray {
+		elem := subst(r.a, tpS, tpN, argS, argN, depth-1)
+		if r.b != 0 {
+			b := substLookup(r.b, tpS, tpN, argS, argN)
+			if b != 0 && tk(b) == TCConstArg {
+				return mkArray(typs.items[usize(b)].n, 0, elem)
+			}
+			if b != 0 && tk(b) == TCTypeParam {
+				return mkArray(0, b, elem)
+			}
+		}
+		return mkArray(r.n, r.b, elem)
+	}
+	if k == TCSlice {
+		return mkSlice(subst(r.a, tpS, tpN, argS, argN, depth-1))
+	}
+	if k == TCPointer {
+		return mkPointer(subst(r.a, tpS, tpN, argS, argN, depth-1))
+	}
+	if k == TCStruct {
+		m := tmark()
+		n := nfields(t)
+		for i := usize(0); i < n; i++ {
+			nm := fieldName(t, i)
+			ft := subst(fieldType(t, i), tpS, tpN, argS, argN, depth-1)
+			tpush(nm)
+			tpush(ft)
+		}
+		return mkStruct(m)
+	}
+	if k == TCEnum {
+		m := tmark()
+		n := nvariants(t)
+		for i := usize(0); i < n; i++ {
+			pm := tmark()
+			pn := variantPayN(t, i)
+			for j := usize(0); j < pn; j++ {
+				tpush(subst(variantPay(t, i, j), tpS, tpN, argS, argN, depth-1))
+			}
+			ps, pc := tcommitStack(pm)
+			tpush(variantName(t, i))
+			tpush(ps)
+			tpush(pc)
+		}
+		return mkEnum(m)
+	}
+	if k == TCSig {
+		m1 := tmark()
+		n := tl1n(t)
+		for i := usize(0); i < n; i++ {
+			tpush(subst(tl1(t, i), tpS, tpN, argS, argN, depth-1))
+		}
+		m2 := tmark()
+		nr := tl2n(t)
+		for i := usize(0); i < nr; i++ {
+			tpush(subst(tl2(t, i), tpS, tpN, argS, argN, depth-1))
+		}
+		m3 := tmark()
+		return mkSig(r.sub, r.flag&1 != 0, m1, m2, m3)
+	}
+	if k == TCTuple {
+		m := tmark()
+		n := tl1n(t)
+		for i := usize(0); i < n; i++ {
+			tpush(subst(tl1(t, i), tpS, tpN, argS, argN, depth-1))
+		}
+		x := mkTuple(tslice(m, typs.top))
+		typs.top = m
+		return x
+	}
+	return t
+}

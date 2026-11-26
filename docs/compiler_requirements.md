@@ -19,3 +19,14 @@ Reported by the M6 author; see compiler/README.md for details.
 15. Plain `for` in driver funcs must pass T1.
 16. T1 shapes: `for i := usize(<init>); i < <bound>; i++` with invariant local/param/const bound, non-zero init, break/continue in body.
 17. T3 SCCs: 33-method *Parser SCC, 4-method *Printer SCC, 2 self-recursive methods; each `decreases(depth)` with `if depth == 0 { return ... }` guard first and `depth - 1` on in-SCC calls; entry calls pass constants (ParseDepth=65536, WalkDepth=MaxNodes+1). Call graph needs method resolution by receiver type.
+
+## Added by M7 part A (semantic phases: sema/resolve/types/values/checker/check_expr/check_stmt/comptime.fc)
+
+18. Free total functions that read and write package-level Value arenas directly (`syms.items[usize(s)].typ = t`, `typs.items[usize(t)].flag = typs.items[usize(t)].flag | 2`); about 40 large globals (NodeArena ≈ 50 MB at MaxNodes = 524_288, value slots ≈ 100 MB virtual), never copied whole.
+19. Struct values passed and returned by value (`Val` 32 B, `Operand` ≈ 72 B, `TypeRec`, `Call`, `FuncInfo`), `var z Val` zero values, struct field copies `r := typs.items[usize(t)]`.
+20. Pointer parameters into global arrays and locals: `assignment(&opStack.items[i], t, c)`, `singleValue(&x)`, `putType(o *OutBuf, ...)` with `o := &msgBuf` (scope checker: origins at depth 0 or the caller's frame).
+21. Package-level `var` with a constant initializer (`var evalFuel u64 = DefaultFuel`); local fixed arrays (`var seen [NumBuiltins]bool`, `var digits [48]byte`, `var imps [MaxPkgs]u32` in a driver).
+22. `int` results and comparisons (`bytesCompare`, `cmp128`, `codeLevel`), 128-bit arithmetic on `u64` pairs with `^`, `&`, `|`, `<<`, `>>` by `u64` counts, wrapping `u64` multiplication.
+23. Recursion SCCs: one ≈ 80-function checker/interpreter SCC (`dp usize`, `decreases(dp)`, guard `if dp == 0 { tooDeep(); return ... }`, `dp-1` on every in-SCC call, entry with `SemaDepth`), plus smaller SCCs (binder, putType, classOf, subst/instantiate/completeInstance, copyVal, persistVal, equalVals, writeExpr, isTerminating, containsCall, ...). Recursion between driver funcs (`visitPackage` ↔ `loadImport`) is not checked.
+24. Multi-line conditions (`&&` at line end), `continue` in T1 loops, loops whose bound is a local copy of a global (`top := typs.top`), `for g := u64(0); g < lim; g++` with `lim := inBudget + 2`.
+25. Codegen: the generated `main` must keep printing `error: <err>` and exiting 1 for a non-nil error (scripts/diffcheck strips that line).

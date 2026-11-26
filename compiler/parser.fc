@@ -1574,10 +1574,12 @@ func (p *Parser) binary(prec u8, depth usize) u32 decreases(depth) {
 		if !ok || binOpPrec(op) < prec {
 			return x
 		}
+		opPos := (u64(p.tok.line) << 32) | u64(p.tok.col)
 		p.next()
 		y := p.binary(binOpPrec(op)+1, depth-1)
 		be := p.mk(NkBinaryExpr, s)
 		p.setOp(be, op)
+		p.na.items[usize(be)].ival = opPos
 		p.setA(be, x)
 		p.setB(be, y)
 		x = p.finish(be)

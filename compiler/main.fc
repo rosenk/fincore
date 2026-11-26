@@ -218,7 +218,10 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	if strEq(cmd, "parse") {
 		return runParse(fs, env, io)
 	}
-	if strEq(cmd, "check") || strEq(cmd, "build") || strEq(cmd, "run") || strEq(cmd, "test") {
+	if strEq(cmd, "check") {
+		return runCheck(fs, env, io)
+	}
+	if strEq(cmd, "build") || strEq(cmd, "run") || strEq(cmd, "test") {
 		eb.reset()
 		eb.putStr("finc1 ")
 		eb.putStr(cmd)
@@ -292,17 +295,77 @@ driver func runParse(fs FS, env Env, io Stdio) error {
 // parsePackage parses a file or all `.fc` files of a directory as one
 // package, then prints the diagnostics or (optionally) the AST dump.
 driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
-	eb := &errBuf
 	ob := &outBuf
+	np := &nodes
 	sources.used = 0
 	sources.nfiles = 0
-	eb.reset()
+	errBuf.len = 0
+	f0, f1, ndiag, err := parseSources(fs, io, path, false)
+	if err != nil {
+		return err
+	}
+	if ndiag > 0 {
+		if err := flushErr(io); err != nil {
+			return err
+		}
+		return ErrParse
+	}
+	if !dump {
+		return nil
+	}
+	nincluded := usize(0)
+	pkgName := ""
+	for i := f0; i < f1; i++ {
+		if sources.files[i].ok {
+			if nincluded == 0 {
+				pk := nodes.items[usize(nodes.items[usize(sources.files[i].root)].a)]
+				pkgName = bytesToStr(sources.bytes[usize(pk.tOff) : usize(pk.tOff)+usize(pk.tLen)])
+			}
+			nincluded++
+		}
+	}
+	ob.reset()
+	ob.putStr("Package ")
+	ob.putStr(pkgName)
+	ob.putStr(" (")
+	ob.putUint(u64(nincluded))
+	ob.putStr(" files)\n")
+	if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+		return err
+	}
+	d := Dumper{na: np, sa: &sources, src: sources.bytes[:], out: ob, tmp: &tmpBuf}
+	dp := &d
+	for i := f0; i < f1; i++ {
+		if !sources.files[i].ok {
+			continue
+		}
+		ob.reset()
+		dp.dumpNode(sources.files[i].root, 0, WalkDepth)
+		if outBuf.full {
+			return capacityFail(io, sources.files[i].path, "output buffer")
+		}
+		if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseSources parses a file or all `.fc` files of a directory as one
+// package, appending the files to sources.files. It returns the range of
+// the new files and the number of files with diagnostics. In parse mode
+// (check == false) the diagnostics accumulate in errBuf in file order; in
+// check mode they are added to the sorted diagnostic list. err is set for
+// I/O and capacity failures (already reported on stderr).
+driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize, usize, error) {
+	eb := &errBuf
+	f0 := sources.nfiles
 	nfiles := usize(0)
 	single := !fs.IsDir(path)
 	if !single {
 		n, err := fs.ListSourceFiles(path, fileNames[:])
 		if err != nil {
-			return ioFail(io, "open ", path, err)
+			return f0, f0, 0, ioFail(io, "open ", path, err)
 		}
 		if n == 0 {
 			eb.reset()
@@ -310,24 +373,31 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 			eb.putStr(path)
 			eb.putStr(": no .fc files in directory\n")
 			if e := flushErr(io); e != nil {
-				return e
+				return f0, f0, 0, e
 			}
-			return ErrNotFound
+			return f0, f0, 0, ErrNotFound
+		}
+		if f0+n > MaxFiles {
+			return f0, f0, 0, capacityFail(io, path, "files")
 		}
 		var pb [MaxPathBytes]byte
 		for i := usize(0); i < n; i++ {
 			k := cleanJoin(strBytes(path), strBytes(fileNames[i]), pb[:])
 			if k == 0 {
-				return capacityFail(io, path, "path too long")
+				return f0, f0, 0, capacityFail(io, path, "path too long")
 			}
-			sources.files[i].path = bytesToStr(pb[:k])
+			sources.files[f0+i].path = bytesToStr(pb[:k])
 		}
 		nfiles = n
 	} else {
-		sources.files[0].path = path
+		if f0+1 > MaxFiles {
+			return f0, f0, 0, capacityFail(io, path, "files")
+		}
+		sources.files[f0].path = path
 		nfiles = 1
 	}
-	sources.nfiles = nfiles
+	f1 := f0 + nfiles
+	sources.nfiles = f1
 
 	ndiag := usize(0)
 	nincluded := usize(0)
@@ -335,26 +405,26 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 	pkgName := ""
 	tp := &tokens
 	np := &nodes
-	for i := usize(0); i < nfiles; i++ {
+	for i := f0; i < f1; i++ {
 		fpath := sources.files[i].path
+		sources.files[i].root = 0
+		sources.files[i].ok = false
 		st := sources.used
 		n, err := fs.ReadFileInto(fpath, sources.bytes[st:])
 		if err != nil {
 			if single && err == ErrNotFound {
-				return ioFail(io, "stat ", fpath, err)
+				return f0, f1, ndiag, ioFail(io, "stat ", fpath, err)
 			}
-			return ioFail(io, "open ", fpath, err)
+			return f0, f1, ndiag, ioFail(io, "open ", fpath, err)
 		}
 		sources.files[i].start = st
 		sources.files[i].size = n
-		sources.files[i].root = 0
-		sources.files[i].ok = false
 		sources.used = st + n
 
 		lx := newLexer(sources.bytes[st : st+n])
 		lp := &lx
 		if !tokenize(lp, tp) {
-			return capacityFail(io, fpath, "tokens")
+			return f0, f1, ndiag, capacityFail(io, fpath, "tokens")
 		}
 
 		nodeMark := nodes.count
@@ -376,13 +446,17 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 		root := pp.run()
 		if nodes.full || listStack.full || errBuf.full {
 			errBuf.len = diagMark
-			return capacityFail(io, fpath, "AST nodes")
+			return f0, f1, ndiag, capacityFail(io, fpath, "AST nodes")
 		}
 		if root == 0 {
 			nodes.count = nodeMark
 			nodes.nlist = listMark
 			listStack.top = 0
 			ndiag++
+			if check {
+				addParseDiag(i, errBuf.data[diagMark:errBuf.len])
+				errBuf.len = diagMark
+			}
 			continue
 		}
 		np.assignIDs(root, WalkDepth)
@@ -405,46 +479,412 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 			eb.putStr(")")
 			diagEnd(eb)
 			ndiag++
+			if check {
+				addParseDiag(i, errBuf.data[diagMark:errBuf.len])
+				errBuf.len = diagMark
+			}
 			continue
 		}
 		sources.files[i].root = root
 		sources.files[i].ok = true
 		nincluded++
 	}
+	return f0, f1, ndiag, nil
+}
 
-	if ndiag > 0 {
-		if err := flushErr(io); err != nil {
+// ---------------------------------------------------------------------------
+// check
+
+driver func checkUsage(io Stdio) error {
+	if err := say(io, true, "usage: finc1 check [--comptime-fuel=N] <file.fc | dir>\n  -comptime-fuel uint\n    \tcomptime fuel budget per evaluation (default 1000000)\n"); err != nil {
+		return err
+	}
+	return ErrParse
+}
+
+// parseU64 parses a decimal u64 (false on syntax error or overflow).
+func parseU64(b []byte) (u64, bool) {
+	n := len(b)
+	if n == 0 {
+		return 0, false
+	}
+	v := u64(0)
+	for i := usize(0); i < n; i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := u64(c - '0')
+		if v > (0xFFFFFFFFFFFFFFFF-d)/10 {
+			return 0, false
+		}
+		v = v*10 + d
+	}
+	return v, true
+}
+
+// runCheck implements `check [--comptime-fuel=N] <file.fc | dir>`.
+driver func runCheck(fs FS, env Env, io Stdio) error {
+	eb := &errBuf
+	argc := env.ArgsCount()
+	fuel := u64(DefaultFuel)
+	operand := ""
+	nops := usize(0)
+	flagsDone := false
+	skipNext := false
+	for i := usize(2); i < argc; i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		a := env.Arg(i)
+		ab := strBytes(a)
+		isFlag := !flagsDone && nops == 0 && len(ab) > 1 && ab[0] == '-'
+		if isFlag && strEq(a, "--") {
+			flagsDone = true
+			continue
+		}
+		if !isFlag {
+			operand = a
+			nops++
+			continue
+		}
+		st := usize(1)
+		if ab[1] == '-' {
+			st = 2
+		}
+		eq := len(ab)
+		for k := st; k < len(ab); k++ {
+			if ab[k] == '=' {
+				eq = k
+				break
+			}
+		}
+		name := ab[st:eq]
+		if bytesEqual(name, strBytes("stats")) && eq == len(ab) {
+			semaStats = true
+			continue
+		}
+		if !bytesEqual(name, strBytes("comptime-fuel")) {
+			eb.reset()
+			eb.putStr("flag provided but not defined: -")
+			eb.putBytes(name)
+			eb.putByte('\n')
+			if err := flushErr(io); err != nil {
+				return err
+			}
+			return checkUsage(io)
+		}
+		val := ""
+		if eq < len(ab) {
+			val = bytesToStr(ab[eq+1:])
+		} else if i+1 < argc {
+			val = env.Arg(i + 1)
+			skipNext = true
+		} else {
+			eb.reset()
+			eb.putStr("flag needs an argument: -comptime-fuel\n")
+			if err := flushErr(io); err != nil {
+				return err
+			}
+			return checkUsage(io)
+		}
+		v, ok := parseU64(strBytes(val))
+		if !ok {
+			eb.reset()
+			eb.putStr("invalid value ")
+			putQuoted(eb, strBytes(val))
+			eb.putStr(" for flag -comptime-fuel: parse error\n")
+			if err := flushErr(io); err != nil {
+				return err
+			}
+			return checkUsage(io)
+		}
+		fuel = v
+	}
+	if nops != 1 {
+		return checkUsage(io)
+	}
+	if fuel == 0 {
+		if err := say(io, true, "finc1 check: --comptime-fuel must be positive\n"); err != nil {
 			return err
 		}
 		return ErrParse
 	}
-	if !dump {
-		return nil
-	}
+	evalFuel = fuel
+	return checkPath(fs, io, operand)
+}
 
-	ob.reset()
-	ob.putStr("Package ")
-	ob.putStr(pkgName)
-	ob.putStr(" (")
-	ob.putUint(u64(nincluded))
-	ob.putStr(" files)\n")
-	if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+// printDiags writes the sorted diagnostics to stderr.
+driver func printDiags(io Stdio) error {
+	eb := &errBuf
+	n := sortDiags()
+	eb.reset()
+	for i := usize(0); i < n; i++ {
+		eb.putBytes(diagLine(usize(diags.order[i])))
+		eb.putByte('\n')
+		if errBuf.len > MaxOutputBytes/2 {
+			if err := flushErr(io); err != nil {
+				return err
+			}
+		}
+	}
+	return flushErr(io)
+}
+
+// checkPath loads, resolves and type-checks the program rooted at path
+// (module root = current directory), like finc0's check.Run restricted to
+// the type-level passes.
+driver func checkPath(fs FS, io Stdio, path string) error {
+	sources.used = 0
+	sources.nfiles = 0
+	errBuf.len = 0
+	nameBlank = internStr("_")
+	nameMain = internStr("main")
+	f0, f1, _, err := parseSources(fs, io, path, true)
+	if err != nil {
 		return err
 	}
-	d := Dumper{na: np, sa: &sources, src: sources.bytes[:], out: ob, tmp: &tmpBuf}
-	dp := &d
-	for i := usize(0); i < nfiles; i++ {
-		if !sources.files[i].ok {
-			continue
+	var kb [MaxPathBytes]byte
+	kn := cleanPath(strBytes(path), kb[:])
+	root, lerr := visitPackage(fs, io, f0, f1, "", bytesToStr(kb[:kn]))
+	if lerr != nil {
+		return lerr
+	}
+	pkgs.root = root
+	if semaFull || nodes.full {
+		return capacityFail(io, path, semaFullWhat)
+	}
+	if diags.count > 0 {
+		if err := printDiags(io); err != nil {
+			return err
 		}
-		ob.reset()
-		dp.dumpNode(sources.files[i].root, 0, WalkDepth)
-		if outBuf.full {
-			return capacityFail(io, sources.files[i].path, "output buffer")
+		return ErrParse
+	}
+	resolveProgram()
+	if semaFull || nodes.full {
+		return capacityFail(io, path, semaFullWhat)
+	}
+	if diags.count > 0 {
+		if err := printDiags(io); err != nil {
+			return err
 		}
-		if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+		return ErrParse
+	}
+	checkProgram()
+	if semaFull || nodes.full {
+		return capacityFail(io, path, semaFullWhat)
+	}
+	if semaStats {
+		if err := printStats(io); err != nil {
 			return err
 		}
 	}
+	if diags.count > 0 {
+		if err := printDiags(io); err != nil {
+			return err
+		}
+		return ErrParse
+	}
 	return nil
+}
+
+var semaStats bool
+
+func statLine(o *OutBuf, what string, used usize, capacity usize) {
+	o.putStr(what)
+	o.putStr(": ")
+	o.putUint(u64(used))
+	o.putStr(" / ")
+	o.putUint(u64(capacity))
+	o.putByte('\n')
+}
+
+// printStats writes the arena usage (hidden flag --stats; capacity
+// planning for compiler/ itself).
+driver func printStats(io Stdio) error {
+	o := &outBuf
+	o.reset()
+	statLine(o, "files", sources.nfiles, MaxFiles)
+	statLine(o, "source bytes", sources.used, MaxSourceBytes)
+	statLine(o, "nodes", nodes.count, MaxNodes)
+	statLine(o, "node list items", nodes.nlist, MaxListItems)
+	statLine(o, "names", names.count, MaxNames)
+	statLine(o, "name bytes", names.used, MaxNameBytes)
+	statLine(o, "symbols", syms.count, MaxSyms)
+	statLine(o, "scopes", scopes.count, MaxScopes)
+	statLine(o, "u32 lists", ulists.count, MaxULists)
+	statLine(o, "cells", cells.count, MaxCells)
+	statLine(o, "types", typs.count, MaxTypes)
+	statLine(o, "type list items", typs.nlists, MaxTypeLists)
+	statLine(o, "methods", meths.count, MaxMethods)
+	statLine(o, "instances", insts.count, MaxInsts)
+	statLine(o, "funcs", funcs.count, MaxFuncs)
+	statLine(o, "calls", callTab.count, MaxCalls)
+	statLine(o, "selections", selTab.count, MaxSels)
+	statLine(o, "named types", nNamed, MaxNamed)
+	statLine(o, "constant value slots", vals.ptop, VtabCap)
+	statLine(o, "string pool bytes", nstr, MaxStrBytes)
+	statLine(o, "diagnostics", diags.count, MaxDiags)
+	return io.WriteStdout(outBuf.data[:outBuf.len])
+}
+
+// visitPackage registers the package made of sources.files[f0:f1] (state
+// "visiting"), loads its imports depth-first and appends it to the
+// dependency order (resolve/load.go: visit).
+driver func visitPackage(fs FS, io Stdio, f0 usize, f1 usize, importPath string, key string) (u32, error) {
+	if pkgs.count == 0 {
+		pkgs.count = 1
+	}
+	if pkgs.count >= MaxPkgs {
+		return 0, capacityFail(io, key, "packages")
+	}
+	pid := u32(pkgs.count)
+	pkgs.count++
+	name := u32(0)
+	for i := f0; i < f1; i++ {
+		if sources.files[i].ok {
+			name = idName(nodes.items[usize(sources.files[i].root)].a)
+			break
+		}
+	}
+	if name == 0 {
+		name = internStr("")
+	}
+	var pk Pkg
+	pk.name = name
+	pk.path = importPath
+	pk.key = key
+	pk.state = 1
+	pk.f0 = f0
+	pk.f1 = f1
+	pkgs.items[usize(pid)] = pk
+	var imps [MaxPkgs]u32
+	nimps := usize(0)
+	for i := f0; i < f1; i++ {
+		if !sources.files[i].ok {
+			continue
+		}
+		root := sources.files[i].root
+		ni := l1len(root)
+		for j := usize(0); j < ni; j++ {
+			imp := l1at(root, j)
+			nsp := l1len(imp)
+			for k := usize(0); k < nsp; k++ {
+				dep, err := loadImport(fs, io, l1at(imp, k))
+				if err != nil {
+					return 0, err
+				}
+				if dep == 0 {
+					continue
+				}
+				seen := false
+				for q := usize(0); q < nimps; q++ {
+					if imps[q] == dep {
+						seen = true
+						break
+					}
+				}
+				if !seen && nimps < MaxPkgs {
+					imps[nimps] = dep
+					nimps++
+				}
+			}
+		}
+	}
+	mark := ustack.count
+	for q := usize(0); q < nimps; q++ {
+		upush(imps[q])
+	}
+	is, in := ucommit(mark)
+	pkgs.items[usize(pid)].impS = is
+	pkgs.items[usize(pid)].impN = in
+	pkgs.items[usize(pid)].state = 2
+	pkgs.order[pkgs.norder] = pid
+	pkgs.norder++
+	return pid, nil
+}
+
+// validImportPath: non-empty, relative, clean, slash-separated, not
+// escaping the module root (decision 41).
+func validImportPath(ip []byte) bool {
+	n := len(ip)
+	if n == 0 || ip[0] == '/' {
+		return false
+	}
+	for i := usize(0); i < n; i++ {
+		if ip[i] == '\\' {
+			return false
+		}
+	}
+	if n >= 2 && ip[0] == '.' && ip[1] == '.' {
+		return false
+	}
+	var cb [MaxPathBytes]byte
+	k := cleanPath(ip, cb[:])
+	return k == n && bytesEqual(cb[:k], ip)
+}
+
+// loadImport resolves one import spec (resolve/load.go: importSpec);
+// problems are E2001/E2006 diagnostics.
+driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
+	pathLit := nodes.items[usize(spec)].b
+	ipb := importPathOf(spec)
+	ip := bytesToStr(ipb)
+	if !validImportPath(strBytes(ip)) {
+		mreset()
+		ms("invalid import path ")
+		mquote(strBytes(ip))
+		errAt(E2001, pathLit)
+		return 0, nil
+	}
+	n := pkgs.count
+	for p := usize(1); p < n; p++ {
+		if strEq(pkgs.items[p].key, ip) {
+			if pkgs.items[p].state == 1 {
+				mreset()
+				ms("import cycle not allowed: ")
+				mquote(strBytes(ip))
+				ms(" imports itself (directly or indirectly)")
+				errAt(E2006, pathLit)
+				return 0, nil
+			}
+			return u32(p), nil
+		}
+	}
+	if !fs.IsDir(ip) {
+		mreset()
+		ms("cannot find package ")
+		mquote(strBytes(ip))
+		ms(" (no directory ")
+		ms(ip)
+		ms(")")
+		errAt(E2001, pathLit)
+		return 0, nil
+	}
+	cnt, lerr := fs.ListSourceFiles(ip, fileNames[:])
+	if lerr != nil || cnt == 0 {
+		mreset()
+		ms("cannot find package ")
+		mquote(strBytes(ip))
+		ms(" (no .fc files in ")
+		ms(ip)
+		ms(")")
+		errAt(E2001, pathLit)
+		return 0, nil
+	}
+	f0, f1, _, err := parseSources(fs, io, ip, true)
+	if err != nil {
+		return 0, err
+	}
+	anyOK := false
+	for i := f0; i < f1; i++ {
+		if sources.files[i].ok {
+			anyOK = true
+		}
+	}
+	if !anyOK {
+		return 0, nil
+	}
+	return visitPackage(fs, io, f0, f1, ip, ip)
 }

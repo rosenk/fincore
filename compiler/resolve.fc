@@ -1,0 +1,1110 @@
+// resolve.fc — name resolution (port of finc0's bootstrap/internal/resolve:
+// universe.go, resolve.go). The loader that reads imported packages lives
+// in main.fc (it needs FS); this file builds the universe, declares the
+// package-level symbols of every package and binds every identifier use
+// (defs/uses side tables, function-literal captures).
+//
+// The binder is one recursive SCC (bindExpr, bindType, stmt, ...): every
+// member carries decreases(depth) and is entered with SemaDepth.
+package main
+
+// Predeclared entities (resolve.Builtin), in universe insertion order.
+const (
+	BNone        = 0
+	BTBool       = 1
+	BTU8         = 2
+	BTU16        = 3
+	BTU32        = 4
+	BTU64        = 5
+	BTI8         = 6
+	BTI16        = 7
+	BTI32        = 8
+	BTI64        = 9
+	BTInt        = 10
+	BTUsize      = 11
+	BTByte       = 12
+	BTString     = 13
+	BTError      = 14
+	BTDuration   = 15
+	BTSignal     = 16
+	BTExitStatus = 17
+	BTNet        = 18
+	BTSignals    = 19
+	BTClock      = 20
+	BTListener   = 21
+	BTConn       = 22
+	BTContext    = 23
+	BTCancelFunc = 24
+	BTScope      = 25
+	BTSlot       = 26
+	BTFS         = 27
+	BTEnv        = 28
+	BTStdio      = 29
+	BTExec       = 30
+	BTCode       = 31
+	BTEl         = 32
+	BTFieldCode  = 33
+
+	BCNanosecond   = 34
+	BCMicrosecond  = 35
+	BCMillisecond  = 36
+	BCSecond       = 37
+	BCSIGINT       = 38
+	BCSIGTERM      = 39
+	BCErrEOF       = 40
+	BCErrTimeout   = 41
+	BCErrCancelled = 42
+	BCErrZeroWrite = 43
+	BCErrClosed    = 44
+	BCErrIO        = 45
+	BCErrNotFound  = 46
+	BCErrMaxDepth  = 47
+	BCErrArenaFull = 48
+	BCErrExec      = 49
+	BCErrParse     = 50
+
+	BFLen        = 51
+	BFCap        = 52
+	BFCopy       = 53
+	BFBytesEqual = 54
+	BFStrBytes   = 55
+	BFBytesToStr = 56
+	BFFormatUint = 57
+	BFParseUint  = 58
+	BFNewContext = 59
+	BFNewScope   = 60
+	BFPanic      = 61
+	BFCodeEmpty  = 62
+	BFCodeUnit   = 63
+	BFCodeBool   = 64
+	BFCodeU8     = 65
+	BFCodeU16    = 66
+	BFCodeU32    = 67
+	BFCodeU64    = 68
+	BFCodeI8     = 69
+	BFCodeI16    = 70
+	BFCodeI32    = 71
+	BFCodeI64    = 72
+	BFCodeArray  = 73
+	BFCodeSlice  = 74
+	BFCodeStruct = 75
+	BFCodeField  = 76
+	BFCodeUniv   = 77
+
+	NumBuiltins = 78
+)
+
+func builtinName(b u8) string {
+	if b <= BTFieldCode {
+		return builtinTypeName(b)
+	}
+	if b <= BCErrParse {
+		return builtinConstName(b)
+	}
+	return builtinFuncName(b)
+}
+
+func builtinTypeName(b u8) string {
+	if b == BTBool {
+		return "bool"
+	}
+	if b == BTU8 {
+		return "u8"
+	}
+	if b == BTU16 {
+		return "u16"
+	}
+	if b == BTU32 {
+		return "u32"
+	}
+	if b == BTU64 {
+		return "u64"
+	}
+	if b == BTI8 {
+		return "i8"
+	}
+	if b == BTI16 {
+		return "i16"
+	}
+	if b == BTI32 {
+		return "i32"
+	}
+	if b == BTI64 {
+		return "i64"
+	}
+	if b == BTInt {
+		return "int"
+	}
+	if b == BTUsize {
+		return "usize"
+	}
+	if b == BTByte {
+		return "byte"
+	}
+	if b == BTString {
+		return "string"
+	}
+	if b == BTError {
+		return "error"
+	}
+	if b == BTDuration {
+		return "Duration"
+	}
+	if b == BTSignal {
+		return "Signal"
+	}
+	if b == BTExitStatus {
+		return "ExitStatus"
+	}
+	if b == BTNet {
+		return "Net"
+	}
+	if b == BTSignals {
+		return "Signals"
+	}
+	if b == BTClock {
+		return "Clock"
+	}
+	if b == BTListener {
+		return "Listener"
+	}
+	if b == BTConn {
+		return "Conn"
+	}
+	if b == BTContext {
+		return "Context"
+	}
+	if b == BTCancelFunc {
+		return "CancelFunc"
+	}
+	if b == BTScope {
+		return "Scope"
+	}
+	if b == BTSlot {
+		return "Slot"
+	}
+	if b == BTFS {
+		return "FS"
+	}
+	if b == BTEnv {
+		return "Env"
+	}
+	if b == BTStdio {
+		return "Stdio"
+	}
+	if b == BTExec {
+		return "Exec"
+	}
+	if b == BTCode {
+		return "Code"
+	}
+	if b == BTEl {
+		return "El"
+	}
+	if b == BTFieldCode {
+		return "FieldCode"
+	}
+	return "?"
+}
+
+func builtinConstName(b u8) string {
+	if b == BCNanosecond {
+		return "Nanosecond"
+	}
+	if b == BCMicrosecond {
+		return "Microsecond"
+	}
+	if b == BCMillisecond {
+		return "Millisecond"
+	}
+	if b == BCSecond {
+		return "Second"
+	}
+	if b == BCSIGINT {
+		return "SIGINT"
+	}
+	if b == BCSIGTERM {
+		return "SIGTERM"
+	}
+	if b == BCErrEOF {
+		return "ErrEOF"
+	}
+	if b == BCErrTimeout {
+		return "ErrTimeout"
+	}
+	if b == BCErrCancelled {
+		return "ErrCancelled"
+	}
+	if b == BCErrZeroWrite {
+		return "ErrZeroWrite"
+	}
+	if b == BCErrClosed {
+		return "ErrClosed"
+	}
+	if b == BCErrIO {
+		return "ErrIO"
+	}
+	if b == BCErrNotFound {
+		return "ErrNotFound"
+	}
+	if b == BCErrMaxDepth {
+		return "ErrMaxDepth"
+	}
+	if b == BCErrArenaFull {
+		return "ErrArenaFull"
+	}
+	if b == BCErrExec {
+		return "ErrExec"
+	}
+	if b == BCErrParse {
+		return "ErrParse"
+	}
+	return "?"
+}
+
+func builtinFuncName(b u8) string {
+	if b == BFLen {
+		return "len"
+	}
+	if b == BFCap {
+		return "cap"
+	}
+	if b == BFCopy {
+		return "copy"
+	}
+	if b == BFBytesEqual {
+		return "bytesEqual"
+	}
+	if b == BFStrBytes {
+		return "strBytes"
+	}
+	if b == BFBytesToStr {
+		return "bytesToStr"
+	}
+	if b == BFFormatUint {
+		return "formatUint"
+	}
+	if b == BFParseUint {
+		return "parseUint"
+	}
+	if b == BFNewContext {
+		return "NewContext"
+	}
+	if b == BFNewScope {
+		return "NewScope"
+	}
+	if b == BFPanic {
+		return "panic"
+	}
+	if b == BFCodeEmpty {
+		return "CodeEmpty"
+	}
+	if b == BFCodeUnit {
+		return "CodeUnit"
+	}
+	if b == BFCodeBool {
+		return "CodeBool"
+	}
+	if b == BFCodeU8 {
+		return "CodeU8"
+	}
+	if b == BFCodeU16 {
+		return "CodeU16"
+	}
+	if b == BFCodeU32 {
+		return "CodeU32"
+	}
+	if b == BFCodeU64 {
+		return "CodeU64"
+	}
+	if b == BFCodeI8 {
+		return "CodeI8"
+	}
+	if b == BFCodeI16 {
+		return "CodeI16"
+	}
+	if b == BFCodeI32 {
+		return "CodeI32"
+	}
+	if b == BFCodeI64 {
+		return "CodeI64"
+	}
+	if b == BFCodeArray {
+		return "CodeArray"
+	}
+	if b == BFCodeSlice {
+		return "CodeSlice"
+	}
+	if b == BFCodeStruct {
+		return "CodeStruct"
+	}
+	if b == BFCodeField {
+		return "CodeField"
+	}
+	if b == BFCodeUniv {
+		return "CodeUniv"
+	}
+	return "?"
+}
+
+func builtinIsType(b u8) bool {
+	return b >= BTBool && b <= BTFieldCode
+}
+
+func builtinIsConst(b u8) bool {
+	return b >= BCNanosecond && b <= BCErrParse
+}
+
+func builtinIsErrorSentinel(b u8) bool {
+	return b >= BCErrEOF && b <= BCErrParse
+}
+
+func builtinIsFunc(b u8) bool {
+	return b >= BFLen && b <= BFCodeUniv
+}
+
+func builtinIsCodeCtor(b u8) bool {
+	return b >= BFCodeEmpty && b <= BFCodeUniv
+}
+
+func builtinKind(b u8) u8 {
+	if builtinIsType(b) {
+		return SymType
+	}
+	if builtinIsConst(b) {
+		return SymConst
+	}
+	if builtinIsFunc(b) {
+		return SymBuiltin
+	}
+	return SymBad
+}
+
+// ---------------------------------------------------------------------------
+// Universe
+
+var universe u32
+var builtinSym [NumBuiltins]u32
+
+func newUniverse() {
+	universe = newScope(0, ScopeUniverse, 0)
+	for b := u8(1); b < NumBuiltins; b++ {
+		s := newSym(builtinKind(b), internStr(builtinName(b)), 0, 0, 0)
+		if s == 0 {
+			return
+		}
+		syms.items[usize(s)].builtin = b
+		_ = scopeInsert(universe, s)
+		builtinSym[usize(b)] = s
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Binder state
+
+var bPkg u32
+var bScope u32
+var bFuncs [MaxFuncNest]u32
+var bNFuncs usize
+
+func bPushFunc(n u32) {
+	if bNFuncs >= MaxFuncNest {
+		setFull("function nesting")
+		return
+	}
+	bFuncs[bNFuncs] = n
+	bNFuncs++
+}
+
+func bPopFunc() {
+	if bNFuncs > 0 {
+		bNFuncs--
+	}
+}
+
+// resolveProgram builds the universe and binds all loaded packages (in
+// dependency order). Diagnostics go to `diags`.
+func resolveProgram() {
+	newUniverse()
+	n := pkgs.norder
+	for i := usize(0); i < n; i++ {
+		declarePackage(pkgs.order[i])
+	}
+	for i := usize(0); i < n; i++ {
+		bindPackage(pkgs.order[i], SemaDepth)
+	}
+}
+
+// pkgAddDecl declares one package-level symbol (resolve's `add`).
+func pkgAddDecl(pkg u32, kind u8, id u32, decl u32) {
+	sym := newSym(kind, idName(id), id, decl, pkg)
+	if sym == 0 {
+		return
+	}
+	if kind == SymVar {
+		syms.items[usize(sym)].varKind = VarGlobal
+	}
+	upush(sym)
+	defs[usize(id)] = sym
+	if isBlank(id) {
+		return
+	}
+	old := scopeInsert(pkgs.items[usize(pkg)].scp, sym)
+	if old != 0 {
+		mreset()
+		mname(idName(id))
+		ms(" redeclared in this package (previous declaration at ")
+		mpos(syms.items[usize(old)].ident)
+		ms(")")
+		errAt(E2001, id)
+	}
+}
+
+func declarePackage(pkg u32) {
+	sc := newScope(universe, ScopePackage, 0)
+	pkgs.items[usize(pkg)].scp = sc
+	f0 := pkgs.items[usize(pkg)].f0
+	f1 := pkgs.items[usize(pkg)].f1
+	mark := ustack.count
+	for fi := f0; fi < f1; fi++ {
+		if !sources.files[fi].ok {
+			continue
+		}
+		root := sources.files[fi].root
+		nd := l2len(root)
+		for i := usize(0); i < nd; i++ {
+			d := l2at(root, i)
+			k := nkind(d)
+			if k == NkConstDecl {
+				ns := l1len(d)
+				for j := usize(0); j < ns; j++ {
+					s := l1at(d, j)
+					pkgAddDecl(pkg, SymConst, na(s), s)
+				}
+			} else if k == NkTypeDecl {
+				pkgAddDecl(pkg, SymType, na(d), d)
+			} else if k == NkVarDecl {
+				pkgAddDecl(pkg, SymVar, na(d), d)
+			} else if k == NkFuncDecl {
+				if na(d) != 0 {
+					name := nb(d)
+					sym := newSym(SymFunc, idName(name), name, d, pkg)
+					if sym == 0 {
+						return
+					}
+					syms.items[usize(sym)].recvType = idName(nb(na(d)))
+					upush(sym)
+					defs[usize(name)] = sym
+				} else {
+					pkgAddDecl(pkg, SymFunc, nb(d), d)
+				}
+			}
+		}
+	}
+	ds, dn := ucommit(mark)
+	pkgs.items[usize(pkg)].declS = ds
+	pkgs.items[usize(pkg)].declN = dn
+	// Methods (redeclared ones are reported and left out).
+	mark2 := ustack.count
+	for i := usize(0); i < usize(dn); i++ {
+		s := uat(ds, i)
+		if syms.items[usize(s)].recvType == 0 {
+			continue
+		}
+		old := u32(0)
+		top := ustack.count
+		for j := mark2; j < top; j++ {
+			m := ustack.items[j]
+			if syms.items[usize(m)].recvType == syms.items[usize(s)].recvType && syms.items[usize(m)].name == syms.items[usize(s)].name {
+				old = m
+				break
+			}
+		}
+		if old != 0 {
+			mreset()
+			ms("method ")
+			mname(syms.items[usize(s)].recvType)
+			mbyte('.')
+			mname(syms.items[usize(s)].name)
+			ms(" redeclared (previous declaration at ")
+			mpos(syms.items[usize(old)].ident)
+			ms(")")
+			errAt(E2001, syms.items[usize(s)].ident)
+		} else {
+			upush(s)
+		}
+	}
+	ms2, mn2 := ucommit(mark2)
+	pkgs.items[usize(pkg)].methS = ms2
+	pkgs.items[usize(pkg)].methN = mn2
+	for fi := f0; fi < f1; fi++ {
+		if !sources.files[fi].ok {
+			continue
+		}
+		fileScope[fi] = newScope(sc, ScopeFile, sources.files[fi].root)
+		filePkg[fi] = pkg
+	}
+}
+
+// importPathOf decodes the path literal of an import spec into tmpBuf and
+// returns it.
+func importPathOf(spec u32) []byte {
+	t := &tmpBuf
+	t.reset()
+	decodeStringLit(t, ntext(nb(spec)))
+	return tmpBuf.data[:tmpBuf.len]
+}
+
+func bindPackage(pkg u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	bPkg = pkg
+	f0 := pkgs.items[usize(pkg)].f0
+	f1 := pkgs.items[usize(pkg)].f1
+	for fi := f0; fi < f1; fi++ {
+		if !sources.files[fi].ok {
+			continue
+		}
+		fs := fileScope[fi]
+		root := sources.files[fi].root
+		ni := l1len(root)
+		for i := usize(0); i < ni; i++ {
+			imp := l1at(root, i)
+			nsp := l1len(imp)
+			for j := usize(0); j < nsp; j++ {
+				spec := l1at(imp, j)
+				ip := importPathOf(spec)
+				dep := u32(0)
+				nimp := usize(pkgs.items[usize(pkg)].impN)
+				for k := usize(0); k < nimp; k++ {
+					q := uat(pkgs.items[usize(pkg)].impS, k)
+					if bytesEqual(strBytes(pkgs.items[usize(q)].path), ip) {
+						dep = q
+						break
+					}
+				}
+				if dep == 0 {
+					continue
+				}
+				name := pkgs.items[usize(dep)].name
+				id := na(spec)
+				if id != 0 {
+					name = idName(id)
+				}
+				if name == nameBlank {
+					continue
+				}
+				sym := newSym(SymPackage, name, id, spec, pkg)
+				if sym == 0 {
+					return
+				}
+				syms.items[usize(sym)].imported = dep
+				if id != 0 {
+					defs[usize(id)] = sym
+				}
+				if scopeInsert(fs, sym) != 0 {
+					mreset()
+					mname(name)
+					ms(" redeclared in this file")
+					errAt(E2001, spec)
+				} else if lookupLocal(pkgs.items[usize(pkg)].scp, name) != 0 {
+					mreset()
+					ms("import name ")
+					mname(name)
+					ms(" conflicts with a package-level declaration")
+					errAt(E2001, spec)
+				}
+			}
+		}
+	}
+	for fi := f0; fi < f1; fi++ {
+		if !sources.files[fi].ok {
+			continue
+		}
+		bScope = fileScope[fi]
+		root := sources.files[fi].root
+		nd := l2len(root)
+		for i := usize(0); i < nd; i++ {
+			bTopDecl(l2at(root, i), depth-1)
+		}
+	}
+	bScope = 0
+}
+
+func bTopDecl(d u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	k := nkind(d)
+	if k == NkConstDecl {
+		ns := l1len(d)
+		for j := usize(0); j < ns; j++ {
+			s := l1at(d, j)
+			bindType(nb(s), depth-1)
+			bindExpr(nc(s), depth-1)
+		}
+	} else if k == NkVarDecl {
+		bindType(nb(d), depth-1)
+		bindExpr(nc(d), depth-1)
+	} else if k == NkTypeDecl {
+		outer := bScope
+		if nb(d) != 0 {
+			bScope = newScope(outer, ScopeTypeDecl, d)
+			bTypeParams(nb(d), depth-1)
+		}
+		bindType(nc(d), depth-1)
+		bScope = outer
+	} else if k == NkFuncDecl {
+		bFuncDecl(d, depth-1)
+	}
+}
+
+func bTypeParams(l u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	n := l1len(l)
+	for i := usize(0); i < n; i++ {
+		bindType(na(l1at(l, i)), depth-1)
+	}
+	for i := usize(0); i < n; i++ {
+		tp := l1at(l, i)
+		m := l1len(tp)
+		for j := usize(0); j < m; j++ {
+			_ = bDeclare(SymTypeParam, VarNone, l1at(tp, j), tp)
+		}
+	}
+}
+
+// bDeclare defines a new local symbol in the current scp.
+func bDeclare(kind u8, vk u8, id u32, decl u32) u32 {
+	sym := newSym(kind, idName(id), id, decl, bPkg)
+	if sym == 0 {
+		return 0
+	}
+	syms.items[usize(sym)].varKind = vk
+	if bNFuncs > 0 {
+		syms.items[usize(sym)].fn = bFuncs[bNFuncs-1]
+	}
+	if isBlank(id) {
+		return sym
+	}
+	defs[usize(id)] = sym
+	if scopeInsert(bScope, sym) != 0 {
+		mreset()
+		mname(idName(id))
+		ms(" redeclared in this block")
+		errAt(E2001, id)
+	}
+	return sym
+}
+
+func bFuncDecl(d u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	outer := bScope
+	bScope = newScope(outer, ScopeFunc, d)
+	bPushFunc(d)
+	r := na(d)
+	if r != 0 {
+		tn := nb(r)
+		tsym := lookupLocal(pkgs.items[usize(bPkg)].scp, idName(tn))
+		if tsym == 0 || symKind(tsym) != SymType {
+			mreset()
+			ms("undefined receiver type ")
+			mname(idName(tn))
+			ms(" (must be a type declared in package ")
+			mname(pkgs.items[usize(bPkg)].name)
+			ms(")")
+			errAt(E2001, tn)
+		} else {
+			uses[usize(tn)] = tsym
+		}
+		n := l1len(r)
+		for i := usize(0); i < n; i++ {
+			_ = bDeclare(SymTypeParam, VarNone, l1at(r, i), r)
+		}
+	}
+	if nc(d) != 0 {
+		bTypeParams(nc(d), depth-1)
+	}
+	bSignatureTypes(nd(d), depth-1)
+	if r != 0 {
+		_ = bDeclare(SymVar, VarRecv, na(r), r)
+	}
+	bParams(nd(d))
+	if ne(d) != 0 {
+		bindExpr(na(ne(d)), depth-1)
+	}
+	if nf(d) != 0 {
+		bStmts(nf(d), depth-1)
+	}
+	bPopFunc()
+	bScope = outer
+}
+
+func bSignatureTypes(s u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	n := l1len(s)
+	for i := usize(0); i < n; i++ {
+		bindType(na(l1at(s, i)), depth-1)
+	}
+	m := l2len(s)
+	for i := usize(0); i < m; i++ {
+		bindType(l2at(s, i), depth-1)
+	}
+}
+
+func bParams(s u32) {
+	n := l1len(s)
+	for i := usize(0); i < n; i++ {
+		p := l1at(s, i)
+		m := l1len(p)
+		for j := usize(0); j < m; j++ {
+			_ = bDeclare(SymVar, VarParam, l1at(p, j), p)
+		}
+	}
+}
+
+func bindType(t u32, depth usize) decreases(depth) {
+	if depth == 0 || t == 0 {
+		return
+	}
+	k := nkind(t)
+	if k == NkNamedType {
+		bNamedType(t, depth-1)
+	} else if k == NkArrayType {
+		bindExpr(na(t), depth-1)
+		bindType(nb(t), depth-1)
+	} else if k == NkSliceType || k == NkPointerType {
+		bindType(na(t), depth-1)
+	} else if k == NkStructType {
+		n := l1len(t)
+		for i := usize(0); i < n; i++ {
+			bindType(na(l1at(t, i)), depth-1)
+		}
+	} else if k == NkEnumType {
+		n := l1len(t)
+		for i := usize(0); i < n; i++ {
+			v := l1at(t, i)
+			m := l1len(v)
+			for j := usize(0); j < m; j++ {
+				bindType(l1at(v, j), depth-1)
+			}
+		}
+	} else if k == NkFuncType {
+		bSignatureTypes(na(t), depth-1)
+	} else if k == NkCodeType || k == NkElType {
+		bindExpr(na(t), depth-1)
+	}
+}
+
+func bNamedType(t u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	if na(t) != 0 {
+		_ = bQualified(na(t), nb(t))
+	} else {
+		_ = bLookup(nb(t))
+	}
+	n := l1len(t)
+	for i := usize(0); i < n; i++ {
+		bindExpr(l1at(t, i), depth-1)
+	}
+}
+
+// bQualified resolves pkg.Name; it returns false if pkg is not a package.
+func bQualified(pkg u32, name u32) bool {
+	ps := bLookup(pkg)
+	if ps == 0 {
+		return true
+	}
+	if symKind(ps) != SymPackage {
+		return false
+	}
+	nm := idName(name)
+	imp := syms.items[usize(ps)].imported
+	member := lookupLocal(pkgs.items[usize(imp)].scp, nm)
+	if member == 0 {
+		mreset()
+		ms("undefined: ")
+		mname(idName(pkg))
+		mbyte('.')
+		mname(nm)
+		errAt(E2001, name)
+	} else if !isExportedName(nm) {
+		mreset()
+		mname(idName(pkg))
+		mbyte('.')
+		mname(nm)
+		ms(" is not exported")
+		errAt(E2001, name)
+	} else {
+		uses[usize(name)] = member
+	}
+	return true
+}
+
+// bLookup resolves an identifier use, reporting E2001 if undefined.
+func bLookup(id u32) u32 {
+	if isBlank(id) {
+		mreset()
+		ms("cannot use _ as value")
+		errAt(E2001, id)
+		return 0
+	}
+	sym := lookupChain(bScope, idName(id))
+	if sym == 0 {
+		mreset()
+		ms("undefined: ")
+		mname(idName(id))
+		errAt(E2001, id)
+		return 0
+	}
+	uses[usize(id)] = sym
+	bNoteCapture(sym)
+	return sym
+}
+
+// bNoteCapture records sym as captured by every function literal between
+// the current function and the function declaring sym.
+func bNoteCapture(sym u32) {
+	sf := syms.items[usize(sym)].fn
+	if sf == 0 || bNFuncs == 0 || symKind(sym) == SymTypeParam {
+		return
+	}
+	n := bNFuncs
+	for k := usize(0); k < n; k++ {
+		fn := bFuncs[n-1-k]
+		if fn == sf {
+			return
+		}
+		if nkind(fn) != NkFuncLit {
+			return
+		}
+		dup := false
+		c := litCapHead[usize(fn)]
+		for g := usize(0); g < MaxCells; g++ {
+			if c == 0 {
+				break
+			}
+			if cellVal(c) == sym {
+				dup = true
+				break
+			}
+			c = cellNext(c)
+		}
+		if !dup {
+			h, t := cellAppend(litCapHead[usize(fn)], litCapTail[usize(fn)], sym)
+			litCapHead[usize(fn)] = h
+			litCapTail[usize(fn)] = t
+		}
+	}
+}
+
+func bindExpr(e u32, depth usize) decreases(depth) {
+	if depth == 0 || e == 0 {
+		return
+	}
+	k := nkind(e)
+	if k == NkIdent {
+		_ = bLookup(e)
+	} else if k == NkBinaryExpr {
+		bindExpr(na(e), depth-1)
+		bindExpr(nb(e), depth-1)
+	} else if k == NkUnaryExpr || k == NkParenExpr {
+		bindExpr(na(e), depth-1)
+	} else if k == NkCallExpr || k == NkIndexExpr {
+		bindExpr(na(e), depth-1)
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			bindExpr(l1at(e, i), depth-1)
+		}
+	} else if k == NkSliceExpr {
+		bindExpr(na(e), depth-1)
+		bindExpr(nb(e), depth-1)
+		bindExpr(nc(e), depth-1)
+	} else if k == NkSelectorExpr {
+		x := na(e)
+		if nkind(x) == NkIdent && !isBlank(x) {
+			_ = bQualified(x, nb(e))
+			return
+		}
+		bindExpr(x, depth-1)
+	} else if k == NkFuncLit {
+		outer := bScope
+		bScope = newScope(outer, ScopeFunc, e)
+		bSignatureTypes(na(e), depth-1)
+		bPushFunc(e)
+		bParams(na(e))
+		bStmts(nb(e), depth-1)
+		bPopFunc()
+		bScope = outer
+	} else if k == NkStructLit {
+		bNamedType(na(e), depth-1)
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			bindExpr(nb(l1at(e, i)), depth-1)
+		}
+	} else if k == NkTypeExpr {
+		bindType(na(e), depth-1)
+	}
+}
+
+// bStmts binds the statements of a block without opening a scp.
+func bStmts(bl u32, depth usize) decreases(depth) {
+	if depth == 0 || bl == 0 {
+		return
+	}
+	n := l1len(bl)
+	for i := usize(0); i < n; i++ {
+		bStmt(l1at(bl, i), depth-1)
+	}
+}
+
+func bBlock(bl u32, depth usize) decreases(depth) {
+	if depth == 0 || bl == 0 {
+		return
+	}
+	outer := bScope
+	bScope = newScope(outer, ScopeBlock, bl)
+	bStmts(bl, depth-1)
+	bScope = outer
+}
+
+func bStmt(s u32, depth usize) decreases(depth) {
+	if depth == 0 || s == 0 {
+		return
+	}
+	k := nkind(s)
+	if k == NkBlockStmt {
+		bBlock(s, depth-1)
+	} else if k == NkDeclStmt {
+		d := na(s)
+		if nkind(d) == NkConstDecl {
+			n := l1len(d)
+			for i := usize(0); i < n; i++ {
+				sp := l1at(d, i)
+				bindType(nb(sp), depth-1)
+				bindExpr(nc(sp), depth-1)
+				_ = bDeclare(SymConst, VarNone, na(sp), sp)
+			}
+		} else if nkind(d) == NkVarDecl {
+			bindType(nb(d), depth-1)
+			bindExpr(nc(d), depth-1)
+			_ = bDeclare(SymVar, VarLocal, na(d), d)
+		}
+	} else if k == NkShortVarDecl {
+		nv := l2len(s)
+		for i := usize(0); i < nv; i++ {
+			bindExpr(l2at(s, i), depth-1)
+		}
+		fresh := 0
+		nn := l1len(s)
+		for i := usize(0); i < nn; i++ {
+			id := l1at(s, i)
+			if isBlank(id) {
+				continue
+			}
+			old := lookupLocal(bScope, idName(id))
+			if old != 0 {
+				uses[usize(id)] = old
+				continue
+			}
+			fresh++
+			_ = bDeclare(SymVar, VarLocal, id, s)
+		}
+		if fresh == 0 {
+			mreset()
+			ms("no new variables on left side of :=")
+			errAt(E2002, s)
+		}
+	} else if k == NkAssignStmt {
+		nl := l1len(s)
+		for i := usize(0); i < nl; i++ {
+			l := l1at(s, i)
+			if nkind(l) == NkIdent && isBlank(l) && nop(s) == AsgAssign {
+				continue
+			}
+			bindExpr(l, depth-1)
+		}
+		nr := l2len(s)
+		for i := usize(0); i < nr; i++ {
+			bindExpr(l2at(s, i), depth-1)
+		}
+	} else if k == NkIncDecStmt || k == NkExprStmt || k == NkDeferStmt {
+		bindExpr(na(s), depth-1)
+	} else if k == NkReturnStmt {
+		n := l1len(s)
+		for i := usize(0); i < n; i++ {
+			bindExpr(l1at(s, i), depth-1)
+		}
+	} else if k == NkIfStmt {
+		outer := bScope
+		bScope = newScope(outer, ScopeBlock, s)
+		bStmt(na(s), depth-1)
+		bindExpr(nb(s), depth-1)
+		bBlock(nc(s), depth-1)
+		bStmt(nd(s), depth-1)
+		bScope = outer
+	} else if k == NkForStmt {
+		outer := bScope
+		bScope = newScope(outer, ScopeBlock, s)
+		bStmt(na(s), depth-1)
+		bindExpr(nb(s), depth-1)
+		bStmt(nc(s), depth-1)
+		if nd(s) != 0 {
+			bindExpr(na(nd(s)), depth-1)
+		}
+		bBlock(ne(s), depth-1)
+		bScope = outer
+	} else if k == NkMatchStmt {
+		bindExpr(na(s), depth-1)
+		n := l1len(s)
+		for i := usize(0); i < n; i++ {
+			bMatchArm(l1at(s, i), depth-1)
+		}
+	} else if k == NkScopeStmt {
+		bindExpr(nb(s), depth-1)
+		outer := bScope
+		bScope = newScope(outer, ScopeBlock, s)
+		_ = bDeclare(SymVar, VarScope, na(s), s)
+		bBlock(nc(s), depth-1)
+		bScope = outer
+	}
+}
+
+func bMatchArm(arm u32, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	outer := bScope
+	bScope = newScope(outer, ScopeBlock, arm)
+	cp := na(arm)
+	if nkind(cp) == NkCtorPattern {
+		if na(cp) != 0 {
+			_ = bQualified(na(cp), nb(cp))
+		} else if !nflag(cp) {
+			sym := lookupChain(bScope, idName(nb(cp)))
+			if sym != 0 && symKind(sym) == SymConst {
+				uses[usize(nb(cp))] = sym
+			}
+		}
+		n := l1len(cp)
+		for i := usize(0); i < n; i++ {
+			_ = bDeclare(SymVar, VarBinding, l1at(cp, i), cp)
+		}
+	}
+	if nb(arm) != 0 {
+		bindExpr(nb(arm), depth-1)
+	}
+	if nc(arm) != 0 {
+		bStmts(nc(arm), depth-1)
+	}
+	bScope = outer
+}

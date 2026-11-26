@@ -10,11 +10,11 @@
 package main
 
 const (
-	MaxFiles       = 64
+	MaxFiles       = 128
 	MaxSourceBytes = 4 * 1024 * 1024
 	MaxTokens      = 262_144
-	MaxNodes       = 131_072
-	MaxListItems   = 262_144
+	MaxNodes       = 524_288
+	MaxListItems   = 1_048_576
 	MaxOutputBytes = 8 * 1024 * 1024
 )
 

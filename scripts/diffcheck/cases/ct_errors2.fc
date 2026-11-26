@@ -1,0 +1,38 @@
+package main
+
+comptime func Loop(n u64) u64 {
+	s := u64(0)
+	for i := u64(0); i < n; i++ {
+		s += i
+	}
+	return s
+}
+
+comptime func Rec(n u64) u64 {
+	if n == 0 {
+		return 0
+	}
+	return Rec(n-1) + 1
+}
+
+comptime func NoRet(n u64) u64 {
+	if n > 5 {
+		return n
+	}
+}
+
+comptime func A(n u64) u64 {
+	return B(n)
+}
+
+comptime func B(n u64) u64 {
+	return A(n)
+}
+
+const L1 = Loop(100)
+const L2 = Loop(2000)
+const R1 = Rec(50)
+const R2 = Rec(20000)
+const N1 = NoRet(1)
+const AB = A(1)
+const Neg = Loop(-1)

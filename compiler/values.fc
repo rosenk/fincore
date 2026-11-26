@@ -1,0 +1,1375 @@
+// values.fc — compile-time values (port of finc0's types/value.go).
+//
+// A Val is a small by-value record. Integers are exact 128-bit two's
+// complement numbers (finc0 uses math/big; values outside ±2^127 set the
+// `ovf` flag, see README "Known gaps"). Aggregates (arrays, structs, enum
+// payloads, tuples, code trees) live in the value-slot arena: a Val refers
+// to its first element slot. The arena has two regions: the persistent
+// region (values recorded in the typed model) and the comptime heap, which
+// is reset after every evaluation root once the result has been copied
+// into the persistent region (persistVal). Pointers at compile time are
+// slot indices. String bytes live in strPool.
+package main
+
+const (
+	VtabCap          = 1 << 20
+	HeapCap          = 1 << 21
+	MaxValSlots      = VtabCap + HeapCap
+	MaxStrBytes      = 1 << 22
+	MaxComptimeElems = 1 << 20
+	MaxShift         = 1024
+	SignBit          = 0x8000000000000000
+	AllOnes          = 0xFFFFFFFFFFFFFFFF
+)
+
+// Value kinds.
+const (
+	VNone      = 0
+	VInt       = 1  // lo/hi: two's complement; flag&1: overflowed 128 bits
+	VBool      = 2  // lo: 0/1
+	VString    = 3  // ref: strPool offset, aux: length
+	VError     = 4  // lo: sentinel builtin (0 = nil error)
+	VNil       = 5  // untyped nil
+	VArray     = 6  // ref: first element slot, aux: length
+	VSlice     = 7  // flag&2: has array; ref: array's first slot, lo: array length, aux: lo, aux2: hi
+	VStruct    = 8  // ref, aux: field count
+	VEnum      = 9  // lo: variant index; ref, aux: payload
+	VTuple     = 10 // ref, aux: element count
+	VCode      = 11 // lo: code kind, hi: Len/Univ, ref: elem slot (array, slice) or fields (struct), aux: field count
+	VFieldCode = 12 // lo/hi: name (strPool offset/len), ref: slot of the Code value
+	VPtr       = 13 // ref: target slot (0 = nil pointer)
+)
+
+// Code kinds (types.CodeKind).
+const (
+	CKEmpty  = 0
+	CKUnit   = 1
+	CKBool   = 2
+	CKU8     = 3
+	CKU16    = 4
+	CKU32    = 5
+	CKU64    = 6
+	CKI8     = 7
+	CKI16    = 8
+	CKI32    = 9
+	CKI64    = 10
+	CKArray  = 11
+	CKSlice  = 12
+	CKStruct = 13
+	CKUniv   = 14
+)
+
+type Val struct {
+	lo   u64
+	hi   u64
+	ref  u32
+	aux  u32
+	aux2 u32
+	kind u8
+	flag u8
+}
+
+type ValArena struct {
+	items [MaxValSlots]Val
+	ptop  usize // persistent region [1, VtabCap)
+	htop  usize // heap region [VtabCap, MaxValSlots)
+}
+
+var vals ValArena
+
+var strPool [MaxStrBytes]byte
+var nstr usize
+
+// errTxt receives the text of value-operation errors (Go's error values).
+var errTxt OutBuf
+
+func etReset() {
+	errTxt.len = 0
+	errTxt.full = false
+}
+
+func et(s string) {
+	o := &errTxt
+	o.putStr(s)
+}
+
+// valAlloc reserves n zeroed slots in the heap or persistent region and
+// returns the first (0 if the region is full or n == 0).
+func valAlloc(n usize, heap bool) u32 {
+	if n == 0 {
+		return 0
+	}
+	st := usize(0)
+	if heap {
+		if vals.htop < VtabCap {
+			vals.htop = VtabCap
+		}
+		if vals.htop+n > MaxValSlots {
+			setFull("comptime heap")
+			return 0
+		}
+		st = vals.htop
+		vals.htop = st + n
+	} else {
+		if vals.ptop == 0 {
+			vals.ptop = 1
+		}
+		if vals.ptop+n > VtabCap {
+			setFull("constant values")
+			return 0
+		}
+		st = vals.ptop
+		vals.ptop = st + n
+	}
+	var z Val
+	for i := usize(0); i < n; i++ {
+		vals.items[st+i] = z
+	}
+	return u32(st)
+}
+
+// valStore stores v in a fresh persistent slot.
+func valStore(v Val) u32 {
+	s := valAlloc(1, false)
+	if s != 0 {
+		vals.items[usize(s)] = v
+	}
+	return s
+}
+
+func slotGet(s u32) Val {
+	return vals.items[usize(s)]
+}
+
+func slotSet(s u32, v Val) {
+	if s != 0 {
+		vals.items[usize(s)] = v
+	}
+}
+
+func strAlloc(b []byte) u32 {
+	n := len(b)
+	if nstr == 0 {
+		nstr = 1
+	}
+	if nstr+n > MaxStrBytes {
+		setFull("string pool")
+		return 0
+	}
+	st := nstr
+	k := copy(strPool[st:st+n], b)
+	nstr = st + k
+	return u32(st)
+}
+
+func strOf(v Val) []byte {
+	return strPool[usize(v.ref) : usize(v.ref)+usize(v.aux)]
+}
+
+// ---------------------------------------------------------------------------
+// Constructors
+
+func vIntU(u u64) Val {
+	var v Val
+	v.kind = VInt
+	v.lo = u
+	return v
+}
+
+func vInt(hi u64, lo u64) Val {
+	var v Val
+	v.kind = VInt
+	v.lo = lo
+	v.hi = hi
+	return v
+}
+
+func vIntOvf() Val {
+	var v Val
+	v.kind = VInt
+	v.flag = 1
+	return v
+}
+
+func vBool(b bool) Val {
+	var v Val
+	v.kind = VBool
+	if b {
+		v.lo = 1
+	}
+	return v
+}
+
+func vErr(b u8) Val {
+	var v Val
+	v.kind = VError
+	v.lo = u64(b)
+	return v
+}
+
+func vNilV() Val {
+	var v Val
+	v.kind = VNil
+	return v
+}
+
+func vStr(b []byte) Val {
+	var v Val
+	v.kind = VString
+	v.ref = strAlloc(b)
+	v.aux = u32(len(b))
+	return v
+}
+
+func vAgg(kind u8, ref u32, n usize) Val {
+	var v Val
+	v.kind = kind
+	v.ref = ref
+	v.aux = u32(n)
+	return v
+}
+
+func vCode(k u8) Val {
+	var v Val
+	v.kind = VCode
+	v.lo = u64(k)
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// 128-bit two's complement integers
+
+func isNeg128(hi u64) bool {
+	return hi&SignBit != 0
+}
+
+func neg128(hi u64, lo u64) (u64, u64) {
+	l := (lo ^ AllOnes) + 1
+	h := hi ^ AllOnes
+	if l == 0 {
+		h++
+	}
+	return h, l
+}
+
+func abs128(hi u64, lo u64) (u64, u64) {
+	if isNeg128(hi) {
+		return neg128(hi, lo)
+	}
+	return hi, lo
+}
+
+func add128(ah u64, al u64, bh u64, bl u64) (u64, u64, bool) {
+	lo := al + bl
+	c := u64(0)
+	if lo < al {
+		c = 1
+	}
+	hi := ah + bh + c
+	ovf := isNeg128(ah) == isNeg128(bh) && isNeg128(hi) != isNeg128(ah)
+	return hi, lo, ovf
+}
+
+func sub128(ah u64, al u64, bh u64, bl u64) (u64, u64, bool) {
+	lo := al - bl
+	c := u64(0)
+	if al < bl {
+		c = 1
+	}
+	hi := ah - bh - c
+	ovf := isNeg128(ah) != isNeg128(bh) && isNeg128(hi) != isNeg128(ah)
+	return hi, lo, ovf
+}
+
+// mul64 returns the 128-bit product of a and b.
+func mul64(a u64, b u64) (u64, u64) {
+	a0 := a & 0xFFFFFFFF
+	a1 := a >> 32
+	b0 := b & 0xFFFFFFFF
+	b1 := b >> 32
+	p00 := a0 * b0
+	p01 := a0 * b1
+	p10 := a1 * b0
+	p11 := a1 * b1
+	mid := (p00 >> 32) + (p01 & 0xFFFFFFFF) + (p10 & 0xFFFFFFFF)
+	lo := (p00 & 0xFFFFFFFF) | (mid << 32)
+	hi := p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)
+	return hi, lo
+}
+
+func mulU128(ah u64, al u64, bh u64, bl u64) (u64, u64, bool) {
+	if ah != 0 && bh != 0 {
+		return 0, 0, true
+	}
+	h0, l0 := mul64(al, bl)
+	h1, l1 := mul64(ah, bl)
+	h2, l2 := mul64(al, bh)
+	if h1 != 0 || h2 != 0 {
+		return 0, 0, true
+	}
+	hi := h0 + l1
+	if hi < h0 {
+		return 0, 0, true
+	}
+	hi2 := hi + l2
+	if hi2 < hi {
+		return 0, 0, true
+	}
+	return hi2, l0, false
+}
+
+func mul128(ah u64, al u64, bh u64, bl u64) (u64, u64, bool) {
+	neg := isNeg128(ah) != isNeg128(bh)
+	xh, xl := abs128(ah, al)
+	yh, yl := abs128(bh, bl)
+	h, l, ovf := mulU128(xh, xl, yh, yl)
+	if ovf {
+		return 0, 0, true
+	}
+	if neg {
+		if h > SignBit || (h == SignBit && l != 0) {
+			return 0, 0, true
+		}
+		rh, rl := neg128(h, l)
+		return rh, rl, false
+	}
+	if h >= SignBit {
+		return 0, 0, true
+	}
+	return h, l, false
+}
+
+func geU128(ah u64, al u64, bh u64, bl u64) bool {
+	if ah != bh {
+		return ah > bh
+	}
+	return al >= bl
+}
+
+// divModU128 divides unsigned 128-bit numbers (d != 0).
+func divModU128(nh u64, nl u64, dh u64, dl u64) (u64, u64, u64, u64) {
+	if nh == 0 && dh == 0 {
+		return 0, nl / dl, 0, nl % dl
+	}
+	qh := u64(0)
+	ql := u64(0)
+	rh := u64(0)
+	rl := u64(0)
+	for i := u64(0); i < 128; i++ {
+		b := 127 - i
+		bit := u64(0)
+		if b >= 64 {
+			bit = (nh >> (b - 64)) & 1
+		} else {
+			bit = (nl >> b) & 1
+		}
+		rh = (rh << 1) | (rl >> 63)
+		rl = (rl << 1) | bit
+		if geU128(rh, rl, dh, dl) {
+			if rl < dl {
+				rh--
+			}
+			rl = rl - dl
+			rh = rh - dh
+			if b >= 64 {
+				qh = qh | (u64(1) << (b - 64))
+			} else {
+				ql = ql | (u64(1) << b)
+			}
+		}
+	}
+	return qh, ql, rh, rl
+}
+
+// quoRem128: truncated division (big.Int Quo/Rem). ovf for MIN / -1.
+func quoRem128(ah u64, al u64, bh u64, bl u64) (u64, u64, u64, u64, bool) {
+	xh, xl := abs128(ah, al)
+	yh, yl := abs128(bh, bl)
+	qh, ql, rh, rl := divModU128(xh, xl, yh, yl)
+	if isNeg128(ah) != isNeg128(bh) {
+		qh, ql = neg128(qh, ql)
+	} else if qh >= SignBit {
+		return 0, 0, 0, 0, true
+	}
+	if isNeg128(ah) {
+		rh, rl = neg128(rh, rl)
+	}
+	return qh, ql, rh, rl, false
+}
+
+func shl128(hi u64, lo u64, n u64) (u64, u64) {
+	if n == 0 {
+		return hi, lo
+	}
+	if n >= 128 {
+		return 0, 0
+	}
+	if n >= 64 {
+		return lo << (n - 64), 0
+	}
+	return (hi << n) | (lo >> (64 - n)), lo << n
+}
+
+// sar128 is an arithmetic right shift.
+func sar128(hi u64, lo u64, n u64) (u64, u64) {
+	fill := u64(0)
+	if isNeg128(hi) {
+		fill = AllOnes
+	}
+	if n == 0 {
+		return hi, lo
+	}
+	if n >= 128 {
+		return fill, fill
+	}
+	if n >= 64 {
+		l := hi >> (n - 64)
+		if n > 64 {
+			l = l | (fill << (128 - n))
+		}
+		return fill, l
+	}
+	l := (lo >> n) | (hi << (64 - n))
+	h := (hi >> n) | (fill << (64 - n))
+	return h, l
+}
+
+// cmp128 compares signed 128-bit numbers.
+func cmp128(ah u64, al u64, bh u64, bl u64) int {
+	xa := ah ^ SignBit
+	xb := bh ^ SignBit
+	if xa != xb {
+		if xa < xb {
+			return -1
+		}
+		return 1
+	}
+	if al != bl {
+		if al < bl {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+func intSign(v Val) int {
+	if isNeg128(v.hi) {
+		return -1
+	}
+	if v.hi == 0 && v.lo == 0 {
+		return 0
+	}
+	return 1
+}
+
+// putInt128 writes the decimal form of an integer value.
+func putInt128(o *OutBuf, v Val) {
+	if v.flag&1 != 0 {
+		o.putStr("<overflow>")
+		return
+	}
+	h := v.hi
+	l := v.lo
+	if isNeg128(h) {
+		o.putByte('-')
+		h, l = neg128(h, l)
+	}
+	if h == 0 {
+		o.putUint(l)
+		return
+	}
+	var digits [48]byte
+	n := usize(0)
+	for g := usize(0); g < 48; g++ {
+		if h == 0 && l == 0 {
+			break
+		}
+		qh, ql, r := divSmall128(h, l, 10)
+		digits[n] = byte('0' + r)
+		n++
+		h = qh
+		l = ql
+	}
+	for i := usize(0); i < n; i++ {
+		o.putByte(digits[n-1-i])
+	}
+}
+
+func divSmall128(h u64, l u64, d u64) (u64, u64, u64) {
+	qh := h / d
+	r := h % d
+	x := (r << 32) | (l >> 32)
+	q1 := x / d
+	r = x % d
+	y := (r << 32) | (l & 0xFFFFFFFF)
+	q0 := y / d
+	r = y % d
+	return qh, (q1 << 32) | q0, r
+}
+
+// inRange reports whether integer v fits a bits-wide integer type.
+func inRange(v Val, bits u32, signed bool) bool {
+	if v.flag&1 != 0 {
+		return false
+	}
+	if signed {
+		lim := u64(1) << u64(bits-1)
+		if isNeg128(v.hi) {
+			// v >= -lim
+			if v.hi != AllOnes {
+				return false
+			}
+			if bits == 64 {
+				return v.lo >= SignBit
+			}
+			return v.lo >= AllOnes-lim+1
+		}
+		return v.hi == 0 && v.lo < lim
+	}
+	if v.hi != 0 {
+		return false
+	}
+	if bits == 64 {
+		return true
+	}
+	return v.lo < (u64(1) << u64(bits))
+}
+
+// representable reports whether constant v fits type t.
+func representable(v Val, t u32) bool {
+	if v.kind == VInt {
+		bits, signed, ok := intInfo(t)
+		if ok {
+			return inRange(v, bits, signed)
+		}
+		return isUntyped(t) && isInteger(t)
+	}
+	if v.kind == VBool {
+		return isBoolean(t)
+	}
+	if v.kind == VString {
+		return isString(t)
+	}
+	return true
+}
+
+// wrapVal truncates an integer to the range of t (two's complement).
+func wrapVal(v Val, t u32) Val {
+	if v.kind != VInt {
+		return v
+	}
+	bits, signed, ok := intInfo(t)
+	if !ok || inRange(v, bits, signed) {
+		return v
+	}
+	lo := v.lo
+	if bits < 64 {
+		lo = lo & ((u64(1) << u64(bits)) - 1)
+	}
+	hi := u64(0)
+	if signed && (lo>>u64(bits-1))&1 == 1 {
+		if bits < 64 {
+			lo = lo | (u64(AllOnes) << u64(bits))
+		}
+		hi = AllOnes
+	}
+	return vInt(hi, lo)
+}
+
+// valUint64 returns v as a u64 if it is a non-negative integer that fits.
+func valUint64(v Val) (u64, bool) {
+	if v.kind != VInt || v.flag&1 != 0 || v.hi != 0 {
+		return 0, false
+	}
+	return v.lo, true
+}
+
+// ---------------------------------------------------------------------------
+// Value strings (Value.String)
+
+func putVal(o *OutBuf, v Val, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	k := v.kind
+	if k == VInt {
+		putInt128(o, v)
+	} else if k == VBool {
+		if v.lo != 0 {
+			o.putStr("true")
+		} else {
+			o.putStr("false")
+		}
+	} else if k == VString {
+		putQuoted(o, strOf(v))
+	} else if k == VError {
+		if v.lo == 0 {
+			o.putStr("nil")
+		} else {
+			o.putStr(builtinName(u8(v.lo)))
+		}
+	} else if k == VNil {
+		o.putStr("nil")
+	} else if k == VArray {
+		putElems(o, v.ref, usize(v.aux), depth-1)
+	} else if k == VSlice {
+		if v.flag&2 == 0 {
+			o.putStr("[]")
+		} else {
+			putElems(o, v.ref+v.aux, usize(v.aux2-v.aux), depth-1)
+		}
+	} else if k == VStruct {
+		o.putByte('{')
+		putValList(o, v.ref, usize(v.aux), depth-1)
+		o.putByte('}')
+	} else if k == VEnum {
+		o.putStr("variant#")
+		o.putUint(v.lo)
+		if v.aux > 0 {
+			o.putByte('(')
+			putValList(o, v.ref, usize(v.aux), depth-1)
+			o.putByte(')')
+		}
+	} else if k == VTuple {
+		o.putByte('(')
+		putValList(o, v.ref, usize(v.aux), depth-1)
+		o.putByte(')')
+	} else if k == VCode {
+		putCode(o, v, depth-1)
+	} else if k == VFieldCode {
+		o.putStr("CodeField(")
+		putQuoted(o, strPool[usize(v.lo):usize(v.lo)+usize(v.hi)])
+		o.putStr(", ")
+		putVal(o, slotGet(v.ref), depth-1)
+		o.putByte(')')
+	} else if k == VPtr {
+		o.putByte('&')
+		if v.ref != 0 {
+			putVal(o, slotGet(v.ref), depth-1)
+		} else {
+			o.putStr("<nil>")
+		}
+	}
+}
+
+func putValList(o *OutBuf, ref u32, n usize, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	for i := usize(0); i < n; i++ {
+		if i > 0 {
+			o.putStr(", ")
+		}
+		putVal(o, slotGet(ref+u32(i)), depth-1)
+	}
+}
+
+func putElems(o *OutBuf, ref u32, n usize, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	o.putByte('[')
+	for i := usize(0); i < n; i++ {
+		if i > 0 {
+			o.putStr(", ")
+		}
+		if i == 8 {
+			o.putStr("...")
+			break
+		}
+		putVal(o, slotGet(ref+u32(i)), depth-1)
+	}
+	o.putByte(']')
+}
+
+func codeKindName(k u64) string {
+	if k == CKEmpty {
+		return "CodeEmpty"
+	}
+	if k == CKUnit {
+		return "CodeUnit"
+	}
+	if k == CKBool {
+		return "CodeBool"
+	}
+	if k == CKU8 {
+		return "CodeU8"
+	}
+	if k == CKU16 {
+		return "CodeU16"
+	}
+	if k == CKU32 {
+		return "CodeU32"
+	}
+	if k == CKU64 {
+		return "CodeU64"
+	}
+	if k == CKI8 {
+		return "CodeI8"
+	}
+	if k == CKI16 {
+		return "CodeI16"
+	}
+	if k == CKI32 {
+		return "CodeI32"
+	}
+	if k == CKI64 {
+		return "CodeI64"
+	}
+	if k == CKArray {
+		return "CodeArray"
+	}
+	if k == CKSlice {
+		return "CodeSlice"
+	}
+	if k == CKStruct {
+		return "CodeStruct"
+	}
+	return "CodeUniv"
+}
+
+func putCode(o *OutBuf, v Val, depth usize) decreases(depth) {
+	if depth == 0 {
+		return
+	}
+	k := v.lo
+	if k == CKArray {
+		o.putStr("CodeArray(")
+		o.putUint(v.hi)
+		o.putStr(", ")
+		putVal(o, slotGet(v.ref), depth-1)
+		o.putByte(')')
+	} else if k == CKSlice {
+		o.putStr("CodeSlice(")
+		putVal(o, slotGet(v.ref), depth-1)
+		o.putByte(')')
+	} else if k == CKStruct {
+		o.putStr("CodeStruct(")
+		putValList(o, v.ref, usize(v.aux), depth-1)
+		o.putByte(')')
+	} else if k == CKUniv {
+		o.putStr("CodeUniv(")
+		o.putUint(v.hi)
+		o.putByte(')')
+	} else {
+		o.putStr(codeKindName(k))
+		o.putStr("()")
+	}
+}
+
+// mval writes a value into the diagnostic message; etval into errTxt.
+func mval(v Val) {
+	o := &msgBuf
+	putVal(o, v, SemaDepth)
+}
+
+func etval(v Val) {
+	o := &errTxt
+	putVal(o, v, SemaDepth)
+}
+
+// ---------------------------------------------------------------------------
+// Copying
+
+// copyVal deep-copies arrays, structs and enums into the comptime heap
+// (types.CopyValue); other values are returned as is.
+func copyVal(v Val, depth usize) Val decreases(depth) {
+	if depth == 0 {
+		return v
+	}
+	k := v.kind
+	if k != VArray && k != VStruct && k != VEnum {
+		return v
+	}
+	n := usize(v.aux)
+	if n == 0 {
+		return v
+	}
+	st := valAlloc(n, true)
+	if st == 0 {
+		return v
+	}
+	for i := usize(0); i < n; i++ {
+		vals.items[usize(st)+i] = copyVal(slotGet(v.ref+u32(i)), depth-1)
+	}
+	r := v
+	r.ref = st
+	return r
+}
+
+func copyV(v Val) Val {
+	return copyVal(v, SemaDepth)
+}
+
+// persistVal copies v and everything it refers to into the persistent
+// region (comptime results outlive the heap of their evaluation).
+func persistVal(v Val, depth usize) Val decreases(depth) {
+	if depth == 0 {
+		return v
+	}
+	k := v.kind
+	if k == VArray || k == VStruct || k == VEnum || k == VTuple || (k == VCode && v.lo == CKStruct) {
+		n := usize(v.aux)
+		if n == 0 {
+			return v
+		}
+		st := valAlloc(n, false)
+		if st == 0 {
+			return v
+		}
+		for i := usize(0); i < n; i++ {
+			vals.items[usize(st)+i] = persistVal(slotGet(v.ref+u32(i)), depth-1)
+		}
+		r := v
+		r.ref = st
+		return r
+	}
+	if k == VSlice {
+		if v.flag&2 == 0 || v.lo == 0 {
+			return v
+		}
+		n := usize(v.lo)
+		st := valAlloc(n, false)
+		if st == 0 {
+			return v
+		}
+		for i := usize(0); i < n; i++ {
+			vals.items[usize(st)+i] = persistVal(slotGet(v.ref+u32(i)), depth-1)
+		}
+		r := v
+		r.ref = st
+		return r
+	}
+	if (k == VCode && v.ref != 0) || k == VFieldCode || (k == VPtr && v.ref != 0) {
+		st := valAlloc(1, false)
+		if st == 0 {
+			return v
+		}
+		vals.items[usize(st)] = persistVal(slotGet(v.ref), depth-1)
+		r := v
+		r.ref = st
+		return r
+	}
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// Zero values (types.Zero). Errors leave their text in errTxt.
+
+var zeroBudget usize
+
+func zeroVal(t u32, heap bool) (Val, bool) {
+	zeroBudget = MaxComptimeElems
+	return zeroRec(t, heap, SemaDepth)
+}
+
+func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
+	var z Val
+	if depth == 0 {
+		etReset()
+		et("type too deep")
+		return z, false
+	}
+	u := underlying(t)
+	k := tk(u)
+	if k == TCBasic {
+		if isInteger(u) {
+			return vIntU(0), true
+		}
+		if isBoolean(u) {
+			return vBool(false), true
+		}
+		if isString(u) {
+			return vStr(emptyBytes()), true
+		}
+		if basicKind(u) == BkError {
+			return vErr(0), true
+		}
+	} else if k == TCCode {
+		return vCode(CKEmpty), true
+	} else if k == TCArray {
+		r := typs.items[usize(u)]
+		if r.b != 0 {
+			etReset()
+			et("array with generic length")
+			return z, false
+		}
+		if r.n > u64(zeroBudget) {
+			etReset()
+			et("array too large for compile-time evaluation")
+			return z, false
+		}
+		zeroBudget -= usize(r.n)
+		n := usize(r.n)
+		st := valAlloc(n, heap)
+		for i := usize(0); i < n; i++ {
+			e, ok := zeroRec(r.a, heap, depth-1)
+			if !ok {
+				return z, false
+			}
+			slotSet(st+u32(i), e)
+		}
+		return vAgg(VArray, st, n), true
+	} else if k == TCSlice {
+		var s Val
+		s.kind = VSlice
+		return s, true
+	} else if k == TCStruct {
+		n := nfields(u)
+		st := valAlloc(n, heap)
+		for i := usize(0); i < n; i++ {
+			e, ok := zeroRec(fieldType(u, i), heap, depth-1)
+			if !ok {
+				return z, false
+			}
+			slotSet(st+u32(i), e)
+		}
+		return vAgg(VStruct, st, n), true
+	} else if k == TCEnum {
+		if nvariants(u) == 0 {
+			return vAgg(VEnum, 0, 0), true
+		}
+		n := variantPayN(u, 0)
+		st := valAlloc(n, heap)
+		for i := usize(0); i < n; i++ {
+			e, ok := zeroRec(variantPay(u, 0, i), heap, depth-1)
+			if !ok {
+				return z, false
+			}
+			slotSet(st+u32(i), e)
+		}
+		return vAgg(VEnum, st, n), true
+	}
+	if builtinOf(t) == BTFieldCode {
+		c := valAlloc(1, heap)
+		slotSet(c, vCode(CKEmpty))
+		var f Val
+		f.kind = VFieldCode
+		f.ref = c
+		return f, true
+	}
+	etReset()
+	o := &errTxt
+	putType(o, t, SemaDepth)
+	if t != 0 && tk(t) == TCNamed && namedBuiltin(t) != 0 {
+		et(" has no compile-time value")
+	} else {
+		et(" has no zero value")
+	}
+	return z, false
+}
+
+func emptyBytes() []byte {
+	return strPool[0:0]
+}
+
+// ---------------------------------------------------------------------------
+// Constant arithmetic (types.BinaryOp, Equal, UnaryOp). On error they return
+// false with the error text in errTxt.
+
+func opNotDefined(op u8, x Val, y Val, two bool) {
+	etReset()
+	et("operator ")
+	et(binOpString(op))
+	et(" not defined on ")
+	etval(x)
+	if two {
+		et(", ")
+		etval(y)
+	}
+}
+
+func isCompareOp(op u8) bool {
+	return op >= OpEq && op <= OpGe
+}
+
+func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
+	var z Val
+	if isCompareOp(op) {
+		return compareVals(op, x, y)
+	}
+	if op == OpLAnd || op == OpLOr {
+		if x.kind != VBool || y.kind != VBool {
+			etReset()
+			et("non-boolean operands")
+			return z, false
+		}
+		if op == OpLAnd {
+			return vBool(x.lo != 0 && y.lo != 0), true
+		}
+		return vBool(x.lo != 0 || y.lo != 0), true
+	}
+	if x.kind != VInt || y.kind != VInt {
+		opNotDefined(op, x, y, true)
+		return z, false
+	}
+	if x.flag&1 != 0 || y.flag&1 != 0 {
+		return vIntOvf(), true
+	}
+	if op == OpAdd {
+		h, l, ovf := add128(x.hi, x.lo, y.hi, y.lo)
+		return intResult(h, l, ovf), true
+	}
+	if op == OpSub {
+		h, l, ovf := sub128(x.hi, x.lo, y.hi, y.lo)
+		return intResult(h, l, ovf), true
+	}
+	if op == OpMul {
+		h, l, ovf := mul128(x.hi, x.lo, y.hi, y.lo)
+		return intResult(h, l, ovf), true
+	}
+	if op == OpDiv || op == OpRem {
+		if y.hi == 0 && y.lo == 0 {
+			etReset()
+			et("division by zero")
+			return z, false
+		}
+		qh, ql, rh, rl, ovf := quoRem128(x.hi, x.lo, y.hi, y.lo)
+		if op == OpDiv {
+			return intResult(qh, ql, ovf), true
+		}
+		return intResult(rh, rl, ovf), true
+	}
+	if op == OpAnd {
+		return vInt(x.hi&y.hi, x.lo&y.lo), true
+	}
+	if op == OpOr {
+		return vInt(x.hi|y.hi, x.lo|y.lo), true
+	}
+	if op == OpXor {
+		return vInt(x.hi^y.hi, x.lo^y.lo), true
+	}
+	if op == OpShl || op == OpShr {
+		if isNeg128(y.hi) {
+			etReset()
+			et("negative shift count")
+			return z, false
+		}
+		if y.hi != 0 || y.lo > MaxShift {
+			if op == OpShr {
+				if isNeg128(x.hi) {
+					return vInt(AllOnes, AllOnes), true
+				}
+				return vIntU(0), true
+			}
+			etReset()
+			et("shift count too large")
+			return z, false
+		}
+		if op == OpShl {
+			if x.hi == 0 && x.lo == 0 {
+				return vIntU(0), true
+			}
+			if y.lo >= 128 {
+				return vIntOvf(), true
+			}
+			h, l := shl128(x.hi, x.lo, y.lo)
+			bh, bl := sar128(h, l, y.lo)
+			if bh != x.hi || bl != x.lo {
+				return vIntOvf(), true
+			}
+			return vInt(h, l), true
+		}
+		h, l := sar128(x.hi, x.lo, y.lo)
+		return vInt(h, l), true
+	}
+	etReset()
+	et("unsupported operator ")
+	et(binOpString(op))
+	return z, false
+}
+
+func intResult(h u64, l u64, ovf bool) Val {
+	if ovf {
+		return vIntOvf()
+	}
+	return vInt(h, l)
+}
+
+func compareVals(op u8, x Val, y Val) (Val, bool) {
+	var z Val
+	if op == OpEq || op == OpNe {
+		eq, ok := equalVals(x, y, SemaDepth)
+		if !ok {
+			return z, false
+		}
+		return vBool(eq == (op == OpEq)), true
+	}
+	c := 0
+	if x.kind == VInt {
+		if y.kind != VInt {
+			etReset()
+			et("mismatched operands")
+			return z, false
+		}
+		c = cmp128(x.hi, x.lo, y.hi, y.lo)
+	} else if x.kind == VString {
+		if y.kind != VString {
+			etReset()
+			et("mismatched operands")
+			return z, false
+		}
+		c = bytesCompare(strOf(x), strOf(y))
+	} else {
+		opNotDefined(op, x, y, false)
+		return z, false
+	}
+	if op == OpLt {
+		return vBool(c < 0), true
+	}
+	if op == OpLe {
+		return vBool(c <= 0), true
+	}
+	if op == OpGt {
+		return vBool(c > 0), true
+	}
+	return vBool(c >= 0), true
+}
+
+func cannotCompare(x Val, y Val) {
+	etReset()
+	et("cannot compare ")
+	etval(x)
+	et(" and ")
+	etval(y)
+}
+
+// equalVals compares two values for == (types.Equal).
+func equalVals(x Val, y Val, depth usize) (bool, bool) decreases(depth) {
+	if depth == 0 {
+		return false, true
+	}
+	k := x.kind
+	if k == VInt {
+		return y.kind == VInt && x.hi == y.hi && x.lo == y.lo && x.flag == y.flag, true
+	}
+	if k == VBool {
+		return y.kind == VBool && x.lo == y.lo, true
+	}
+	if k == VString {
+		return y.kind == VString && bytesEqual(strOf(x), strOf(y)), true
+	}
+	if k == VError {
+		if y.kind == VError {
+			return x.lo == y.lo, true
+		}
+		if y.kind == VNil {
+			return x.lo == 0, true
+		}
+		return false, true
+	}
+	if k == VNil {
+		if y.kind == VError {
+			return y.lo == 0, true
+		}
+		if y.kind == VSlice {
+			return y.flag&2 == 0 || y.aux2 == y.aux, true
+		}
+		if y.kind == VNil {
+			return true, true
+		}
+		cannotCompare(x, y)
+		return false, false
+	}
+	if k == VSlice {
+		if y.kind == VNil {
+			return x.flag&2 == 0 || x.aux2 == x.aux, true
+		}
+		cannotCompare(x, y)
+		return false, false
+	}
+	if k == VCode {
+		if y.kind != VCode {
+			return false, true
+		}
+		return codeEqual(x, y, depth-1), true
+	}
+	if k == VArray || k == VStruct {
+		if y.kind != k || x.aux != y.aux {
+			return false, true
+		}
+		return equalList(x.ref, y.ref, usize(x.aux), depth-1)
+	}
+	if k == VEnum {
+		if y.kind != VEnum || x.lo != y.lo || x.aux != y.aux {
+			return false, true
+		}
+		return equalList(x.ref, y.ref, usize(x.aux), depth-1)
+	}
+	cannotCompare(x, y)
+	return false, false
+}
+
+func equalList(a u32, b u32, n usize, depth usize) (bool, bool) decreases(depth) {
+	if depth == 0 {
+		return false, true
+	}
+	for i := usize(0); i < n; i++ {
+		eq, ok := equalVals(slotGet(a+u32(i)), slotGet(b+u32(i)), depth-1)
+		if !ok || !eq {
+			return eq, ok
+		}
+	}
+	return true, true
+}
+
+// codeEqual compares code values structurally (finc0 compares their
+// String forms, which is equivalent).
+func codeEqual(x Val, y Val, depth usize) bool decreases(depth) {
+	if depth == 0 {
+		return false
+	}
+	if x.kind != y.kind {
+		return false
+	}
+	if x.kind == VFieldCode {
+		if !bytesEqual(strPool[usize(x.lo):usize(x.lo)+usize(x.hi)], strPool[usize(y.lo):usize(y.lo)+usize(y.hi)]) {
+			return false
+		}
+		return codeEqual(slotGet(x.ref), slotGet(y.ref), depth-1)
+	}
+	if x.lo != y.lo {
+		return false
+	}
+	k := x.lo
+	if k == CKArray {
+		return x.hi == y.hi && codeEqual(slotGet(x.ref), slotGet(y.ref), depth-1)
+	}
+	if k == CKSlice {
+		return codeEqual(slotGet(x.ref), slotGet(y.ref), depth-1)
+	}
+	if k == CKUniv {
+		return x.hi == y.hi
+	}
+	if k == CKStruct {
+		if x.aux != y.aux {
+			return false
+		}
+		n := usize(x.aux)
+		for i := usize(0); i < n; i++ {
+			if !codeEqual(slotGet(x.ref+u32(i)), slotGet(y.ref+u32(i)), depth-1) {
+				return false
+			}
+		}
+		return true
+	}
+	return true
+}
+
+// unaryOpVal evaluates !x or -x.
+func unaryOpVal(op u8, x Val) (Val, bool) {
+	var z Val
+	if op == OpNot && x.kind == VBool {
+		return vBool(x.lo == 0), true
+	}
+	if op == OpNeg && x.kind == VInt {
+		if x.flag&1 != 0 {
+			return x, true
+		}
+		if x.hi == SignBit && x.lo == 0 {
+			return vIntOvf(), true
+		}
+		h, l := neg128(x.hi, x.lo)
+		return vInt(h, l), true
+	}
+	etReset()
+	et("operator ")
+	et(unaryOpString(op))
+	et(" not defined on ")
+	etval(x)
+	return z, false
+}
+
+// ---------------------------------------------------------------------------
+// Code values
+
+// codeLevelOf returns the universe level of a code (CodeVal.Level).
+func codeLevelOf(v Val, depth usize) int decreases(depth) {
+	if depth == 0 {
+		return -1
+	}
+	k := v.lo
+	if k == CKUniv {
+		return int(v.hi) + 1
+	}
+	if k == CKArray || k == CKSlice {
+		return codeLevelOf(slotGet(v.ref), depth-1)
+	}
+	if k == CKStruct {
+		l := -1
+		n := usize(v.aux)
+		for i := usize(0); i < n; i++ {
+			f := slotGet(v.ref + u32(i))
+			x := codeLevelOf(slotGet(f.ref), depth-1)
+			if x > l {
+				l = x
+			}
+		}
+		return l
+	}
+	return -1
+}
+
+// foldCode converts a code value into the type it denotes (types.FoldCode).
+func foldCode(v Val, depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return TyInvalid
+	}
+	k := v.lo
+	if k == CKEmpty {
+		return mkEnum(tmark())
+	}
+	if k == CKUnit {
+		return mkStruct(tmark())
+	}
+	if k == CKBool {
+		return TyBool
+	}
+	if k == CKU8 {
+		return TyU8
+	}
+	if k == CKU16 {
+		return TyU16
+	}
+	if k == CKU32 {
+		return TyU32
+	}
+	if k == CKU64 {
+		return TyU64
+	}
+	if k == CKI8 {
+		return TyI8
+	}
+	if k == CKI16 {
+		return TyI16
+	}
+	if k == CKI32 {
+		return TyI32
+	}
+	if k == CKI64 {
+		return TyI64
+	}
+	if k == CKArray {
+		return mkArray(v.hi, 0, foldCode(slotGet(v.ref), depth-1))
+	}
+	if k == CKSlice {
+		return mkSlice(foldCode(slotGet(v.ref), depth-1))
+	}
+	if k == CKStruct {
+		m := tmark()
+		n := usize(v.aux)
+		for i := usize(0); i < n; i++ {
+			f := slotGet(v.ref + u32(i))
+			nm := intern(strPool[usize(f.lo) : usize(f.lo)+usize(f.hi)])
+			ft := foldCode(slotGet(f.ref), depth-1)
+			tpush(nm)
+			tpush(ft)
+		}
+		return mkStruct(m)
+	}
+	if k == CKUniv {
+		return mkCode(int(v.hi))
+	}
+	return TyInvalid
+}

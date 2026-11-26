@@ -1,0 +1,37 @@
+package main
+
+comptime func C(n usize) Code 0 {
+	return CodeArray(n, CodeStruct(Fields()))
+}
+
+comptime func Fields() []FieldCode {
+	var fs [2]FieldCode
+	fs[0] = CodeField("a", CodeU8())
+	fs[1] = CodeField("b", CodeSlice(CodeI64()))
+	return fs[:]
+}
+
+comptime func Up() Code 2 {
+	return CodeSlice(CodeUniv(1))
+}
+
+comptime func Bad(c Code 1) Code 0 {
+	return c
+}
+
+type X = El(C(2))
+type Y = El(Up())
+type Z = El(CodeUniv(7))
+type W = El(3)
+type V = El(Bad(CodeUnit()))
+type S = Code 2000000
+type Q = El(CodeEmpty())
+
+var x X
+var y Y
+var z Z
+var q Q
+
+func use() usize {
+	return len(x) + len(x[0].b)
+}

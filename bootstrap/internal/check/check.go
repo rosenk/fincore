@@ -32,6 +32,10 @@ type Options struct {
 	Fuel uint64
 	// ModuleRoot for local imports ("" = current directory).
 	ModuleRoot string
+	// TypesOnly stops after load/resolve and type checking (with comptime
+	// evaluation); the later Passes do not run. Used by the hidden
+	// `finc0 check --passes=types` oracle for finc1's differential tests.
+	TypesOnly bool
 }
 
 // Result is the output of the front end.
@@ -65,7 +69,7 @@ func Run(path string, opts Options) (*Result, error) {
 	}
 	info, diags := types.Check(prog, types.Config{Evaluator: comptime.New(opts.Fuel)})
 	res.Info = info
-	if len(diags) > 0 {
+	if len(diags) > 0 || opts.TypesOnly {
 		res.Diags = diags
 		return res, nil
 	}

@@ -1,0 +1,2107 @@
+// checker.fc — the type checker, part 1 (port of finc0's types/checker.go,
+// typexpr.go and the assignability half of expr.go): operands, package-
+// level declarations, type expressions, assignability and untyped
+// constants, and the whole-program checks (recursive types, main, finish).
+//
+// The checker, the expression/statement checkers (check_expr.fc,
+// check_stmt.fc) and the comptime interpreter (comptime.fc) form one
+// recursive SCC: every member takes `dp usize` with decreases(dp), returns
+// early when dp == 0 (setting semaFull) and passes dp-1 inside the SCC.
+// The entry point checkProgram starts at SemaDepth.
+package main
+
+const (
+	MaxOpStack = 65_536
+	MaxNamed   = 32_768
+)
+
+// Checker state (types.Checker): the current function and its context.
+var chkFn u32       // current FuncInfo (0 outside functions)
+var chkLoops u32    // enclosing for loops
+var chkConstCtx u32 // > 0 while checking an expression that must be constant
+
+// Operand is the result of checking an expression (types.operand).
+type Operand struct {
+	val      Val
+	mode     u8 // ExprKind; KNone = invalid
+	indirect bool
+	typ      u32
+	expr     u32
+	sym      u32 // KFunc, KBuiltin, KPackage
+	method   u32 // method selections (mode KFunc)
+	recv     u32
+	recvType u32
+	vEnum    u32 // KVariantCtor: underlying Enum TypeID
+	vIndex   u32 //   and variant index
+}
+
+// opStack holds operand lists (call arguments, assignment sides) in LIFO
+// order.
+type OpStack struct {
+	items [MaxOpStack]Operand
+	top   usize
+}
+
+var opStack OpStack
+
+func opPush(x Operand) {
+	if opStack.top >= MaxOpStack {
+		setFull("operand stack")
+		return
+	}
+	opStack.items[opStack.top] = x
+	opStack.top++
+}
+
+// Value stack for comptime call arguments.
+var vstack [MaxOpStack]Val
+var vtop usize
+
+func vpush(v Val) {
+	if vtop >= MaxOpStack {
+		setFull("value stack")
+		return
+	}
+	vstack[vtop] = v
+	vtop++
+}
+
+// Info.Named: declared named types in source order.
+var namedTypes [MaxNamed]u32
+var nNamed usize
+
+func invalidOp(e u32) Operand {
+	var x Operand
+	x.typ = TyInvalid
+	x.expr = e
+	return x
+}
+
+func opMode(mode u8, t u32) Operand {
+	var x Operand
+	x.mode = mode
+	x.typ = t
+	return x
+}
+
+func opConst(t u32, v Val) Operand {
+	var x Operand
+	x.mode = KConst
+	x.typ = t
+	x.val = v
+	return x
+}
+
+func isInvalidOp(x *Operand) bool {
+	return x.mode == KNone
+}
+
+func tooDeep() {
+	setFull("recursion depth")
+}
+
+// record stores the operand's type, kind and value for its expression.
+func record(x *Operand) {
+	e := x.expr
+	if e == 0 {
+		return
+	}
+	ntype[usize(e)] = x.typ
+	if x.mode == KBuiltin || x.mode == KPackage {
+		ntype[usize(e)] = 0
+	}
+	nmode[usize(e)] = x.mode
+	if x.mode == KConst && x.val.kind != VNone {
+		nval[usize(e)] = valStore(x.val)
+	}
+}
+
+func setSymType(s u32, t u32) {
+	if s == 0 {
+		return
+	}
+	syms.items[usize(s)].typ = t
+	id := syms.items[usize(s)].ident
+	if id != 0 {
+		ntype[usize(id)] = t
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Expression strings (types.exprString): at most 60 bytes.
+
+var exprBuf OutBuf
+
+func mexpr(e u32) {
+	o := &exprBuf
+	o.reset()
+	writeExpr(o, e, SemaDepth)
+	n := exprBuf.len
+	if n > 60 {
+		mbytes(exprBuf.data[:57])
+		ms("...")
+		return
+	}
+	mbytes(exprBuf.data[:n])
+}
+
+func writeExprList(o *OutBuf, n u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	c := l1len(n)
+	for i := usize(0); i < c; i++ {
+		if i > 0 {
+			o.putStr(", ")
+		}
+		writeExpr(o, l1at(n, i), dp-1)
+	}
+}
+
+func writeExpr(o *OutBuf, e u32, dp usize) decreases(dp) {
+	if dp == 0 || e == 0 {
+		return
+	}
+	k := nkind(e)
+	if k == NkIdent || k == NkBasicLit {
+		o.putBytes(ntext(e))
+	} else if k == NkBoolLit {
+		if nflag(e) {
+			o.putStr("true")
+		} else {
+			o.putStr("false")
+		}
+	} else if k == NkNilLit {
+		o.putStr("nil")
+	} else if k == NkBinaryExpr {
+		writeExpr(o, na(e), dp-1)
+		o.putByte(' ')
+		o.putStr(binOpString(nop(e)))
+		o.putByte(' ')
+		writeExpr(o, nb(e), dp-1)
+	} else if k == NkUnaryExpr {
+		o.putStr(unaryOpString(nop(e)))
+		writeExpr(o, na(e), dp-1)
+	} else if k == NkParenExpr {
+		o.putByte('(')
+		writeExpr(o, na(e), dp-1)
+		o.putByte(')')
+	} else if k == NkCallExpr {
+		writeExpr(o, na(e), dp-1)
+		o.putByte('(')
+		writeExprList(o, e, dp-1)
+		o.putByte(')')
+	} else if k == NkIndexExpr {
+		writeExpr(o, na(e), dp-1)
+		o.putByte('[')
+		writeExprList(o, e, dp-1)
+		o.putByte(']')
+	} else if k == NkSliceExpr {
+		writeExpr(o, na(e), dp-1)
+		o.putByte('[')
+		writeExpr(o, nb(e), dp-1)
+		o.putByte(':')
+		writeExpr(o, nc(e), dp-1)
+		o.putByte(']')
+	} else if k == NkSelectorExpr {
+		writeExpr(o, na(e), dp-1)
+		o.putByte('.')
+		o.putBytes(ntext(nb(e)))
+	} else if k == NkFuncLit {
+		o.putStr("func literal")
+	} else if k == NkStructLit {
+		t := na(e)
+		if na(t) != 0 {
+			o.putBytes(ntext(na(t)))
+			o.putByte('.')
+		}
+		o.putBytes(ntext(nb(t)))
+		o.putStr("{...}")
+	} else if k == NkTypeExpr {
+		o.putStr("type expression")
+	} else {
+		o.putStr("expression")
+	}
+}
+
+// errAtOp reports at the operator of a BinaryExpr (OpPos).
+func errAtOp(code u32, e u32) {
+	p := nival(e)
+	addDiag(nfile(e), u32(p>>32), u32(p&0xFFFFFFFF), code)
+}
+
+// errAtEnd reports at the last byte of a node (missing return).
+func errAtEnd(code u32, n u32) {
+	line := nodes.items[usize(n)].eLine
+	col := nodes.items[usize(n)].eCol
+	if col > 1 {
+		col--
+	}
+	addDiag(nfile(n), line, col, code)
+}
+
+func unparen(e u32) u32 {
+	x := e
+	for g := usize(0); g < MaxNodes; g++ {
+		if x == 0 || nkind(x) != NkParenExpr {
+			return x
+		}
+		x = na(x)
+	}
+	return x
+}
+
+// synthNode allocates a synthetic node (ast.ExprAsType's NamedType /
+// PointerType) at the position of `from`.
+func synthNode(kind u8, from u32) u32 {
+	np := &nodes
+	n := np.alloc(kind, nodes.items[usize(from)].file, nodes.items[usize(from)].sLine, nodes.items[usize(from)].sCol)
+	if n == 0 {
+		setFull("AST nodes")
+		return 0
+	}
+	nodes.items[usize(n)].eLine = nodes.items[usize(from)].eLine
+	nodes.items[usize(n)].eCol = nodes.items[usize(from)].eCol
+	return n
+}
+
+// exprAsNamedType converts Ident, Ident.Ident and X[...] to a NamedType.
+func exprAsNamedType(e u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		return 0
+	}
+	k := nkind(e)
+	if k == NkIdent {
+		n := synthNode(NkNamedType, e)
+		nodes.items[usize(n)].b = e
+		return n
+	}
+	if k == NkSelectorExpr {
+		if nkind(na(e)) == NkIdent {
+			n := synthNode(NkNamedType, e)
+			nodes.items[usize(n)].a = na(e)
+			nodes.items[usize(n)].b = nb(e)
+			return n
+		}
+		return 0
+	}
+	if k == NkIndexExpr {
+		x := na(e)
+		xk := nkind(x)
+		if xk == NkIdent || xk == NkSelectorExpr {
+			nt := exprAsNamedType(x, dp-1)
+			if nt == 0 {
+				return 0
+			}
+			n := synthNode(NkNamedType, e)
+			nodes.items[usize(n)].a = na(nt)
+			nodes.items[usize(n)].b = nb(nt)
+			nodes.items[usize(n)].l1s = nodes.items[usize(e)].l1s
+			nodes.items[usize(n)].l1n = nodes.items[usize(e)].l1n
+			return n
+		}
+	}
+	return 0
+}
+
+// exprAsType converts an expression to a type node (0 if impossible).
+func exprAsType(e u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		return 0
+	}
+	k := nkind(e)
+	if k == NkTypeExpr {
+		return na(e)
+	}
+	if k == NkParenExpr {
+		return exprAsType(na(e), dp-1)
+	}
+	if k == NkUnaryExpr {
+		if nop(e) != OpDeref {
+			return 0
+		}
+		elem := exprAsType(na(e), dp-1)
+		if elem == 0 {
+			return 0
+		}
+		n := synthNode(NkPointerType, e)
+		nodes.items[usize(n)].a = elem
+		return n
+	}
+	return exprAsNamedType(e, dp-1)
+}
+
+// ---------------------------------------------------------------------------
+// Assignment contexts ("argument to f", "struct literal", ...)
+
+const (
+	CtxConstDecl  = 1
+	CtxVarDecl    = 2
+	CtxAssign     = 3
+	CtxDecreases  = 4
+	CtxStructLit  = 5
+	CtxReturn     = 6
+	CtxPattern    = 7
+	CtxTypeArg    = 8
+	CtxMatch      = 9
+	CtxArgExpr    = 10 // "argument to " + exprString(a)
+	CtxArgMethod  = 11 // "argument to " + Recv.Name + "." + method (a = method)
+	CtxArgBuiltin = 12 // "argument to " + builtin (a)
+	CtxArgVariant = 13 // "argument to " + type(a) + "." + name(b)
+)
+
+type Ctx struct {
+	kind u8
+	a    u32
+	b    u32
+}
+
+func mkCtx(kind u8) Ctx {
+	return Ctx{kind: kind, a: 0, b: 0}
+}
+
+// mcallName writes the callee name of an argument context.
+func mcallName(c Ctx) {
+	if c.kind == CtxArgExpr {
+		mexpr(c.a)
+	} else if c.kind == CtxArgMethod {
+		m := meths.items[usize(c.a)]
+		mname(u32(typs.items[usize(m.recv)].n))
+		mbyte('.')
+		mname(m.name)
+	} else if c.kind == CtxArgBuiltin {
+		ms(builtinName(u8(c.a)))
+	} else if c.kind == CtxArgVariant {
+		mtype(c.a)
+		mbyte('.')
+		mname(c.b)
+	}
+}
+
+func mctx(c Ctx) {
+	k := c.kind
+	if k == CtxConstDecl {
+		ms("constant declaration")
+	} else if k == CtxVarDecl {
+		ms("variable declaration")
+	} else if k == CtxAssign {
+		ms("assignment")
+	} else if k == CtxDecreases {
+		ms("decreases clause")
+	} else if k == CtxStructLit {
+		ms("struct literal")
+	} else if k == CtxReturn {
+		ms("return statement")
+	} else if k == CtxPattern {
+		ms("match pattern")
+	} else if k == CtxTypeArg {
+		ms("type argument")
+	} else if k == CtxMatch {
+		ms("match")
+	} else {
+		ms("argument to ")
+		mcallName(c)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Assignability (expr.go)
+
+// assignment checks that x can be assigned to type t, converting untyped
+// constants and level-polymorphic codes (E2004 nil, E2010 levels, E2002).
+func assignment(x *Operand, t u32, c Ctx) bool {
+	if isInvalidOp(x) || isInvalid(t) {
+		return true
+	}
+	if isUntyped(x.typ) {
+		return convertUntyped(x, t)
+	}
+	if tk(x.typ) == TCCode {
+		ct := underlying(t)
+		if tk(ct) == TCCode {
+			if codeLevel(x.typ) < 0 {
+				x.typ = t
+				updateType(x.expr, t, SemaDepth)
+				return true
+			}
+			if codeLevel(ct) >= 0 && codeLevel(ct) != codeLevel(x.typ) {
+				mreset()
+				ms("universe level mismatch: cannot use ")
+				mexpr(x.expr)
+				ms(" (Code ")
+				mu(u64(codeLevel(x.typ)))
+				ms(") as Code ")
+				mu(u64(codeLevel(ct)))
+				ms(" in ")
+				mctx(c)
+				errAt(E2010, x.expr)
+				return false
+			}
+		}
+	}
+	if assignable(x.typ, t) {
+		return true
+	}
+	mreset()
+	ms("cannot use ")
+	mexpr(x.expr)
+	ms(" (type ")
+	mtype(x.typ)
+	ms(") as type ")
+	mtype(t)
+	ms(" in ")
+	mctx(c)
+	errAt(E2002, x.expr)
+	return false
+}
+
+// assignable reports whether a value of type v may be assigned to t.
+func assignable(v u32, t u32) bool {
+	if v == t {
+		return true
+	}
+	vn := tk(v) == TCNamed
+	tn := tk(t) == TCNamed
+	if !vn || !tn {
+		vu := underlying(v)
+		tu := underlying(t)
+		if tk(vu) != TCTypeParam && vu == tu && tk(vu) != TCOpaque {
+			return true
+		}
+		if tk(vu) == TCSig && tk(tu) == TCSig && sigEffect(vu) <= sigEffect(tu) && sigVariadic(vu) == sigVariadic(tu) &&
+			u32sEqual(sigParamsSlice(vu), sigParamsSlice(tu)) && u32sEqual(sigResultsSlice(vu), sigResultsSlice(tu)) {
+			return true
+		}
+	}
+	return false
+}
+
+// convertUntyped converts an untyped operand to type t.
+func convertUntyped(x *Operand, t u32) bool {
+	if !isUntyped(x.typ) || isInvalid(t) {
+		return true
+	}
+	k := basicKind(x.typ)
+	ok := false
+	if k == BkUntypedNil {
+		u := underlying(t)
+		if tk(u) == TCSlice || basicKind(t) == BkError {
+			ok = true
+		} else {
+			mreset()
+			ms("cannot use nil as ")
+			mtype(t)
+			if tk(u) == TCPointer || isScoped(t) {
+				ms(" value: nil is only valid for error and slices")
+				errAt(E2004, x.expr)
+			} else {
+				ms(" value")
+				errAt(E2002, x.expr)
+			}
+			return false
+		}
+	} else if k == BkUntypedInt || k == BkUntypedChar {
+		if isInteger(t) && !isUntyped(t) {
+			if x.val.kind != VNone && !representable(x.val, t) {
+				mreset()
+				ms("constant ")
+				mval(x.val)
+				ms(" overflows ")
+				mtype(t)
+				errAt(E2002, x.expr)
+				return false
+			}
+			ok = true
+		} else if isUntyped(t) && isInteger(t) {
+			ok = true
+		}
+	} else if k == BkUntypedBool {
+		ok = isBoolean(t)
+	} else if k == BkUntypedString {
+		ok = isString(t)
+	}
+	if isTypeParamT(t) {
+		ok = false
+	}
+	if !ok {
+		mreset()
+		ms("cannot use ")
+		mexpr(x.expr)
+		ms(" (")
+		mtype(x.typ)
+		ms(" constant) as type ")
+		mtype(t)
+		errAt(E2002, x.expr)
+		return false
+	}
+	x.typ = t
+	updateType(x.expr, t, SemaDepth)
+	return true
+}
+
+// defaultTypeOp gives an untyped operand its default type (`:=`, var
+// declarations without type) and returns it.
+func defaultTypeOp(x *Operand, c Ctx) u32 {
+	if isInvalidOp(x) {
+		return TyInvalid
+	}
+	if basicKind(x.typ) == BkUntypedNil {
+		mreset()
+		ms("use of untyped nil in ")
+		mctx(c)
+		errAt(E2004, x.expr)
+		return TyInvalid
+	}
+	if isUntyped(x.typ) || isPolyCode(x.typ) {
+		d := defaultOf(x.typ)
+		if isUntyped(x.typ) {
+			_ = convertUntyped(x, d)
+		} else {
+			x.typ = d
+			updateType(x.expr, d, SemaDepth)
+		}
+		return d
+	}
+	return x.typ
+}
+
+// updateType records the final type of an untyped expression tree.
+func updateType(e u32, t u32, dp usize) decreases(dp) {
+	if dp == 0 || e == 0 {
+		return
+	}
+	old := ntype[usize(e)]
+	if old != 0 && !isUntyped(old) && !isPolyCode(old) {
+		return
+	}
+	ntype[usize(e)] = t
+	k := nkind(e)
+	if k == NkParenExpr {
+		updateType(na(e), t, dp-1)
+	} else if k == NkUnaryExpr {
+		if nop(e) == OpNeg || nop(e) == OpNot {
+			updateType(na(e), t, dp-1)
+		}
+	} else if k == NkBinaryExpr {
+		op := nop(e)
+		if isCompareOp(op) {
+			return
+		}
+		updateType(na(e), t, dp-1)
+		if op != OpShl && op != OpShr {
+			updateType(nb(e), t, dp-1)
+		}
+	}
+}
+
+// singleValue checks that x denotes a single value.
+func singleValue(x *Operand) {
+	m := x.mode
+	if m == KNone {
+		return
+	}
+	if m == KValue || m == KVar || m == KConst {
+		if x.typ != 0 && tk(x.typ) == TCTuple {
+			mreset()
+			ms("multiple-value ")
+			mexpr(x.expr)
+			ms(" (")
+			mu(u64(tl1n(x.typ)))
+			ms(" values) in single-value context")
+			errAt(E2003, x.expr)
+			x.mode = KNone
+		}
+		return
+	}
+	mreset()
+	if m == KNoValue {
+		mexpr(x.expr)
+		ms(" (no value) used as value")
+		errAt(E2002, x.expr)
+	} else if m == KType {
+		ms("type ")
+		mtype(x.typ)
+		ms(" is not an expression")
+		errAt(E2002, x.expr)
+	} else if m == KBuiltin {
+		ms("builtin ")
+		mexpr(x.expr)
+		ms(" must be called")
+		errAt(E2002, x.expr)
+	} else if m == KFunc {
+		isSig := x.typ != 0 && tk(x.typ) == TCSig
+		if x.method != 0 {
+			ms("method value ")
+			mexpr(x.expr)
+			ms(" is not supported; call the method")
+			errAt(E2002, x.expr)
+		} else if isSig && sigNTParams(x.typ) > 0 {
+			ms("generic function ")
+			mexpr(x.expr)
+			ms(" must be instantiated with explicit type arguments")
+			errAt(E2002, x.expr)
+		} else if isSig && sigEffect(x.typ) == EffComptime {
+			ms("comptime function ")
+			mexpr(x.expr)
+			ms(" can only be called")
+			errAt(E2002, x.expr)
+		} else {
+			x.mode = KValue
+			return
+		}
+	} else if m == KPackage {
+		ms("package ")
+		mexpr(x.expr)
+		ms(" is not an expression")
+		errAt(E2002, x.expr)
+	} else if m == KVariantCtor {
+		ms("variant ")
+		mexpr(x.expr)
+		ms(" requires ")
+		mu(u64(variantPayN(x.vEnum, usize(x.vIndex))))
+		ms(" payload values")
+		errAt(E2003, x.expr)
+	}
+	x.mode = KNone
+	x.typ = TyInvalid
+}
+
+// ---------------------------------------------------------------------------
+// Program entry (types.Check)
+
+// checkProgram type-checks all loaded packages. Diagnostics go to diags.
+func checkProgram() {
+	initBasicTypes()
+	initUnivTypes()
+	n := pkgs.norder
+	for i := usize(0); i < n; i++ {
+		p := pkgs.order[i]
+		nd := usize(pkgs.items[usize(p)].declN)
+		for j := usize(0); j < nd; j++ {
+			objDecl(uat(pkgs.items[usize(p)].declS, j), SemaDepth)
+		}
+	}
+	for i := usize(0); i < n; i++ {
+		p := pkgs.order[i]
+		nd := usize(pkgs.items[usize(p)].declN)
+		for j := usize(0); j < nd; j++ {
+			s := uat(pkgs.items[usize(p)].declS, j)
+			if symKind(s) == SymFunc {
+				_ = ensureBody(s, SemaDepth)
+			}
+		}
+	}
+	checkRecursiveTypes()
+	checkMain()
+	finishInfo()
+}
+
+// symType returns the type of a symbol, checking its declaration first.
+func symType(s u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	objDecl(s, dp-1)
+	return syms.items[usize(s)].typ
+}
+
+// hostEnsureBody implements types.Host.EnsureBody for the interpreter.
+func hostEnsureBody(fn u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
+	}
+	objDecl(fn, dp-1)
+	if fn != 0 && syms.items[usize(fn)].body == 1 {
+		mreset()
+		ms("comptime evaluation cycle: ")
+		mname(symName(fn))
+		ms(" is evaluated while its own body is being checked")
+		errAt(E4001, syms.items[usize(fn)].ident)
+		syms.items[usize(fn)].body = 3
+		return false
+	}
+	return ensureBody(fn, dp-1)
+}
+
+// hostConstValue implements types.Host.ConstValue (0 slot if erroneous).
+func hostConstValue(s u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return 0
+	}
+	objDecl(s, dp-1)
+	return syms.items[usize(s)].val
+}
+
+func objDecl(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if s == 0 {
+		return
+	}
+	st := syms.items[usize(s)].objState
+	if st == 2 {
+		return
+	}
+	k := symKind(s)
+	if st == 1 {
+		mreset()
+		if k == SymType {
+			t := syms.items[usize(s)].typ
+			if t != 0 && tk(t) == TCNamed {
+				return
+			}
+			ms("invalid recursive type alias ")
+		} else if k == SymConst {
+			ms("initialization cycle: constant ")
+		} else if k == SymVar {
+			ms("initialization cycle: variable ")
+		} else {
+			return
+		}
+		mname(symName(s))
+		if k == SymConst || k == SymVar {
+			ms(" refers to itself")
+		}
+		errAt(E2002, syms.items[usize(s)].ident)
+		syms.items[usize(s)].typ = TyInvalid
+		return
+	}
+	b := syms.items[usize(s)].builtin
+	if b != 0 {
+		syms.items[usize(s)].objState = 2
+		if builtinIsType(b) {
+			t := predeclaredType(b)
+			if t != 0 {
+				syms.items[usize(s)].typ = t
+			}
+		} else if builtinIsConst(b) {
+			t, v := predeclaredConst(b)
+			syms.items[usize(s)].typ = t
+			syms.items[usize(s)].val = valStore(v)
+		}
+		return
+	}
+	syms.items[usize(s)].objState = 1
+	d := syms.items[usize(s)].decl
+	dk := u8(0)
+	if d != 0 {
+		dk = nkind(d)
+	}
+	if dk == NkConstSpec {
+		constSpec(s, d, dp-1)
+	} else if dk == NkTypeDecl {
+		typeDecl(s, d, dp-1)
+	} else if dk == NkVarDecl {
+		varDecl(s, d, d, dp-1)
+	} else if dk == NkFuncDecl {
+		funcDecl(s, d, dp-1)
+	}
+	syms.items[usize(s)].objState = 2
+}
+
+func predeclaredConst(b u8) (u32, Val) {
+	if b == BCNanosecond {
+		return univNamed[BTDuration], vIntU(1)
+	}
+	if b == BCMicrosecond {
+		return univNamed[BTDuration], vIntU(1_000)
+	}
+	if b == BCMillisecond {
+		return univNamed[BTDuration], vIntU(1_000_000)
+	}
+	if b == BCSecond {
+		return univNamed[BTDuration], vIntU(1_000_000_000)
+	}
+	if b == BCSIGINT {
+		return univNamed[BTSignal], vIntU(2)
+	}
+	if b == BCSIGTERM {
+		return univNamed[BTSignal], vIntU(15)
+	}
+	if builtinIsErrorSentinel(b) {
+		return TyError, vErr(b)
+	}
+	var z Val
+	return TyInvalid, z
+}
+
+// Function context save/restore (withoutFunc).
+type FnCtx struct {
+	fn    u32
+	loops u32
+	cc    u32
+}
+
+func saveFn() FnCtx {
+	return FnCtx{fn: chkFn, loops: chkLoops, cc: chkConstCtx}
+}
+
+func restoreFn(c FnCtx) {
+	chkFn = c.fn
+	chkLoops = c.loops
+	chkConstCtx = c.cc
+}
+
+func enterFn(fn u32) FnCtx {
+	c := saveFn()
+	chkFn = fn
+	chkLoops = 0
+	chkConstCtx = 0
+	return c
+}
+
+func constSpec(s u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if symIsGlobal(s) {
+		c := enterFn(0)
+		chkConstCtx++
+		constSpecIn(s, d, dp-1)
+		restoreFn(c)
+		return
+	}
+	chkConstCtx++
+	constSpecIn(s, d, dp-1)
+	chkConstCtx--
+}
+
+func constSpecIn(s u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	t := u32(0)
+	if nb(d) != 0 {
+		t = typExpr(nb(d), dp-1)
+	}
+	x := exprValue(nc(d), dp-1)
+	if isInvalidOp(&x) || (isInvalid(t) && nb(d) != 0) {
+		setSymType(s, TyInvalid)
+		return
+	}
+	if x.mode != KConst {
+		mreset()
+		mexpr(nc(d))
+		ms(" is not constant")
+		errAt(E2002, nc(d))
+		setSymType(s, TyInvalid)
+		return
+	}
+	if t != 0 {
+		if !assignment(&x, t, mkCtx(CtxConstDecl)) {
+			setSymType(s, TyInvalid)
+			return
+		}
+	}
+	if isScoped(x.typ) {
+		mreset()
+		ms("constant ")
+		mname(symName(s))
+		ms(" cannot have Scoped type ")
+		mtype(x.typ)
+		errAt(E2002, nc(d))
+		setSymType(s, TyInvalid)
+		return
+	}
+	setSymType(s, x.typ)
+	slot := valStore(x.val)
+	syms.items[usize(s)].val = slot
+	nmode[usize(na(d))] = KConst
+	nval[usize(na(d))] = slot
+}
+
+func typeDecl(s u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	c := enterFn(0)
+	typeDeclIn(s, d, dp-1)
+	restoreFn(c)
+}
+
+func typeDeclIn(s u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if nflag(d) {
+		if nb(d) != 0 {
+			mreset()
+			ms("generic type alias ")
+			mname(symName(s))
+			ms(" is not supported")
+			errAt(E2002, na(d))
+		}
+		t := typExpr(nc(d), dp-1)
+		setSymType(s, t)
+		return
+	}
+	n := newNamed(symName(s), s, syms.items[usize(s)].pkg, 0)
+	setSymType(s, n)
+	if nNamed < MaxNamed {
+		namedTypes[nNamed] = n
+		nNamed++
+	} else {
+		setFull("named types")
+	}
+	if nb(d) != 0 {
+		ts, tn := typeParams(nb(d), dp-1)
+		typs.items[usize(n)].l2s = ts
+		typs.items[usize(n)].l2n = tn
+	}
+	under := typExpr(nc(d), dp-1)
+	uk := tk(under)
+	if uk == TCNamed {
+		ua := typs.items[usize(under)].a
+		if ua == 0 {
+			mreset()
+			ms("invalid recursive type ")
+			mname(symName(s))
+			errAt(E2002, na(d))
+			typs.items[usize(n)].a = TyInvalid
+		} else {
+			typs.items[usize(n)].a = ua
+			if namedBuiltin(under) != 0 && typs.items[usize(under)].flag&1 != 0 {
+				typs.items[usize(n)].cls = typs.items[usize(under)].cls
+				typs.items[usize(n)].flag = typs.items[usize(n)].flag | 1
+			}
+		}
+	} else if uk == TCTypeParam {
+		mreset()
+		ms("cannot use a type parameter as the underlying type of ")
+		mname(symName(s))
+		errAt(E2002, nc(d))
+		typs.items[usize(n)].a = TyInvalid
+	} else {
+		typs.items[usize(n)].a = under
+	}
+	completePending(n)
+}
+
+// varDecl checks a variable declaration; s may be 0 for a local `var _`
+// (ident is then the blank identifier).
+func varDecl(s u32, d u32, ident u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if s != 0 && symIsGlobal(s) {
+		c := enterFn(0)
+		varDeclIn(s, d, dp-1)
+		restoreFn(c)
+		return
+	}
+	varDeclIn(s, d, dp-1)
+}
+
+func setVarType(s u32, d u32, t u32) {
+	if s != 0 {
+		setSymType(s, t)
+	} else {
+		ntype[usize(na(d))] = t
+	}
+}
+
+func mvarName(s u32) {
+	if s == 0 {
+		ms("_")
+	} else {
+		mname(symName(s))
+	}
+}
+
+func varDeclIn(s u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	global := s != 0 && symIsGlobal(s)
+	t := u32(0)
+	if nb(d) != 0 {
+		t = typExpr(nb(d), dp-1)
+		if isInvalid(t) {
+			setVarType(s, d, TyInvalid)
+			if nc(d) != 0 {
+				_ = exprValue(nc(d), dp-1)
+			}
+			return
+		}
+		if global && isScoped(t) {
+			mreset()
+			ms("package-level variable ")
+			mvarName(s)
+			ms(" cannot have Scoped type ")
+			mtype(t)
+			errAt(E3001, na(d))
+			setVarType(s, d, t)
+			return
+		}
+	}
+	if nc(d) == 0 {
+		if t != 0 && isScoped(t) {
+			mreset()
+			ms("variable ")
+			mvarName(s)
+			ms(" of Scoped type ")
+			mtype(t)
+			ms(" must be initialized")
+			errAt(E2005, na(d))
+		}
+		setVarType(s, d, t)
+		return
+	}
+	if global {
+		chkConstCtx++
+	}
+	x := exprValue(nc(d), dp-1)
+	if global {
+		chkConstCtx--
+	}
+	if isInvalidOp(&x) {
+		if t == 0 {
+			t = TyInvalid
+		}
+		setVarType(s, d, t)
+		return
+	}
+	if t != 0 {
+		_ = assignment(&x, t, mkCtx(CtxVarDecl))
+	} else {
+		t = defaultTypeOp(&x, mkCtx(CtxVarDecl))
+		if global && isScoped(t) {
+			mreset()
+			ms("package-level variable ")
+			mvarName(s)
+			ms(" cannot have Scoped type ")
+			mtype(t)
+			errAt(E3001, na(d))
+		}
+	}
+	if global && x.mode != KConst && !isInvalidOp(&x) {
+		mreset()
+		ms("package-level variable initializer must be a constant expression")
+		errAt(E2002, nc(d))
+	}
+	setVarType(s, d, t)
+}
+
+// typeParams creates the type/const parameters of a TypeParamList and
+// returns them as a type list.
+func typeParams(l u32, dp usize) (u32, u32) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return 0, 0
+	}
+	mark := tmark()
+	np := l1len(l)
+	for i := usize(0); i < np; i++ {
+		p := l1at(l, i)
+		constT := u32(0)
+		if nkind(na(p)) != NkAnyType {
+			ct := typExpr(na(p), dp-1)
+			_, _, ok := intInfo(ct)
+			if ok {
+				constT = ct
+			} else if !isInvalid(ct) {
+				mreset()
+				ms("unsupported constraint ")
+				mtype(ct)
+				ms(" (want any or an integer type such as usize)")
+				errAt(E2002, na(p))
+			}
+		}
+		nn := l1len(p)
+		for j := usize(0); j < nn; j++ {
+			id := l1at(p, j)
+			sym := defs[usize(id)]
+			tp := newTypeParam(idName(id), sym, u32(typs.top-mark), constT)
+			tpush(tp)
+			setSymType(sym, tp)
+		}
+	}
+	return tcommitStack(mark)
+}
+
+func funcDecl(s u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	c := enterFn(0)
+	funcDeclIn(s, d, dp-1)
+	restoreFn(c)
+}
+
+func funcDeclIn(s u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	eff := u8(EffTotal)
+	if nop(d) == ModDriver {
+		eff = EffDriver
+	} else if nop(d) == ModComptime {
+		eff = EffComptime
+	}
+	var fi FuncInfo
+	fi.sym = s
+	fi.decl = d
+	fi.effect = eff
+	fi.body = nf(d)
+	if ne(d) != 0 {
+		fi.measure = na(ne(d))
+	}
+	fid := newFuncInfo(fi)
+	if fid == 0 {
+		return
+	}
+	nfunc[usize(d)] = fid
+	if na(d) != 0 {
+		receiver(fid, d, dp-1)
+	}
+	if nc(d) != 0 {
+		ts, tn := typeParams(nc(d), dp-1)
+		if na(d) != 0 {
+			mreset()
+			ms("methods cannot have their own type parameters")
+			errAt(E2002, nc(d))
+		} else {
+			funcs.items[usize(fid)].tpS = ts
+			funcs.items[usize(fid)].tpN = tn
+		}
+	}
+	tpS := u32(0)
+	tpN := u32(0)
+	if na(d) == 0 {
+		tpS = funcs.items[usize(fid)].tpS
+		tpN = funcs.items[usize(fid)].tpN
+	}
+	sig := signature(nd(d), eff, tpS, tpN, dp-1)
+	funcs.items[usize(fid)].sig = sig
+	m := funcs.items[usize(fid)].method
+	if m != 0 {
+		meths.items[usize(m)].sig = sig
+	}
+	setSymType(s, sig)
+	ps, pn := paramSyms(nd(d), sig)
+	funcs.items[usize(fid)].parS = ps
+	funcs.items[usize(fid)].parN = pn
+}
+
+// paramSyms records the parameter types and returns the parameter Ident
+// nodes (FuncInfo.Params; blank `_` params have no symbol).
+func paramSyms(as u32, sig u32) (u32, u32) {
+	mark := ustack.count
+	i := usize(0)
+	np := sigNParams(sig)
+	n := l1len(as)
+	for k := usize(0); k < n; k++ {
+		p := l1at(as, k)
+		m := l1len(p)
+		for j := usize(0); j < m; j++ {
+			id := l1at(p, j)
+			sym := defs[usize(id)]
+			t := u32(TyInvalid)
+			if i < np {
+				t = sigParam(sig, i)
+				if sigVariadic(sig) && i == np-1 {
+					t = mkSlice(t)
+				}
+			}
+			if sym != 0 {
+				setSymType(sym, t)
+			} else {
+				ntype[usize(id)] = t
+			}
+			upush(id)
+			i++
+		}
+	}
+	return ucommit(mark)
+}
+
+func receiver(fid u32, d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	r := na(d)
+	tn := nb(r)
+	tsym := uses[usize(tn)]
+	var m Method
+	m.name = idName(nb(d))
+	m.ptrRecv = nflag(r)
+	m.sym = funcs.items[usize(fid)].sym
+	m.decl = d
+	mid := newMethod(m)
+	if mid == 0 {
+		return
+	}
+	funcs.items[usize(fid)].method = mid
+	syms.items[usize(m.sym)].method = mid
+	rs := defs[usize(na(r))]
+	funcs.items[usize(fid)].recvSym = rs
+	if tsym == 0 {
+		setSymType(rs, TyInvalid)
+		return
+	}
+	named := symType(tsym, dp-1)
+	if named == 0 || tk(named) != TCNamed || namedSym(named) != tsym {
+		mreset()
+		ms("invalid receiver type ")
+		mname(idName(tn))
+		ms(" (must be a named type declared in this package)")
+		errAt(E2002, tn)
+		setSymType(rs, TyInvalid)
+		return
+	}
+	meths.items[usize(mid)].recv = named
+	ntype[usize(tn)] = named
+	recvT := named
+	nr := l1len(r)
+	ntp := tl2n(named)
+	if nr != ntp {
+		mreset()
+		ms("receiver ")
+		mname(u32(typs.items[usize(named)].n))
+		ms(" needs ")
+		mu(u64(ntp))
+		ms(" type parameters, got ")
+		mu(u64(nr))
+		errAt(E2003, r)
+	} else if ntp > 0 {
+		mark := tmark()
+		for i := usize(0); i < nr; i++ {
+			id := l1at(r, i)
+			sym := defs[usize(id)]
+			tp := newTypeParam(idName(id), sym, u32(i), typs.items[usize(tl2(named, i))].a)
+			setSymType(sym, tp)
+			tpush(tp)
+		}
+		ts, tc := tcommitStack(mark)
+		meths.items[usize(mid)].rtpS = ts
+		meths.items[usize(mid)].rtpN = tc
+		funcs.items[usize(fid)].tpS = ts
+		funcs.items[usize(fid)].tpN = tc
+		recvT = instantiate(named, typs.lists[usize(ts):usize(ts)+usize(tc)], 0, SemaDepth)
+	}
+	if nflag(r) {
+		recvT = mkPointer(recvT)
+	}
+	setSymType(rs, recvT)
+}
+
+// methodsOf returns the methods (ulists range) of an origin named type.
+func methodsOf(n0 u32, dp usize) (u32, u32) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return 0, 0
+	}
+	n := n0
+	if namedOrigin(n) != 0 {
+		n = namedOrigin(n)
+	}
+	if typs.items[usize(n)].flag&2 != 0 || namedBuiltin(n) != 0 {
+		return typs.items[usize(n)].l3s, typs.items[usize(n)].l3n
+	}
+	mark := ustack.count
+	ns := namedSym(n)
+	if ns != 0 && syms.items[usize(ns)].pkg != 0 {
+		p := syms.items[usize(ns)].pkg
+		cnt := usize(pkgs.items[usize(p)].methN)
+		tname := u32(typs.items[usize(n)].n)
+		for i := usize(0); i < cnt; i++ {
+			msym := uat(pkgs.items[usize(p)].methS, i)
+			if syms.items[usize(msym)].recvType != tname {
+				continue
+			}
+			objDecl(msym, dp-1)
+			m := syms.items[usize(msym)].method
+			if m != 0 && meths.items[usize(m)].recv == n {
+				upush(m)
+			}
+		}
+	}
+	s, c := ucommit(mark)
+	typs.items[usize(n)].l3s = s
+	typs.items[usize(n)].l3n = c
+	typs.items[usize(n)].flag = typs.items[usize(n)].flag | 2
+	return s, c
+}
+
+func lookupMethod(n u32, name u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return 0
+	}
+	s, c := methodsOf(n, dp-1)
+	cnt := usize(c)
+	for i := usize(0); i < cnt; i++ {
+		m := uat(s, i)
+		if meths.items[usize(m)].name == name {
+			return m
+		}
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Function bodies
+
+func ensureBody(s u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
+	}
+	if s == 0 || symKind(s) != SymFunc {
+		return false
+	}
+	objDecl(s, dp-1)
+	st := syms.items[usize(s)].body
+	if st == 1 || st == 3 {
+		return false
+	}
+	if st == 2 {
+		return true
+	}
+	d := syms.items[usize(s)].decl
+	if d == 0 || nkind(d) != NkFuncDecl || nf(d) == 0 {
+		return false
+	}
+	fi := nfunc[usize(d)]
+	if fi == 0 {
+		return false
+	}
+	syms.items[usize(s)].body = 1
+	before := diags.count
+	c := enterFn(fi)
+	funcBody(fi, dp-1)
+	restoreFn(c)
+	if diags.count > before {
+		syms.items[usize(s)].body = 3
+		return false
+	}
+	syms.items[usize(s)].body = 2
+	return true
+}
+
+func funcBody(fi u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	if funcs.items[usize(fi)].measure != 0 {
+		measure(funcs.items[usize(fi)].measure, dp-1)
+	}
+	body := funcs.items[usize(fi)].body
+	stmtList(body, dp-1)
+	if sigNResults(funcs.items[usize(fi)].sig) > 0 && !isTerminatingList(body, SemaDepth) {
+		mreset()
+		ms("missing return at end of ")
+		mfuncName(fi)
+		errAtEnd(E2003, body)
+	}
+}
+
+// measure checks a decreases(M) expression: M must be a usize value.
+func measure(e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	x := exprValue(e, dp-1)
+	if isInvalidOp(&x) {
+		return
+	}
+	_ = assignment(&x, TyUsize, mkCtx(CtxDecreases))
+}
+
+// ---------------------------------------------------------------------------
+// Type expressions (typexpr.go)
+
+func typExpr(t u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	r := typExpr0(t, dp-1)
+	if r == 0 {
+		r = TyInvalid
+	}
+	ntype[usize(t)] = r
+	nmode[usize(t)] = KType
+	return r
+}
+
+func typExpr0(t u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	k := nkind(t)
+	if k == NkNamedType {
+		return namedTypeExpr(t, dp-1)
+	}
+	if k == NkArrayType {
+		elem := typExpr(nb(t), dp-1)
+		n, lp, ok := arrayLen(na(t), dp-1)
+		if !ok || isInvalid(elem) {
+			return TyInvalid
+		}
+		return mkArray(n, lp, elem)
+	}
+	if k == NkSliceType || k == NkPointerType {
+		elem := typExpr(na(t), dp-1)
+		if isInvalid(elem) {
+			return TyInvalid
+		}
+		if k == NkSliceType {
+			return mkSlice(elem)
+		}
+		return mkPointer(elem)
+	}
+	if k == NkStructType {
+		mark := tmark()
+		nf := l1len(t)
+		for i := usize(0); i < nf; i++ {
+			f := l1at(t, i)
+			ft := typExpr(na(f), dp-1)
+			nn := l1len(f)
+			for j := usize(0); j < nn; j++ {
+				id := l1at(f, j)
+				nm := idName(id)
+				if nm != nameBlank {
+					cnt := (typs.top - mark) / 2
+					for q := usize(0); q < cnt; q++ {
+						if typs.stack[mark+2*q] == nm {
+							mreset()
+							ms("duplicate field ")
+							mname(nm)
+							errAt(E2002, id)
+							break
+						}
+					}
+				}
+				tpush(nm)
+				tpush(ft)
+				ntype[usize(id)] = ft
+			}
+		}
+		return mkStruct(mark)
+	}
+	if k == NkEnumType {
+		mark := tmark()
+		nv := l1len(t)
+		for i := usize(0); i < nv; i++ {
+			v := l1at(t, i)
+			nm := idName(na(v))
+			cnt := (typs.top - mark) / 3
+			for q := usize(0); q < cnt; q++ {
+				if typs.stack[mark+3*q] == nm {
+					mreset()
+					ms("duplicate variant ")
+					mname(nm)
+					errAt(E2002, na(v))
+					break
+				}
+			}
+			pm := tmark()
+			np := l1len(v)
+			for j := usize(0); j < np; j++ {
+				tpush(typExpr(l1at(v, j), dp-1))
+			}
+			ps, pn := tcommitStack(pm)
+			tpush(nm)
+			tpush(ps)
+			tpush(pn)
+		}
+		return mkEnum(mark)
+	}
+	if k == NkFuncType {
+		eff := u8(EffTotal)
+		if nflag(t) {
+			eff = EffDriver
+		}
+		return signature(na(t), eff, 0, 0, dp-1)
+	}
+	if k == NkCodeType {
+		chkConstCtx++
+		r := codeTypeLevel(na(t), dp-1)
+		chkConstCtx--
+		return r
+	}
+	if k == NkElType {
+		chkConstCtx++
+		r := elType(na(t), dp-1)
+		chkConstCtx--
+		return r
+	}
+	if k == NkAnyType {
+		mreset()
+		ms("any is only allowed as a type parameter constraint")
+		errAt(E2002, t)
+		return TyInvalid
+	}
+	return TyInvalid
+}
+
+func codeTypeLevel(e u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	x := exprValue(e, dp-1)
+	if isInvalidOp(&x) {
+		return TyInvalid
+	}
+	if x.mode != KConst || !isInteger(x.typ) {
+		mreset()
+		ms("Code level must be a constant natural number, not ")
+		mexpr(e)
+		errAt(E2010, e)
+		return TyInvalid
+	}
+	_ = convertUntyped(&x, TyUsize)
+	lvl, ok := valUint64(x.val)
+	if !ok || lvl > 1<<20 {
+		mreset()
+		ms("invalid Code level ")
+		mval(x.val)
+		errAt(E2010, e)
+		return TyInvalid
+	}
+	return mkCode(int(lvl))
+}
+
+// elType evaluates El(e): e must be a constant Code.
+func elType(e u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	x := exprValue(e, dp-1)
+	if isInvalidOp(&x) {
+		return TyInvalid
+	}
+	if tk(x.typ) != TCCode {
+		mreset()
+		ms("El expects a Code value, got ")
+		mexpr(e)
+		ms(" (type ")
+		mtype(x.typ)
+		ms(")")
+		errAt(E2002, e)
+		return TyInvalid
+	}
+	if x.mode != KConst || x.val.kind != VCode {
+		mreset()
+		ms("El argument ")
+		mexpr(e)
+		ms(" is not a compile-time constant")
+		errAt(E2002, e)
+		return TyInvalid
+	}
+	return foldCode(x.val, SemaDepth)
+}
+
+// arrayLen evaluates an array length: a constant or a const type parameter.
+func arrayLen(e u32, dp usize) (u64, u32, bool) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return 0, 0, false
+	}
+	if nkind(e) == NkIdent {
+		sym := uses[usize(e)]
+		if sym != 0 && symKind(sym) == SymTypeParam {
+			tp := syms.items[usize(sym)].typ
+			if tp != 0 && tk(tp) == TCTypeParam && tpIsConst(tp) {
+				ntype[usize(e)] = typs.items[usize(tp)].a
+				nmode[usize(e)] = KValue
+				return 0, tp, true
+			}
+		}
+	}
+	chkConstCtx++
+	x := exprValue(e, dp-1)
+	chkConstCtx--
+	if isInvalidOp(&x) {
+		return 0, 0, false
+	}
+	if x.mode != KConst {
+		mreset()
+		ms("array length ")
+		mexpr(e)
+		ms(" is not a compile-time constant")
+		errAt(E4003, e)
+		return 0, 0, false
+	}
+	if !isInteger(x.typ) {
+		mreset()
+		ms("array length ")
+		mexpr(e)
+		ms(" must be an integer (have ")
+		mtype(x.typ)
+		ms(")")
+		errAt(E4003, e)
+		return 0, 0, false
+	}
+	n, ok := valUint64(x.val)
+	if !ok || n > 1<<48 {
+		mreset()
+		ms("invalid array length ")
+		mval(x.val)
+		errAt(E4003, e)
+		return 0, 0, false
+	}
+	if isUntyped(x.typ) {
+		_ = convertUntyped(&x, TyUsize)
+	}
+	return n, 0, true
+}
+
+// signature builds a function type; tps are the type parameters of a
+// generic function (type list range).
+func signature(s u32, eff u8, tpS u32, tpN u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	m1 := tmark()
+	variadic := false
+	np := l1len(s)
+	for i := usize(0); i < np; i++ {
+		p := l1at(s, i)
+		t := typExpr(na(p), dp-1)
+		nn := l1len(p)
+		for j := usize(0); j < nn; j++ {
+			tpush(t)
+		}
+		if nflag(p) {
+			variadic = true
+		}
+	}
+	m2 := tmark()
+	nr := l2len(s)
+	for i := usize(0); i < nr; i++ {
+		tpush(typExpr(l2at(s, i), dp-1))
+	}
+	m3 := tmark()
+	for i := usize(0); i < usize(tpN); i++ {
+		tpush(tlist(tpS, i))
+	}
+	return mkSig(eff, variadic, m1, m2, m3)
+}
+
+// namedTypeExpr resolves [pkg.]Name[Args].
+func namedTypeExpr(t u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	name := nb(t)
+	sym := uses[usize(name)]
+	if sym == 0 {
+		return TyInvalid
+	}
+	if na(t) != 0 {
+		nmode[usize(na(t))] = KPackage
+	}
+	r := typeSym(sym, name, dp-1)
+	if isInvalid(r) {
+		return r
+	}
+	ntype[usize(name)] = r
+	nmode[usize(name)] = KType
+	if tk(r) == TCNamed && tl2n(r) > 0 {
+		if l1len(t) == 0 {
+			mreset()
+			ms("generic type ")
+			mname(u32(typs.items[usize(r)].n))
+			ms(" used without type arguments")
+			errAt(E2002, t)
+			return TyInvalid
+		}
+		return instantiateArgs(r, t, t, t, dp-1)
+	}
+	if l1len(t) > 0 {
+		mreset()
+		mtype(r)
+		ms(" is not a generic type")
+		errAt(E2002, t)
+		return TyInvalid
+	}
+	return r
+}
+
+// typeSym returns the type denoted by a symbol in type position.
+func typeSym(sym u32, id u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	k := symKind(sym)
+	if k == SymType {
+		b := syms.items[usize(sym)].builtin
+		if b == BTCode {
+			mreset()
+			ms("Code requires a level (Code n)")
+			errAt(E2010, id)
+			return TyInvalid
+		}
+		if b == BTEl {
+			mreset()
+			ms("El requires an argument (El(code))")
+			errAt(E2002, id)
+			return TyInvalid
+		}
+		t := symType(sym, dp-1)
+		if t == 0 {
+			return TyInvalid
+		}
+		return t
+	}
+	if k == SymTypeParam {
+		tp := syms.items[usize(sym)].typ
+		if tp == 0 || tk(tp) != TCTypeParam {
+			return TyInvalid
+		}
+		if tpIsConst(tp) {
+			mreset()
+			mname(symName(sym))
+			ms(" is a const parameter, not a type")
+			errAt(E2002, id)
+			return TyInvalid
+		}
+		return tp
+	}
+	mreset()
+	mname(symName(sym))
+	ms(" is not a type")
+	errAt(E2002, id)
+	return TyInvalid
+}
+
+// instantiateArgs instantiates generic named type n with the type
+// arguments in list l1 of `args` (a NamedType or IndexExpr); node records
+// the instance, sp is the error position.
+func instantiateArgs(n u32, args u32, node u32, sp u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	na1 := l1len(args)
+	ntp := tl2n(n)
+	if na1 != ntp {
+		mreset()
+		ms("wrong number of type arguments for ")
+		mname(u32(typs.items[usize(n)].n))
+		ms(": have ")
+		mu(u64(na1))
+		ms(", want ")
+		mu(u64(ntp))
+		errAt(E2003, sp)
+		return TyInvalid
+	}
+	mark := tmark()
+	for i := usize(0); i < na1; i++ {
+		ta := typeArg(l1at(args, i), tl2(n, i), dp-1)
+		if isInvalid(ta) {
+			typs.top = mark
+			return TyInvalid
+		}
+		tpush(ta)
+	}
+	s, c := tcommitStack(mark)
+	return instantiate(n, typs.lists[usize(s):usize(s)+usize(c)], node, SemaDepth)
+}
+
+// typeArg checks one type argument against its parameter.
+func typeArg(e u32, tp u32, dp usize) u32 decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return TyInvalid
+	}
+	if tpIsConst(tp) {
+		u := unparen(e)
+		if nkind(u) == NkIdent {
+			sym := uses[usize(u)]
+			if sym != 0 && symKind(sym) == SymTypeParam {
+				p := syms.items[usize(sym)].typ
+				if p != 0 && tk(p) == TCTypeParam && tpIsConst(p) {
+					ntype[usize(u)] = typs.items[usize(p)].a
+					nmode[usize(u)] = KValue
+					return p
+				}
+			}
+		}
+		chkConstCtx++
+		x := exprValue(e, dp-1)
+		chkConstCtx--
+		if isInvalidOp(&x) {
+			return TyInvalid
+		}
+		if x.mode != KConst || !isInteger(x.typ) {
+			mreset()
+			ms("type argument ")
+			mexpr(e)
+			ms(" for const parameter ")
+			mname(u32(typs.items[usize(tp)].n))
+			ms(" must be an integer constant")
+			errAt(E2002, e)
+			return TyInvalid
+		}
+		if !assignment(&x, typs.items[usize(tp)].a, mkCtx(CtxTypeArg)) {
+			return TyInvalid
+		}
+		v, ok := valUint64(x.val)
+		if !ok {
+			mreset()
+			ms("invalid const argument ")
+			mval(x.val)
+			errAt(E2002, e)
+			return TyInvalid
+		}
+		return mkConstArg(v)
+	}
+	at := exprAsType(e, SemaDepth)
+	if at == 0 {
+		mreset()
+		mexpr(e)
+		ms(" is not a type")
+		errAt(E2002, e)
+		return TyInvalid
+	}
+	t := typExpr(at, dp-1)
+	if isInvalid(t) {
+		return t
+	}
+	if classOfT(t) != ClassValue {
+		mreset()
+		ms("type argument ")
+		mtype(t)
+		ms(" must be a Value type (type parameters range over Value types)")
+		errAt(E2002, e)
+		return TyInvalid
+	}
+	return t
+}
+
+// ---------------------------------------------------------------------------
+// Whole-program checks
+
+var recState [MaxTypes]u8
+
+func recVisit(t u32, dp usize) bool decreases(dp) {
+	if dp == 0 || t == 0 {
+		return false
+	}
+	k := tk(t)
+	if k == TCNamed {
+		return recVisitNamed(t, dp-1)
+	}
+	if k == TCArray {
+		return recVisit(elemOf(t), dp-1)
+	}
+	if k == TCStruct {
+		n := nfields(t)
+		for i := usize(0); i < n; i++ {
+			if recVisit(fieldType(t, i), dp-1) {
+				return true
+			}
+		}
+	} else if k == TCEnum {
+		n := nvariants(t)
+		for i := usize(0); i < n; i++ {
+			m := variantPayN(t, i)
+			for j := usize(0); j < m; j++ {
+				if recVisit(variantPay(t, i, j), dp-1) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func recVisitNamed(t u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		return false
+	}
+	n := t
+	if namedOrigin(n) != 0 {
+		n = namedOrigin(n)
+	}
+	st := recState[usize(n)]
+	if st == 1 {
+		return true
+	}
+	if st == 2 {
+		return false
+	}
+	recState[usize(n)] = 1
+	bad := recVisit(typs.items[usize(n)].a, dp-1)
+	recState[usize(n)] = 2
+	return bad
+}
+
+// checkRecursiveTypes reports named types that contain themselves by value.
+func checkRecursiveTypes() {
+	n := nNamed
+	for i := usize(0); i < n; i++ {
+		t := namedTypes[i]
+		if recState[usize(t)] == 0 && recVisitNamed(t, SemaDepth) {
+			s := namedSym(t)
+			if s != 0 && syms.items[usize(s)].ident != 0 {
+				mreset()
+				ms("invalid recursive type ")
+				mname(u32(typs.items[usize(t)].n))
+				ms(" (contains itself by value)")
+				errAt(E2002, syms.items[usize(s)].ident)
+			}
+		}
+	}
+}
+
+func badMainBegin() {
+	mreset()
+	ms("invalid main signature: ")
+}
+
+func badMainEnd(d u32) {
+	ms(" (want driver func main(<capabilities>) error)")
+	errAt(E5002, nb(d))
+}
+
+// checkMain validates the entry point of the root package.
+func checkMain() {
+	root := pkgs.root
+	if root == 0 || !nameIs(pkgs.items[usize(root)].name, "main") || pkgs.items[usize(root)].scp == 0 {
+		return
+	}
+	sym := lookupLocal(pkgs.items[usize(root)].scp, nameMain)
+	if sym == 0 {
+		return
+	}
+	d := syms.items[usize(sym)].decl
+	if symKind(sym) != SymFunc || d == 0 || nkind(d) != NkFuncDecl {
+		mreset()
+		ms("main must be a function")
+		errAt(E5002, syms.items[usize(sym)].ident)
+		return
+	}
+	fi := nfunc[usize(d)]
+	funcs.main = fi
+	if nop(d) != ModDriver {
+		badMainBegin()
+		ms("main must be a driver func")
+		badMainEnd(d)
+		return
+	}
+	if nc(d) != 0 {
+		badMainBegin()
+		ms("main cannot have type parameters")
+		badMainEnd(d)
+		return
+	}
+	if fi == 0 || funcs.items[usize(fi)].sig == 0 {
+		return
+	}
+	sig := funcs.items[usize(fi)].sig
+	var seen [NumBuiltins]bool
+	np := sigNParams(sig)
+	for i := usize(0); i < np; i++ {
+		p := sigParam(sig, i)
+		if isInvalid(p) {
+			return
+		}
+		if !isCapability(p) || (sigVariadic(sig) && i == np-1) {
+			badMainBegin()
+			ms("parameter of type ")
+			mtype(p)
+			ms(" is not a capability (Net, Signals, Clock, FS, Env, Stdio, Exec)")
+			badMainEnd(d)
+			return
+		}
+		b := builtinOf(p)
+		if seen[usize(b)] {
+			badMainBegin()
+			ms("duplicate capability ")
+			mtype(p)
+			badMainEnd(d)
+			return
+		}
+		seen[usize(b)] = true
+	}
+	if sigNResults(sig) != 1 || basicKind(sigResult(sig, 0)) != BkError {
+		badMainBegin()
+		ms("main must return exactly error")
+		badMainEnd(d)
+	}
+}
+
+func addFuncOrder(fi u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	upush(fi)
+	c := funcs.items[usize(fi)].litH
+	for g := usize(0); g < MaxCells; g++ {
+		if c == 0 {
+			break
+		}
+		addFuncOrder(cellVal(c), dp-1)
+		c = cellNext(c)
+	}
+}
+
+// finishInfo orders Info.Funcs and gives remaining untyped expressions
+// their default types.
+func finishInfo() {
+	mark := ustack.count
+	n := pkgs.norder
+	for i := usize(0); i < n; i++ {
+		p := pkgs.order[i]
+		nd := usize(pkgs.items[usize(p)].declN)
+		for j := usize(0); j < nd; j++ {
+			s := uat(pkgs.items[usize(p)].declS, j)
+			d := syms.items[usize(s)].decl
+			if symKind(s) == SymFunc && d != 0 && nkind(d) == NkFuncDecl {
+				fi := nfunc[usize(d)]
+				if fi != 0 {
+					addFuncOrder(fi, SemaDepth)
+				}
+			}
+		}
+	}
+	s, c := ucommit(mark)
+	funcs.orderS = s
+	funcs.orderN = c
+	nn := nodes.count
+	for i := usize(0); i < nn; i++ {
+		t := ntype[i]
+		if t == 0 {
+			continue
+		}
+		if (isUntyped(t) && basicKind(t) != BkUntypedNil) || isPolyCode(t) {
+			ntype[i] = defaultOf(t)
+		}
+	}
+	ns := syms.count
+	for i := usize(1); i < ns; i++ {
+		t := syms.items[i].typ
+		if t != 0 && isUntyped(t) {
+			if syms.items[i].kind == SymConst {
+				syms.items[i].untyped = true
+			}
+			syms.items[i].typ = defaultOf(t)
+		}
+	}
+}

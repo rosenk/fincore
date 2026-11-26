@@ -106,3 +106,36 @@ func TestCheck(t *testing.T) {
 		t.Fatal(code)
 	}
 }
+
+func TestCheckPassesTypes(t *testing.T) {
+	dir := t.TempDir()
+	// Well-typed, but the totality checker rejects the loop (E4002).
+	loop := filepath.Join(dir, "loop.fc")
+	if err := os.WriteFile(loop, []byte("package main\nfunc f(n usize) {\n\tfor n > 0 {\n\t}\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errs := run("check", loop); code != ExitError || !strings.Contains(errs, "E4002") {
+		t.Fatalf("default: %d %q", code, errs)
+	}
+	if code, out, errs := run("check", "--passes=types", loop); code != ExitOK || out != "" || errs != "" {
+		t.Fatalf("--passes=types: %d %q %q", code, out, errs)
+	}
+	if code, _, errs := run("check", "-passes=all", "--comptime-fuel=5", loop); code != ExitError || !strings.Contains(errs, "E4002") {
+		t.Fatalf("-passes=all: %d %q", code, errs)
+	}
+	// Type errors are still reported.
+	bad := filepath.Join(dir, "bad.fc")
+	if err := os.WriteFile(bad, []byte("package main\nvar g Conn\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errs := run("check", "--passes=types", bad); code != ExitError || !strings.Contains(errs, ":2:5: error[E3001]") {
+		t.Fatalf("bad: %d %q", code, errs)
+	}
+	if code, _, _ := run("check", "--passes=bogus", loop); code != ExitUsage {
+		t.Fatal(code)
+	}
+	// The hidden flag is not documented.
+	if _, _, errs := run("check"); strings.Contains(errs, "passes") {
+		t.Fatalf("usage mentions --passes: %q", errs)
+	}
+}

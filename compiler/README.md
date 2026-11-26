@@ -1,8 +1,10 @@
 # compiler/ — the self-hosted FinCore compiler (Stage 1+, `finc1`)
 
 Milestone M6 (front half): arenas, diagnostics, lexer, parser, AST dump and
-the `finc` driver, written in FinCore. It is a single package `main`
-spread over several files (spec 9.5.6); there are no local imports.
+the `finc` driver, written in FinCore. Milestone M7 part A (semantic
+foundation): name resolution, type checking and the comptime interpreter,
+wired as `finc1 check`. It is a single package `main` spread over several
+files (spec 9.5.6); there are no local imports.
 
 | File | Contents |
 | :--- | :--- |
@@ -11,7 +13,15 @@ spread over several files (spec 9.5.6); there are no local imports.
 | `lexer.fc` | Token kinds, keyword lookup, total lexer with semicolon insertion, literal/escape validation, E1001/E1002 messages |
 | `ast.fc` | Node kinds, the per-kind slot `layout`, post-order NodeID assignment, the `--dump-ast` dumper and the source printer |
 | `parser.fc` | Recursive-descent parser for the full grammar of spec section 3 |
-| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`; the other subcommands print "not implemented" |
+| `sema.fc` | Semantic data model: interned names, symbols, scopes and the (scope, name) symbol table, packages, u32 lists and list cells, per-node resolver tables, the sorted diagnostic list, AST accessors |
+| `resolve.fc` | Port of `resolve`: universe (predeclared entities), package declarations, binder (defs/uses/captures, E2001/E2002) |
+| `types.fc` | Typed model: hash-consed `TypeArena`, predicates, type strings, value classes, builtin named types and capability methods, `FuncInfo`/`Call`/`Selection`/`Inst` records, per-node type tables, instantiation and substitution |
+| `values.fc` | Compile-time values: 128-bit integers, value slots (persistent region + comptime heap), zero values, copying, constant arithmetic, equality, value strings, Code folding |
+| `checker.fc` | Type checker part 1: operands, assignability and untyped constants, package-level declarations, type expressions, recursive types, `main`, finishing |
+| `check_expr.fc` | Type checker part 2: expressions and calls (builtins, conversions, methods, capability methods, variants, generic instances, comptime folding) |
+| `check_stmt.fc` | Type checker part 3: statements, match patterns, terminating statements |
+| `comptime.fc` | Fuel-bounded comptime interpreter (the checker's evaluator) |
+| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`, `check [--comptime-fuel=N] <file.fc \| dir>` (the loader for local imports lives here); build/run/test print "not implemented" |
 
 ## Architecture
 
@@ -25,24 +35,25 @@ frame. Capacities:
 
 | Arena | Capacity |
 | :--- | :--- |
-| `SourceArena` | `MaxFiles = 64` files, `MaxSourceBytes = 4 MiB` in total |
+| `SourceArena` | `MaxFiles = 128` files, `MaxSourceBytes = 4 MiB` in total |
 | `TokenArena` | `MaxTokens = 262_144` tokens (reset per file) |
-| `NodeArena` | `MaxNodes = 131_072` nodes, `MaxListItems = 262_144` list items (whole package) |
+| `NodeArena` | `MaxNodes = 524_288` nodes, `MaxListItems = 1_048_576` list items (whole program) |
 | `ListStack` | `MaxListItems` (scratch for lists under construction) |
 | `OutBuf` | `MaxOutputBytes = 8 MiB` (stdout dump per file, stderr diagnostics, string scratch) |
 
 Overflow never panics: `alloc`/`push`/`commit`/`put*` set a sticky `full`
 flag (writes go to the reserved slot 0 or are dropped) and the driver
 reports `finc1: <file>: compiler capacity exceeded (...)` and returns
-`ErrArenaFull`. `compiler/` itself parses to about 25k nodes and a 1.7 MB
-dump.
+`ErrArenaFull`. The semantic arenas are listed in "Semantic model" below.
+`finc1 check --stats <path>` (hidden flag) prints the usage of every arena.
 
 **IDs.** `NodeID`, list starts and lengths, token offsets and positions are
 `u32`; arena index 0 means "none". A `Node` has six single-child slots
 (`a`..`f`), two list slots (`l1`, `l2`, ranges in `NodeArena.lists`), two
 flag bits, a small `op` field (operator, modifier or literal kind), a text
 span `tOff/tLen` (absolute offset into `SourceArena.bytes`: identifier name
-or literal spelling) and `ival` (integer or char value). The meaning of the
+or literal spelling) and `ival` (integer or char value; for a BinaryExpr
+the operator position `line<<32 | col`, finc0's `OpPos`). The meaning of the
 slots per kind is in the header comment of `ast.fc`. Lists are built
 on the `ListStack` (lists nest in LIFO order) and committed into
 `NodeArena.lists` in one piece when complete.
@@ -86,10 +97,191 @@ fixtures, `compiler/` itself, all 50 error cases from finc0's
 cases, directory cases (package mismatch, several failing files, no `.fc`
 files) and 3,000 randomly mutated sources.
 
+## Semantic model (M7): what `finc1 check` builds
+
+The semantic phases mirror finc0's `resolve.Program` and `types.Info`, but
+every table is a fixed array in a package-level `var`, indexed by u32 IDs
+(0 = none), and every pass is a set of free functions over those globals
+(total functions may read and write globals; no Scoped helper struct is
+needed). Later passes (scope checker, totality checker, codegen) read the
+same tables. Unless stated otherwise, per-node tables are indexed by the
+**NodeArena index** of the node, not by finc0's post-order NodeID (that one
+is still available as `Node.id`).
+
+### Pipeline (`checkPath` in main.fc)
+
+1. `parseSources` parses the root file/directory (like `parser.ParsePath`);
+   `visitPackage` / `loadImport` load local imports depth-first relative to
+   the current directory (module root), exactly like `resolve/load.go`:
+   E2001 invalid/missing/empty packages, E2006 import cycles, files of
+   imported packages are named `importpath/file.fc`. `pkgs.order` is the
+   dependency order (root last), `pkgs.root` the root package.
+2. If any diagnostic exists, print them (sorted) and stop. Otherwise
+   `resolveProgram` (resolve.fc): universe, `declarePackage` for all
+   packages, then `bindPackage`.
+3. If the resolver reported anything, stop. Otherwise `checkProgram`
+   (checker.fc): `objDecl` of every package-level symbol, `ensureBody` of
+   every function, `checkRecursiveTypes`, `checkMain`, `finishInfo`.
+4. Diagnostics are collected in `diags` (sema.fc) and printed sorted by
+   (file path, line, column, code, message) with exact duplicates removed,
+   as `diag.List.Sort` does. `--comptime-fuel=N` sets `evalFuel`.
+
+The later passes (scope, totality) must run only when `diags.count == 0`
+after step 3, and may then assume a well-typed program: every expression
+has a type, every CallExpr has a `Call`, every identifier use a symbol.
+
+### Names, symbols, scopes, packages (sema.fc, resolve.fc)
+
+| Table | Contents |
+| :--- | :--- |
+| `names` | Interned spellings (`NameID`); `idName(identNode)` caches the NameID of an Ident; `nameBytes(id)`, `nameBlank`, `nameMain` |
+| `syms.items[SymID]` (`Sym`) | `kind` (SymConst/SymType/SymVar/SymFunc/SymBuiltin/SymTypeParam/SymPackage), `varKind` (VarGlobal/Local/Param/Recv/Binding/Scope), `builtin` (predeclared entity, `BT*`/`BC*`/`BF*` in resolve.fc), `name`, `ident` (defining Ident node), `decl` (declaring node, as `resolve.Symbol.Decl`), `pkg`, `fn` (enclosing FuncDecl/FuncLit node of locals; 0 = package level), `imported` (SymPackage), `recvType` (NameID of the receiver type of methods) |
+| checker fields of `Sym` | `typ` (SymTypes; untyped constants hold their default type), `val` (SymValues: value slot), `untyped` (UntypedConsts), `method` (MethodOf), `objState`/`body` (checker bookkeeping) |
+| `scopes.items[ScopeID]` | `parent`, `kind`, `node`; all bindings are in one open-addressing table keyed by (scope, name): `lookupLocal(scope, name)`, `lookupChain(scope, name)` |
+| `pkgs.items[PkgID]` (`Pkg`) | `name`, `path` (import path, "" for root), `scp` (package scope), source files `[f0, f1)` (only `sources.files[i].ok` ones belong to it), `impS/impN` (imports), `declS/declN` (package-level symbols in source order, methods included), `methS/methN` (methods); `fileScope[file]`, `filePkg[file]` |
+| `defs[node]`, `uses[node]` | Prog.Defs / Prog.Uses; `symbolOf(ident)` |
+| `litCapHead[funcLit]` | Prog.Captures: cell list of captured outer locals, first-use order |
+| `builtinSym[b]`, `universe` | Universe symbols of the predeclared entities |
+
+Struct field names, enum variant names and method selector names are not
+symbols (see `Selection`), exactly as in finc0. Blank `_` locals get a
+symbol but no `defs` entry.
+
+### Types (types.fc)
+
+`typs.items[TypeID]` (`TypeRec`), see the field table in types.fc. Basic
+types have fixed IDs `TyBool`..`TyUntypedNil` (`TyInvalid = 1`). Structural
+types and generic instances are **hash-consed**, so `types.Identical(a, b)`
+is `a == b`. Named types (`newNamed`), type parameters and opaque resource
+types are unique records. Helpers: `underlying`, `basicKind`, `isInteger`,
+`isUnsigned`, `isUntyped`, `isBoolean`, `isString`, `intInfo`, `defaultOf`,
+`derefType`, `elemOf`, `nfields/fieldName/fieldType/fieldByName`,
+`nvariants/variantName/variantPay*/variantByName`, `sig*` (effect,
+variadic, params, results, type params, `sigResultType`), `namedOrigin`,
+`namedSym`, `builtinOf`, `isResource`, `isCapability`, `comparable`,
+`hasTypeParam`, `putType`/`mtype` (types.Type.String). Lists (fields as
+(name, type) pairs, variants as (name, payload start, payload len) triples,
+params, results, type args) live in `typs.lists`.
+
+**Classes (spec 4.1):** `classOfT(t)` returns `ClassValue`, `ClassScoped` or
+`ClassLinear` (cached on named types, like `types.ClassOf`); `isScoped`,
+`isLinear`.
+
+### Typed model records
+
+| Table | finc0 equivalent |
+| :--- | :--- |
+| `ntype[node]` | `Info.TypeOf`: final type of expressions (untyped constants defaulted), Tuple types of multi-result calls, 0 for calls without results and builtin/package names; the type of type nodes; the instantiated signature for a method selector used as callee |
+| `nmode[node]` | `Info.KindOf` (`KValue`, `KVar`, `KConst`, `KType`, `KNoValue`, `KBuiltin`, `KFunc`, `KPackage`, `KVariantCtor`) |
+| `nval[node]` | `Info.ValueOf`: value slot of constants and folded comptime calls (`VTuple` for multi-result ones) |
+| `ncall[callExpr]` → `callTab.items[CallID]` | `Info.CallOf`: `kind` (CallFunc/CallMethod/CallBuiltinMeth/CallBuiltin/CallConversion/CallVariant/CallValue), `callee` (function/method symbol, or the builtin's universe symbol), `builtin`, `method`, `recv` (receiver expression), `recvType`, `taS/taN` (TypeArgs), `sig` (instantiated signature), `effect` (EffComptime < EffTotal < EffDriver), `folded`, `conv`, `variantType` / `variantEnum` / `variant`, and the scope-checker hints `resourceCtor`, `consumesRecv`, `consumesArg0` (`ConsumesArgs == [0]`) |
+| `nsel[selectorExpr]` → `selTab.items` | `Info.SelectionOf`: `kind` (SelField/SelMethod/SelVariant), `recv` (type of x), `indirect`, `ctype`+`index` (field of a struct type / variant of an enum type), `method`; no entry for package-qualified names |
+| `ninst[node]` → `insts.items[InstID]` | `Info.InstanceOf` / `Info.InstanceList` (records in first-use order): `sym`, `named` (type instances), `argS/argN`, `sig` (function instances), `generic` |
+| `nvarEnum[ctorPattern]`, `nvarIdx` | `Info.VariantOf` |
+| `nfunc[funcDecl or funcLit]` → `funcs.items[FuncID]` | `Info.FuncOf`; `funcOfSym(sym)` = `Info.FuncOfSym` |
+| `funcs.orderS/orderN` (ulists) | `Info.Funcs`: declarations in package/source order, each followed by its literals depth-first |
+| `funcs.main` | `Info.Main` |
+| `namedTypes[0:nNamed]` | `Info.Named` |
+| `meths.items[MethodID]` | `types.Method`: `name`, `recv` (origin Named), `ptrRecv`, `builtin` (`BM*`, capability/resource methods), `rtpS/rtpN` (RecvTypeParams), `sig` (0 for the generic Scope methods), `sym`, `decl`; `methodsOf(named)` lists the methods of a type (cached on the type) |
+
+`FuncInfo`: `sym`, `decl`, `lit`, `outer`, `effect`, `sig`, `method`,
+`recvSym`, `parS/parN` (parameter **Ident nodes** in order; the symbol is
+`defs[ident]`, 0 for `_`), `tpS/tpN` (TypeParams), `measure`
+(the `decreases(M)` expression), `body`, `callH/callT` (cell list of the
+CallExpr nodes of the body in source order, excluding nested literals),
+`litH/litT` (cell list of directly nested literal FuncInfos); captures of a
+literal are `litCapHead[lit]`. Call-graph edges: for each call with kind
+CallFunc or CallMethod the callee is `funcOfSym(call.callee)` (methods are
+resolved by receiver type).
+
+### Values (values.fc)
+
+`Val` is a by-value record: `VInt` (exact 128-bit two's complement in
+`hi/lo`; `flag&1` marks values outside ±2^127), `VBool`, `VString`
+(`strPool` span), `VError` (sentinel builtin, 0 = nil), `VNil`, `VArray`,
+`VSlice`, `VStruct`, `VEnum`, `VTuple`, `VCode`, `VFieldCode`, `VPtr`.
+Aggregates refer to contiguous **value slots** in `vals`: the persistent
+region `[1, VtabCap)` holds every value recorded in the typed model; the
+comptime heap `[VtabCap, MaxValSlots)` is reset after each evaluation root
+once its result has been copied with `persistVal`. Operations:
+`binaryOpVal`, `unaryOpVal`, `equalVals`, `representable`, `wrapVal`,
+`valUint64`, `zeroVal`, `copyV`, `putVal`, `foldCode`, `codeLevelOf`.
+
+### Recursion and scratch stacks
+
+The checker, the expression and statement checkers and the interpreter form
+one recursive SCC (about 80 functions). Each member takes `dp usize` with
+`decreases(dp)`, returns at once when `dp == 0` (after `tooDeep()`, which
+sets `semaFull`), and passes `dp-1` inside the SCC; entry points pass
+`SemaDepth = 1_000_000`. Smaller SCCs (binder, type strings, classes,
+substitution/instantiation, value copies, terminating statements, AST
+walks) follow the same pattern. Lists under construction use LIFO scratch
+stacks that every function leaves balanced: `typs.stack` (type lists,
+`tpush`/`tcommitStack`/`mk*`), `ustack` (`upush`/`ucommit`), `opStack`
+(operands of calls and assignments), `vstack` (comptime argument values),
+`rstack` (assignment references).
+
+### Comptime interpreter (comptime.fc)
+
+`callComptime(fn, argMark, dp)` is `types.Evaluator.CallComptime`: a fresh
+fuel budget per evaluation root, one unit per call, loop iteration and index
+operation, `CtMaxDepth = 10_000` frames, E4001 messages with the collapsed
+call stack, E4003/E2002/E5001 as finc0. finc0 unwinds failures with panic;
+here the first failure sets `ifail` (`ifailCode`, `ifailMsg`; code 0 = already
+reported) and every step returns as soon as it sees it. Nested roots (a
+comptime call folded while the checker checks a body on behalf of the
+interpreter) save and restore the interpreter state. Frame variables live in
+`fvSym/fvSlot` ranges; a variable's cell is a heap slot and `&x` marks it so
+that a redeclaration allocates a fresh cell (finc0's map semantics).
+
+### Semantic capacities
+
+| Arena | Capacity | `compiler/` (18k lines) |
+| :--- | :--- | :--- |
+| `names` | `MaxNames = 65_536`, `MaxNameBytes = 1 MiB` | 1.9k |
+| `syms` | `MaxSyms = 131_072`, `SymBuckets = 524_288` | 4.9k |
+| `scopes` | `MaxScopes = 524_288` | 6.7k |
+| `ulists`, `ustack` | `MaxULists = 1_048_576` | 3.3k |
+| `cells` | `MaxCells = 524_288` | 7.7k |
+| `typs` | `MaxTypes = 131_072`, `TypeBuckets = 262_144`, `MaxTypeLists = 1_048_576` | 501 / 1.6k |
+| `meths`, `insts`, `funcs` | 16_384, 8_192, 65_536 | 164, 0, 644 |
+| `callTab`, `selTab` | 262_144 each | 7.7k, 5.1k |
+| `vals` | `VtabCap = 1 Mi` persistent + `HeapCap = 2 Mi` heap slots | 9.4k |
+| `strPool` | `MaxStrBytes = 4 MiB` | 16 KB |
+| `diags` | `MaxDiags = 8_192`, `MaxDiagBytes = 2 MiB` | 0 |
+
+`compiler/` itself uses 84k nodes (4.6 per line), so a 35k-line compiler
+needs about 165k of `MaxNodes = 524_288`; every other table has more than
+10x headroom. Deviations from the spec 9.4 table: MaxNodes 524_288 (spec
+131_072), MaxListItems 1_048_576 (262_144), MaxFiles 128 (64), MaxTypes
+131_072 (32_768), MaxSyms 131_072 (32_768) with 524_288 buckets (65_536);
+there is no separate MaxFields: fields are entries of `typs.lists`.
+`finc1 check compiler/` takes about 20 ms and 90 MB RSS.
+
+### Validation
+
+`make diff-check` (scripts/diffcheck) runs `finc1 check` and the oracle
+`finc0 check --passes=types` (hidden flag: load + resolve + types +
+comptime only) on examples/, testdata/{pass,fail,integration},
+the parser fixtures, scripts/diffcheck/cases/*.fc (hand-written edge cases
+for the interpreter, generics, enums, Code and error paths), compiler/ and
+every FinCore snippet embedded in finc0's resolve/types/comptime unit tests
+(single files and multi-file import modules, each with the default and a
+small fuel), and requires byte-identical stdout/stderr and the same
+success/failure status (finc1's generated `main` appends one
+`error: fincore: ...` line and always exits 1 on failure; that line is
+removed before comparing). `make diff-check-fuzz SEED=n` adds 20 random
+token-level mutants per source.
+
 ## Language subset used (conservative on purpose)
 
 - Only `func` (total) and `driver func`; no `comptime`, generics, enums,
-  `match`, closures, `defer` or `scope`.
+  `match`, closures, `defer` or `scope`. The M7 files use free functions
+  over package-level arenas instead of methods on Scoped helper structs
+  (total functions read and write globals directly); pointers appear only
+  as `*Operand` / `*OutBuf` parameters (`&opStack.items[i]`, `&msgBuf`).
+- No compound assignment other than `+= -= *= /=` (no `|=`); `scope`,
+  `any` and `decreases` are keywords and cannot name fields or variables.
 - No `iota`: every constant is spelled out. Token, node and operator kinds
   are untyped integer constants compared against `u8` fields.
 - No array literals and no lookup tables: name tables are `if` chains that
@@ -108,7 +300,9 @@ files) and 3,000 randomly mutated sources.
   `MaxNesting`. Tree walks start at `WalkDepth = MaxNodes + 1`, because a
   tree is never deeper than its node count. Recursive method names are
   unique across receiver types, so even a name-based call graph gives the
-  same SCCs.
+  same SCCs. The M7 semantic SCCs use `dp usize` and `SemaDepth` (see
+  "Recursion and scratch stacks"). Recursion between driver functions
+  (`visitPackage` / `loadImport`) is not totality-checked.
 - Methods with pointer receivers are always called through a pointer
   variable (decision 10). For globals this means `eb := &errBuf;
   eb.putStr(...)`.
@@ -166,3 +360,27 @@ files) and 3,000 randomly mutated sources.
   `filepath.Join` (lexical Clean). finc0 also skips non-regular entries
   that are not symlinks. `fincrt.ListSourceFiles` only skips directories.
 - **Usage texts** say `finc1` where finc0 says `finc0`.
+- **Exit status.** The generated `main` prints `error: <err>` after a failed
+  driver and always exits 1, so usage errors exit 1 (finc0: 2) and every
+  failure has one extra stderr line.
+
+### `check` (M7)
+
+- **Integer constants are exact only within ±2^127** (finc0 uses
+  `math/big`). Larger intermediate values (e.g. `1 << 127 - 1`,
+  `1 << 200`) are marked as overflowed: they still fail every range check,
+  but their decimal form prints as `<overflow>` in messages, and `Wrap` of
+  such a value is not exact. This is the only divergence found by
+  `make diff-check-fuzz`.
+- **The comptime heap is not garbage-collected within one evaluation
+  root**: every array/struct copy allocates value slots, and a root that
+  allocates more than `HeapCap = 2 Mi` slots (e.g. copying a 1000-element
+  array in a 10,000-iteration loop) fails with `compiler capacity exceeded
+  (comptime heap)` where finc0 succeeds. The heap is reset after every
+  root, and a variable redefined in a loop reuses its cell.
+- `diag.List.Sort` removes duplicates including the end of the span; finc1
+  compares (file, line, column, code, message) only.
+- `--comptime-fuel` accepts decimal numbers only (Go's flag package also
+  accepts `0x..`); `check` has the hidden flag `--stats`.
+- I/O failures while loading an imported package are reported as
+  E2001 `cannot load package` without Go's error text.

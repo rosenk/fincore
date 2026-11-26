@@ -1,0 +1,78 @@
+package main
+
+type Color enum {
+	Red
+	Green
+	Blue
+	Red
+}
+
+type Opt enum {
+	None
+	Some(u32)
+}
+
+const K = 3
+
+func f(o Opt, c Color) u32 {
+	match o {
+		Opt.Some(x) -> {
+			return x
+		}
+		None -> {
+			return 0
+		}
+	}
+}
+
+func g(o Opt) u32 {
+	match o {
+		Opt.Some(x, y) -> {
+			return x
+		}
+		Opt.Nope -> {
+			return 1
+		}
+		Color.Red -> {
+			return 2
+		}
+		K(z) -> {
+			return 3
+		}
+		u32.X -> {
+			return 4
+		}
+		Missing -> {
+			return 5
+		}
+	}
+	return 9
+}
+
+func h(n u32) u32 {
+	match n {
+		1 -> {
+			return 1
+		}
+		K -> {
+			return 3
+		}
+		"s" -> {
+			return 4
+		}
+		_ -> {
+			return 0
+		}
+	}
+}
+
+func k() Opt {
+	a := Opt.Some(1)
+	b := Opt.Some
+	c := Opt.None
+	d := Opt.Some(1, 2)
+	e := Color.Purple
+	_ = b
+	_, _, _ = c, d, e
+	return a
+}
