@@ -1,0 +1,241 @@
+// pass_total_algorithms: every loop and recursion here lives in the total
+// layer and must be proven terminating by T1/T2/T3:
+//   - T1: indexed loops counting up / down with constant steps;
+//   - T3: binary search with decreases(hi - lo);
+//   - T2: writeAll slice-shrink with an explicit `if n == 0` guard;
+//   - T3+SCC: mutual recursion isEven <-> isOdd with decreases(depth).
+package main
+
+const MaxDepth = 64
+
+// ---- T1: indexed loops ----
+
+func sum(a []u32) u64 {
+	var s u64
+	for i := usize(0); i < len(a); i++ {
+		s += u64(a[i])
+	}
+	return s
+}
+
+func sumEven(a []u32) u64 {
+	var s u64
+	for i := usize(0); i < len(a); i += 2 {
+		s += u64(a[i])
+	}
+	return s
+}
+
+func countdown(dst []byte) usize {
+	k := usize(0)
+	for i := usize(9); i > 0; i -= 1 {
+		if k < len(dst) {
+			dst[k] = byte(i) + '0'
+			k++
+		}
+	}
+	return k
+}
+
+// ---- T3: binary search ----
+
+func search(a []u32, key u32) (usize, bool) {
+	lo := usize(0)
+	hi := len(a)
+	for lo < hi decreases(hi - lo) {
+		mid := lo + (hi-lo)/2
+		if a[mid] == key {
+			return mid, true
+		}
+		if a[mid] < key {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return 0, false
+}
+
+// ---- T2: writeAll over a fake, bounded writer ----
+
+type Sink struct {
+	data [64]byte
+	len  usize
+}
+
+// Write accepts at most 5 bytes per call and returns 0 when full.
+func (s *Sink) Write(p []byte) (usize, error) {
+	n := len(p)
+	if n > 5 {
+		n = 5
+	}
+	room := len(s.data) - s.len
+	if n > room {
+		n = room
+	}
+	k := copy(s.data[s.len:s.len+n], p[:n])
+	s.len += k
+	return k, nil
+}
+
+func writeAll(s *Sink, data []byte) error {
+	for rem := data; len(rem) > 0; {
+		n, err := s.Write(rem)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+	return nil
+}
+
+// ---- T3 + SCC: mutual recursion with a shared depth measure ----
+
+func isEven(n u32, depth usize) (bool, error) decreases(depth) {
+	if depth == 0 {
+		return false, ErrMaxDepth
+	}
+	if n == 0 {
+		return true, nil
+	}
+	return isOdd(n-1, depth-1)
+}
+
+func isOdd(n u32, depth usize) (bool, error) decreases(depth) {
+	if depth == 0 {
+		return false, ErrMaxDepth
+	}
+	if n == 0 {
+		return false, nil
+	}
+	return isEven(n-1, depth-1)
+}
+
+// ---- output helpers (driver layer) ----
+
+driver func putStr(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func putBool(io Stdio, label string, b bool, err error) error {
+	if e := io.WriteStdout(strBytes(label)); e != nil {
+		return e
+	}
+	if err == ErrMaxDepth {
+		return io.WriteStdout(strBytes("max depth\n"))
+	}
+	if b {
+		return io.WriteStdout(strBytes("true\n"))
+	}
+	return io.WriteStdout(strBytes("false\n"))
+}
+
+driver func main(io Stdio) error {
+	var arr [10]u32
+	for i := usize(0); i < len(arr); i++ {
+		arr[i] = u32(i*i + 1)
+	}
+	a := arr[:]
+
+	if err := putUint(io, "sum: ", sum(a)); err != nil {
+		return err
+	}
+	if err := putUint(io, "sum even idx: ", sumEven(a)); err != nil {
+		return err
+	}
+
+	var cd [16]byte
+	k := countdown(cd[:])
+	if err := putStr(io, "countdown: "); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(cd[:k]); err != nil {
+		return err
+	}
+	if err := putStr(io, "\n"); err != nil {
+		return err
+	}
+
+	idx, ok := search(a, 50)
+	if ok {
+		if err := putUint(io, "search 50 at: ", u64(idx)); err != nil {
+			return err
+		}
+	}
+	_, ok = search(a, 51)
+	if !ok {
+		if err := putStr(io, "search 51: absent\n"); err != nil {
+			return err
+		}
+	}
+	idx, ok = search(a, 1)
+	if ok {
+		if err := putUint(io, "search 1 at: ", u64(idx)); err != nil {
+			return err
+		}
+	}
+	idx, ok = search(a, 82)
+	if ok {
+		if err := putUint(io, "search 82 at: ", u64(idx)); err != nil {
+			return err
+		}
+	}
+
+	var sink Sink
+	sp := &sink
+	if err := writeAll(sp, strBytes("hello, finite world")); err != nil {
+		return err
+	}
+	if err := putStr(io, "sink: "); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(sink.data[:sink.len]); err != nil {
+		return err
+	}
+	if err := putStr(io, "\n"); err != nil {
+		return err
+	}
+	if err := putUint(io, "sink len: ", u64(sink.len)); err != nil {
+		return err
+	}
+
+	var big [100]byte
+	if err := writeAll(sp, big[:]); err == ErrZeroWrite {
+		if err := putUint(io, "sink full at: ", u64(sink.len)); err != nil {
+			return err
+		}
+	}
+
+	b, err := isEven(10, MaxDepth)
+	if e := putBool(io, "isEven(10): ", b, err); e != nil {
+		return e
+	}
+	b, err = isOdd(7, MaxDepth)
+	if e := putBool(io, "isOdd(7): ", b, err); e != nil {
+		return e
+	}
+	b, err = isOdd(10, MaxDepth)
+	if e := putBool(io, "isOdd(10): ", b, err); e != nil {
+		return e
+	}
+	b, err = isEven(100, 8)
+	return putBool(io, "isEven(100) depth 8: ", b, err)
+}

@@ -1,0 +1,11 @@
+// fail_type_in_type: CodeUniv(0) has type Code 1; returning it from a
+// comptime func declared to return Code 0 is a universe-level mismatch.
+package main
+
+comptime func Bad() Code 0 {
+	return CodeUniv(0) // ERROR E2010
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

@@ -1,0 +1,8 @@
+box
+width: 7
+height: 3
+moved min.x: 8
+moved max.y: 24
+copy |min.x|: 2
+zero point ok
+partial literal y: 9

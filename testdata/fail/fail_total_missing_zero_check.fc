@@ -1,0 +1,18 @@
+// fail_total_missing_zero_check: writeAll without `if n == 0 { ... }`.
+// n : usize may be 0, so `rem = rem[n:]` is not a proven strict shrink (T2).
+package main
+
+func writeAll(ctx Context, conn Conn, data []byte) error {
+	for rem := data; len(rem) > 0; { // ERROR E4002
+		n, err := conn.Write(ctx, rem)
+		if err != nil {
+			return err
+		}
+		rem = rem[n:]
+	}
+	return nil
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

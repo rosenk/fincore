@@ -1,0 +1,39 @@
+// fail_use_after_move: `conn` is moved into the conns.Go task; using it
+// afterwards in the enclosing block is E3003.
+package main
+
+const (
+	Slots   = 4
+	BufSize = 16
+)
+
+driver func main(net Net) error {
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	ctx, cancel := NewContext()
+	defer cancel()
+
+	var pool [Slots][BufSize]byte
+
+	scope conns := NewScope(Slots) {
+		slot, err := conns.AcquireSlot(ctx, &pool)
+		if err != nil {
+			return err
+		}
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			conns.ReleaseSlot(slot)
+			return err
+		}
+		conns.Go(slot, driver func(buf *[BufSize]byte) {
+			defer conn.Close()
+			buf[0] = 1
+		})
+		_ = conn.Close() // ERROR E3003
+	}
+	return nil
+}

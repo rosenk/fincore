@@ -1,0 +1,19 @@
+// multifile (directory test, file 1 of 2): `finc build testdata/pass/multifile`.
+// All .fc files in the directory with the same `package` form one package.
+// This file uses a type, a const, a method and functions declared in b_util.fc.
+package main
+
+driver func main(io Stdio) error {
+	var c Counter
+	cp := &c
+	for i := usize(0); i < Steps; i++ {
+		cp.Add(u64(i))
+	}
+	if err := putUint(io, "steps: ", u64(Steps)); err != nil {
+		return err
+	}
+	if err := putUint(io, "total: ", cp.total); err != nil {
+		return err
+	}
+	return putUint(io, "doubled: ", double(cp.total))
+}

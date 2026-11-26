@@ -1,0 +1,90 @@
+// pass_extra_generic_vec: a fixed-capacity generic arena
+// `Vec[N usize, T any]` (spec 4.1) with const + type parameters, generic
+// pointer-receiver methods, and a generic total function over it.
+// N is a compile-time constant; Go codegen must monomorphize [N]T.
+package main
+
+type Vec[N usize, T any] struct {
+	data [N]T
+	len  usize
+}
+
+func (v *Vec[N, T]) Push(x T) error {
+	if v.len >= N {
+		return ErrArenaFull
+	}
+	v.data[v.len] = x
+	v.len++
+	return nil
+}
+
+func (v *Vec[N, T]) Get(i usize, dflt T) T {
+	if i >= v.len {
+		return dflt
+	}
+	return v.data[i]
+}
+
+func (v *Vec[N, T]) Len() usize {
+	return v.len
+}
+
+func sumVec[N usize](v *Vec[N, u32]) u64 {
+	var s u64
+	for i := usize(0); i < v.len; i++ {
+		s += u64(v.data[i])
+	}
+	return s
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func main(io Stdio) error {
+	var nums Vec[4, u32]
+	np := &nums
+	pushed := usize(0)
+	for i := usize(1); i < 7; i++ {
+		if err := np.Push(u32(i * 11)); err != nil {
+			break
+		}
+		pushed++
+	}
+	if err := putUint(io, "pushed: ", u64(pushed)); err != nil {
+		return err
+	}
+	if err := putUint(io, "len: ", u64(np.Len())); err != nil {
+		return err
+	}
+	if err := putUint(io, "sum: ", sumVec[4](np)); err != nil {
+		return err
+	}
+	if err := putUint(io, "get 2: ", u64(np.Get(2, 0))); err != nil {
+		return err
+	}
+	if err := putUint(io, "get 9 (default): ", u64(np.Get(9, 7777))); err != nil {
+		return err
+	}
+
+	var flags Vec[2, bool]
+	fp := &flags
+	if err := fp.Push(true); err != nil {
+		return err
+	}
+	if fp.Get(0, false) && !fp.Get(1, false) {
+		return putUint(io, "bool vec len: ", u64(fp.Len()))
+	}
+	return nil
+}

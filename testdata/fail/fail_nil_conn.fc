@@ -1,0 +1,9 @@
+// fail_nil_conn: nil is only valid for error and []T, never for a resource.
+// The defer keeps the program otherwise linear-clean (no cascading E3005).
+package main
+
+driver func main(io Stdio) error {
+	var c Conn = nil // ERROR E2004
+	defer c.Close()
+	return nil
+}

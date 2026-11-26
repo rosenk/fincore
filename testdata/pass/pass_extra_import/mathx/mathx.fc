@@ -1,0 +1,12 @@
+// Imported local package for pass_extra_import.
+package mathx
+
+const Base = 7
+
+func Square(v u64) u64 {
+	return v * v
+}
+
+func Cube(v u64) u64 {
+	return Square(v) * v
+}

@@ -1,0 +1,15 @@
+// FLAGS: --comptime-fuel=1000
+// fail_comptime_loop: unbounded comptime recursion exhausts the fuel budget.
+// comptime funcs are fuel-bounded and NOT subject to T1-T4, so the only
+// diagnostic is E4001, reported at the evaluation root (the const decl).
+package main
+
+comptime func Forever(n usize) usize {
+	return Forever(n + 1)
+}
+
+const Boom = Forever(0) // ERROR E4001
+
+driver func main(io Stdio) error {
+	return nil
+}

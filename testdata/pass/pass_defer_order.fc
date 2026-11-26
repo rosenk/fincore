@@ -1,0 +1,47 @@
+// pass_defer_order: deferred calls run LIFO (3 -> 2 -> 1) both on normal
+// return and on an early return; a defer that is never reached never runs.
+// Deferred call arguments are evaluated at the defer statement (Go rule).
+package main
+
+driver func say(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func normal(io Stdio) error {
+	defer say(io, "normal: 1\n")
+	defer say(io, "normal: 2\n")
+	defer say(io, "normal: 3\n")
+	return say(io, "normal: body\n")
+}
+
+driver func early(io Stdio, stop bool) error {
+	defer say(io, "early: 1\n")
+	defer say(io, "early: 2\n")
+	defer say(io, "early: 3\n")
+	if stop {
+		return say(io, "early: returning\n")
+	}
+	defer say(io, "early: unreachable\n")
+	return nil
+}
+
+driver func withResource(io Stdio) error {
+	ctx, cancel := NewContext()
+	defer say(io, "resource: 1\n")
+	defer cancel()
+	defer say(io, "resource: 2\n")
+	if !ctx.Done() {
+		return say(io, "resource: live\n")
+	}
+	return nil
+}
+
+driver func main(io Stdio) error {
+	if err := normal(io); err != nil {
+		return err
+	}
+	if err := early(io, true); err != nil {
+		return err
+	}
+	return withResource(io)
+}

@@ -1,0 +1,11 @@
+// fail_total_infinite_for: a bare `for {}` inside a total func.
+package main
+
+func spin() {
+	for { // ERROR E4002
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

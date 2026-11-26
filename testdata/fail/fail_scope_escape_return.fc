@@ -1,0 +1,11 @@
+// fail_scope_escape_return: returning the address of a local (S3).
+package main
+
+func leak() *[16]byte {
+	var local [16]byte
+	return &local // ERROR E3002
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

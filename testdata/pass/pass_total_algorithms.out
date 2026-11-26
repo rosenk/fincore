@@ -1,0 +1,14 @@
+sum: 295
+sum even idx: 125
+countdown: 987654321
+search 50 at: 7
+search 51: absent
+search 1 at: 0
+search 82 at: 9
+sink: hello, finite world
+sink len: 19
+sink full at: 64
+isEven(10): true
+isOdd(7): true
+isOdd(10): false
+isEven(100) depth 8: max depth

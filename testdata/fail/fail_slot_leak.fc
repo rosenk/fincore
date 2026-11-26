@@ -1,0 +1,49 @@
+// fail_slot_leak: the Accept error branch forgets conns.ReleaseSlot(slot),
+// so `slot` (Linear) is live on the `continue`/`break` exit paths.
+// E3005 is reported at the binding site of the leaked resource.
+package main
+
+const (
+	MaxConns = 4
+	BufSize  = 16
+)
+
+driver func handleConn(conn Conn, buf *[BufSize]byte) {
+	defer conn.Close()
+	buf[0] = 1
+}
+
+driver func main(net Net, sig Signals) error {
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	drainCtx, stopSignals := sig.NotifyContext(SIGINT, SIGTERM)
+	defer stopSignals()
+
+	var pool [MaxConns][BufSize]byte
+
+	scope conns := NewScope(MaxConns) {
+		driver for {
+			slot, err := conns.AcquireSlot(drainCtx, &pool) // ERROR E3005
+			if err != nil {
+				break
+			}
+
+			conn, err := ln.Accept(drainCtx)
+			if err != nil {
+				if drainCtx.Done() {
+					break
+				}
+				continue
+			}
+
+			conns.Go(slot, driver func(buf *[BufSize]byte) {
+				handleConn(conn, buf)
+			})
+		}
+	}
+	return nil
+}

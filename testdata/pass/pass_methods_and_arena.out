@@ -1,0 +1,23 @@
+pushed id 0
+pushed id 1
+pushed id 2
+pushed id 3
+pushed id 4
+pushed id 5
+pushed id 6
+pushed id 7
+arena full at push #8
+arena get 5: 50
+arena sum: 280
+put -> bucket 3
+put -> bucket 4
+put -> bucket 5
+put -> bucket 6
+put -> bucket 0
+put -> bucket 4
+table count: 5
+lookup hit: 1105
+lookup hit: 1902
+lookup hit: 403
+lookup miss
+table full, count: 8

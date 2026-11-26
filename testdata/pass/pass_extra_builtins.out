@@ -1,0 +1,22 @@
+parsed+1: 1234567891
+parse 12x fails: true
+copied: 8
+abcdefgh
+cap of buf[2:5]: 6
+bytesToStr copies: true
+bytesEqual differs: false
+string bytes: 3
+hex: 255
+bin: 10
+sep: 10000
+char: 97
+esc:	A\"
+and: 8
+or: 14
+xor: 6
+shl: 48
+shr: 3
+mod: 2
+compound: 66
+neg abs: 7
+duration ns: 300000000

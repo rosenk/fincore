@@ -1,0 +1,14 @@
+// fail_driver_in_total: a total func calls a driver func.
+package main
+
+driver func sideEffect() u32 {
+	return 1
+}
+
+func pure() u32 {
+	return sideEffect() // ERROR E5001
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

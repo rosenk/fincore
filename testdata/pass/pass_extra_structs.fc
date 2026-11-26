@@ -1,0 +1,98 @@
+// pass_extra_structs: struct literals (named fields, multi-line with
+// trailing comma, nested), value-copy semantics of Value structs, field
+// assignment through pointers, and methods with value receivers.
+package main
+
+type Point struct {
+	x i32
+	y i32
+}
+
+type Rect struct {
+	min  Point
+	max  Point
+	name string
+}
+
+func (r Rect) Width() i32 {
+	return r.max.x - r.min.x
+}
+
+func (r Rect) Height() i32 {
+	return r.max.y - r.min.y
+}
+
+func (r *Rect) Translate(dx i32, dy i32) {
+	r.min.x += dx
+	r.min.y += dy
+	r.max.x += dx
+	r.max.y += dy
+}
+
+func abs(v i32) u64 {
+	if v < 0 {
+		return u64(-v)
+	}
+	return u64(v)
+}
+
+driver func putStr(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func main(io Stdio) error {
+	r := Rect{
+		min:  Point{x: -2, y: 1},
+		max:  Point{x: 5, y: 4},
+		name: "box",
+	}
+	copyOfR := r
+	rp := &r
+	rp.Translate(10, 20)
+
+	if err := putStr(io, r.name); err != nil {
+		return err
+	}
+	if err := putStr(io, "\n"); err != nil {
+		return err
+	}
+	if err := putUint(io, "width: ", u64(r.Width())); err != nil {
+		return err
+	}
+	if err := putUint(io, "height: ", u64(r.Height())); err != nil {
+		return err
+	}
+	if err := putUint(io, "moved min.x: ", u64(r.min.x)); err != nil {
+		return err
+	}
+	if err := putUint(io, "moved max.y: ", u64(r.max.y)); err != nil {
+		return err
+	}
+	if err := putUint(io, "copy |min.x|: ", abs(copyOfR.min.x)); err != nil {
+		return err
+	}
+
+	var zero Point
+	if zero.x == 0 && zero.y == 0 {
+		if err := putStr(io, "zero point ok\n"); err != nil {
+			return err
+		}
+	}
+	p := Point{y: 9}
+	return putUint(io, "partial literal y: ", u64(p.y+p.x))
+}

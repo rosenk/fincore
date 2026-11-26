@@ -1,0 +1,6 @@
+id u64: 42
+id string: hello
+swap first: seven
+swap second: 7
+swap bool/u16: 9
+point sum: 14

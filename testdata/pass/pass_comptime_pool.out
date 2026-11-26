@@ -1,0 +1,8 @@
+pool slots: 1024
+slot bytes: 4096
+last byte: 255
+first byte: 7
+source buf: 64
+source last: 122
+table size: 1024
+table last: 512

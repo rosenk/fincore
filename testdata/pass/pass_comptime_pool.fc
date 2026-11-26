@@ -1,0 +1,79 @@
+// pass_comptime_pool: Layer-1 codes. PoolCode/El must fold to [1024][4096]uint8
+// at compile time; comptime funcs with loops are evaluated under fuel.
+package main
+
+const (
+	MaxConns = 1024
+	BufSize  = 4096
+)
+
+comptime func PoolCode(maxConns usize, bufSize usize) Code 0 {
+	return CodeArray(maxConns, CodeArray(bufSize, CodeU8()))
+}
+
+comptime func ByteBufCode(c usize) Code 0 {
+	return CodeArray(c, CodeU8())
+}
+
+comptime func Pow2(k usize) usize {
+	r := usize(1)
+	for i := usize(0); i < k; i++ {
+		r *= 2
+	}
+	return r
+}
+
+type ConnPool = El(PoolCode(MaxConns, BufSize))
+type SourceBuf = El(ByteBufCode(64))
+
+const TableSize = Pow2(10)
+
+var table [TableSize]u16
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func main(io Stdio) error {
+	var pool ConnPool
+	var src SourceBuf
+
+	pool[1023][4095] = 255
+	pool[0][0] = 7
+	src[63] = 'z'
+	table[TableSize-1] = 512
+
+	if err := putUint(io, "pool slots: ", u64(len(pool))); err != nil {
+		return err
+	}
+	if err := putUint(io, "slot bytes: ", u64(len(pool[0]))); err != nil {
+		return err
+	}
+	if err := putUint(io, "last byte: ", u64(pool[1023][4095])); err != nil {
+		return err
+	}
+	if err := putUint(io, "first byte: ", u64(pool[0][0])); err != nil {
+		return err
+	}
+	if err := putUint(io, "source buf: ", u64(len(src))); err != nil {
+		return err
+	}
+	if err := putUint(io, "source last: ", u64(src[63])); err != nil {
+		return err
+	}
+	if err := putUint(io, "table size: ", u64(len(table))); err != nil {
+		return err
+	}
+	return putUint(io, "table last: ", u64(table[TableSize-1]))
+}

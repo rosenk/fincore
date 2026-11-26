@@ -1,0 +1,6 @@
+pushed: 4
+len: 4
+sum: 110
+get 2: 33
+get 9 (default): 7777
+bool vec len: 1

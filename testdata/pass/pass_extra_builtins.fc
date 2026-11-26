@@ -1,0 +1,131 @@
+// pass_extra_builtins: the total builtins of spec 10.7 plus literal forms
+// of spec 2.6 (hex, binary, `_` separators, char and string escapes) and
+// integer operators.
+package main
+
+driver func putStr(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func putBool(io Stdio, label string, b bool) error {
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if b {
+		return io.WriteStdout(strBytes("true\n"))
+	}
+	return io.WriteStdout(strBytes("false\n"))
+}
+
+driver func main(io Stdio) error {
+	// parseUint / formatUint round trip
+	v, err := parseUint(strBytes("1234567890"))
+	if err != nil {
+		return err
+	}
+	if err := putUint(io, "parsed+1: ", v+1); err != nil {
+		return err
+	}
+	_, perr := parseUint(strBytes("12x"))
+	if err := putBool(io, "parse 12x fails: ", perr != nil); err != nil {
+		return err
+	}
+
+	// copy returns min(len(dst), len(src))
+	var buf [8]byte
+	n := copy(buf[:], strBytes("abcdefghijkl"))
+	if err := putUint(io, "copied: ", u64(n)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(buf[:n]); err != nil {
+		return err
+	}
+	if err := putStr(io, "\n"); err != nil {
+		return err
+	}
+	if err := putUint(io, "cap of buf[2:5]: ", u64(cap(buf[2:5]))); err != nil {
+		return err
+	}
+
+	// bytesEqual / bytesToStr / strBytes
+	s := bytesToStr(buf[0:3])
+	buf[0] = 'X'
+	if err := putBool(io, "bytesToStr copies: ", bytesEqual(strBytes(s), strBytes("abc"))); err != nil {
+		return err
+	}
+	if err := putBool(io, "bytesEqual differs: ", bytesEqual(buf[0:3], strBytes("abc"))); err != nil {
+		return err
+	}
+	if err := putUint(io, "string bytes: ", u64(len(strBytes(s)))); err != nil {
+		return err
+	}
+
+	// literals
+	if err := putUint(io, "hex: ", 0xFF); err != nil {
+		return err
+	}
+	if err := putUint(io, "bin: ", 0b1010); err != nil {
+		return err
+	}
+	if err := putUint(io, "sep: ", 10_000); err != nil {
+		return err
+	}
+	if err := putUint(io, "char: ", u64('a')); err != nil {
+		return err
+	}
+	if err := putStr(io, "esc:\t\x41\\\"\n"); err != nil {
+		return err
+	}
+
+	// operators
+	x := u32(0b1100)
+	y := u32(0b1010)
+	if err := putUint(io, "and: ", u64(x&y)); err != nil {
+		return err
+	}
+	if err := putUint(io, "or: ", u64(x|y)); err != nil {
+		return err
+	}
+	if err := putUint(io, "xor: ", u64(x^y)); err != nil {
+		return err
+	}
+	if err := putUint(io, "shl: ", u64(x<<2)); err != nil {
+		return err
+	}
+	if err := putUint(io, "shr: ", u64(x>>2)); err != nil {
+		return err
+	}
+	if err := putUint(io, "mod: ", u64(17%5)); err != nil {
+		return err
+	}
+	z := u64(100)
+	z -= 1
+	z *= 2
+	z /= 3
+	if err := putUint(io, "compound: ", z); err != nil {
+		return err
+	}
+	k := i64(-7)
+	if k < 0 && !(k > 0) || false {
+		if err := putUint(io, "neg abs: ", u64(-k)); err != nil {
+			return err
+		}
+	}
+	d := 300 * Millisecond
+	return putUint(io, "duration ns: ", u64(d))
+}

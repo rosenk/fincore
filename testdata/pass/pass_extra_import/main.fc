@@ -1,0 +1,21 @@
+// pass_extra_import (directory test): local import. The import path is
+// resolved relative to the project root (the module root, i.e. the
+// directory finc is invoked from): `finc build testdata/pass/pass_extra_import`
+// run from the repository root. The nested mathx/ directory is a separate
+// package and is NOT part of package main.
+package main
+
+import "testdata/pass/pass_extra_import/mathx"
+
+driver func main(io Stdio) error {
+	var nb [20]byte
+	v := mathx.Square(mathx.Base) + mathx.Cube(2)
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}

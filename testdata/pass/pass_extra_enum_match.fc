@@ -1,0 +1,159 @@
+// pass_extra_enum_match: enums with and without payloads, `match` with
+// enum patterns (qualified Type.Variant, payload bindings), integer literal
+// patterns and the `_` wildcard; both Block arms and Expr arms.
+// Variant construction syntax: Type.Variant(args) / Type.Variant.
+package main
+
+type Color enum {
+	Red
+	Green
+	Blue
+}
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+func area3(s Shape) u64 {
+	var a u64
+	match s {
+		Shape.Circle(r) -> {
+			a = 3 * u64(r) * u64(r)
+		}
+		Shape.Rect(w, h) -> {
+			a = u64(w) * u64(h)
+		}
+		Shape.Empty -> {
+			a = 0
+		}
+	}
+	return a
+}
+
+func colorCode(c Color) u32 {
+	var v u32
+	match c {
+		Color.Red -> {
+			v = 0xFF0000
+		}
+		Color.Green -> {
+			v = 0x00FF00
+		}
+		_ -> {
+			v = 0x0000FF
+		}
+	}
+	return v
+}
+
+func classify(n u32) u32 {
+	var k u32
+	match n {
+		0 -> {
+			k = 100
+		}
+		1 -> {
+			k = 101
+		}
+		_ -> {
+			k = 999
+		}
+	}
+	return k
+}
+
+driver func putStr(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func describe(io Stdio, s Shape) error {
+	var err error
+	match s {
+		Shape.Circle(r) -> {
+			err = putUint(io, "circle r=", u64(r))
+		}
+		Shape.Rect(w, h) -> {
+			err = putUint(io, "rect w+h=", u64(w+h))
+		}
+		Shape.Empty -> {
+			err = putStr(io, "empty\n")
+		}
+	}
+	return err
+}
+
+// note has no results, so it can be used as an Expr arm.
+driver func note(io Stdio, s string) {
+	_ = io.WriteStdout(strBytes(s))
+}
+
+driver func sayColor(io Stdio, c Color) {
+	match c {
+		Color.Red -> note(io, "say red\n")
+		Color.Green -> note(io, "say green\n")
+		Color.Blue -> note(io, "say blue\n")
+	}
+}
+
+driver func main(io Stdio) error {
+	c := Shape.Circle(2)
+	r := Shape.Rect(3, 5)
+	e := Shape.Empty
+
+	if err := describe(io, c); err != nil {
+		return err
+	}
+	if err := describe(io, r); err != nil {
+		return err
+	}
+	if err := describe(io, e); err != nil {
+		return err
+	}
+	if err := putUint(io, "area3 circle: ", area3(c)); err != nil {
+		return err
+	}
+	if err := putUint(io, "area3 rect: ", area3(r)); err != nil {
+		return err
+	}
+	if err := putUint(io, "area3 empty: ", area3(e)); err != nil {
+		return err
+	}
+	if err := putUint(io, "red: ", u64(colorCode(Color.Red))); err != nil {
+		return err
+	}
+	if err := putUint(io, "green: ", u64(colorCode(Color.Green))); err != nil {
+		return err
+	}
+	if err := putUint(io, "blue: ", u64(colorCode(Color.Blue))); err != nil {
+		return err
+	}
+	if err := putUint(io, "classify 0: ", u64(classify(0))); err != nil {
+		return err
+	}
+	if err := putUint(io, "classify 1: ", u64(classify(1))); err != nil {
+		return err
+	}
+	if err := putUint(io, "classify 7: ", u64(classify(7))); err != nil {
+		return err
+	}
+	sayColor(io, Color.Blue)
+	sayColor(io, Color.Red)
+	return nil
+}

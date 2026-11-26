@@ -1,0 +1,184 @@
+// pass_methods_and_arena: methods on pointer receivers, a fixed-capacity
+// arena returning ErrArenaFull, and a fixed-capacity open-addressing hash
+// table (linear probing) whose probe loop is total by T1.
+package main
+
+const (
+	ArenaCap = 8
+	Buckets  = 8
+)
+
+type Arena struct {
+	items [ArenaCap]u32
+	len   usize
+}
+
+func (a *Arena) Push(v u32) (u32, error) {
+	if a.len >= ArenaCap {
+		return 0, ErrArenaFull
+	}
+	idx := a.len
+	a.items[idx] = v
+	a.len++
+	return u32(idx), nil
+}
+
+func (a *Arena) Get(id u32) u32 {
+	return a.items[usize(id)]
+}
+
+func (a *Arena) Sum() u64 {
+	var s u64
+	for i := usize(0); i < a.len; i++ {
+		s += u64(a.items[i])
+	}
+	return s
+}
+
+type Entry struct {
+	key  u32
+	val  u32
+	used bool
+}
+
+type Table struct {
+	slots [Buckets]Entry
+	count usize
+}
+
+func hash(k u32) usize {
+	return usize(k) % Buckets
+}
+
+// Put inserts or overwrites; returns the bucket index used.
+func (t *Table) Put(k u32, v u32) (usize, error) {
+	h := hash(k)
+	for step := usize(0); step < Buckets; step++ {
+		i := (h + step) % Buckets
+		if !t.slots[i].used {
+			t.slots[i] = Entry{key: k, val: v, used: true}
+			t.count++
+			return i, nil
+		}
+		if t.slots[i].key == k {
+			t.slots[i].val = v
+			return i, nil
+		}
+	}
+	return 0, ErrArenaFull
+}
+
+func (t *Table) Lookup(k u32) (u32, bool) {
+	h := hash(k)
+	for step := usize(0); step < Buckets; step++ {
+		i := (h + step) % Buckets
+		if !t.slots[i].used {
+			return 0, false
+		}
+		if t.slots[i].key == k {
+			return t.slots[i].val, true
+		}
+	}
+	return 0, false
+}
+
+driver func putStr(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func main(io Stdio) error {
+	var arena Arena
+	ap := &arena
+
+	for i := usize(0); i < 10; i++ {
+		id, err := ap.Push(u32(i * 10))
+		if err != nil {
+			if err == ErrArenaFull {
+				if err := putUint(io, "arena full at push #", u64(i)); err != nil {
+					return err
+				}
+			}
+			break
+		}
+		if err := putUint(io, "pushed id ", u64(id)); err != nil {
+			return err
+		}
+	}
+	if err := putUint(io, "arena get 5: ", u64(ap.Get(5))); err != nil {
+		return err
+	}
+	if err := putUint(io, "arena sum: ", ap.Sum()); err != nil {
+		return err
+	}
+
+	var table Table
+	tp := &table
+
+	// 3, 11 and 19 all hash to bucket 3 and probe linearly.
+	var keys [6]u32
+	keys[0] = 3
+	keys[1] = 11
+	keys[2] = 19
+	keys[3] = 4
+	keys[4] = 8
+	keys[5] = 11
+	for i := usize(0); i < len(keys); i++ {
+		b, err := tp.Put(keys[i], keys[i]*100+u32(i))
+		if err != nil {
+			return err
+		}
+		if err := putUint(io, "put -> bucket ", u64(b)); err != nil {
+			return err
+		}
+	}
+	if err := putUint(io, "table count: ", u64(tp.count)); err != nil {
+		return err
+	}
+
+	var probe [4]u32
+	probe[0] = 11
+	probe[1] = 19
+	probe[2] = 4
+	probe[3] = 27
+	for i := usize(0); i < len(probe); i++ {
+		v, ok := tp.Lookup(probe[i])
+		if ok {
+			if err := putUint(io, "lookup hit: ", u64(v)); err != nil {
+				return err
+			}
+		} else {
+			if err := putStr(io, "lookup miss\n"); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Fill the remaining buckets, then one more insert must fail.
+	var extra u32 = 100
+	for i := usize(0); i < Buckets; i++ {
+		_, err := tp.Put(extra, 1)
+		if err != nil {
+			if err := putUint(io, "table full, count: ", u64(tp.count)); err != nil {
+				return err
+			}
+			break
+		}
+		extra++
+	}
+	return nil
+}

@@ -1,0 +1,9 @@
+// fail_global_conn: package-level variable of a Scoped type (S1).
+// E3001 takes precedence over E2005 for package-level declarations.
+package main
+
+var g Conn // ERROR E3001
+
+driver func main(io Stdio) error {
+	return nil
+}

@@ -1,0 +1,11 @@
+normal: body
+normal: 3
+normal: 2
+normal: 1
+early: returning
+early: 3
+early: 2
+early: 1
+resource: live
+resource: 2
+resource: 1

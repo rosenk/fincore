@@ -1,0 +1,31 @@
+// multifile (directory test, file 2 of 2).
+package main
+
+const Steps = 5
+
+type Counter struct {
+	total u64
+}
+
+func (c *Counter) Add(v u64) {
+	c.total += v
+}
+
+func double(v u64) u64 {
+	return v * 2
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}

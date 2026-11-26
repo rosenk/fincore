@@ -1,0 +1,82 @@
+// pass_parametric_id: parametric polymorphism without inspection of T.
+// Type arguments are passed explicitly (type-argument inference is not
+// specified in v0.1).
+package main
+
+type Point struct {
+	x u32
+	y u32
+}
+
+func id[T any](x T) T {
+	return x
+}
+
+func swap[A, B any](a A, b B) (B, A) {
+	return b, a
+}
+
+func twice[T any](x T) (T, T) {
+	return id[T](x), id[T](x)
+}
+
+driver func putStr(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func main(io Stdio) error {
+	if err := putUint(io, "id u64: ", id[u64](42)); err != nil {
+		return err
+	}
+
+	s := id[string]("hello")
+	if err := putStr(io, "id string: "); err != nil {
+		return err
+	}
+	if err := putStr(io, s); err != nil {
+		return err
+	}
+	if err := putStr(io, "\n"); err != nil {
+		return err
+	}
+
+	b, a := swap[u32, string](7, "seven")
+	if err := putStr(io, "swap first: "); err != nil {
+		return err
+	}
+	if err := putStr(io, b); err != nil {
+		return err
+	}
+	if err := putStr(io, "\n"); err != nil {
+		return err
+	}
+	if err := putUint(io, "swap second: ", u64(a)); err != nil {
+		return err
+	}
+
+	flag, n := swap[u16, bool](9, true)
+	if flag {
+		if err := putUint(io, "swap bool/u16: ", u64(n)); err != nil {
+			return err
+		}
+	}
+
+	p := id[Point](Point{x: 3, y: 4})
+	q, r := twice[Point](p)
+	return putUint(io, "point sum: ", u64(q.x+q.y+r.x+r.y))
+}

@@ -1,0 +1,14 @@
+circle r=2
+rect w+h=8
+empty
+area3 circle: 12
+area3 rect: 15
+area3 empty: 0
+red: 16711680
+green: 65280
+blue: 255
+classify 0: 100
+classify 1: 101
+classify 7: 999
+say blue
+say red

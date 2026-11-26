@@ -1,0 +1,100 @@
+package main
+
+const (
+	MaxConns     = 1024
+	BufSize      = 4096
+	IdleTimeout  = 30 * Second
+	DrainHorizon = 5 * Second
+)
+
+// Слой 1 (comptime): интенсионален код на буферния пул -> сгъва се до [1024][4096]uint8
+comptime func PoolCode(maxConns usize, bufSize usize) Code 0 {
+	return CodeArray(maxConns, CodeArray(bufSize, CodeU8()))
+}
+
+type ConnPool = El(PoolCode(MaxConns, BufSize))
+
+// Слой 2 (тотална функция): компилаторът доказва терминиране по Правило T2
+func writeAll(ctx Context, conn Conn, data []byte) error {
+	for rem := data; len(rem) > 0; {
+		n, err := conn.Write(ctx, rem)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+	return nil
+}
+
+// Слой 3 (неявна параметричност): `conn` е Linear (затваря се с defer),
+// `buf` е scoped указател към слота в pool (не може да избяга извън handleConn)
+driver func handleConn(drainCtx Context, hardCtx Context, conn Conn, buf *[BufSize]byte) {
+	defer conn.Close()
+
+	driver for {
+		if drainCtx.Done() {
+			_ = conn.CloseWrite()
+			return
+		}
+
+		readCtx := hardCtx.WithTimeout(IdleTimeout)
+		n, err := conn.Read(readCtx, buf[:])
+		if err != nil {
+			return
+		}
+
+		if err := writeAll(hardCtx, conn, buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+driver func main(net Net, sig Signals) error {
+	ln, err := net.ListenTCP("0.0.0.0:8080")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	drainCtx, stopSignals := sig.NotifyContext(SIGINT, SIGTERM)
+	defer stopSignals()
+
+	var pool ConnPool
+
+	hardCtx, cancelHard := NewContext()
+	defer cancelHard()
+
+	scope conns := NewScope(MaxConns) {
+		driver for {
+			slot, err := conns.AcquireSlot(drainCtx, &pool)
+			if err != nil {
+				break
+			}
+
+			conn, err := ln.Accept(drainCtx)
+			if err != nil {
+				conns.ReleaseSlot(slot)
+				if drainCtx.Done() {
+					break
+				}
+				continue
+			}
+
+			conns.Go(slot, driver func(buf *[BufSize]byte) {
+				handleConn(drainCtx, hardCtx, conn, buf)
+			})
+		}
+
+		_ = ln.Close()
+
+		if !conns.WaitTimeout(DrainHorizon) {
+			cancelHard()
+			conns.Wait()
+		}
+	}
+
+	return nil
+}

@@ -1,0 +1,23 @@
+// fail_mutual_recursion_unbounded: isEven <-> isOdd form a non-trivial SCC
+// in the call graph and neither carries a decreases clause.
+// E4004 is reported once per SCC, at the first function of the SCC in
+// source order.
+package main
+
+func isEven(n u32) bool { // ERROR E4004
+	if n == 0 {
+		return true
+	}
+	return isOdd(n - 1)
+}
+
+func isOdd(n u32) bool {
+	if n == 0 {
+		return false
+	}
+	return isEven(n - 1)
+}
+
+driver func main(io Stdio) error {
+	return nil
+}
