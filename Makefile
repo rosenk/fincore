@@ -9,7 +9,7 @@ SEED    ?= 1
 export CGO_ENABLED ?= 0
 
 .PHONY: all build finc0 test race vet fmt fmt-check lint parse-corpus check-corpus \
-        integration finc1 diff-parse diff-check diff-check-fuzz bootstrap ci clean help
+        integration finc1 diff-parse diff-check diff-check-fuzz diff-build finc2 bootstrap ci clean help
 
 all: vet test build ## vet, test and build finc0
 
@@ -74,3 +74,12 @@ diff-check: finc1 ## finc0 check --passes=types vs finc1 check: identical diagno
 
 diff-check-fuzz: finc1 ## diff-check plus 20 random mutants per corpus file (SEED=n)
 	$(GO) run ./scripts/diffcheck -mutate 20 -seed $(SEED)
+
+diff-build: finc1 ## finc0 vs finc1: byte-identical `build --emit-go` (corpus, edge cases, unit-test snippets, compiler/)
+	$(GO) run ./scripts/diffbuild
+
+finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3.go
+	@mkdir -p $(STAGE)
+	$(BIN)/finc1 build --emit-go=$(STAGE)/stage2.go -o $(BIN)/finc2 ./compiler
+	$(BIN)/finc2 build --emit-go=$(STAGE)/stage3.go -o $(BIN)/finc3 ./compiler
+	cmp $(STAGE)/stage2.go $(STAGE)/stage3.go && echo "finc2: stage2.go == stage3.go"

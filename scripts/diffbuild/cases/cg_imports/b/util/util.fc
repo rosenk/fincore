@@ -1,0 +1,15 @@
+package util
+
+const Base = 9
+
+type T struct {
+	V u64
+}
+
+func (t T) Get() u64 {
+	return t.V
+}
+
+func Make(v u64) T {
+	return T{V: v}
+}

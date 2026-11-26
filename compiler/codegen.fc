@@ -1,0 +1,2078 @@
+// codegen.fc — lowering and the deterministic Go code generator, part 1
+// (port of finc0's bootstrap/internal/ir and codegen/golang gen.go,
+// types.go, values.go). Parts 2 and 3 are codegen_expr.fc (expressions,
+// calls) and codegen_stmt.fc (statements, function bodies).
+//
+// finc0 builds the program plan (ir.Program) as Go objects; here the plan
+// is computed on the fly from the semantic tables: packages in
+// pkgs.order, declarations in Pkg.declS order, type declarations are the
+// SymType symbols of non-alias TypeDecls whose underlying type does not
+// mention Code, methods are found by receiver type, `scope` statements are
+// numbered per function by cgPrepare, and Go's "declared and not used"
+// analysis is the cgUsed table (by SymID).
+//
+// Emission. finc0 renders every construct as a Go string and concatenates.
+// Here all text is appended to the scratch buffer `gw` in the same order;
+// a finished top-level declaration is moved to its section (genTypes,
+// genVars, genFuncs) and `assembleGo` joins header, imports and sections
+// into outBuf. Where finc0 decides on parentheses after rendering an
+// operand, the operand is rendered at a mark and wrapped in place
+// (wwrap); where finc0 evaluates parts in a different order than it
+// prints them (generic instance names after their type arguments, a for
+// header's post statement before its condition, struct literal types
+// after their fields), the parts are rendered in evaluation order and
+// rotated into print order (wrotate), so that side effects (monomorphized
+// instance discovery, temporaries, labels) happen in finc0's order.
+// Values that finc0 renders once and prints later or several times
+// (return values evaluated before scope waits, a match scrutinee) are cut
+// out of gw onto the cgStash stack.
+//
+// The output is the unformatted Go text; the build driver runs gofmt on it
+// (build.fc), which makes it byte-identical to finc0's go/format output.
+package main
+
+const (
+	CgMaxMonos    = 4096
+	CgMaxMonoVals = 32_768
+	CgMaxEnv      = 256
+	CgMaxFrames = 65_536
+	CgMaxPend   = 65_536
+	CgMaxArms   = 262_144
+	CgMaxSeen   = 4096
+)
+
+// Output sections and scratch buffers.
+var cgBuf OutBuf
+var genTypes OutBuf
+var genVars OutBuf
+var genFuncs OutBuf
+var cgStash OutBuf
+var cgErrBuf OutBuf
+
+var cgUsesRT bool
+var cgFailed bool
+
+// Per-symbol and per-node lowering tables.
+var cgUsed [MaxSyms]bool         // local variable is read somewhere (live code)
+var cgScopeIdx [MaxNodes]u32     // ScopeStmt -> 1 + index within its function
+var cgScopeCount [MaxFuncs]u32   // FuncInfo -> number of scope statements
+var cgPrefix [MaxPkgs]string     // package -> Go name prefix ("" for the root)
+
+// Monomorphized instances (const parameters), in discovery order.
+var cgMonoKind [CgMaxMonos]u8 // 1 type, 2 function
+var cgMonoSym [CgMaxMonos]u32 // type or function symbol
+var cgMonoValS [CgMaxMonos]u32
+var cgMonoValN [CgMaxMonos]u32
+var cgMonoVals [CgMaxMonoVals]u64
+var cgNMonoVals usize
+var cgNMonos usize
+var cgValStack [CgMaxMonoVals]u64
+var cgValTop usize
+
+// Environment: bindings of const parameters (TypeParam TypeID and its
+// symbol) to values for the declaration being emitted.
+var cgEnvTP [CgMaxEnv]u32
+var cgEnvSym [CgMaxEnv]u32
+var cgEnvVal [CgMaxEnv]u64
+var cgEnvN usize
+
+// Function context (finc0's fnCtx). Nested function literals save and
+// restore it; frames and pending `_ = x` statements are stacks whose
+// visible part starts at the context's base.
+var cgFn u32 // FuncInfo being emitted (0 for package-level initializers)
+var cgTmp u64
+var cgLabel u64
+var cgHeader u32
+var cgTyped bool
+var cgFrameKind [CgMaxFrames]u8 // 1 loop, 2 switch, 3 scope
+var cgFrameLabel [CgMaxFrames]u64 // loops: 1 + label number (0 = none)
+var cgFrameSym [CgMaxFrames]u32   // scopes: symbol of the scope variable
+var cgFrameTmp [CgMaxFrames]u64   // scopes: 1 + temporary number (when unnamed)
+var cgFrameTop usize
+var cgFrameBase usize
+var cgPend [CgMaxPend]u32 // symbols that need `_ = x`
+var cgPendTop usize
+var cgPendBase usize
+
+// Match arm lists under construction (LIFO).
+var cgArms [CgMaxArms]u32
+var cgArmTop usize
+var cgSeenV [CgMaxArms]u32 // seen variant indices / value slots
+var cgSeenK [CgMaxArms]u8  // 1 variant, 2 value
+var cgSeenTop usize
+
+// Named types on the mentionsCode path (cycle guard).
+var cgSeen [CgMaxSeen]u32
+var cgSeenN usize
+
+const (
+	CgFrLoop   = 1
+	CgFrSwitch = 2
+	CgFrScope  = 3
+)
+
+// ---------------------------------------------------------------------------
+// Writing
+
+func cgW(s string) {
+	o := &cgBuf
+	o.putStr(s)
+}
+
+func cgWb(b []byte) {
+	o := &cgBuf
+	o.putBytes(b)
+}
+
+func cgWc(c byte) {
+	o := &cgBuf
+	o.putByte(c)
+}
+
+func cgWu(v u64) {
+	o := &cgBuf
+	o.putUint(v)
+}
+
+func cgWmark() usize {
+	return cgBuf.len
+}
+
+// wtruncate drops everything written after mark.
+func cgWtruncate(mark usize) {
+	if mark <= cgBuf.len {
+		cgBuf.len = mark
+	}
+}
+
+// wreverse reverses gw.data[a:b].
+func cgWreverse(a usize, b usize) {
+	if b <= a {
+		return
+	}
+	n := (b - a) / 2
+	for i := usize(0); i < n; i++ {
+		x := cgBuf.data[a+i]
+		cgBuf.data[a+i] = cgBuf.data[b-1-i]
+		cgBuf.data[b-1-i] = x
+	}
+}
+
+// wrotate moves gw.data[q:len] in front of gw.data[p:q].
+func cgWrotate(p usize, q usize) {
+	e := cgBuf.len
+	if p >= q || q >= e {
+		return
+	}
+	cgWreverse(p, q)
+	cgWreverse(q, e)
+	cgWreverse(p, e)
+}
+
+// wwrap wraps everything written since mark in parentheses.
+func cgWwrap(mark usize) {
+	cgWc('(')
+	cgWrotate(mark, cgBuf.len-1)
+	cgWc(')')
+}
+
+// wbyteAt returns gw.data[i] (0 past the end).
+func cgWbyteAt(i usize) byte {
+	if i >= cgBuf.len {
+		return 0
+	}
+	return cgBuf.data[i]
+}
+
+func cgWendsWith(mark usize, c byte) bool {
+	return cgBuf.len > mark && cgBuf.data[cgBuf.len-1] == c
+}
+
+func cgWhasPrefix(mark usize, s string) bool {
+	b := strBytes(s)
+	n := len(b)
+	if cgBuf.len < mark+n {
+		return false
+	}
+	for i := usize(0); i < n; i++ {
+		if cgBuf.data[mark+i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// wtemp writes the name of temporary n.
+func cgWtemp(n u64) {
+	cgW("_fc_t")
+	cgWu(n)
+}
+
+// newTemp allocates the next temporary number.
+func cgNewTemp() u64 {
+	t := cgTmp
+	cgTmp++
+	return t
+}
+
+// stashCut moves gw.data[mark:len] onto cgStash.
+func cgStashCut(mark usize) {
+	if mark > cgBuf.len {
+		return
+	}
+	o := &cgStash
+	o.putBytes(cgBuf.data[mark:cgBuf.len])
+	cgBuf.len = mark
+}
+
+// stashEmit writes cgStash.data[a:b] to gw.
+func cgStashEmit(a usize, b usize) {
+	if a >= b || b > cgStash.len {
+		return
+	}
+	cgWb(cgStash.data[a:b])
+}
+
+// flushTo appends gw to a section and resets gw.
+func cgFlushTo(sec u8) {
+	if sec == 1 {
+		o := &genTypes
+		o.putBytes(cgBuf.data[:cgBuf.len])
+	} else if sec == 2 {
+		o := &genVars
+		o.putBytes(cgBuf.data[:cgBuf.len])
+	} else {
+		o := &genFuncs
+		o.putBytes(cgBuf.data[:cgBuf.len])
+	}
+	cgBuf.len = 0
+}
+
+// rt writes a reference to the runtime package.
+func cgRt(name string) {
+	cgUsesRT = true
+	cgW("fincrt.")
+	cgW(name)
+}
+
+// cgFail records the first code generation failure (finc0's *Error):
+// "<file:line:col>: codegen: <msg>".
+func cgFail(n u32, msg string) {
+	if cgFailed {
+		return
+	}
+	cgFailed = true
+	o := &cgErrBuf
+	o.reset()
+	if n != 0 {
+		o.putStr(sources.files[nfile(n)].path)
+		o.putByte(':')
+		o.putUint(u64(nodes.items[usize(n)].sLine))
+		o.putByte(':')
+		o.putUint(u64(nodes.items[usize(n)].sCol))
+		o.putStr(": ")
+	}
+	o.putStr("codegen: ")
+	o.putStr(msg)
+}
+
+// ---------------------------------------------------------------------------
+// Names (ir.GoIdent, FieldIdent, MethodIdent, Program.Name)
+
+func cgBytesIs(b []byte, s string) bool {
+	return bytesEqual(b, strBytes(s))
+}
+
+func cgBytesHasPrefix(b []byte, s string) bool {
+	p := strBytes(s)
+	n := len(p)
+	if len(b) < n {
+		return false
+	}
+	return bytesEqual(b[:n], p)
+}
+
+func cgIsGoKeyword(b []byte) bool {
+	return cgBytesIs(b, "break") || cgBytesIs(b, "case") || cgBytesIs(b, "chan") || cgBytesIs(b, "const") ||
+		cgBytesIs(b, "continue") || cgBytesIs(b, "default") || cgBytesIs(b, "defer") || cgBytesIs(b, "else") ||
+		cgBytesIs(b, "fallthrough") || cgBytesIs(b, "for") || cgBytesIs(b, "func") || cgBytesIs(b, "go") ||
+		cgBytesIs(b, "goto") || cgBytesIs(b, "if") || cgBytesIs(b, "import") || cgBytesIs(b, "interface") ||
+		cgBytesIs(b, "map") || cgBytesIs(b, "package") || cgBytesIs(b, "range") || cgBytesIs(b, "return") ||
+		cgBytesIs(b, "select") || cgBytesIs(b, "struct") || cgBytesIs(b, "switch") || cgBytesIs(b, "type") ||
+		cgBytesIs(b, "var")
+}
+
+func cgIsGoPredeclared(b []byte) bool {
+	return cgBytesIs(b, "any") || cgBytesIs(b, "bool") || cgBytesIs(b, "byte") || cgBytesIs(b, "comparable") ||
+		cgBytesIs(b, "complex64") || cgBytesIs(b, "complex128") || cgBytesIs(b, "error") || cgBytesIs(b, "float32") ||
+		cgBytesIs(b, "float64") || cgBytesIs(b, "int") || cgBytesIs(b, "int8") || cgBytesIs(b, "int16") ||
+		cgBytesIs(b, "int32") || cgBytesIs(b, "int64") || cgBytesIs(b, "rune") || cgBytesIs(b, "string") ||
+		cgBytesIs(b, "uint") || cgBytesIs(b, "uint8") || cgBytesIs(b, "uint16") || cgBytesIs(b, "uint32") ||
+		cgBytesIs(b, "uint64") || cgBytesIs(b, "uintptr") || cgBytesIs(b, "true") || cgBytesIs(b, "false") ||
+		cgBytesIs(b, "iota") || cgBytesIs(b, "nil") || cgBytesIs(b, "append") || cgBytesIs(b, "cap") ||
+		cgBytesIs(b, "clear") || cgBytesIs(b, "close") || cgBytesIs(b, "complex") || cgBytesIs(b, "copy") ||
+		cgBytesIs(b, "delete") || cgBytesIs(b, "imag") || cgBytesIs(b, "len") || cgBytesIs(b, "make") ||
+		cgBytesIs(b, "max") || cgBytesIs(b, "min") || cgBytesIs(b, "new") || cgBytesIs(b, "panic") ||
+		cgBytesIs(b, "print") || cgBytesIs(b, "println") || cgBytesIs(b, "real") || cgBytesIs(b, "recover") ||
+		cgBytesIs(b, "init") || cgBytesIs(b, "main") || cgBytesIs(b, "fincrt") || cgBytesIs(b, "os")
+}
+
+func cgIsVetMethod(b []byte) bool {
+	return cgBytesIs(b, "Format") || cgBytesIs(b, "GobDecode") || cgBytesIs(b, "GobEncode") ||
+		cgBytesIs(b, "MarshalJSON") || cgBytesIs(b, "MarshalXML") || cgBytesIs(b, "Peek") ||
+		cgBytesIs(b, "ReadByte") || cgBytesIs(b, "ReadFrom") || cgBytesIs(b, "ReadRune") || cgBytesIs(b, "Scan") ||
+		cgBytesIs(b, "Seek") || cgBytesIs(b, "UnmarshalJSON") || cgBytesIs(b, "UnmarshalXML") ||
+		cgBytesIs(b, "UnreadByte") || cgBytesIs(b, "UnreadRune") || cgBytesIs(b, "WriteByte") ||
+		cgBytesIs(b, "WriteTo") || cgBytesIs(b, "Is") || cgBytesIs(b, "As")
+}
+
+// wGoIdent writes ir.GoIdent(name).
+func cgWGoIdent(b []byte) {
+	if cgBytesIs(b, "_") {
+		cgW("_")
+		return
+	}
+	if cgIsGoKeyword(b) || cgIsGoPredeclared(b) || cgBytesHasPrefix(b, "_fc") || cgBytesHasPrefix(b, "_pkg_") {
+		cgW("_fc_u_")
+	}
+	cgWb(b)
+}
+
+// wFieldIdent writes ir.FieldIdent(name).
+func cgWFieldIdent(b []byte) {
+	if cgIsGoKeyword(b) || cgBytesIs(b, "_") {
+		cgW("_fc_u_")
+	}
+	cgWb(b)
+}
+
+// wMethodIdent writes ir.MethodIdent(name).
+func cgWMethodIdent(b []byte) {
+	if cgIsGoKeyword(b) || cgIsVetMethod(b) || cgBytesHasPrefix(b, "_fc") {
+		cgW("_fc_m_")
+	}
+	cgWb(b)
+}
+
+// wSymName writes Program.Name(sym).
+func cgWSymName(s u32) {
+	if s == 0 {
+		cgW("_")
+		return
+	}
+	nm := nameBytes(symName(s))
+	if cgBytesIs(nm, "_") {
+		cgW("_")
+		return
+	}
+	k := symKind(s)
+	if k == SymTypeParam {
+		cgWGoIdent(nm)
+		return
+	}
+	if k == SymFunc && syms.items[usize(s)].recvType != 0 {
+		cgWMethodIdent(nm)
+		return
+	}
+	p := syms.items[usize(s)].pkg
+	if syms.items[usize(s)].fn == 0 && p != 0 && k != SymPackage {
+		pre := strBytes(cgPrefix[usize(p)])
+		if len(pre) > 0 {
+			cgWb(pre)
+			cgWb(nm)
+			return
+		}
+		if k == SymFunc && syms.items[usize(s)].name == nameMain && p == pkgs.root {
+			cgW("_fc_main")
+			return
+		}
+	}
+	cgWGoIdent(nm)
+}
+
+// symNameIsBlank reports whether Program.Name(sym) is "_".
+func cgSymNameIsBlank(s u32) bool {
+	return s == 0 || cgBytesIs(nameBytes(symName(s)), "_")
+}
+
+// symUsed is Program.Used.
+func cgSymUsed(s u32) bool {
+	if s == 0 {
+		return true
+	}
+	return cgUsed[usize(s)]
+}
+
+// assignPrefixes gives every imported package a unique `_pkg_<name>_`
+// prefix (in package order; duplicates get a counter).
+func cgAssignPrefixes() {
+	n := pkgs.norder
+	for i := usize(0); i < n; i++ {
+		pid := pkgs.order[i]
+		if pid == pkgs.root {
+			cgPrefix[usize(pid)] = ""
+			continue
+		}
+		base := nameBytes(pkgs.items[usize(pid)].name)
+		var nb [512]byte
+		bl := len(base)
+		if bl+40 > 512 {
+			bl = 512 - 40
+		}
+		k := copy(nb[:], base[:bl])
+		for c := u64(2); c < 100_000; c++ {
+			if !cgPrefixTaken(nb[:k], i) {
+				break
+			}
+			k = bl
+			var db [24]byte
+			dn, _ := formatUint(c, db[:])
+			k += copy(nb[k:], db[:dn])
+		}
+		var pb [600]byte
+		m := copy(pb[:], strBytes("_pkg_"))
+		m += copy(pb[m:], nb[:k])
+		pb[m] = '_'
+		m++
+		cgPrefix[usize(pid)] = bytesToStr(pb[:m])
+	}
+}
+
+// prefixTaken reports whether `_pkg_<name>_` is used by one of the first
+// `upto` packages.
+func cgPrefixTaken(name []byte, upto usize) bool {
+	for j := usize(0); j < upto; j++ {
+		pre := strBytes(cgPrefix[usize(pkgs.order[j])])
+		n := len(pre)
+		if n == len(name)+6 && bytesEqual(pre[5:n-1], name) {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Generic AST walks
+
+// walkMarkExpr is ast.Inspect for markExpr: marks identifier uses; function
+// literals mark their (live) statements instead.
+func cgWalkMarkExpr(n u32, dp usize) decreases(dp) {
+	if dp == 0 || n == 0 {
+		return
+	}
+	k := nkind(n)
+	if k == NkIdent {
+		s := uses[usize(n)]
+		if s != 0 {
+			cgUsed[usize(s)] = true
+		}
+		return
+	}
+	if k == NkFuncLit {
+		cgMarkStmts(nb(n), dp-1)
+		return
+	}
+	node := nodes.items[usize(n)]
+	for i := usize(0); i < MaxSlots; i++ {
+		slot, _ := layout(node.kind, i)
+		if slot == SlotNone {
+			break
+		}
+		if slot >= SlotL1 {
+			st, cnt := slotList(node, slot)
+			m := usize(cnt)
+			for j := usize(0); j < m; j++ {
+				cgWalkMarkExpr(nodes.lists[usize(st)+j], dp-1)
+			}
+		} else {
+			cgWalkMarkExpr(slotChild(node, slot), dp-1)
+		}
+	}
+}
+
+// markStmts marks the uses in the live statements of a block.
+func cgMarkStmts(bl u32, dp usize) decreases(dp) {
+	if dp == 0 || bl == 0 {
+		return
+	}
+	n := cgLiveLen(bl, WalkDepth)
+	for i := usize(0); i < n; i++ {
+		cgMarkStmt(l1at(bl, i), dp-1)
+	}
+}
+
+func cgMarkStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 || s == 0 {
+		return
+	}
+	k := nkind(s)
+	if k == NkAssignStmt {
+		nl := l1len(s)
+		for i := usize(0); i < nl; i++ {
+			l := l1at(s, i)
+			if nkind(l) != NkIdent {
+				cgWalkMarkExpr(l, dp-1)
+			}
+		}
+		nr := l2len(s)
+		for i := usize(0); i < nr; i++ {
+			cgWalkMarkExpr(l2at(s, i), dp-1)
+		}
+	} else if k == NkIncDecStmt {
+		if nkind(na(s)) != NkIdent {
+			cgWalkMarkExpr(na(s), dp-1)
+		}
+	} else if k == NkShortVarDecl {
+		nr := l2len(s)
+		for i := usize(0); i < nr; i++ {
+			cgWalkMarkExpr(l2at(s, i), dp-1)
+		}
+	} else if k == NkBlockStmt {
+		cgMarkStmts(s, dp-1)
+	} else if k == NkIfStmt {
+		cgMarkStmt(na(s), dp-1)
+		cgWalkMarkExpr(nb(s), dp-1)
+		cgMarkStmts(nc(s), dp-1)
+		cgMarkStmt(nd(s), dp-1)
+	} else if k == NkForStmt {
+		cgMarkStmt(na(s), dp-1)
+		if nb(s) != 0 {
+			cgWalkMarkExpr(nb(s), dp-1)
+		}
+		cgMarkStmt(nc(s), dp-1)
+		cgMarkStmts(ne(s), dp-1)
+	} else if k == NkMatchStmt {
+		cgWalkMarkExpr(na(s), dp-1)
+		narms := l1len(s)
+		for i := usize(0); i < narms; i++ {
+			a := l1at(s, i)
+			if nkind(na(a)) == NkLiteralPattern {
+				cgWalkMarkExpr(na(na(a)), dp-1)
+			}
+			if nb(a) != 0 {
+				cgWalkMarkExpr(nb(a), dp-1)
+			}
+			if nc(a) != 0 {
+				cgMarkStmts(nc(a), dp-1)
+			}
+		}
+	} else if k == NkScopeStmt {
+		cgWalkMarkExpr(nb(s), dp-1)
+		cgMarkStmts(nc(s), dp-1)
+	} else if k == NkDeclStmt {
+		d := na(s)
+		if nkind(d) == NkVarDecl && nc(d) != 0 {
+			cgWalkMarkExpr(nc(d), dp-1)
+		}
+	} else if k == NkExprStmt || k == NkDeferStmt {
+		cgWalkMarkExpr(na(s), dp-1)
+	} else if k == NkReturnStmt {
+		nr := l1len(s)
+		for i := usize(0); i < nr; i++ {
+			cgWalkMarkExpr(l1at(s, i), dp-1)
+		}
+	}
+}
+
+// numberScopes numbers the scope statements of a function body in source
+// order (ast.Inspect pre-order, not descending into function literals).
+func cgNumberScopes(n u32, fi u32, dp usize) decreases(dp) {
+	if dp == 0 || n == 0 {
+		return
+	}
+	k := nkind(n)
+	if k == NkFuncLit {
+		return
+	}
+	if k == NkScopeStmt {
+		cgScopeCount[usize(fi)]++
+		cgScopeIdx[usize(n)] = cgScopeCount[usize(fi)]
+	}
+	node := nodes.items[usize(n)]
+	for i := usize(0); i < MaxSlots; i++ {
+		slot, _ := layout(node.kind, i)
+		if slot == SlotNone {
+			break
+		}
+		if slot >= SlotL1 {
+			st, cnt := slotList(node, slot)
+			m := usize(cnt)
+			for j := usize(0); j < m; j++ {
+				cgNumberScopes(nodes.lists[usize(st)+j], fi, dp-1)
+			}
+		} else {
+			cgNumberScopes(slotChild(node, slot), fi, dp-1)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Terminating statements and dead code (ir.LiveStmts, IsTerminating,
+// HasBreak, MatchArms)
+
+// liveLen returns the number of statements of a block up to and including
+// the first terminating one.
+func cgLiveLen(bl u32, dp usize) usize decreases(dp) {
+	if dp == 0 || bl == 0 {
+		return 0
+	}
+	n := l1len(bl)
+	for i := usize(0); i < n; i++ {
+		if cgIsTerm(l1at(bl, i), dp-1) {
+			return i + 1
+		}
+	}
+	return n
+}
+
+func cgIsTermList(bl u32, dp usize) bool decreases(dp) {
+	if dp == 0 || bl == 0 {
+		return false
+	}
+	n := l1len(bl)
+	for i := usize(0); i < n; i++ {
+		if cgIsTerm(l1at(bl, i), dp-1) {
+			return true
+		}
+	}
+	return false
+}
+
+func cgUnparenNode(e u32) u32 {
+	x := e
+	for g := usize(0); g < MaxNodes; g++ {
+		if x == 0 || nkind(x) != NkParenExpr {
+			break
+		}
+		x = na(x)
+	}
+	return x
+}
+
+func cgIsPanicCall(e u32) bool {
+	x := cgUnparenNode(e)
+	if x == 0 || nkind(x) != NkCallExpr {
+		return false
+	}
+	c := ncall[usize(x)]
+	return c != 0 && callTab.items[usize(c)].kind == CallBuiltin && callTab.items[usize(c)].builtin == BFPanic
+}
+
+func cgIsTerm(s u32, dp usize) bool decreases(dp) {
+	if dp == 0 || s == 0 {
+		return false
+	}
+	k := nkind(s)
+	if k == NkReturnStmt {
+		return true
+	}
+	if k == NkExprStmt {
+		return cgIsPanicCall(na(s))
+	}
+	if k == NkBlockStmt {
+		return cgIsTermList(s, dp-1)
+	}
+	if k == NkIfStmt {
+		return nd(s) != 0 && cgIsTermList(nc(s), dp-1) && cgIsTerm(nd(s), dp-1)
+	}
+	if k == NkForStmt {
+		return nb(s) == 0 && !cgHasBreakList(ne(s), dp-1)
+	}
+	if k == NkScopeStmt {
+		return cgIsTermList(nc(s), dp-1)
+	}
+	if k == NkMatchStmt {
+		mark, cnt, hasDef, _ := cgMatchArms(s)
+		ok := hasDef
+		if ok {
+			for i := usize(0); i < cnt; i++ {
+				a := cgArms[mark+i]
+				if nb(a) != 0 && !cgIsPanicCall(nb(a)) {
+					ok = false
+					break
+				}
+				if nc(a) != 0 && !cgIsTermList(nc(a), dp-1) {
+					ok = false
+					break
+				}
+			}
+		}
+		cgArmTop = mark
+		return ok
+	}
+	return false
+}
+
+// hasBreakList reports whether the live statements of a block contain a
+// break that targets the enclosing loop.
+func cgHasBreakList(bl u32, dp usize) bool decreases(dp) {
+	if dp == 0 || bl == 0 {
+		return false
+	}
+	n := cgLiveLen(bl, dp-1)
+	for i := usize(0); i < n; i++ {
+		if cgHasBreakStmt(l1at(bl, i), dp-1) {
+			return true
+		}
+	}
+	return false
+}
+
+func cgHasBreakStmt(s u32, dp usize) bool decreases(dp) {
+	if dp == 0 || s == 0 {
+		return false
+	}
+	k := nkind(s)
+	if k == NkBreakStmt {
+		return true
+	}
+	if k == NkBlockStmt {
+		return cgHasBreakList(s, dp-1)
+	}
+	if k == NkIfStmt {
+		return cgHasBreakList(nc(s), dp-1) || (nd(s) != 0 && cgHasBreakStmt(nd(s), dp-1))
+	}
+	if k == NkMatchStmt {
+		narms := l1len(s)
+		for i := usize(0); i < narms; i++ {
+			a := l1at(s, i)
+			if nc(a) != 0 && cgHasBreakList(nc(a), dp-1) {
+				return true
+			}
+		}
+		return false
+	}
+	if k == NkScopeStmt {
+		return cgHasBreakList(nc(s), dp-1)
+	}
+	return false
+}
+
+// seenValue reports whether value slot v equals one of the seen values in
+// cgSeenV[mark:] (finc0's dupValue; entries tagged as variants are
+// skipped).
+func cgSeenValue(mark usize, v u32) bool {
+	if v == 0 {
+		return false
+	}
+	top := cgSeenTop
+	for i := mark; i < top; i++ {
+		s := cgSeenV[i]
+		if cgSeenK[i] != 2 || s == 0 {
+			continue
+		}
+		eq, ok := equalVals(slotGet(s), slotGet(v), WalkDepth)
+		if ok && eq {
+			return true
+		}
+	}
+	return false
+}
+
+// seenVariant reports whether variant idx is in cgSeenV[mark:].
+func cgSeenVariant(mark usize, idx u32) bool {
+	top := cgSeenTop
+	for i := mark; i < top; i++ {
+		if cgSeenK[i] == 1 && cgSeenV[i] == idx {
+			return true
+		}
+	}
+	return false
+}
+
+func cgSeenPush(kind u8, v u32) {
+	if cgSeenTop >= CgMaxArms {
+		setFull("codegen match arms")
+		return
+	}
+	cgSeenK[cgSeenTop] = kind
+	cgSeenV[cgSeenTop] = v
+	cgSeenTop++
+}
+
+func cgArmPush(a u32) {
+	if cgArmTop >= CgMaxArms {
+		setFull("codegen match arms")
+		return
+	}
+	cgArms[cgArmTop] = a
+	cgArmTop++
+}
+
+// matchArms lowers the arms of a match statement (ir.MatchArms): the arms
+// to emit are pushed onto cgArms (the caller pops them by resetting
+// cgArmTop to the returned mark). It returns (mark, count, hasDefault,
+// enum TypeID or 0).
+func cgMatchArms(s u32) (usize, usize, bool, u32) {
+	mark := cgArmTop
+	en := u32(0)
+	t := ntype[usize(na(s))]
+	if t != 0 {
+		u := underlying(t)
+		if tk(u) == TCEnum {
+			en = u
+		}
+	}
+	vmark := cgSeenTop
+	nvar := usize(0)
+	hasDef := false
+	narms := l1len(s)
+	for i := usize(0); i < narms; i++ {
+		a := l1at(s, i)
+		pt := na(a)
+		pk := nkind(pt)
+		if pk == NkWildcardPattern {
+			cgArmPush(a)
+			hasDef = true
+			break
+		}
+		v := u32(0)
+		if pk == NkCtorPattern {
+			if nvarEnum[usize(pt)] != 0 {
+				idx := nvarIdx[usize(pt)]
+				if cgSeenVariant(vmark, idx) {
+					continue
+				}
+				cgSeenPush(1, idx)
+				nvar++
+				cgArmPush(a)
+				continue
+			}
+			v = nval[usize(nb(pt))]
+		} else if pk == NkLiteralPattern {
+			v = nval[usize(na(pt))]
+		} else {
+			continue
+		}
+		if cgSeenValue(vmark, v) {
+			continue
+		}
+		cgSeenPush(2, v)
+		cgArmPush(a)
+	}
+	if !hasDef && en != 0 && nvariants(en) > 0 && nvar == nvariants(en) {
+		hasDef = true
+	}
+	cgSeenTop = vmark
+	return mark, cgArmTop - mark, hasDef, en
+}
+
+// ---------------------------------------------------------------------------
+// Lowering (ir.Lower)
+
+// mentionsCode reports whether t mentions a `Code n` type.
+func cgMentionsCode(t u32, dp usize) bool decreases(dp) {
+	if dp == 0 || t == 0 {
+		return false
+	}
+	k := tk(t)
+	if k == TCCode {
+		return true
+	}
+	if k == TCNamed {
+		n := cgSeenN
+		for i := usize(0); i < n; i++ {
+			if cgSeen[i] == t {
+				return false
+			}
+		}
+		b := namedBuiltin(t)
+		if b == BTFieldCode {
+			return true
+		}
+		if b != BNone {
+			return false
+		}
+		nta := tl1n(t)
+		for i := usize(0); i < nta; i++ {
+			if cgMentionsCode(tl1(t, i), dp-1) {
+				return true
+			}
+		}
+		if cgSeenN >= CgMaxSeen {
+			return false
+		}
+		cgSeen[cgSeenN] = t
+		cgSeenN++
+		r := cgMentionsCode(underlying(t), dp-1)
+		cgSeenN--
+		return r
+	}
+	if k == TCArray || k == TCSlice || k == TCPointer {
+		return cgMentionsCode(typs.items[usize(t)].a, dp-1)
+	}
+	if k == TCStruct {
+		nf := nfields(t)
+		for i := usize(0); i < nf; i++ {
+			if cgMentionsCode(fieldType(t, i), dp-1) {
+				return true
+			}
+		}
+		return false
+	}
+	if k == TCEnum {
+		nv := nvariants(t)
+		for i := usize(0); i < nv; i++ {
+			np := variantPayN(t, i)
+			for j := usize(0); j < np; j++ {
+				if cgMentionsCode(variantPay(t, i, j), dp-1) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if k == TCSig {
+		np := sigNParams(t)
+		for i := usize(0); i < np; i++ {
+			if cgMentionsCode(sigParam(t, i), dp-1) {
+				return true
+			}
+		}
+		nr := sigNResults(t)
+		for i := usize(0); i < nr; i++ {
+			if cgMentionsCode(sigResult(t, i), dp-1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cgTypeMentionsCode(t u32) bool {
+	cgSeenN = 0
+	return cgMentionsCode(t, WalkDepth)
+}
+
+// isTypeDeclSym reports whether a SymType symbol is an emitted type
+// declaration (ir.TypeDecl): a non-alias TypeDecl of a Named type whose
+// underlying type does not mention Code.
+func cgIsTypeDeclSym(s u32) bool {
+	if s == 0 || symKind(s) != SymType {
+		return false
+	}
+	d := syms.items[usize(s)].decl
+	if d == 0 || nkind(d) != NkTypeDecl || nflag(d) {
+		return false
+	}
+	t := syms.items[usize(s)].typ
+	if t == 0 || tk(t) != TCNamed {
+		return false
+	}
+	return !cgTypeMentionsCode(underlying(t))
+}
+
+// isEmittedFunc reports whether a FuncInfo is emitted (not comptime, its
+// signature does not mention Code).
+func cgIsEmittedFunc(fi u32) bool {
+	if fi == 0 {
+		return false
+	}
+	if funcs.items[usize(fi)].effect == EffComptime {
+		return false
+	}
+	return !cgTypeMentionsCode(funcs.items[usize(fi)].sig)
+}
+
+// typeConstParams counts the const parameters of a named type.
+func cgTypeConstParams(named u32) usize {
+	c := usize(0)
+	n := tl2n(named)
+	for i := usize(0); i < n; i++ {
+		if tpIsConst(tl2(named, i)) {
+			c++
+		}
+	}
+	return c
+}
+
+func cgFuncConstParams(fi u32) usize {
+	c := usize(0)
+	n := usize(funcs.items[usize(fi)].tpN)
+	for i := usize(0); i < n; i++ {
+		if tpIsConst(tlist(funcs.items[usize(fi)].tpS, i)) {
+			c++
+		}
+	}
+	return c
+}
+
+// methodRecvNamed returns the receiver (origin) Named type of a method
+// FuncInfo (0 for functions).
+func cgMethodRecvNamed(fi u32) u32 {
+	m := funcs.items[usize(fi)].method
+	if m == 0 {
+		return 0
+	}
+	return meths.items[usize(m)].recv
+}
+
+// cgPrepare runs the lowering analyses: prefixes, scope numbering and the
+// usage analysis.
+func cgPrepare() {
+	cgAssignPrefixes()
+	n := funcs.count
+	for fi := usize(1); fi < n; fi++ {
+		cgScopeCount[fi] = 0
+		b := funcs.items[fi].body
+		if b != 0 {
+			cgNumberScopes(b, u32(fi), WalkDepth)
+		}
+	}
+	no := usize(funcs.orderN)
+	for i := usize(0); i < no; i++ {
+		fi := uat(funcs.orderS, i)
+		if funcs.items[usize(fi)].effect == EffComptime || funcs.items[usize(fi)].body == 0 {
+			continue
+		}
+		if funcs.items[usize(fi)].outer == 0 {
+			cgMarkStmts(funcs.items[usize(fi)].body, WalkDepth)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Environments
+
+func cgEnvReset() {
+	cgEnvN = 0
+}
+
+// envBind binds the const parameters among the TypeParams list (type
+// lists) to vals[0:] in order.
+func cgEnvBind(tpS u32, tpN usize, valS u32) {
+	k := usize(0)
+	for i := usize(0); i < tpN; i++ {
+		tp := tlist(tpS, i)
+		if !tpIsConst(tp) {
+			continue
+		}
+		if cgEnvN >= CgMaxEnv {
+			setFull("codegen environment")
+			return
+		}
+		cgEnvTP[cgEnvN] = tp
+		cgEnvSym[cgEnvN] = typs.items[usize(tp)].b
+		cgEnvVal[cgEnvN] = cgMonoVals[usize(valS)+k]
+		cgEnvN++
+		k++
+	}
+}
+
+func cgEnvLookup(tp u32) (u64, bool) {
+	n := cgEnvN
+	for i := usize(0); i < n; i++ {
+		if cgEnvTP[i] == tp {
+			return cgEnvVal[i], true
+		}
+	}
+	return 0, false
+}
+
+func cgEnvLookupSym(s u32) (u64, bool) {
+	n := cgEnvN
+	for i := usize(0); i < n; i++ {
+		if cgEnvSym[i] == s && s != 0 {
+			return cgEnvVal[i], true
+		}
+	}
+	return 0, false
+}
+
+// ---------------------------------------------------------------------------
+// Monomorphization
+
+func cgValPush(v u64) {
+	if cgValTop >= CgMaxMonoVals {
+		setFull("codegen instances")
+		return
+	}
+	cgValStack[cgValTop] = v
+	cgValTop++
+}
+
+// monoLookup finds or registers the instance (kind, sym, cgValStack[mark:])
+// and pops the values. It returns the instance index (0-based) and whether
+// it is valid.
+func cgMonoLookup(kind u8, sym u32, mark usize) (usize, bool) {
+	top := cgValTop
+	nv := top - mark
+	n := cgNMonos
+	for i := usize(0); i < n; i++ {
+		if cgMonoKind[i] != kind || cgMonoSym[i] != sym || usize(cgMonoValN[i]) != nv {
+			continue
+		}
+		same := true
+		for j := usize(0); j < nv; j++ {
+			if cgMonoVals[usize(cgMonoValS[i])+j] != cgValStack[mark+j] {
+				same = false
+				break
+			}
+		}
+		if same {
+			cgValTop = mark
+			return i, true
+		}
+	}
+	if cgNMonos >= CgMaxMonos || cgNMonoVals+nv > CgMaxMonoVals {
+		cgValTop = mark
+		cgFail(0, "too many monomorphized instances (unbounded polymorphic recursion?)")
+		return 0, false
+	}
+	i := cgNMonos
+	cgNMonos++
+	cgMonoKind[i] = kind
+	cgMonoSym[i] = sym
+	cgMonoValS[i] = u32(cgNMonoVals)
+	cgMonoValN[i] = u32(nv)
+	for j := usize(0); j < nv; j++ {
+		cgMonoVals[cgNMonoVals+j] = cgValStack[mark+j]
+	}
+	cgNMonoVals += nv
+	cgValTop = mark
+	return i, true
+}
+
+// wMonoName writes `_fc_<len(base)><base>_<v1>_<v2>...` for instance i.
+func cgWMonoName(i usize) {
+	p := cgWmark()
+	cgWSymName(cgMonoSym[i])
+	blen := cgWmark() - p
+	cgWtruncate(p)
+	cgW("_fc_")
+	cgWu(u64(blen))
+	cgWSymName(cgMonoSym[i])
+	nv := usize(cgMonoValN[i])
+	for j := usize(0); j < nv; j++ {
+		cgWc('_')
+		cgWu(cgMonoVals[usize(cgMonoValS[i])+j])
+	}
+}
+
+// constArg resolves a type argument for a const parameter to its value.
+func cgConstArg(n u32, t u32) u64 {
+	if t != 0 && tk(t) == TCConstArg {
+		return typs.items[usize(t)].n
+	}
+	if t != 0 && tk(t) == TCTypeParam {
+		v, ok := cgEnvLookup(t)
+		if ok {
+			return v
+		}
+	}
+	cgFail(n, "unresolved const type argument")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Types (codegen/golang types.go)
+
+func cgGoType(n u32, t u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		cgFail(n, "type too deep")
+		return
+	}
+	if t == 0 {
+		cgFail(n, "missing type")
+		return
+	}
+	k := tk(t)
+	if k == TCBasic {
+		cgBasicGo(n, t)
+	} else if k == TCNamed {
+		cgNamedType(n, t, dp-1)
+	} else if k == TCArray || k == TCSlice || k == TCPointer || k == TCStruct || k == TCEnum || k == TCSig {
+		cgTypeLit(n, t, dp-1)
+	} else if k == TCTypeParam {
+		if tpIsConst(t) {
+			cgFail(n, "const parameter used as a type")
+			return
+		}
+		cgTpName(t)
+	} else if k == TCCode {
+		cgFail(n, "values of Code types cannot exist at run time")
+	} else {
+		cgFail(n, "unsupported type")
+	}
+}
+
+func cgBasicGo(n u32, t u32) {
+	k := typs.items[usize(t)].sub
+	if k == BkBool || k == BkUntypedBool {
+		cgW("bool")
+	} else if k == BkU8 {
+		cgW("uint8")
+	} else if k == BkU16 {
+		cgW("uint16")
+	} else if k == BkU32 {
+		cgW("uint32")
+	} else if k == BkU64 {
+		cgW("uint64")
+	} else if k == BkI8 {
+		cgW("int8")
+	} else if k == BkI16 {
+		cgW("int16")
+	} else if k == BkI32 {
+		cgW("int32")
+	} else if k == BkI64 {
+		cgW("int64")
+	} else if k == BkInt || k == BkUntypedInt {
+		cgW("int")
+	} else if k == BkUsize {
+		cgW("uint")
+	} else if k == BkString || k == BkUntypedString {
+		cgW("string")
+	} else if k == BkError {
+		cgW("error")
+	} else if k == BkUntypedChar {
+		cgW("uint8")
+	} else {
+		cgFail(n, "unsupported basic type")
+	}
+}
+
+// tpName writes the Go name of a type parameter.
+func cgTpName(tp u32) {
+	s := typs.items[usize(tp)].b
+	if s != 0 {
+		cgWSymName(s)
+		return
+	}
+	cgWGoIdent(nameBytes(u32(typs.items[usize(tp)].n)))
+}
+
+// typeLit writes the type literal of a non-named type (or the underlying
+// type of a type declaration).
+func cgTypeLit(n u32, t u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		cgFail(n, "type too deep")
+		return
+	}
+	k := tk(t)
+	r := typs.items[usize(t)]
+	if k == TCArray {
+		l := r.n
+		if r.b != 0 {
+			v, ok := cgEnvLookup(r.b)
+			if !ok {
+				cgFail(n, "unbound array length parameter")
+			}
+			l = v
+		}
+		cgWc('[')
+		cgWu(l)
+		cgWc(']')
+		cgGoType(n, r.a, dp-1)
+	} else if k == TCSlice {
+		cgW("[]")
+		cgGoType(n, r.a, dp-1)
+	} else if k == TCPointer {
+		cgWc('*')
+		cgGoType(n, r.a, dp-1)
+	} else if k == TCStruct {
+		nf := nfields(t)
+		if nf == 0 {
+			cgW("struct{}")
+			return
+		}
+		cgW("struct {\n")
+		for i := usize(0); i < nf; i++ {
+			cgWFieldIdent(nameBytes(fieldName(t, i)))
+			cgWc(' ')
+			cgGoType(n, fieldType(t, i), dp-1)
+			cgWc('\n')
+		}
+		cgWc('}')
+	} else if k == TCEnum {
+		cgW("struct {\n")
+		cgW("_tag ")
+		nv := nvariants(t)
+		if nv <= 256 {
+			cgW("uint8")
+		} else {
+			cgW("uint32")
+		}
+		cgWc('\n')
+		for i := usize(0); i < nv; i++ {
+			np := variantPayN(t, i)
+			for j := usize(0); j < np; j++ {
+				cgWVariantField(t, i, j)
+				cgWc(' ')
+				cgGoType(n, variantPay(t, i, j), dp-1)
+				cgWc('\n')
+			}
+		}
+		cgWc('}')
+	} else if k == TCSig {
+		cgW("func")
+		cgSigTypes(n, t, dp-1)
+	} else {
+		cgGoType(n, t, dp-1)
+	}
+}
+
+// wVariantField writes `_<Variant>_<j>`.
+func cgWVariantField(en u32, i usize, j usize) {
+	cgWc('_')
+	cgWb(nameBytes(variantName(en, i)))
+	cgWc('_')
+	cgWu(u64(j))
+}
+
+// sigTypes writes `(T1, T2) (R1, R2)` for a signature type.
+func cgSigTypes(n u32, s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	cgWc('(')
+	np := sigNParams(s)
+	for i := usize(0); i < np; i++ {
+		if i > 0 {
+			cgW(", ")
+		}
+		if sigVariadic(s) && i == np-1 {
+			cgW("...")
+		}
+		cgGoType(n, sigParam(s, i), dp-1)
+	}
+	cgWc(')')
+	cgResults(n, s, dp-1)
+}
+
+// results writes the result list of a signature.
+func cgResults(n u32, s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	nr := sigNResults(s)
+	if nr == 0 {
+		return
+	}
+	if nr == 1 {
+		cgWc(' ')
+		cgGoType(n, sigResult(s, 0), dp-1)
+		return
+	}
+	cgW(" (")
+	for i := usize(0); i < nr; i++ {
+		if i > 0 {
+			cgW(", ")
+		}
+		cgGoType(n, sigResult(s, i), dp-1)
+	}
+	cgWc(')')
+}
+
+// namedType writes a named type or instance.
+func cgNamedType(n u32, t u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	origin := namedOrigin(t)
+	if namedBuiltin(t) != BNone || (origin != 0 && namedBuiltin(origin) != BNone) {
+		cgBuiltinNamed(n, t, dp-1)
+		return
+	}
+	if origin == 0 {
+		if tl2n(t) > 0 {
+			cgFail(n, "uninstantiated generic type")
+		}
+		cgWSymName(namedSym(t))
+		return
+	}
+	tdSym := namedSym(origin)
+	if !cgIsTypeDeclSym(tdSym) {
+		cgFail(n, "unknown generic type")
+		return
+	}
+	// finc0 renders the type arguments before the (instance) name.
+	p := cgWmark()
+	vmark := cgValTop
+	nt := tl2n(origin)
+	ntargs := usize(0)
+	for i := usize(0); i < nt; i++ {
+		arg := tl1(t, i)
+		if tpIsConst(tl2(origin, i)) {
+			cgValPush(cgConstArg(n, arg))
+		} else {
+			if ntargs == 0 {
+				cgWc('[')
+			} else {
+				cgW(", ")
+			}
+			cgGoType(n, arg, dp-1)
+			ntargs++
+		}
+	}
+	if ntargs > 0 {
+		cgWc(']')
+	}
+	q := cgWmark()
+	if cgTypeConstParams(origin) > 0 {
+		mi, ok := cgMonoLookup(1, tdSym, vmark)
+		if ok {
+			cgWMonoName(mi)
+		}
+	} else {
+		cgValTop = vmark
+		cgWSymName(tdSym)
+	}
+	cgWrotate(p, q)
+}
+
+func cgBuiltinNamed(n u32, t u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	b := builtinOf(t)
+	if b == BTScope {
+		cgWc('*')
+		cgRt("Scope")
+	} else if b == BTSlot {
+		cgRt("Slot")
+		cgWc('[')
+		cgGoType(n, tl1(t, 0), dp-1)
+		cgWc(']')
+	} else if b == BTDuration || b == BTSignal || b == BTExitStatus || b == BTNet || b == BTSignals ||
+		b == BTClock || b == BTListener || b == BTConn || b == BTContext || b == BTCancelFunc ||
+		b == BTFS || b == BTEnv || b == BTStdio || b == BTExec {
+		cgRt(builtinName(b))
+	} else {
+		cgFail(n, "type cannot be used at run time")
+	}
+}
+
+// typeParamList writes `[A any, B any]` for the non-const parameters of a
+// type parameter list (type lists).
+func cgTypeParamList(tpS u32, tpN usize, withAny bool) {
+	k := usize(0)
+	for i := usize(0); i < tpN; i++ {
+		tp := tlist(tpS, i)
+		if tpIsConst(tp) {
+			continue
+		}
+		if k == 0 {
+			cgWc('[')
+		} else {
+			cgW(", ")
+		}
+		cgTpName(tp)
+		if withAny {
+			cgW(" any")
+		}
+		k++
+	}
+	if k > 0 {
+		cgWc(']')
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Values (codegen/golang values.go)
+
+func cgIsUntypedOrInt(t u32) bool {
+	if t == 0 || tk(t) != TCBasic {
+		return false
+	}
+	k := typs.items[usize(t)].sub
+	return k == BkInt || k == BkUntypedInt
+}
+
+func cgIsNamedT(t u32) bool {
+	return t != 0 && tk(t) == TCNamed
+}
+
+// isZeroVal reports whether v is the zero value of its type.
+func cgIsZeroVal(v Val, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		return false
+	}
+	k := v.kind
+	if k == VNone || k == VNil {
+		return true
+	}
+	if k == VInt {
+		return v.hi == 0 && v.lo == 0 && v.flag&1 == 0
+	}
+	if k == VBool {
+		return v.lo == 0
+	}
+	if k == VString {
+		return v.aux == 0
+	}
+	if k == VError {
+		return v.lo == 0
+	}
+	if k == VStruct || k == VArray {
+		n := usize(v.aux)
+		for i := usize(0); i < n; i++ {
+			if !cgIsZeroVal(slotGet(v.ref+u32(i)), dp-1) {
+				return false
+			}
+		}
+		return true
+	}
+	if k == VEnum {
+		if v.lo != 0 {
+			return false
+		}
+		n := usize(v.aux)
+		for i := usize(0); i < n; i++ {
+			if !cgIsZeroVal(slotGet(v.ref+u32(i)), dp-1) {
+				return false
+			}
+		}
+		return true
+	}
+	if k == VSlice {
+		return v.flag&2 == 0
+	}
+	return false
+}
+
+func cgIsZeroSlot(s u32) bool {
+	if s == 0 {
+		return true
+	}
+	return cgIsZeroVal(slotGet(s), WalkDepth)
+}
+
+func cgWInt(v Val) {
+	o := &cgBuf
+	putInt128(o, v)
+}
+
+func cgWQuoted(b []byte) {
+	o := &cgBuf
+	putQuoted(o, b)
+}
+
+// value writes a compile-time value of type t as a Go expression.
+func cgValue(n u32, v Val, t u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		cgFail(n, "value too deep")
+		return
+	}
+	k := v.kind
+	if k == VInt {
+		if t == 0 || cgIsUntypedOrInt(t) {
+			if isNeg128(v.hi) && v.flag&1 == 0 {
+				cgWc('(')
+				cgWInt(v)
+				cgWc(')')
+				return
+			}
+			cgWInt(v)
+			return
+		}
+		cgGoType(n, t, dp-1)
+		cgWc('(')
+		cgWInt(v)
+		cgWc(')')
+	} else if k == VBool {
+		if cgIsNamedT(t) {
+			cgGoType(n, t, dp-1)
+			cgWc('(')
+		}
+		if v.lo != 0 {
+			cgW("true")
+		} else {
+			cgW("false")
+		}
+		if cgIsNamedT(t) {
+			cgWc(')')
+		}
+	} else if k == VString {
+		if cgIsNamedT(t) {
+			cgGoType(n, t, dp-1)
+			cgWc('(')
+		}
+		cgWQuoted(strOf(v))
+		if cgIsNamedT(t) {
+			cgWc(')')
+		}
+	} else if k == VError {
+		if v.lo == 0 {
+			cgW("nil")
+			return
+		}
+		cgRt(builtinName(u8(v.lo)))
+	} else if k == VNil {
+		cgW("nil")
+	} else if k == VStruct {
+		st := underlying(t)
+		if t == 0 || tk(st) != TCStruct {
+			cgFail(n, "struct value of non-struct type")
+			return
+		}
+		p := cgWmark()
+		cgWc('{')
+		nf := nfields(st)
+		first := true
+		for i := usize(0); i < nf; i++ {
+			if i < usize(v.aux) && !cgIsZeroVal(slotGet(v.ref+u32(i)), dp-1) {
+				if !first {
+					cgW(", ")
+				}
+				first = false
+				cgWFieldIdent(nameBytes(fieldName(st, i)))
+				cgW(": ")
+				cgValue(n, slotGet(v.ref+u32(i)), fieldType(st, i), dp-1)
+			}
+		}
+		cgWc('}')
+		q := cgWmark()
+		cgGoType(n, t, dp-1)
+		cgWrotate(p, q)
+	} else if k == VEnum {
+		en := underlying(t)
+		if t == 0 || tk(en) != TCEnum || usize(v.lo) >= nvariants(en) {
+			cgFail(n, "enum value of non-enum type")
+			return
+		}
+		vi := usize(v.lo)
+		p := cgWmark()
+		cgWc('{')
+		if vi != 0 {
+			cgW("_tag: ")
+			cgWu(u64(vi))
+		}
+		np := usize(v.aux)
+		for i := usize(0); i < np; i++ {
+			if vi != 0 || i > 0 {
+				cgW(", ")
+			}
+			cgWVariantField(en, vi, i)
+			cgW(": ")
+			cgValue(n, slotGet(v.ref+u32(i)), variantPay(en, vi, i), dp-1)
+		}
+		cgWc('}')
+		q := cgWmark()
+		cgGoType(n, t, dp-1)
+		cgWrotate(p, q)
+	} else if k == VArray {
+		at := underlying(t)
+		if t == 0 || tk(at) != TCArray {
+			cgFail(n, "array value of non-array type")
+			return
+		}
+		p := cgWmark()
+		cgWc('{')
+		first := true
+		ne := usize(v.aux)
+		for i := usize(0); i < ne; i++ {
+			el := slotGet(v.ref + u32(i))
+			if !cgIsZeroVal(el, dp-1) {
+				if !first {
+					cgW(", ")
+				}
+				first = false
+				cgWu(u64(i))
+				cgW(": ")
+				cgValue(n, el, typs.items[usize(at)].a, dp-1)
+			}
+		}
+		cgWc('}')
+		q := cgWmark()
+		cgGoType(n, t, dp-1)
+		cgWrotate(p, q)
+	} else if k == VSlice {
+		if v.flag&2 == 0 {
+			cgW("nil")
+			return
+		}
+		sl := underlying(t)
+		if t == 0 || tk(sl) != TCSlice {
+			cgFail(n, "slice value of non-slice type")
+			return
+		}
+		p := cgWmark()
+		cgWc('{')
+		lo := usize(v.aux)
+		hi := usize(v.aux2)
+		for i := lo; i < hi; i++ {
+			if i > lo {
+				cgW(", ")
+			}
+			cgValue(n, slotGet(v.ref+u32(i)), typs.items[usize(sl)].a, dp-1)
+		}
+		cgWc('}')
+		q := cgWmark()
+		cgGoType(n, t, dp-1)
+		cgWrotate(p, q)
+	} else if k == VCode || k == VFieldCode {
+		cgFail(n, "Code values cannot exist at run time")
+	} else {
+		cgFail(n, "unsupported constant")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+
+// constNameOK reports whether a constant is declared as a Go constant
+// (gen.constName != "").
+func cgConstNameOK(s u32) bool {
+	b := syms.items[usize(s)].builtin
+	if b != BNone {
+		return b >= BCNanosecond && b <= BCErrParse && b < BCErrEOF
+	}
+	v := syms.items[usize(s)].val
+	if v == 0 {
+		return false
+	}
+	vk := vals.items[usize(v)].kind
+	if vk != VInt && vk != VBool && vk != VString {
+		return false
+	}
+	t := syms.items[usize(s)].typ
+	if t == 0 {
+		return false
+	}
+	if tk(t) == TCNamed && (namedOrigin(t) != 0 || tl2n(t) > 0) {
+		return false
+	}
+	return tk(underlying(t)) == TCBasic
+}
+
+// wConstName writes gen.constName(sym) (constNameOK must hold).
+func cgWConstName(s u32) {
+	b := syms.items[usize(s)].builtin
+	if b != BNone {
+		cgRt(builtinName(b))
+		return
+	}
+	cgWSymName(s)
+}
+
+// constDecl writes `const Name [T] = value` and reports whether anything
+// was written.
+func cgConstDecl(s u32) bool {
+	if s == 0 || cgSymNameIsBlank(s) || !cgConstNameOK(s) {
+		return false
+	}
+	v := slotGet(syms.items[usize(s)].val)
+	cgW("const ")
+	cgWSymName(s)
+	if !syms.items[usize(s)].untyped {
+		cgWc(' ')
+		saved := cgEnvN
+		cgEnvN = 0
+		cgGoType(syms.items[usize(s)].ident, syms.items[usize(s)].typ, SemaDepth)
+		cgEnvN = saved
+	}
+	cgW(" = ")
+	if v.kind == VInt {
+		cgWInt(v)
+	} else if v.kind == VBool {
+		if v.lo != 0 {
+			cgW("true")
+		} else {
+			cgW("false")
+		}
+	} else {
+		cgWQuoted(strOf(v))
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Declarations
+
+// typeDecl writes `type Name[T any] <underlying>` for a type declaration
+// (name: the declared name, or instance mi >= 0 of a monomorphized type).
+func cgTypeDecl(sym u32, mi int) {
+	named := syms.items[usize(sym)].typ
+	cgW("type ")
+	if mi >= 0 {
+		cgWMonoName(usize(mi))
+	} else {
+		cgWSymName(sym)
+	}
+	cgTypeParamList(typs.items[usize(named)].l2s, tl2n(named), true)
+	cgWc(' ')
+	cgTypeLit(syms.items[usize(sym)].decl, underlying(named), SemaDepth)
+	cgW("\n\n")
+	cgFlushTo(1)
+}
+
+// global writes a package-level variable.
+func cgGlobal(s u32) {
+	d := syms.items[usize(s)].decl
+	t := syms.items[usize(s)].typ
+	cgEnvReset()
+	cgW("var ")
+	cgWSymName(s)
+	cgWc(' ')
+	cgGoType(d, t, SemaDepth)
+	val := u32(0)
+	if d != 0 && nkind(d) == NkVarDecl {
+		val = nc(d)
+	}
+	if val == 0 {
+		cgW("\n\n")
+		cgFlushTo(2)
+		return
+	}
+	vs := nval[usize(val)]
+	if vs != 0 {
+		if cgIsZeroSlot(vs) {
+			cgW("\n\n")
+			cgFlushTo(2)
+			return
+		}
+		cgW(" = ")
+		cgValue(val, slotGet(vs), t, SemaDepth)
+		cgW("\n\n")
+		cgFlushTo(2)
+		return
+	}
+	cgCtxReset(0)
+	cgW(" = ")
+	cgExpr(val, SemaDepth)
+	cgW("\n\n")
+	cgFlushTo(2)
+}
+
+// ctxReset starts a fresh function context (finc0: a new fnCtx with new
+// temporary and label counters).
+func cgCtxReset(fi u32) {
+	cgFn = fi
+	cgTmp = 0
+	cgLabel = 0
+	cgHeader = 0
+	cgTyped = false
+	cgFrameTop = 0
+	cgFrameBase = 0
+	cgPendTop = 0
+	cgPendBase = 0
+	cgArmTop = 0
+	cgSeenTop = 0
+	cgStash.len = 0
+}
+
+// funcDecl writes a function or method. mi >= 0 is the monomorphized
+// instance (of the receiver type for methods, else of the function).
+func cgFuncDecl(fi u32, mi int) {
+	f := funcs.items[usize(fi)]
+	cgCtxReset(fi)
+	cgW("func ")
+	if f.method != 0 {
+		cgWc('(')
+		if f.recvSym != 0 {
+			cgWSymName(f.recvSym)
+		} else {
+			cgW("_")
+		}
+		cgWc(' ')
+		if meths.items[usize(f.method)].ptrRecv {
+			cgWc('*')
+		}
+		if mi >= 0 {
+			cgWMonoName(usize(mi))
+		} else {
+			cgWSymName(namedSym(meths.items[usize(f.method)].recv))
+		}
+		cgTypeParamList(f.tpS, usize(f.tpN), false)
+		cgW(") ")
+		cgWSymName(f.sym)
+	} else {
+		if mi >= 0 {
+			cgWMonoName(usize(mi))
+		} else {
+			cgWSymName(f.sym)
+		}
+		cgTypeParamList(f.tpS, usize(f.tpN), true)
+	}
+	cgSignature(fi, SemaDepth)
+	cgWc(' ')
+	cgBody(f.body, SemaDepth)
+	cgW("\n\n")
+	cgFlushTo(3)
+}
+
+// emitMethods writes the methods of type declaration sym (declared in
+// package pid), in source order.
+func cgEmitMethods(pid u32, sym u32, mi int) {
+	named := syms.items[usize(sym)].typ
+	p := pkgs.items[usize(pid)]
+	ndecl := usize(p.declN)
+	for i := usize(0); i < ndecl; i++ {
+		s := uat(p.declS, i)
+		if symKind(s) != SymFunc {
+			continue
+		}
+		fi := funcOfSym(s)
+		if !cgIsEmittedFunc(fi) || cgMethodRecvNamed(fi) != named {
+			continue
+		}
+		cgEnvReset()
+		if mi >= 0 {
+			cgEnvBind(funcs.items[usize(fi)].tpS, usize(funcs.items[usize(fi)].tpN), cgMonoValS[usize(mi)])
+		}
+		cgFuncDecl(fi, mi)
+	}
+}
+
+// entryPoint writes Go's main.
+func cgEntryPoint() {
+	m := funcs.main
+	cgW("func main() {\n")
+	cgW("if err := ")
+	cgWSymName(funcs.items[usize(m)].sym)
+	cgWc('(')
+	s := funcs.items[usize(m)].sig
+	np := sigNParams(s)
+	for i := usize(0); i < np; i++ {
+		if i > 0 {
+			cgW(", ")
+		}
+		b := builtinOf(sigParam(s, i))
+		if b == BTNet {
+			cgRt("DefaultNet")
+		} else if b == BTSignals {
+			cgRt("DefaultSignals")
+		} else if b == BTClock {
+			cgRt("DefaultClock")
+		} else if b == BTFS {
+			cgRt("DefaultFS")
+		} else if b == BTEnv {
+			cgRt("DefaultEnv")
+		} else if b == BTStdio {
+			cgRt("DefaultStdio")
+		} else if b == BTExec {
+			cgRt("DefaultExec")
+		} else {
+			cgFail(funcs.items[usize(m)].decl, "unsupported main parameter type")
+		}
+		cgW("()")
+	}
+	cgW("); err != nil {\n")
+	cgW("_, _ = os.Stderr.WriteString(\"error: \" + err.Error() + \"\\n\")\n")
+	cgW("os.Exit(1)\n}\n}\n")
+	cgFlushTo(3)
+}
+
+// generateGo emits the Go program of the checked program into outBuf
+// (unformatted). It returns false after a code generation failure (the
+// message is in cgErrBuf).
+func cgGenerateGo() bool {
+	cgFailed = false
+	cgUsesRT = false
+	cgNMonos = 0
+	cgNMonoVals = 0
+	cgValTop = 0
+	cgBuf.len = 0
+	cgBuf.full = false
+	genTypes.len = 0
+	genTypes.full = false
+	genVars.len = 0
+	genVars.full = false
+	genFuncs.len = 0
+	genFuncs.full = false
+	m := funcs.main
+	if m == 0 || funcs.items[usize(m)].sym == 0 || syms.items[usize(funcs.items[usize(m)].sym)].pkg != pkgs.root {
+		cgFail(0, "the root package has no main function")
+		return false
+	}
+	cgPrepare()
+	no := pkgs.norder
+	for i := usize(0); i < no; i++ {
+		p := pkgs.items[usize(pkgs.order[i])]
+		ndecl := usize(p.declN)
+		for j := usize(0); j < ndecl; j++ {
+			s := uat(p.declS, j)
+			if symKind(s) == SymConst {
+				cgEnvReset()
+				if cgConstDecl(s) {
+					cgW("\n\n")
+					cgFlushTo(1)
+				}
+			}
+		}
+	}
+	for i := usize(0); i < no; i++ {
+		pid := pkgs.order[i]
+		p := pkgs.items[usize(pid)]
+		ndecl := usize(p.declN)
+		for j := usize(0); j < ndecl; j++ {
+			s := uat(p.declS, j)
+			if !cgIsTypeDeclSym(s) || cgTypeConstParams(syms.items[usize(s)].typ) > 0 {
+				continue
+			}
+			cgEnvReset()
+			cgTypeDecl(s, -1)
+			cgEmitMethods(pid, s, -1)
+		}
+	}
+	for i := usize(0); i < no; i++ {
+		p := pkgs.items[usize(pkgs.order[i])]
+		ndecl := usize(p.declN)
+		for j := usize(0); j < ndecl; j++ {
+			s := uat(p.declS, j)
+			if symKind(s) == SymVar && !cgTypeMentionsCode(syms.items[usize(s)].typ) {
+				cgGlobal(s)
+			}
+		}
+	}
+	for i := usize(0); i < no; i++ {
+		p := pkgs.items[usize(pkgs.order[i])]
+		ndecl := usize(p.declN)
+		for j := usize(0); j < ndecl; j++ {
+			s := uat(p.declS, j)
+			if symKind(s) != SymFunc {
+				continue
+			}
+			fi := funcOfSym(s)
+			if !cgIsEmittedFunc(fi) || funcs.items[usize(fi)].method != 0 || cgFuncConstParams(fi) > 0 {
+				continue
+			}
+			cgEnvReset()
+			cgFuncDecl(fi, -1)
+		}
+	}
+	for next := usize(0); next < CgMaxMonos; next++ {
+		if next >= cgNMonos || cgFailed {
+			break
+		}
+		cgEnvReset()
+		sym := cgMonoSym[next]
+		if cgMonoKind[next] == 1 {
+			named := syms.items[usize(sym)].typ
+			cgEnvBind(typs.items[usize(named)].l2s, tl2n(named), cgMonoValS[next])
+			cgTypeDecl(sym, int(next))
+			pid := syms.items[usize(sym)].pkg
+			cgEmitMethods(pid, sym, int(next))
+		} else {
+			fi := funcOfSym(sym)
+			cgEnvBind(funcs.items[usize(fi)].tpS, usize(funcs.items[usize(fi)].tpN), cgMonoValS[next])
+			cgFuncDecl(fi, int(next))
+		}
+	}
+	cgEntryPoint()
+	if cgFailed {
+		return false
+	}
+	return cgAssembleGo()
+}
+
+// assembleGo joins the header, the imports and the sections into outBuf.
+func cgAssembleGo() bool {
+	o := &outBuf
+	o.reset()
+	o.putStr("// Code generated by finc0 from FinCore sources. DO NOT EDIT.\n\npackage main\n\n")
+	o.putStr("import (\n")
+	if cgUsesRT {
+		o.putStr("\"fincore/runtime/fincrt\"\n")
+	}
+	o.putStr("\"os\"\n")
+	o.putStr(")\n\n")
+	o.putBytes(genTypes.data[:genTypes.len])
+	o.putBytes(genVars.data[:genVars.len])
+	o.putBytes(genFuncs.data[:genFuncs.len])
+	if outBuf.full || cgBuf.full || genTypes.full || genVars.full || genFuncs.full || cgStash.full {
+		setFull("generated Go output")
+		return false
+	}
+	return true
+}

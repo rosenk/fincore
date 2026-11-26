@@ -221,15 +221,14 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	if strEq(cmd, "check") {
 		return runCheck(fs, env, io)
 	}
-	if strEq(cmd, "build") || strEq(cmd, "run") || strEq(cmd, "test") {
-		eb.reset()
-		eb.putStr("finc1 ")
-		eb.putStr(cmd)
-		eb.putStr(": not implemented\n")
-		if err := flushErr(io); err != nil {
-			return err
-		}
-		return ErrExec
+	if strEq(cmd, "build") {
+		return runBuild(fs, env, io, exec)
+	}
+	if strEq(cmd, "run") {
+		return runRun(fs, env, io, exec)
+	}
+	if strEq(cmd, "test") {
+		return runTest(fs, env, io, exec)
 	}
 	eb.reset()
 	eb.putStr("finc1: unknown command ")

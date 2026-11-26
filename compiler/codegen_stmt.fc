@@ -1,0 +1,729 @@
+// codegen_stmt.fc — the Go code generator, part 3: function bodies and
+// statements (port of finc0's codegen/golang stmt.go), including the
+// `scope` lowering: a plain block with explicit Wait() calls on every exit
+// edge plus one function-level safety-net defer per scope statement.
+package main
+
+// body writes a function body including the scope safety-net prologue.
+func cgBody(b u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	cgW("{\n")
+	if cgFn != 0 {
+		n := u64(cgScopeCount[usize(cgFn)])
+		for i := u64(0); i < n; i++ {
+			cgW("var _fc_s")
+			cgWu(i)
+			cgW(" *")
+			cgRt("Scope")
+			cgW("\ndefer func() {\nif _fc_s")
+			cgWu(i)
+			cgW(" != nil {\n_fc_s")
+			cgWu(i)
+			cgW(".Wait()\n}\n}()\n")
+		}
+	}
+	cgStmts(b, dp-1)
+	cgWc('}')
+}
+
+func cgPendPush(s u32) {
+	if cgPendTop >= CgMaxPend {
+		setFull("codegen pending statements")
+		return
+	}
+	cgPend[cgPendTop] = s
+	cgPendTop++
+}
+
+// flushPending writes the queued `_ = x` statements.
+func cgFlushPending() {
+	top := cgPendTop
+	for i := cgPendBase; i < top; i++ {
+		cgW("_ = ")
+		cgWSymName(cgPend[i])
+		cgWc('\n')
+	}
+	cgPendTop = cgPendBase
+}
+
+// stmts writes the live statements of a block.
+func cgStmts(bl u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	cgFlushPending()
+	if bl == 0 {
+		return
+	}
+	n := cgLiveLen(bl, WalkDepth)
+	for i := usize(0); i < n; i++ {
+		cgStmt(l1at(bl, i), dp-1)
+	}
+}
+
+func cgStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	if s == 0 {
+		return
+	}
+	k := nkind(s)
+	if k == NkBlockStmt {
+		cgW("{\n")
+		cgStmts(s, dp-1)
+		cgW("}\n")
+	} else if k == NkDeclStmt {
+		d := na(s)
+		if nkind(d) == NkVarDecl {
+			cgVarDecl(d, dp-1)
+		} else if nkind(d) == NkConstDecl {
+			n := l1len(d)
+			for i := usize(0); i < n; i++ {
+				sym := defs[usize(na(l1at(d, i)))]
+				if sym != 0 && cgConstDecl(sym) {
+					cgWc('\n')
+				}
+			}
+		}
+	} else if k == NkShortVarDecl || k == NkAssignStmt || k == NkIncDecStmt || k == NkExprStmt {
+		p := cgWmark()
+		cgSimple(s, dp-1)
+		if cgWmark() > p {
+			cgWc('\n')
+		}
+		cgFlushPending()
+	} else if k == NkDeferStmt {
+		p := cgWmark()
+		cgW("defer ")
+		q := cgWmark()
+		cgExprStmt(na(s), dp-1)
+		if cgWmark() == q {
+			cgWtruncate(p)
+		} else {
+			cgWc('\n')
+		}
+	} else if k == NkReturnStmt {
+		cgReturnStmt(s, dp-1)
+	} else if k == NkIfStmt {
+		cgIfStmt(s, dp-1)
+		cgWc('\n')
+	} else if k == NkForStmt {
+		cgForStmt(s, dp-1)
+	} else if k == NkMatchStmt {
+		cgMatchStmt(s, dp-1)
+	} else if k == NkScopeStmt {
+		cgScopeStmt(s, dp-1)
+	} else if k == NkBreakStmt {
+		cgBranch(s, true)
+	} else if k == NkContinueStmt {
+		cgBranch(s, false)
+	} else {
+		cgFail(s, "unsupported statement")
+	}
+}
+
+func cgVarDecl(d u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	sym := defs[usize(na(d))]
+	t := u32(0)
+	if sym != 0 {
+		t = syms.items[usize(sym)].typ
+	} else {
+		t = ntype[usize(nc(d))]
+		if nb(d) != 0 {
+			t = ntype[usize(nb(d))]
+		}
+	}
+	cgW("var ")
+	cgWSymName(sym)
+	cgWc(' ')
+	cgGoType(d, t, dp-1)
+	if nc(d) != 0 {
+		cgW(" = ")
+		cgExpr(nc(d), dp-1)
+	}
+	cgWc('\n')
+	if sym != 0 && !cgSymNameIsBlank(sym) && !cgSymUsed(sym) {
+		cgW("_ = ")
+		cgWSymName(sym)
+		cgWc('\n')
+	}
+}
+
+// exprStmt writes an expression statement (nothing for a folded comptime
+// call).
+func cgExprStmt(e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	x := cgUnparenNode(e)
+	if nkind(x) == NkCallExpr {
+		c := ncall[usize(x)]
+		if c != 0 && callTab.items[usize(c)].folded {
+			return
+		}
+	}
+	cgExpr(e, dp-1)
+}
+
+// simple writes a simple statement on one line; `_ = x` statements for
+// variables Go would consider unused are queued (pendPush).
+func cgSimple(s u32, dp usize) decreases(dp) {
+	if dp == 0 || s == 0 {
+		return
+	}
+	k := nkind(s)
+	if k == NkExprStmt {
+		cgExprStmt(na(s), dp-1)
+	} else if k == NkIncDecStmt {
+		cgLhs(na(s), dp-1)
+		if nflag(s) {
+			cgW("++")
+		} else {
+			cgW("--")
+		}
+	} else if k == NkAssignStmt {
+		nl := l1len(s)
+		for i := usize(0); i < nl; i++ {
+			if i > 0 {
+				cgW(", ")
+			}
+			cgLhs(l1at(s, i), dp-1)
+		}
+		cgWc(' ')
+		cgW(assignOpString(nop(s)))
+		cgWc(' ')
+		cgRhs(s, false, nl, dp-1)
+	} else if k == NkShortVarDecl {
+		nl := l1len(s)
+		for i := usize(0); i < nl; i++ {
+			if i > 0 {
+				cgW(", ")
+			}
+			id := l1at(s, i)
+			def := defs[usize(id)]
+			if def != 0 {
+				cgWSymName(def)
+				if !cgSymNameIsBlank(def) && !cgSymUsed(def) {
+					cgPendPush(def)
+				}
+			} else {
+				cgLhs(id, dp-1)
+			}
+		}
+		cgW(" := ")
+		cgRhsDecl(s, nl, dp-1)
+	} else {
+		cgFail(s, "unsupported simple statement")
+	}
+}
+
+func cgLhs(e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	if nkind(e) == NkIdent {
+		if isBlank(e) {
+			cgW("_")
+			return
+		}
+		cgIdent(e, dp-1)
+		return
+	}
+	cgExpr(e, dp-1)
+}
+
+// rhsItem returns the i-th right-hand side: l2 of assignments and short
+// variable declarations, l1 of return statements.
+func cgRhsItem(s u32, ret bool, i usize) u32 {
+	if ret {
+		return l1at(s, i)
+	}
+	return l2at(s, i)
+}
+
+func cgRhsLen(s u32, ret bool) usize {
+	if ret {
+		return l1len(s)
+	}
+	return l2len(s)
+}
+
+// rhsDecl writes the right-hand side of `:=`: literals at the top level
+// get explicit types (Go would infer int/rune for them).
+func cgRhsDecl(s u32, nl usize, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	n := l2len(s)
+	if n == 1 && nl > 1 {
+		cgRhs(s, false, nl, dp-1)
+		return
+	}
+	for i := usize(0); i < n; i++ {
+		if i > 0 {
+			cgW(", ")
+		}
+		cgTyped = true
+		cgExpr(cgUnparenNode(l2at(s, i)), dp-1)
+	}
+}
+
+func cgRhs(s u32, ret bool, nl usize, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	n := cgRhsLen(s, ret)
+	if n == 1 && nl > 1 {
+		r0 := cgRhsItem(s, ret, 0)
+		cs := cgConstValueSlot(r0)
+		if cs != 0 && vals.items[usize(cs)].kind == VTuple {
+			cgTupleValues(r0, slotGet(cs), dp-1)
+			return
+		}
+	}
+	for i := usize(0); i < n; i++ {
+		if i > 0 {
+			cgW(", ")
+		}
+		cgExpr(cgRhsItem(s, ret, i), dp-1)
+	}
+}
+
+// wScopeVar writes the Go variable of scope frame i.
+func cgWScopeVar(i usize) {
+	if cgFrameTmp[i] != 0 {
+		cgWtemp(cgFrameTmp[i] - 1)
+		return
+	}
+	cgWSymName(cgFrameSym[i])
+}
+
+// waitScopes writes `s.Wait()` for the enclosing scope frames, innermost
+// first.
+func cgWaitScopes() usize {
+	n := cgFrameTop - cgFrameBase
+	cnt := usize(0)
+	top := cgFrameTop
+	for g := usize(0); g < n; g++ {
+		i := top - 1 - g
+		if cgFrameKind[i] == CgFrScope {
+			cgWScopeVar(i)
+			cgW(".Wait()\n")
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func cgCountScopes() usize {
+	cnt := usize(0)
+	top := cgFrameTop
+	for i := cgFrameBase; i < top; i++ {
+		if cgFrameKind[i] == CgFrScope {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func cgStashStr(s string) {
+	o := &cgStash
+	o.putStr(s)
+}
+
+func cgReturnStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	nres := l1len(s)
+	sig := funcs.items[usize(cgFn)].sig
+	nw := sigNResults(sig)
+	if cgCountScopes() == 0 || nres == 0 {
+		_ = cgWaitScopes()
+		if nres == 0 {
+			cgW("return\n")
+		} else {
+			cgW("return ")
+			cgRhs(s, true, nw, dp-1)
+			cgWc('\n')
+		}
+		return
+	}
+	// Evaluate the results inside the scope, then wait, then return.
+	smark := cgStash.len
+	if nres == 1 && nw > 1 {
+		r0 := l1at(s, 0)
+		cs := cgConstValueSlot(r0)
+		if cs != 0 && vals.items[usize(cs)].kind == VTuple {
+			p := cgWmark()
+			cgTupleValues(r0, slotGet(cs), dp-1)
+			cgStashCut(p)
+		} else {
+			t0 := cgTmp
+			for i := usize(0); i < nw; i++ {
+				_ = cgNewTemp()
+			}
+			for i := usize(0); i < nw; i++ {
+				if i > 0 {
+					cgW(", ")
+				}
+				cgWtemp(t0 + u64(i))
+			}
+			cgW(" := ")
+			cgExpr(r0, dp-1)
+			cgWc('\n')
+			p := cgWmark()
+			for i := usize(0); i < nw; i++ {
+				if i > 0 {
+					cgW(", ")
+				}
+				cgWtemp(t0 + u64(i))
+			}
+			cgStashCut(p)
+		}
+	} else {
+		for i := usize(0); i < nres; i++ {
+			if i > 0 {
+				cgStashStr(", ")
+			}
+			r := l1at(s, i)
+			if cgConstValueSlot(r) != 0 {
+				p := cgWmark()
+				cgExpr(r, dp-1)
+				cgStashCut(p)
+				continue
+			}
+			t := cgNewTemp()
+			cgW("var ")
+			cgWtemp(t)
+			cgWc(' ')
+			want := u32(0)
+			if i < nw {
+				want = sigResult(sig, i)
+			}
+			cgGoType(r, want, dp-1)
+			cgW(" = ")
+			cgExpr(r, dp-1)
+			cgWc('\n')
+			p := cgWmark()
+			cgWtemp(t)
+			cgStashCut(p)
+		}
+	}
+	_ = cgWaitScopes()
+	cgW("return ")
+	cgStashEmit(smark, cgStash.len)
+	cgWc('\n')
+	cgStash.len = smark
+}
+
+func cgIfStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	cgHeader++
+	cgW("if ")
+	if na(s) != 0 {
+		cgSimple(na(s), dp-1)
+		cgW("; ")
+	}
+	cgExpr(nb(s), dp-1)
+	cgHeader--
+	cgW(" {\n")
+	cgStmts(nc(s), dp-1)
+	cgWc('}')
+	e := nd(s)
+	if e == 0 {
+		return
+	}
+	if nkind(e) == NkIfStmt {
+		cgW(" else ")
+		cgIfStmt(e, dp-1)
+	} else if nkind(e) == NkBlockStmt {
+		cgW(" else {\n")
+		cgStmts(e, dp-1)
+		cgWc('}')
+	}
+}
+
+func cgPushFrame(kind u8, sym u32, tmp u64) usize {
+	if cgFrameTop >= CgMaxFrames {
+		setFull("codegen frames")
+		return CgMaxFrames - 1
+	}
+	i := cgFrameTop
+	cgFrameKind[i] = kind
+	cgFrameLabel[i] = 0
+	cgFrameSym[i] = sym
+	cgFrameTmp[i] = tmp
+	cgFrameTop++
+	return i
+}
+
+func cgPopFrame() {
+	if cgFrameTop > cgFrameBase {
+		cgFrameTop--
+	}
+}
+
+func cgForStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	p := cgWmark()
+	cgHeader++
+	if nflag2(s) {
+		// finc0 renders init, post, then cond.
+		cgW("for ")
+		cgSimple(na(s), dp-1)
+		cgW("; ")
+		q := cgWmark()
+		cgSimple(nc(s), dp-1)
+		r := cgWmark()
+		if nb(s) != 0 {
+			cgExpr(nb(s), dp-1)
+		}
+		cgW("; ")
+		cgWrotate(q, r)
+		cgWc(' ')
+	} else if nb(s) != 0 {
+		cgW("for ")
+		cgExpr(nb(s), dp-1)
+		cgWc(' ')
+	} else {
+		cgW("for ")
+	}
+	cgHeader--
+	fr := cgPushFrame(CgFrLoop, 0, 0)
+	cgW("{\n")
+	cgStmts(ne(s), dp-1)
+	cgW("}\n")
+	lbl := cgFrameLabel[fr]
+	cgPopFrame()
+	if lbl != 0 {
+		q := cgWmark()
+		cgW("_fc_L")
+		cgWu(lbl - 1)
+		cgW(":\n")
+		cgWrotate(p, q)
+	}
+}
+
+// branch writes break/continue: scope blocks left by the jump are waited
+// for first; a break out of a match (Go switch) is labeled.
+func cgBranch(s u32, isBreak bool) {
+	n := cgFrameTop - cgFrameBase
+	top := cgFrameTop
+	loop := usize(0)
+	found := false
+	crossed := false
+	for g := usize(0); g < n; g++ {
+		i := top - 1 - g
+		k := cgFrameKind[i]
+		if k == CgFrLoop {
+			loop = i
+			found = true
+			break
+		}
+		if k == CgFrSwitch {
+			crossed = true
+		}
+		if k == CgFrScope {
+			cgWScopeVar(i)
+			cgW(".Wait()\n")
+		}
+	}
+	if !found {
+		cgFail(s, "break/continue outside a loop")
+		return
+	}
+	if isBreak && crossed {
+		if cgFrameLabel[loop] == 0 {
+			cgFrameLabel[loop] = cgLabel + 1
+			cgLabel++
+		}
+		cgW("break _fc_L")
+		cgWu(cgFrameLabel[loop] - 1)
+		cgWc('\n')
+		return
+	}
+	if isBreak {
+		cgW("break\n")
+	} else {
+		cgW("continue\n")
+	}
+}
+
+func cgScopeStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	sym := defs[usize(na(s))]
+	tmp := u64(0)
+	if cgSymNameIsBlank(sym) {
+		tmp = cgNewTemp() + 1
+	}
+	cgW("{\n")
+	fr := cgPushFrame(CgFrScope, sym, tmp)
+	cgWScopeVar(fr)
+	cgW(" := ")
+	cgExpr(nb(s), dp-1)
+	cgWc('\n')
+	idx := cgScopeIdx[usize(s)]
+	if idx > 0 {
+		cgW("_fc_s")
+		cgWu(u64(idx - 1))
+		cgW(" = ")
+		cgWScopeVar(fr)
+		cgWc('\n')
+	}
+	cgStmts(nc(s), dp-1)
+	cgPopFrame()
+	if !cgIsTermList(nc(s), WalkDepth) {
+		if tmp != 0 {
+			cgWtemp(tmp - 1)
+		} else {
+			cgWSymName(sym)
+		}
+		cgW(".Wait()\n")
+	}
+	cgW("}\n")
+}
+
+func cgIsPlainVar(e u32) bool {
+	if nkind(e) != NkIdent {
+		return false
+	}
+	s := uses[usize(e)]
+	return s != 0 && symKind(s) == SymVar && syms.items[usize(s)].fn != 0
+}
+
+func cgMatchStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	mark, cnt, hasDef, en := cgMatchArms(s)
+	needBind := false
+	if en != 0 {
+		for i := usize(0); i < cnt; i++ {
+			pt := na(cgArms[mark+i])
+			if nkind(pt) != NkCtorPattern {
+				continue
+			}
+			nbd := l1len(pt)
+			for j := usize(0); j < nbd; j++ {
+				sym := defs[usize(l1at(pt, j))]
+				if sym != 0 && cgSymUsed(sym) {
+					needBind = true
+				}
+			}
+		}
+	}
+	cgHeader++
+	smark := cgStash.len
+	bTmp := u64(0)
+	x := na(s)
+	if en == 0 {
+		cgW("switch ")
+		cgExpr(x, dp-1)
+	} else if needBind && !cgIsPlainVar(x) {
+		bTmp = cgNewTemp() + 1
+		cgW("switch ")
+		cgWtemp(bTmp - 1)
+		cgW(" := ")
+		cgExpr(x, dp-1)
+		cgW("; ")
+		cgWtemp(bTmp - 1)
+		cgW("._tag")
+	} else {
+		cgW("switch ")
+		p := cgWmark()
+		cgPrimary(x, dp-1)
+		o := &cgStash
+		o.putBytes(cgBuf.data[p:cgBuf.len])
+		cgW("._tag")
+	}
+	bEnd := cgStash.len
+	cgHeader--
+	cgW(" {\n")
+	_ = cgPushFrame(CgFrSwitch, 0, 0)
+	for i := usize(0); i < cnt; i++ {
+		a := cgArms[mark+i]
+		pt := na(a)
+		if i == cnt-1 && hasDef {
+			cgW("default:\n")
+		} else {
+			cgW("case ")
+			cgCaseLabel(s, a, dp-1)
+			cgW(":\n")
+		}
+		if nkind(pt) == NkCtorPattern && en != 0 && nvarEnum[usize(pt)] != 0 {
+			ven := nvarEnum[usize(pt)]
+			vi := usize(nvarIdx[usize(pt)])
+			nbd := l1len(pt)
+			for j := usize(0); j < nbd; j++ {
+				sym := defs[usize(l1at(pt, j))]
+				if sym == 0 || !cgSymUsed(sym) {
+					continue
+				}
+				cgWSymName(sym)
+				cgW(" := ")
+				if bTmp != 0 {
+					cgWtemp(bTmp - 1)
+				} else {
+					cgStashEmit(smark, bEnd)
+				}
+				cgWc('.')
+				cgWVariantField(ven, vi, j)
+				cgWc('\n')
+			}
+		}
+		if nb(a) != 0 {
+			p := cgWmark()
+			cgExprStmt(nb(a), dp-1)
+			if cgWmark() > p {
+				cgWc('\n')
+			}
+		}
+		if nc(a) != 0 {
+			cgStmts(nc(a), dp-1)
+		}
+	}
+	cgPopFrame()
+	cgW("}\n")
+	cgArmTop = mark
+	cgStash.len = smark
+}
+
+func cgCaseLabel(s u32, a u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	pt := na(a)
+	k := nkind(pt)
+	xt := ntype[usize(na(s))]
+	if k == NkCtorPattern {
+		if nvarEnum[usize(pt)] != 0 {
+			cgWu(u64(nvarIdx[usize(pt)]))
+			return
+		}
+		v := nval[usize(nb(pt))]
+		if v != 0 {
+			cgValue(pt, slotGet(v), xt, dp-1)
+			return
+		}
+	} else if k == NkLiteralPattern {
+		v := nval[usize(na(pt))]
+		if v != 0 {
+			cgValue(pt, slotGet(v), xt, dp-1)
+			return
+		}
+	}
+	cgFail(a, "unsupported match pattern")
+}

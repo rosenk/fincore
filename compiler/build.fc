@@ -1,0 +1,1394 @@
+// build.fc — `finc build`, `finc run` and `finc test` (port of finc0's
+// bootstrap/cmd/finc0 build.go and test.go).
+//
+// build: check (checkPath) -> generateGo (codegen*.fc, unformatted Go in
+// outBuf) -> a temporary module directory (FS.MkdirTemp) holding main.go
+// -> gofmt -> --emit-go copy -> go.mod (`replace fincore => <root>`, plus
+// the race-only GORACE re-exec helper zz_race.go for --race) -> `go build`.
+//
+// Formatting: finc0 formats with go/format; finc1 cannot import Go
+// packages, so it writes the raw text to <tmp>/main.go and runs gofmt
+// through the Exec capability: `go run cmd/gofmt -w <tmp>/main.go` (the
+// gofmt of the same toolchain, built from GOROOT and cached by the go
+// command), or $FINC_GOFMT if set. go/format and gofmt print identically,
+// so the result is byte-identical to finc0's. The formatted file is read
+// back into outBuf for --emit-go.
+//
+// Go tool and module root: the go command is $FINC_GO or `go` from PATH.
+// Version-manager shims (mise) pick the toolchain from the working
+// directory, so every go invocation runs with workdir = the fincore module
+// root and `go build -C <tmp>` switches to the temporary module. The root
+// is $FINCORE_ROOT, else the first directory at or above the working
+// directory ($PWD; FS has no Getwd) or above the finc1 executable (Arg(0),
+// when it is a path) whose go.mod declares `module fincore`. Relative -o
+// paths are made absolute with $PWD.
+//
+// Exec forwards a child's stdout to finc1's stdout and captures stderr, so
+// `test` runs the compiled pass programs through `/bin/sh -c 'exec "$0"
+// >"$1"'` to capture their stdout in a file, and lists subdirectories with
+// /bin/sh (FS can only list .fc files). Fail tests and builds run finc1
+// itself (Arg(0)) as a subprocess.
+package main
+
+const (
+	MaxExecArgs  = 128
+	ExecErrBytes = 1 << 20
+	MaxTests     = 1024
+	TestBufBytes = 1 << 20
+)
+
+var execErr [ExecErrBytes]byte
+var bScratch [4 * MaxPathBytes]byte
+var testBuf [TestBufBytes]byte
+var testBuf2 [TestBufBytes]byte
+
+// Build options (flags of build/run).
+var bOut string
+var bEmitGo string
+var bRace bool
+var bTrim bool
+
+func catStr(a string, b string) string {
+	n := copy(bScratch[:], strBytes(a))
+	n += copy(bScratch[n:], strBytes(b))
+	return bytesToStr(bScratch[:n])
+}
+
+func cat3(a string, b string, c string) string {
+	n := copy(bScratch[:], strBytes(a))
+	n += copy(bScratch[n:], strBytes(b))
+	n += copy(bScratch[n:], strBytes(c))
+	return bytesToStr(bScratch[:n])
+}
+
+func uintStr(v u64) string {
+	var nb [24]byte
+	n, _ := formatUint(v, nb[:])
+	return bytesToStr(nb[:n])
+}
+
+// intStr formats an int (exit codes).
+func intStr(v int) string {
+	if v < 0 {
+		return catStr("-", uintStr(u64(0-v)))
+	}
+	return uintStr(u64(v))
+}
+
+func hasSuffixStr(s string, suf string) bool {
+	b := strBytes(s)
+	x := strBytes(suf)
+	if len(b) < len(x) {
+		return false
+	}
+	return bytesEqual(b[len(b)-len(x):], x)
+}
+
+// joinPath is filepath.Join(dir, name).
+func joinPath(dir string, name string) string {
+	var pb [MaxPathBytes]byte
+	k := cleanJoin(strBytes(dir), strBytes(name), pb[:])
+	return bytesToStr(pb[:k])
+}
+
+func cleanStr(p string) string {
+	var pb [MaxPathBytes]byte
+	k := cleanPath(strBytes(p), pb[:])
+	return bytesToStr(pb[:k])
+}
+
+// dirOf is filepath.Dir of a clean path.
+func dirOf(p string) string {
+	b := strBytes(p)
+	n := len(b)
+	last := n
+	for i := usize(0); i < n; i++ {
+		if b[n-1-i] == '/' {
+			last = n - 1 - i
+			break
+		}
+	}
+	if last == n {
+		return "."
+	}
+	if last == 0 {
+		return "/"
+	}
+	return cleanStr(bytesToStr(b[:last]))
+}
+
+// baseOf is filepath.Base.
+func baseOf(p string) string {
+	c := strBytes(cleanStr(p))
+	n := len(c)
+	if n == 1 && c[0] == '/' {
+		return "/"
+	}
+	st := usize(0)
+	for i := usize(0); i < n; i++ {
+		if c[i] == '/' {
+			st = i + 1
+		}
+	}
+	return bytesToStr(c[st:n])
+}
+
+func isWordByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 12 || c == 11
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+
+driver func emsg(io Stdio, s string) error {
+	return io.WriteStderr(strBytes(s))
+}
+
+driver func emsg3(io Stdio, a string, b string, c string) error {
+	eb := &errBuf
+	eb.reset()
+	eb.putStr(a)
+	eb.putStr(b)
+	eb.putStr(c)
+	return flushErr(io)
+}
+
+// ---------------------------------------------------------------------------
+// Flags (Go flag package syntax)
+
+driver func buildUsage(io Stdio, name string, withOut bool) error {
+	if withOut {
+		if err := emsg(io, "usage: finc1 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n"); err != nil {
+			return err
+		}
+	} else {
+		if err := emsg(io, "usage: finc1 run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n"); err != nil {
+			return err
+		}
+	}
+	if err := emsg(io, "  -comptime-fuel uint\n    \tcomptime fuel budget per evaluation (default 1000000)\n"); err != nil {
+		return err
+	}
+	if withOut {
+		if err := emsg(io, "  -emit-go string\n    \talso write the generated Go source to this file\n  -o string\n    \toutput binary (default: base name of the source)\n"); err != nil {
+			return err
+		}
+	}
+	if err := emsg(io, "  -race\n    \tbuild with the race detector (needs cgo)\n"); err != nil {
+		return err
+	}
+	if withOut {
+		return emsg(io, "  -trimpath\n    \tpass -trimpath to go build\n")
+	}
+	return nil
+}
+
+func parseBoolStr(b []byte) (bool, bool) {
+	if cgBytesIs(b, "1") || cgBytesIs(b, "t") || cgBytesIs(b, "T") || cgBytesIs(b, "true") || cgBytesIs(b, "TRUE") || cgBytesIs(b, "True") {
+		return true, true
+	}
+	if cgBytesIs(b, "0") || cgBytesIs(b, "f") || cgBytesIs(b, "F") || cgBytesIs(b, "false") || cgBytesIs(b, "FALSE") || cgBytesIs(b, "False") {
+		return false, true
+	}
+	return false, false
+}
+
+// parseBuildFlags parses the flags of build/run in env args [from, to) and
+// returns the index of the first positional argument.
+driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut bool) (usize, error) {
+	bOut = ""
+	bEmitGo = ""
+	bRace = false
+	bTrim = false
+	evalFuel = DefaultFuel
+	name := "run"
+	if withOut {
+		name = "build"
+	}
+	i := from
+	for g := usize(0); g < to; g++ {
+		if i >= to {
+			break
+		}
+		a := env.Arg(i)
+		ab := strBytes(a)
+		if len(ab) < 2 || ab[0] != '-' {
+			break
+		}
+		if cgBytesIs(ab, "--") {
+			i++
+			break
+		}
+		st := usize(1)
+		if ab[1] == '-' {
+			st = 2
+		}
+		eq := len(ab)
+		for k := st; k < len(ab); k++ {
+			if ab[k] == '=' {
+				eq = k
+				break
+			}
+		}
+		fname := ab[st:eq]
+		hasVal := eq < len(ab)
+		val := ""
+		if hasVal {
+			val = bytesToStr(ab[eq+1:])
+		}
+		i++
+		isBool := cgBytesIs(fname, "race") || (withOut && cgBytesIs(fname, "trimpath"))
+		isStr := withOut && (cgBytesIs(fname, "o") || cgBytesIs(fname, "emit-go"))
+		isFuel := cgBytesIs(fname, "comptime-fuel")
+		if !isBool && !isStr && !isFuel {
+			if err := emsg3(io, "flag provided but not defined: -", bytesToStr(fname), "\n"); err != nil {
+				return 0, err
+			}
+			if err := buildUsage(io, name, withOut); err != nil {
+				return 0, err
+			}
+			return 0, ErrParse
+		}
+		if isBool {
+			v := true
+			if hasVal {
+				bv, ok := parseBoolStr(strBytes(val))
+				if !ok {
+					if err := emsg3(io, "invalid boolean value ", catStr(cat3("\"", val, "\""), cat3(" for -", bytesToStr(fname), ": parse error\n")), ""); err != nil {
+						return 0, err
+					}
+					if err := buildUsage(io, name, withOut); err != nil {
+						return 0, err
+					}
+					return 0, ErrParse
+				}
+				v = bv
+			}
+			if cgBytesIs(fname, "race") {
+				bRace = v
+			} else {
+				bTrim = v
+			}
+			continue
+		}
+		if !hasVal {
+			if i >= to {
+				if err := emsg3(io, "flag needs an argument: -", bytesToStr(fname), "\n"); err != nil {
+					return 0, err
+				}
+				if err := buildUsage(io, name, withOut); err != nil {
+					return 0, err
+				}
+				return 0, ErrParse
+			}
+			val = env.Arg(i)
+			i++
+		}
+		if isStr {
+			if cgBytesIs(fname, "o") {
+				bOut = val
+			} else {
+				bEmitGo = val
+			}
+			continue
+		}
+		v, ok := parseU64(strBytes(val))
+		if !ok {
+			if err := emsg3(io, "invalid value \"", val, "\" for flag -comptime-fuel: parse error\n"); err != nil {
+				return 0, err
+			}
+			if err := buildUsage(io, name, withOut); err != nil {
+				return 0, err
+			}
+			return 0, ErrParse
+		}
+		evalFuel = v
+	}
+	if evalFuel == 0 {
+		if err := emsg3(io, "finc1 ", name, ": --comptime-fuel must be positive\n"); err != nil {
+			return 0, err
+		}
+		return 0, ErrParse
+	}
+	return i, nil
+}
+
+// ---------------------------------------------------------------------------
+// Module root and paths
+
+// absPath makes p absolute using $PWD ("" if that is impossible).
+driver func absPath(env Env, p string) string {
+	b := strBytes(p)
+	if len(b) > 0 && b[0] == '/' {
+		return cleanStr(p)
+	}
+	wd, ok := env.GetEnv("PWD")
+	if !ok || len(strBytes(wd)) == 0 || strBytes(wd)[0] != '/' {
+		return ""
+	}
+	return joinPath(wd, p)
+}
+
+// lineMatches reports whether a go.mod line is `<kw> <arg>` (kw followed
+// by whitespace, one non-space word, optional trailing whitespace) and
+// returns the word.
+func goModWord(line []byte, kw string) (usize, usize, bool) {
+	k := strBytes(kw)
+	n := len(line)
+	m := len(k)
+	if n <= m || !bytesEqual(line[:m], k) || !isSpaceByte(line[m]) {
+		return 0, 0, false
+	}
+	i := m
+	for g := usize(0); g < n; g++ {
+		if i >= n || !isSpaceByte(line[i]) {
+			break
+		}
+		i++
+	}
+	st := i
+	for g := usize(0); g < n; g++ {
+		if i >= n || isSpaceByte(line[i]) {
+			break
+		}
+		i++
+	}
+	en := i
+	if en == st {
+		return 0, 0, false
+	}
+	for g := usize(0); g < n; g++ {
+		if i >= n {
+			break
+		}
+		if !isSpaceByte(line[i]) {
+			return 0, 0, false
+		}
+		i++
+	}
+	return st, en, true
+}
+
+// goModInfo reads dir/go.mod: whether it declares `module fincore`, and
+// its go directive ("" if none).
+driver func goModInfo(fs FS, dir string) (bool, string) {
+	n, err := fs.ReadFileInto(joinPath(dir, "go.mod"), testBuf2[:])
+	if err != nil {
+		return false, ""
+	}
+	data := testBuf2[:n]
+	isRoot := false
+	goVer := ""
+	ls := usize(0)
+	lim := n + 1
+	for i := usize(0); i < lim; i++ {
+		if i < n && data[i] != '\n' {
+			continue
+		}
+		line := data[ls:i]
+		ls = i + 1
+		st, en, ok := goModWord(line, "module")
+		if ok && cgBytesIs(line[st:en], "fincore") {
+			isRoot = true
+		}
+		st2, en2, ok2 := goModWord(line, "go")
+		if ok2 && len(strBytes(goVer)) == 0 {
+			goVer = bytesToStr(line[st2:en2])
+		}
+	}
+	return isRoot, goVer
+}
+
+// findRootFrom walks up from an absolute directory.
+driver func findRootFrom(fs FS, start string) string {
+	dir := start
+	for g := usize(0); g < MaxPathBytes; g++ {
+		ok, _ := goModInfo(fs, dir)
+		if ok {
+			return dir
+		}
+		parent := dirOf(dir)
+		if strEq(parent, dir) {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// findModuleRoot locates the fincore module root ("" after reporting an
+// error).
+driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
+	r, ok := env.GetEnv("FINCORE_ROOT")
+	if ok && len(strBytes(r)) > 0 {
+		abs := absPath(env, r)
+		isRoot := false
+		if len(strBytes(abs)) > 0 {
+			isRoot, _ = goModInfo(fs, abs)
+		}
+		if !isRoot {
+			if !quiet {
+				_ = emsg3(io, "finc1: FINCORE_ROOT=", r, " does not contain the fincore go.mod\n")
+			}
+			return ""
+		}
+		return abs
+	}
+	wd, okw := env.GetEnv("PWD")
+	if okw && len(strBytes(wd)) > 0 && strBytes(wd)[0] == '/' {
+		root := findRootFrom(fs, cleanStr(wd))
+		if len(strBytes(root)) > 0 {
+			return root
+		}
+	}
+	exe := env.Arg(0)
+	eb := strBytes(exe)
+	hasSlash := false
+	for i := usize(0); i < len(eb); i++ {
+		if eb[i] == '/' {
+			hasSlash = true
+		}
+	}
+	if hasSlash {
+		ae := absPath(env, exe)
+		if len(strBytes(ae)) > 0 {
+			root := findRootFrom(fs, dirOf(ae))
+			if len(strBytes(root)) > 0 {
+				return root
+			}
+		}
+	}
+	if !quiet {
+		_ = emsg(io, "finc1: cannot find the fincore module root (go.mod with `module fincore`); set FINCORE_ROOT\n")
+	}
+	return ""
+}
+
+driver func goTool(env Env) string {
+	p, ok := env.GetEnv("FINC_GO")
+	if ok && len(strBytes(p)) > 0 {
+		return p
+	}
+	return "go"
+}
+
+// stripDir writes execErr[:n] to errBuf with every "<dir>/" removed.
+func putStripped(o *OutBuf, data []byte, dir string) {
+	d := strBytes(dir)
+	nd := len(d)
+	n := len(data)
+	i := usize(0)
+	for g := usize(0); g < n; g++ {
+		if i >= n {
+			break
+		}
+		if nd > 0 && i+nd+1 <= n && bytesEqual(data[i:i+nd], d) && data[i+nd] == '/' {
+			i += nd + 1
+			continue
+		}
+		o.putByte(data[i])
+		i++
+	}
+}
+
+// ---------------------------------------------------------------------------
+// build
+
+const raceInitSrc = "//go:build race\n\npackage main\n\nimport (\n\t\"os\"\n\t\"strings\"\n\t\"syscall\"\n)\n\nfunc init() {\n\tgorace := os.Getenv(\"GORACE\")\n\tif strings.Contains(gorace, \"atexit_sleep_ms\") {\n\t\treturn\n\t}\n\texe, err := os.Executable()\n\tif err != nil {\n\t\treturn\n\t}\n\tval := \"atexit_sleep_ms=0\"\n\tif gorace != \"\" {\n\t\tval = gorace + \" \" + val\n\t}\n\tvar env []string\n\tfor _, kv := range os.Environ() {\n\t\tif !strings.HasPrefix(kv, \"GORACE=\") {\n\t\t\tenv = append(env, kv)\n\t\t}\n\t}\n\tenv = append(env, \"GORACE=\"+val)\n\t_ = syscall.Exec(exe, os.Args, env)\n}\n"
+
+// compileGo runs the front end and the code generator on src; the
+// unformatted Go source is left in outBuf.
+driver func compileGo(fs FS, io Stdio, src string) error {
+	if err := checkPath(fs, io, src); err != nil {
+		return err
+	}
+	if !cgGenerateGo() {
+		if semaFull {
+			return capacityFail(io, src, semaFullWhat)
+		}
+		eb := &errBuf
+		eb.reset()
+		eb.putStr("finc1: ")
+		eb.putBytes(cgErrBuf.data[:cgErrBuf.len])
+		eb.putByte('\n')
+		if err := flushErr(io); err != nil {
+			return err
+		}
+		return ErrParse
+	}
+	return nil
+}
+
+// runGo runs the go command (or bin if not "") with args in workdir; on
+// failure it reports "finc1: <what>: exit status N\n<stderr>".
+driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []string, workdir string, what string, strip string) error {
+	ctx, cancel := NewContext()
+	defer cancel()
+	st, n, err := exec.Run(ctx, bin, args, envs, workdir, execErr[:])
+	if err == nil && st.Code == 0 {
+		return nil
+	}
+	eb := &errBuf
+	eb.reset()
+	eb.putStr("finc1: ")
+	eb.putStr(what)
+	if err != nil {
+		eb.putStr(": cannot run ")
+		eb.putStr(bin)
+	} else {
+		eb.putStr(": exit status ")
+		eb.putStr(intStr(st.Code))
+	}
+	eb.putByte('\n')
+	putStripped(eb, execErr[:n], strip)
+	eb.putByte('\n')
+	if e := flushErr(io); e != nil {
+		return e
+	}
+	return ErrExec
+}
+
+// buildIn formats, emits and builds the program in outBuf inside the
+// temporary module directory dir.
+driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string, emitGo string) error {
+	mainGo := joinPath(dir, "main.go")
+	if err := fs.WriteFile(mainGo, outBuf.data[:outBuf.len]); err != nil {
+		return ioFail(io, "write ", mainGo, err)
+	}
+	root := findModuleRoot(fs, env, io, true)
+	wdir := root
+	var argv [MaxExecArgs]string
+	var envs [8]string
+	envs[0] = "GOWORK=off"
+	gofmt, okf := env.GetEnv("FINC_GOFMT")
+	if okf && len(strBytes(gofmt)) > 0 {
+		argv[0] = "-w"
+		argv[1] = mainGo
+		if err := runTool(io, exec, gofmt, argv[:2], envs[:1], wdir, "codegen: generated Go does not parse (gofmt)", dir); err != nil {
+			return err
+		}
+	} else {
+		argv[0] = "run"
+		argv[1] = "cmd/gofmt"
+		argv[2] = "-w"
+		argv[3] = mainGo
+		if err := runTool(io, exec, goTool(env), argv[:4], envs[:1], wdir, "codegen: generated Go does not parse (gofmt)", dir); err != nil {
+			return err
+		}
+	}
+	n, rerr := fs.ReadFileInto(mainGo, outBuf.data[:])
+	if rerr != nil {
+		return ioFail(io, "read ", mainGo, rerr)
+	}
+	outBuf.len = n
+	if len(strBytes(emitGo)) > 0 {
+		if err := fs.WriteFile(emitGo, outBuf.data[:outBuf.len]); err != nil {
+			return ioFail(io, "write ", emitGo, err)
+		}
+	}
+	if len(strBytes(root)) == 0 {
+		_ = findModuleRoot(fs, env, io, false)
+		return ErrNotFound
+	}
+	absOut := absPath(env, out)
+	if len(strBytes(absOut)) == 0 {
+		_ = emsg3(io, "finc1: cannot make ", out, " absolute ($PWD is not set)\n")
+		return ErrNotFound
+	}
+	_, goVer := goModInfo(fs, root)
+	if len(strBytes(goVer)) == 0 {
+		goVer = "1.22"
+	}
+	mb := &tmpBuf
+	mb.reset()
+	mb.putStr("module fincprog\n\ngo ")
+	mb.putStr(goVer)
+	mb.putStr("\n\nrequire fincore v0.0.0\n\nreplace fincore => ")
+	mb.putStr(root)
+	mb.putStr("\n")
+	gomod := joinPath(dir, "go.mod")
+	if err := fs.WriteFile(gomod, tmpBuf.data[:tmpBuf.len]); err != nil {
+		return ioFail(io, "write ", gomod, err)
+	}
+	if bRace {
+		rf := joinPath(dir, "zz_race.go")
+		if err := fs.WriteFile(rf, strBytes(raceInitSrc)); err != nil {
+			return ioFail(io, "write ", rf, err)
+		}
+	}
+	k := usize(0)
+	argv[k] = "build"
+	k++
+	argv[k] = "-C"
+	k++
+	argv[k] = dir
+	k++
+	argv[k] = "-o"
+	k++
+	argv[k] = absOut
+	k++
+	if bRace {
+		argv[k] = "-race"
+		k++
+	}
+	if bTrim {
+		argv[k] = "-trimpath"
+		k++
+	}
+	argv[k] = "."
+	k++
+	envs[1] = "GOFLAGS=-mod=mod"
+	if bRace {
+		envs[2] = "CGO_ENABLED=1"
+	} else {
+		envs[2] = "CGO_ENABLED=0"
+	}
+	return runTool(io, exec, goTool(env), argv[:k], envs[:3], root, "go build failed", dir)
+}
+
+// buildBinary compiles src into the binary out.
+driver func buildBinary(fs FS, env Env, io Stdio, exec Exec, src string, out string) error {
+	if err := compileGo(fs, io, src); err != nil {
+		return err
+	}
+	dir, err := fs.MkdirTemp("finc1-build-")
+	if err != nil {
+		return ioFail(io, "mkdir ", "temp", err)
+	}
+	berr := buildIn(fs, env, io, exec, dir, out, bEmitGo)
+	_ = fs.RemoveAll(dir)
+	return berr
+}
+
+// runBuild implements `build [-o out] [--emit-go=f] [--race] [--trimpath]
+// [--comptime-fuel=N] <file.fc | dir>`.
+driver func runBuild(fs FS, env Env, io Stdio, exec Exec) error {
+	argc := env.ArgsCount()
+	first, err := parseBuildFlags(env, io, 2, argc, true)
+	if err != nil {
+		return err
+	}
+	if argc-first != 1 {
+		if err := emsg(io, "usage: finc1 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n"); err != nil {
+			return err
+		}
+		return ErrParse
+	}
+	src := env.Arg(first)
+	if len(strBytes(bOut)) == 0 {
+		base := baseOf(src)
+		o := base
+		if hasSuffixStr(base, ".fc") {
+			bb := strBytes(base)
+			o = bytesToStr(bb[:len(bb)-3])
+		}
+		if strEq(o, base) && !fs.IsDir(src) {
+			o = catStr(o, ".bin")
+		}
+		bOut = o
+	}
+	return buildBinary(fs, env, io, exec, src, bOut)
+}
+
+// runRun implements `run [--race] [--comptime-fuel=N] <file.fc | dir>
+// [-- args...]`. The program's stdout is forwarded; its stderr is printed
+// after it exits; stdin is not forwarded and a non-zero exit status is
+// reported as an error (exit status 1).
+driver func runRun(fs FS, env Env, io Stdio, exec Exec) error {
+	argc := env.ArgsCount()
+	dash := argc
+	for i := usize(2); i < argc; i++ {
+		if strEq(env.Arg(i), "--") {
+			dash = i
+			break
+		}
+	}
+	first, err := parseBuildFlags(env, io, 2, dash, false)
+	if err != nil {
+		return err
+	}
+	if dash-first != 1 {
+		if err := emsg(io, "usage: finc1 run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n"); err != nil {
+			return err
+		}
+		return ErrParse
+	}
+	dir, merr := fs.MkdirTemp("finc1-run-")
+	if merr != nil {
+		return ioFail(io, "mkdir ", "temp", merr)
+	}
+	prog := joinPath(dir, "prog")
+	if err := buildBinary(fs, env, io, exec, env.Arg(first), prog); err != nil {
+		_ = fs.RemoveAll(dir)
+		return err
+	}
+	var argv [MaxExecArgs]string
+	k := usize(0)
+	for i := dash + 1; i < argc; i++ {
+		if k < MaxExecArgs {
+			argv[k] = env.Arg(i)
+			k++
+		}
+	}
+	ctx, cancel := NewContext()
+	defer cancel()
+	var envs [1]string
+	st, n, rerr := exec.Run(ctx, prog, argv[:k], envs[:0], "", execErr[:])
+	_ = fs.RemoveAll(dir)
+	if n > 0 {
+		if err := io.WriteStderr(execErr[:n]); err != nil {
+			return err
+		}
+	}
+	if rerr != nil {
+		return rerr
+	}
+	if st.Code != 0 {
+		return ErrExec
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// test (testdata/README.md conventions)
+
+var tName [MaxTests]string // test path (file or directory)
+var tDir [MaxTests]bool    // multi-file package test
+var nTests usize
+
+var subNames [MaxFiles]string
+
+driver func addTest(path string, isDir bool) {
+	if nTests < MaxTests {
+		tName[nTests] = path
+		tDir[nTests] = isDir
+		nTests++
+	}
+}
+
+// listSubdirs stores the names of the subdirectories of dir (sorted by
+// bytes) in subNames and returns their count.
+driver func listSubdirs(exec Exec, dir string) usize {
+	var argv [4]string
+	argv[0] = "-c"
+	argv[1] = "cd \"$1\" && for f in *; do if [ -d \"$f\" ]; then printf '%s\\n' \"$f\"; fi; done >&2"
+	argv[2] = "sh"
+	argv[3] = dir
+	var envs [1]string
+	envs[0] = "LC_ALL=C"
+	ctx, cancel := NewContext()
+	defer cancel()
+	_, n, err := exec.Run(ctx, "/bin/sh", argv[:4], envs[:1], "", execErr[:])
+	if err != nil {
+		return 0
+	}
+	cnt := usize(0)
+	ls := usize(0)
+	for i := usize(0); i < n; i++ {
+		if execErr[i] != '\n' {
+			continue
+		}
+		if i > ls && cnt < MaxFiles {
+			subNames[cnt] = bytesToStr(execErr[ls:i])
+			cnt++
+		}
+		ls = i + 1
+	}
+	return cnt
+}
+
+// collectDir adds the tests of one directory: *.fc files and
+// subdirectories with .fc files, in name order.
+driver func collectDir(fs FS, exec Exec, dir string) error {
+	nf, err := fs.ListSourceFiles(dir, fileNames[:])
+	if err != nil {
+		return err
+	}
+	nd := listSubdirs(exec, dir)
+	i := usize(0)
+	j := usize(0)
+	for g := usize(0); g < nf+nd; g++ {
+		takeFile := false
+		if i < nf && j < nd {
+			takeFile = bytesCompare(strBytes(fileNames[i]), strBytes(subNames[j])) < 0
+		} else if i < nf {
+			takeFile = true
+		} else if j >= nd {
+			break
+		}
+		if takeFile {
+			addTest(joinPath(dir, fileNames[i]), false)
+			i++
+		} else {
+			p := joinPath(dir, subNames[j])
+			j++
+			var tmpNames [4]string
+			cnt, lerr := fs.ListSourceFiles(p, tmpNames[:])
+			if (lerr == nil || lerr == ErrArenaFull) && cnt > 0 {
+				addTest(p, true)
+			}
+		}
+	}
+	return nil
+}
+
+// testFiles lists the source files of test i in fileNames (as paths) and
+// returns their count.
+driver func testFiles(fs FS, i usize) usize {
+	if !tDir[i] {
+		fileNames[0] = tName[i]
+		return 1
+	}
+	n, err := fs.ListSourceFiles(tName[i], fileNames[:])
+	if err != nil {
+		return 0
+	}
+	for k := usize(0); k < n; k++ {
+		fileNames[k] = joinPath(tName[i], fileNames[k])
+	}
+	return n
+}
+
+// Expected / reported diagnostics: (file base name, line, code).
+var wantFile [MaxDiags]string
+var wantLine [MaxDiags]u64
+var wantCode [MaxDiags]u64
+var nWant usize
+var gotFile [MaxDiags]string
+var gotLine [MaxDiags]u64
+var gotCode [MaxDiags]u64
+var gotLive [MaxDiags]bool
+var nGot usize
+
+// Header directives of the current test.
+var hFlags [MaxExecArgs]string
+var nhFlags usize
+var hBuildOnly bool
+
+func parseDigits(b []byte, i usize, max usize) (u64, usize) {
+	v := u64(0)
+	n := len(b)
+	k := i
+	for g := usize(0); g < max; g++ {
+		if k >= n || b[k] < '0' || b[k] > '9' {
+			break
+		}
+		v = v*10 + u64(b[k]-'0')
+		k++
+	}
+	return v, k
+}
+
+// scanMarkers adds the `// ERROR E####` markers of one line.
+func scanMarkers(base string, lineNo u64, line []byte) {
+	n := len(line)
+	pos := usize(0)
+	for g := usize(0); g < n; g++ {
+		if pos+2 > n {
+			break
+		}
+		if line[pos] != '/' || line[pos+1] != '/' {
+			pos++
+			continue
+		}
+		i := pos + 2
+		for h := usize(0); h < n; h++ {
+			if i >= n || !isSpaceByte(line[i]) {
+				break
+			}
+			i++
+		}
+		ok := i+5 <= n && cgBytesIs(line[i:i+5], "ERROR")
+		if ok {
+			i += 5
+			ws := i
+			for h := usize(0); h < n; h++ {
+				if i >= n || !isSpaceByte(line[i]) {
+					break
+				}
+				i++
+			}
+			ok = i > ws && i+5 <= n && line[i] == 'E'
+		}
+		if ok {
+			code, e := parseDigits(line, i+1, 4)
+			ok = e == i+5 && (e >= n || !isWordByte(line[e]))
+			if ok && nWant < MaxDiags {
+				wantFile[nWant] = base
+				wantLine[nWant] = lineNo
+				wantCode[nWant] = code
+				nWant++
+				pos = e
+				continue
+			}
+		}
+		pos++
+	}
+}
+
+// readHeader reads the directives of a test's first file and the ERROR
+// markers of all its files.
+driver func readHeader(fs FS, nfiles usize) error {
+	nhFlags = 0
+	hBuildOnly = false
+	nWant = 0
+	for f := usize(0); f < nfiles; f++ {
+		path := fileNames[f]
+		n, err := fs.ReadFileInto(path, testBuf[:])
+		if err != nil {
+			return err
+		}
+		data := testBuf[:n]
+		base := baseOf(path)
+		inHeader := f == 0
+		ls := usize(0)
+		lineNo := u64(0)
+		lim := n + 1
+		for i := usize(0); i < lim; i++ {
+			if i < n && data[i] != '\n' {
+				continue
+			}
+			line := data[ls:i]
+			ls = i + 1
+			lineNo++
+			if inHeader {
+				st := usize(0)
+				en := len(line)
+				for g := usize(0); g < en; g++ {
+					if st >= en || !isSpaceByte(line[st]) {
+						break
+					}
+					st++
+				}
+				for g := usize(0); g < len(line); g++ {
+					if en <= st || !isSpaceByte(line[en-1]) {
+						break
+					}
+					en--
+				}
+				tl := line[st:en]
+				if cgBytesHasPrefix(tl, "package ") {
+					inHeader = false
+				} else if cgBytesHasPrefix(tl, "// FLAGS:") {
+					rest := tl[9:]
+					rn := len(rest)
+					k := usize(0)
+					for g := usize(0); g < rn; g++ {
+						if k >= rn {
+							break
+						}
+						if isSpaceByte(rest[k]) {
+							k++
+							continue
+						}
+						s := k
+						for h := usize(0); h < rn; h++ {
+							if k >= rn || isSpaceByte(rest[k]) {
+								break
+							}
+							k++
+						}
+						if nhFlags < MaxExecArgs-8 {
+							hFlags[nhFlags] = bytesToStr(rest[s:k])
+							nhFlags++
+						}
+					}
+				} else if cgBytesIs(tl, "// BUILD-ONLY") {
+					hBuildOnly = true
+				}
+			}
+			scanMarkers(base, lineNo, line)
+			if i == n {
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// parseDiagLines collects the (file base, line, code) triples of the
+// diagnostics in execErr[:n].
+func parseDiagLines(n usize) {
+	nGot = 0
+	data := execErr[:n]
+	ls := usize(0)
+	lim := n + 1
+	for i := usize(0); i < lim; i++ {
+		if i < n && data[i] != '\n' {
+			continue
+		}
+		line := data[ls:i]
+		ls = i + 1
+		addDiagLine(line)
+		if i == n {
+			break
+		}
+	}
+}
+
+func addDiagLine(line []byte) {
+	n := len(line)
+	ws := n
+	for k := usize(0); k < n; k++ {
+		if isSpaceByte(line[k]) {
+			ws = k
+			break
+		}
+	}
+	// (\S+\.fc):(\d+):(\d+): error\[(E\d{4})\] with the longest path.
+	for g := usize(0); g < ws; g++ {
+		j := ws - g
+		if j < 4 || j >= n || line[j] != ':' || !cgBytesIs(line[j-3:j], ".fc") {
+			continue
+		}
+		ln, e1 := parseDigits(line, j+1, 20)
+		if e1 == j+1 || e1 >= n || line[e1] != ':' {
+			continue
+		}
+		_, e2 := parseDigits(line, e1+1, 20)
+		if e2 == e1+1 || e2+9 > n || !cgBytesIs(line[e2:e2+9], ": error[E") {
+			continue
+		}
+		code, e3 := parseDigits(line, e2+9, 4)
+		if e3 != e2+13 || e3 >= n || line[e3] != ']' {
+			continue
+		}
+		base := baseOf(bytesToStr(line[:j]))
+		dup := false
+		ng := nGot
+		for q := usize(0); q < ng; q++ {
+			if gotLine[q] == ln && gotCode[q] == code && strEq(gotFile[q], base) {
+				dup = true
+			}
+		}
+		if !dup && nGot < MaxDiags {
+			gotFile[nGot] = base
+			gotLine[nGot] = ln
+			gotCode[nGot] = code
+			gotLive[nGot] = true
+			nGot++
+		}
+		return
+	}
+}
+
+func putDiagCode(o *OutBuf, code u64) {
+	o.putStr("E")
+	var cb [8]byte
+	n, _ := formatUint(code, cb[:])
+	for z := n; z < 4; z++ {
+		o.putByte('0')
+	}
+	o.putBytes(cb[:n])
+}
+
+// runFailTest checks a fail test; the failure message (empty = pass) is
+// left in tmpBuf.
+driver func runFailTest(exec Exec, self string, src string) {
+	mb := &tmpBuf
+	mb.reset()
+	var argv [MaxExecArgs]string
+	k := usize(0)
+	argv[k] = "check"
+	k++
+	for i := usize(0); i < nhFlags; i++ {
+		argv[k] = hFlags[i]
+		k++
+	}
+	argv[k] = src
+	k++
+	var envs [1]string
+	ctx, cancel := NewContext()
+	defer cancel()
+	st, n, err := exec.Run(ctx, self, argv[:k], envs[:0], "", execErr[:])
+	if err != nil {
+		mb.putStr("cannot run ")
+		mb.putStr(self)
+		mb.putStr("\n")
+		return
+	}
+	if st.Code == 0 {
+		mb.putStr("check succeeded; want [")
+		nw := nWant
+		for i := usize(0); i < nw; i++ {
+			if i > 0 {
+				mb.putByte(' ')
+			}
+			mb.putByte('{')
+			mb.putStr(wantFile[i])
+			mb.putByte(' ')
+			mb.putUint(wantLine[i])
+			mb.putByte(' ')
+			putDiagCode(mb, wantCode[i])
+			mb.putByte('}')
+		}
+		mb.putStr("]")
+		return
+	}
+	parseDiagLines(n)
+	ng := nGot
+	nw := nWant
+	for i := usize(0); i < nw; i++ {
+		found := false
+		for q := usize(0); q < ng; q++ {
+			if gotLine[q] == wantLine[i] && gotCode[q] == wantCode[i] && strEq(gotFile[q], wantFile[i]) {
+				found = true
+				gotLive[q] = false
+			}
+		}
+		if !found {
+			mb.putStr("missing diagnostic ")
+			mb.putStr(wantFile[i])
+			mb.putByte(':')
+			mb.putUint(wantLine[i])
+			mb.putStr(": error[")
+			putDiagCode(mb, wantCode[i])
+			mb.putStr("]\n")
+		}
+	}
+	for q := usize(0); q < ng; q++ {
+		if gotLive[q] {
+			mb.putStr("unexpected diagnostic ")
+			mb.putStr(gotFile[q])
+			mb.putByte(':')
+			mb.putUint(gotLine[q])
+			mb.putStr(": error[")
+			putDiagCode(mb, gotCode[q])
+			mb.putStr("]\n")
+		}
+	}
+	if tmpBuf.len > 0 {
+		mb.putStr("check output:\n")
+		mb.putBytes(execErr[:n])
+	}
+}
+
+// runPassTest builds (and unless BUILD-ONLY runs) a pass test; the failure
+// message (empty = pass) is left in tmpBuf.
+driver func runPassTest(fs FS, exec Exec, self string, src string, outPath string, work string, idx usize) {
+	mb := &tmpBuf
+	mb.reset()
+	bin := joinPath(work, catStr("t", uintStr(u64(idx))))
+	var argv [MaxExecArgs]string
+	k := usize(0)
+	argv[k] = "build"
+	k++
+	for i := usize(0); i < nhFlags; i++ {
+		argv[k] = hFlags[i]
+		k++
+	}
+	argv[k] = "-o"
+	k++
+	argv[k] = bin
+	k++
+	argv[k] = src
+	k++
+	var envs [1]string
+	ctx, cancel := NewContext()
+	defer cancel()
+	st, n, err := exec.Run(ctx, self, argv[:k], envs[:0], "", execErr[:])
+	if err != nil || st.Code != 0 {
+		mb.putStr("build failed:\n")
+		mb.putBytes(execErr[:n])
+		return
+	}
+	if hBuildOnly {
+		return
+	}
+	wn, werr := fs.ReadFileInto(outPath, testBuf[:])
+	if werr != nil {
+		mb.putStr("missing expected output: open ")
+		mb.putStr(outPath)
+		mb.putStr(": no such file or directory")
+		return
+	}
+	stdoutFile := joinPath(work, catStr(catStr("t", uintStr(u64(idx))), ".stdout"))
+	argv[0] = "-c"
+	argv[1] = "exec \"$0\" >\"$1\""
+	argv[2] = bin
+	argv[3] = stdoutFile
+	rctx := ctx.WithTimeout(30 * Second)
+	st2, n2, err2 := exec.Run(rctx, "/bin/sh", argv[:4], envs[:0], work, execErr[:])
+	if err2 != nil || st2.Code != 0 {
+		mb.putStr("run: ")
+		if err2 == ErrTimeout {
+			mb.putStr("signal: killed")
+		} else if err2 != nil {
+			mb.putStr("cannot run")
+		} else {
+			mb.putStr("exit status ")
+			mb.putStr(intStr(st2.Code))
+		}
+		mb.putStr("\nstderr:\n")
+		mb.putBytes(execErr[:n2])
+		return
+	}
+	gn, gerr := fs.ReadFileInto(stdoutFile, testBuf2[:])
+	if gerr != nil {
+		gn = 0
+	}
+	if !bytesEqual(testBuf2[:gn], testBuf[:wn]) {
+		mb.putStr("stdout mismatch\n--- got ---\n")
+		mb.putBytes(testBuf2[:gn])
+		mb.putStr("--- want ---\n")
+		mb.putBytes(testBuf[:wn])
+	}
+}
+
+driver func testUsage(io Stdio) error {
+	if err := emsg(io, "usage: finc1 test <dir>\n  -v\tprint every test result\n"); err != nil {
+		return err
+	}
+	return ErrParse
+}
+
+// runTest implements `test [-v] <dir>`.
+driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
+	argc := env.ArgsCount()
+	verbose := false
+	dir := ""
+	nops := usize(0)
+	for i := usize(2); i < argc; i++ {
+		a := env.Arg(i)
+		if nops == 0 && (strEq(a, "-v") || strEq(a, "--v") || strEq(a, "-v=true") || strEq(a, "--v=true")) {
+			verbose = true
+		} else if nops == 0 && len(strBytes(a)) > 1 && strBytes(a)[0] == '-' {
+			if err := emsg3(io, "flag provided but not defined: ", a, "\n"); err != nil {
+				return err
+			}
+			return testUsage(io)
+		} else {
+			dir = a
+			nops++
+		}
+	}
+	if nops != 1 {
+		return testUsage(io)
+	}
+	if !fs.IsDir(dir) {
+		if err := emsg3(io, "finc1 test: ", dir, " is not a directory\n"); err != nil {
+			return err
+		}
+		return ErrParse
+	}
+	nTests = 0
+	failDir := joinPath(dir, "fail")
+	passDir := joinPath(dir, "pass")
+	hasFail := fs.IsDir(failDir)
+	hasPass := fs.IsDir(passDir)
+	if hasFail || hasPass {
+		if hasFail {
+			if err := collectDir(fs, exec, failDir); err != nil {
+				return ioFail(io, "open ", failDir, err)
+			}
+		}
+		if hasPass {
+			if err := collectDir(fs, exec, passDir); err != nil {
+				return ioFail(io, "open ", passDir, err)
+			}
+		}
+	} else if err := collectDir(fs, exec, dir); err != nil {
+		return ioFail(io, "open ", dir, err)
+	}
+	if nTests == 0 {
+		if err := emsg3(io, "finc1 test: no tests in ", dir, "\n"); err != nil {
+			return err
+		}
+		return ErrNotFound
+	}
+	work, werr := fs.MkdirTemp("finc1-test-")
+	if werr != nil {
+		return ioFail(io, "mkdir ", "temp", werr)
+	}
+	self := env.Arg(0)
+	failed := usize(0)
+	n := nTests
+	for i := usize(0); i < n; i++ {
+		nf := testFiles(fs, i)
+		kind := "pass"
+		if nf == 0 {
+			kind = "?"
+			mb := &tmpBuf
+			mb.reset()
+			mb.putStr("no source files")
+		} else if err := readHeader(fs, nf); err != nil {
+			kind = "?"
+			mb := &tmpBuf
+			mb.reset()
+			mb.putStr("cannot read test sources")
+		} else if nWant > 0 {
+			kind = "fail"
+			runFailTest(exec, self, tName[i])
+		} else {
+			outPath := ""
+			if tDir[i] {
+				outPath = catStr(tName[i], ".out")
+			} else {
+				nb := strBytes(tName[i])
+				outPath = catStr(bytesToStr(nb[:len(nb)-3]), ".out")
+			}
+			runPassTest(fs, exec, self, tName[i], outPath, work, i)
+		}
+		bad := tmpBuf.len > 0
+		if bad {
+			failed++
+		}
+		if bad || verbose {
+			o := &outBuf
+			o.reset()
+			if bad {
+				o.putStr("FAIL ")
+			} else {
+				o.putStr("ok   ")
+			}
+			o.putStr(kind)
+			o.putByte(' ')
+			o.putStr(tName[i])
+			o.putByte('\n')
+			if bad {
+				// indent the message lines
+				tl := tmpBuf.len
+				m := tl
+				for g := usize(0); g < tl; g++ {
+					if m == 0 || tmpBuf.data[m-1] != '\n' {
+						break
+					}
+					m--
+				}
+				o.putStr("    ")
+				for q := usize(0); q < m; q++ {
+					c := tmpBuf.data[q]
+					o.putByte(c)
+					if c == '\n' {
+						o.putStr("    ")
+					}
+				}
+				o.putByte('\n')
+			}
+			if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+				_ = fs.RemoveAll(work)
+				return err
+			}
+		}
+	}
+	_ = fs.RemoveAll(work)
+	o := &outBuf
+	o.reset()
+	o.putUint(u64(n))
+	o.putStr(" tests, ")
+	o.putUint(u64(n - failed))
+	o.putStr(" passed, ")
+	o.putUint(u64(failed))
+	o.putStr(" failed\n")
+	if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+		return err
+	}
+	if failed > 0 {
+		return ErrExec
+	}
+	return nil
+}

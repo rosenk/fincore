@@ -1,0 +1,194 @@
+// cg_exprs: expression lowering edge cases (constants, conversions,
+// shifts, precedence, literals, names that collide with Go).
+package main
+
+const (
+	Max          = 10
+	Neg          = -5
+	Ch           = 'a'
+	NL           = '\n'
+	Lim      u32 = 7
+	Big          = 1 << 40
+	Name         = "fin\tcore\x01"
+	Yes          = true
+	Mask     u8  = 0xF0
+	Sec          = 3 * Second
+	Wide     i64 = -9223372036854775807
+	_            = 3
+)
+
+type Celsius u32
+type Label string
+type Flag bool
+
+const Boil Celsius = 100
+const Hello Label = "hi"
+const On Flag = true
+
+type Point struct {
+	x i32
+	y i32
+}
+
+type Pair struct {
+	a Point
+	b Point
+	s string
+	f bool
+}
+
+const Origin = Point{x: 1, y: -2}
+
+comptime func makePair() Pair {
+	var p Pair
+	p.a.x = 3
+	p.s = "pair"
+	p.f = true
+	return p
+}
+
+comptime func two() (u32, string) {
+	return 7, "seven"
+}
+
+comptime func table() [6]u8 {
+	var t [6]u8
+	for i := usize(0); i < 6; i++ {
+		t[i] = u8(i * i)
+	}
+	t[2] = 0
+	return t
+}
+
+comptime func double(x u64) u64 {
+	return x * 2
+}
+
+var origin Point = Point{x: 1}
+var pair Pair = makePair()
+var tab [6]u8 = table()
+var zero Point = Point{}
+var big [100000]u64
+var counter u64 = Big
+var greeting string = Name
+
+func f(len u32, string u32, go u32) u32 {
+	type_ := len + string
+	return type_ + go
+}
+
+func takes2(a u32, b string) u32 {
+	return a + u32(b[0])
+}
+
+func shifts(n u64, k u32) u64 {
+	a := 1 << k
+	b := u64(1) << n
+	c := (1 << 3) + n
+	d := Mask >> 4
+	e := n<<2 | n>>1&7
+	return u64(a) + b + c + u64(d) + e
+}
+
+func prec(a i64, b i64, c i64) i64 {
+	x := a - (b - c)
+	y := (a - b) - c
+	z := a * (b + c)
+	w := -(a + b)
+	v := -(-a)
+	u := a / (b * c)
+	t := (a == b) == (b == c)
+	if t || (a < b && b < c) || !(a > c) {
+		return x + y + z + w + v + u
+	}
+	return Neg * a
+}
+
+func lits() (u8, u16, int, usize, string, bool) {
+	c := 'x'
+	d := '\''
+	e := '\\'
+	var g u16 = 'q'
+	h := 42
+	i := usize(7)
+	s := "a\"b\\cé\n"
+	j := Ch
+	k := NL
+	l := Lim
+	m := Boil
+	n := Hello
+	o := On
+	p := Yes
+	_ = c + d + e + j + k
+	_ = l
+	_ = m
+	_ = n
+	_ = o
+	return c + d, g, h, i, s, p
+}
+
+func consts() u64 {
+	a := Max + 1
+	b := u64(Max)
+	c := u8(Ch)
+	var d u64 = Big
+	e := Sec
+	f := Duration(5)
+	g := Origin
+	h := Origin.x
+	i := pair.a.x
+	x, y := two()
+	z := takes2(two())
+	k := double(21)
+	l := tab[3]
+	m := -Neg
+	n := Wide
+	return u64(a) + b + u64(c) + d + u64(e) + u64(f) + u64(g.y) + u64(h) + u64(i) + u64(x) + u64(len(y)) + u64(z) + k + u64(l) + u64(m) + u64(n)
+}
+
+func ptrs(p *Point, q *[4]u32) i32 {
+	r := *p
+	pp := &r
+	pp.x = 3
+	(*q)[1] = 2
+	s := q[:]
+	t := s[1:]
+	u := s[:2]
+	v := s[1:3]
+	return r.x + (*pp).y + i32(t[0]) + i32(u[0]) + i32(v[0]) + i32(len(s)) + i32(cap(s))
+}
+
+func structs() bool {
+	a := Point{x: 1, y: 2}
+	b := Point{y: 2, x: 1}
+	if a == (Point{x: 1, y: 2}) {
+		return true
+	}
+	if b != zero && a == origin {
+		return false
+	}
+	c := Pair{a: a, b: Point{}, s: "x"}
+	return c.a == a && c.s == "x"
+}
+
+driver func main(io Stdio) error {
+	big[0] = shifts(3, 4) + consts()
+	_ = f(1, 2, 3)
+	_ = prec(1, 2, 3)
+	var p Point
+	var q [4]u32
+	_ = ptrs(&p, &q)
+	_ = structs()
+	a, b, c, d, e, g := lits()
+	_ = a
+	_ = b
+	_ = c
+	_ = d
+	_ = e
+	_ = g
+	counter++
+	if greeting == Name {
+		return nil
+	}
+	return ErrIO
+}

@@ -1,0 +1,45 @@
+package util
+
+const Base = 7
+const Name = "a"
+
+type Vec[N usize, T any] struct {
+	data [N]T
+	len  usize
+}
+
+func (v *Vec[N, T]) Push(x T) bool {
+	if v.len >= N {
+		return false
+	}
+	v.data[v.len] = x
+	v.len++
+	return true
+}
+
+func (v *Vec[N, T]) Cap() usize {
+	return N
+}
+
+type Pt struct {
+	X u32
+	Y u32
+}
+
+var Count u32 = 3
+
+func Square(x u64) u64 {
+	return x * x
+}
+
+func Id[T any](x T) T {
+	return x
+}
+
+func Sum[N usize](v *Vec[N, u32]) u64 {
+	s := u64(0)
+	for i := usize(0); i < v.len; i++ {
+		s += u64(v.data[i])
+	}
+	return s + u64(N)
+}
