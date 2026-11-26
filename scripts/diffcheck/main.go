@@ -1,9 +1,11 @@
-// Command diffcheck compares `finc1 check` with the oracle
-// `finc0 check --passes=types` (load, resolve, type checking and comptime
-// evaluation only) on the corpus and on the source snippets embedded in
-// finc0's resolver, type checker and comptime unit tests.
+// Command diffcheck compares `finc1 check --passes=P` with the oracle
+// `finc0 check --passes=P` on the corpus and on the source snippets
+// embedded in finc0's resolver, type checker, comptime and totality unit
+// tests. P is `types` by default (load, resolve, type checking and
+// comptime evaluation only); `-passes=totality` checks the totality
+// checker (types + totality) and adds mutated copies of compiler/.
 //
-//	go run ./scripts/diffcheck [-finc0 bin/finc0] [-finc1 bin/finc1] [-v] [-keep]
+//	go run ./scripts/diffcheck [-passes types|totality|...] [-finc0 bin/finc0] [-finc1 bin/finc1] [-v] [-keep]
 //
 // Corpus cases (run from the module root): examples/*.fc, testdata/pass
 // (files and package directories), testdata/fail/*.fc,
@@ -16,7 +18,13 @@
 // root, and every map[string]string literal with .fc keys (resolver tests)
 // becomes a multi-file module whose checked path is the next string
 // argument of the enclosing call or composite literal. Snippets run twice,
-// with the default fuel and with --comptime-fuel=1000.
+// with the default fuel and with --comptime-fuel=1000. The snippets of
+// bootstrap/internal/totality/totality_test.go (the source fields of its
+// {name, src} cases and the argument of load(t, src)) are wrapped like the
+// test does: "package main\n" + src + a driver main.
+//
+// With -passes other than types, mutantCompilerCases adds copies of
+// compiler/ with one recursion measure, loop or decreases clause broken.
 //
 // A case matches when stdout, stderr and the exit status are identical.
 // finc1's generated main prints "error: <err>" after a failing driver and
@@ -54,6 +62,7 @@ func main() {
 	keep := flag.Bool("keep", false, "keep temporary directories")
 	mutants := flag.Int("mutate", 0, "also check N random token-level mutants of every corpus file")
 	seed := flag.Int64("seed", 1, "mutation seed")
+	passes := flag.String("passes", "types", "value of the hidden --passes flag of both compilers")
 	flag.Parse()
 	abs0, _ := filepath.Abs(*finc0)
 	abs1, _ := filepath.Abs(*finc1)
@@ -71,15 +80,24 @@ func main() {
 		fatal(err)
 	}
 	cases = append(cases, snips...)
+	tsnips, err := totalitySnippetCases(tmp)
+	if err != nil {
+		fatal(err)
+	}
+	cases = append(cases, tsnips...)
+	if *passes != "types" {
+		cases = append(cases, mutantCompilerCases(tmp)...)
+	}
 	if *mutants > 0 {
-		cases = append(cases, mutantCases(tmp, *mutants, *seed)...)
+		cases = append(cases, mutantCases(tmp, *mutants, *seed, *passes != "types")...)
 	}
 
 	match, mismatch := 0, 0
 	var failed []string
 	for _, c := range cases {
-		o0, e0, x0 := run(abs0, c.dir, append(append([]string{"check", "--passes=types"}, c.flags...), c.path))
-		o1, e1, x1 := run(abs1, c.dir, append(append([]string{"check"}, c.flags...), c.path))
+		pf := "--passes=" + *passes
+		o0, e0, x0 := run(abs0, c.dir, append(append([]string{"check", pf}, c.flags...), c.path))
+		o1, e1, x1 := run(abs1, c.dir, append(append([]string{"check", pf}, c.flags...), c.path))
 		e1 = stripRuntimeError(e1)
 		ok := o0 == o1 && e0 == e1 && (x0 == 0) == (x1 == 0)
 		if ok {
@@ -95,7 +113,7 @@ func main() {
 		fmt.Print(indent("finc0: ", e0+o0))
 		fmt.Print(indent("finc1: ", e1+o1))
 	}
-	fmt.Printf("diff-check: %d cases, %d match, %d mismatch\n", len(cases), match, mismatch)
+	fmt.Printf("diff-check (--passes=%s): %d cases, %d match, %d mismatch\n", *passes, len(cases), match, mismatch)
 	if mismatch > 0 {
 		os.Exit(1)
 	}
@@ -309,6 +327,105 @@ func snippetCases(tmp string) ([]tcase, error) {
 	return out, nil
 }
 
+const totalityMain = "\ndriver func main(io Stdio) error {\n\treturn nil\n}\n"
+
+// totalitySnippetCases extracts the sources of the totality unit tests.
+func totalitySnippetCases(tmp string) ([]tcase, error) {
+	f := "bootstrap/internal/totality/totality_test.go"
+	fset := token.NewFileSet()
+	af, err := parser.ParseFile(fset, f, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []tcase
+	n := 0
+	add := func(lit ast.Expr) {
+		src, ok := strLit(lit)
+		if !ok {
+			return
+		}
+		n++
+		root := filepath.Join(tmp, fmt.Sprintf("t%03d", n))
+		_ = os.MkdirAll(root, 0o755)
+		_ = os.WriteFile(filepath.Join(root, "t.fc"), []byte("package main\n"+src+totalityMain), 0o644)
+		label := fmt.Sprintf("%s:%d", f, fset.Position(lit.Pos()).Line)
+		out = append(out, tcase{name: label, dir: root, path: "t.fc"})
+	}
+	ast.Inspect(af, func(nd ast.Node) bool {
+		switch x := nd.(type) {
+		case *ast.CompositeLit:
+			if len(x.Elts) == 2 {
+				if _, ok := strLit(x.Elts[0]); ok {
+					add(x.Elts[1])
+				}
+			}
+		case *ast.CallExpr:
+			if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "load" && len(x.Args) == 2 {
+				add(x.Args[1])
+			}
+		}
+		return true
+	})
+	return out, nil
+}
+
+// compilerMutations are textual edits of compiler/ that break one
+// recursion measure, loop or decreases clause each.
+var compilerMutations = []struct{ file, old, new string }{
+	{"compiler/types.fc", "depth-1", "depth"},
+	{"compiler/parser.fc", "p.constSpec(depth - 1)", "p.constSpec(depth)"},
+	{"compiler/parser.fc", "depth-1", "depth"},
+	{"compiler/checker.fc", "writeExpr(o, l1at(n, i), dp-1)", "writeExpr(o, l1at(n, i), dp+1)"},
+	{"compiler/check_expr.fc", "dp-1", "dp / 2"},
+	{"compiler/check_stmt.fc", "dp-1", "dp>>1"},
+	{"compiler/totality_flow.fc", "wStmt(l1at(s, i), st, dp-1)", "wStmt(l1at(s, i), st, dp)"},
+	{"compiler/totality_flow.fc", "func eb(e0 u32, st u32, dp usize) Bnds decreases(dp) {", "func eb(e0 u32, st u32, dp usize) Bnds {"},
+	{"compiler/totality_rec.fc", "func measureParam(fi u32)", "func measureParamX(fi u32, d usize) decreases(d) {\n\tif d == 0 {\n\t\treturn\n\t}\n\tmeasureParamX(fi, d)\n}\n\nfunc measureParam(fi u32)"},
+	{"compiler/lexer.fc", "i < n; i++", "i <= n; i++"},
+	{"compiler/sema.fc", "for i := usize(0); i < n; i++ {", "for i := usize(0); i < n; i += 2 {"},
+	{"compiler/sema.fc", "for i := usize(0); i < n; i++ {", "for i := usize(0); i < n; i-- {"},
+	{"compiler/arena.fc", "i < n; i++ {", "i < n; i++ {\n\t\tn++"},
+	{"compiler/totality.fc", "for p := s; p < e; p++ {", "for p := s; p < e; p++ {\n\t\te = e + 0"},
+	{"compiler/values.fc", "decreases(depth)", ""},
+	{"compiler/checker.fc", "func tooDeep() {", "func tooDeep() {\n\tfor {\n\t\tbreak\n\t}"},
+	{"compiler/comptime.fc", "dp-1", "dp-0"},
+	{"compiler/resolve.fc", "bindType(nb(s), depth-1)", "bindType(nb(s), depth/1)"},
+	{"compiler/check_stmt.fc", "if dp == 0 {\n\t\ttooDeep()\n\t\treturn\n\t}", ""},
+	{"compiler/types.fc", "if depth == 0 {", "if depth == 1 {"},
+	{"compiler/main.fc", "driver func checkUsage(io Stdio) error {", "func spin(n usize) usize {\n\tfor n > 0 {\n\t\tn--\n\t}\n\treturn n\n}\n\ndriver func checkUsage(io Stdio) error {"},
+	{"compiler/main.fc", "func strEq(a string, b string) bool {", "func shrink(b []byte) {\n\tfor len(b) > 0 {\n\t\tb = b[1:]\n\t}\n\trem := b\n\tfor len(rem) > 0 {\n\t\tn := len(rem) - 1\n\t\trem = rem[n:]\n\t}\n}\n\nfunc strEq(a string, b string) bool {"},
+}
+
+// mutantCompilerCases writes copies of compiler/ with one mutation each.
+func mutantCompilerCases(tmp string) []tcase {
+	var out []tcase
+	files, _ := filepath.Glob("compiler/*.fc")
+	for i, m := range compilerMutations {
+		root := filepath.Join(tmp, fmt.Sprintf("c%02d", i))
+		dir := filepath.Join(root, "compiler")
+		_ = os.MkdirAll(dir, 0o755)
+		changed := false
+		for _, f := range files {
+			src, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			s := string(src)
+			if f == m.file && strings.Contains(s, m.old) {
+				s = strings.Replace(s, m.old, m.new, 1)
+				changed = true
+			}
+			_ = os.WriteFile(filepath.Join(dir, filepath.Base(f)), []byte(s), 0o644)
+		}
+		if !changed {
+			fmt.Printf("warning: compiler mutation %d (%s) does not apply\n", i, m.file)
+			continue
+		}
+		out = append(out, tcase{name: fmt.Sprintf("compiler mutant %d: %s %q -> %q", i, m.file, m.old, m.new), dir: root, path: "compiler"})
+	}
+	return out
+}
+
 func strLit(e ast.Expr) (string, bool) {
 	bl, ok := e.(*ast.BasicLit)
 	if !ok || bl.Kind != token.STRING {
@@ -320,8 +437,10 @@ func strLit(e ast.Expr) (string, bool) {
 
 // mutantCases writes n token-level mutants of every single-file corpus
 // source and of the snippets (identifier swaps, literal changes, deleted
-// or duplicated lines, swapped operators and types).
-func mutantCases(tmp string, n int, seed int64) []tcase {
+// or duplicated lines, swapped operators and types). With tot (a
+// -passes mode that includes the totality checker), the totality snippets
+// are mutated too and every other mutant uses mutateTotality.
+func mutantCases(tmp string, n int, seed int64, tot bool) []tcase {
 	rng := rand.New(rand.NewSource(seed))
 	var srcs []string
 	for _, pat := range []string{"examples/*.fc", "testdata/pass/*.fc", "testdata/fail/*.fc",
@@ -333,6 +452,11 @@ func mutantCases(tmp string, n int, seed int64) []tcase {
 	snipDirs, _ := filepath.Glob(filepath.Join(tmp, "s*", "t.fc"))
 	sort.Strings(snipDirs)
 	srcs = append(srcs, snipDirs...)
+	if tot {
+		tdirs, _ := filepath.Glob(filepath.Join(tmp, "t*", "t.fc"))
+		sort.Strings(tdirs)
+		srcs = append(srcs, tdirs...)
+	}
 	var out []tcase
 	k := 0
 	for _, f := range srcs {
@@ -345,7 +469,12 @@ func mutantCases(tmp string, n int, seed int64) []tcase {
 			reps = max(1, n/4)
 		}
 		for i := 0; i < reps; i++ {
-			m := mutate(string(src), rng)
+			m := ""
+			if tot && i%2 == 0 {
+				m = mutateTotality(string(src), rng)
+			} else {
+				m = mutate(string(src), rng)
+			}
 			k++
 			root := filepath.Join(tmp, fmt.Sprintf("x%05d", k))
 			_ = os.MkdirAll(root, 0o755)
@@ -412,6 +541,58 @@ func mutate(src string, rng *rand.Rand) string {
 		case 8: // move a line elsewhere
 			lj := rng.Intn(len(lines))
 			lines[li], lines[lj] = lines[lj], lines[li]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// mutateTotality applies 1-3 edits aimed at the totality checker: loop
+// conditions and steps, measure arithmetic, guards, decreases clauses and
+// extra writes inside loop bodies.
+func mutateTotality(src string, rng *rand.Rand) string {
+	lines := strings.Split(src, "\n")
+	edits := [][2]string{
+		{" < ", " <= "}, {" <= ", " < "}, {" > ", " >= "}, {" >= ", " > "}, {" == ", " != "}, {" != ", " == "},
+		{" < ", " > "}, {" > ", " < "}, {"++", "--"}, {"--", "++"}, {"++", " += 2"}, {"++", " += 1"},
+		{" += 1", " += 3"}, {" -= 1", " -= 2"}, {"-1", "-0"}, {" - 1", " - 2"}, {" - 1", " / 2"}, {" - 1", " >> 1"},
+		{"-1", "+1"}, {"- 1", "+ 1"}, {"[1:]", "[0:]"}, {"[n:]", "[1:]"}, {"[k:]", "[k-1:]"}, {"len(", "cap("},
+		{"decreases(", "decreases(1 + "}, {" + 1", " + 2"}, {" / 2", " / 1"}, {") / 2", ") >> 1"},
+		{"hi - lo", "lo - hi"}, {"usize(0)", "usize(1)"}, {"u32(0)", "u32(1)"}, {"if ", "if !"},
+		{"return", "_ = 0 //"}, {"break", "_ = 0 //"}, {"continue", "_ = 0 //"}, {"&&", "||"}, {"||", "&&"},
+	}
+	steps := 1 + rng.Intn(3)
+	for s := 0; s < steps; s++ {
+		if len(lines) < 3 {
+			break
+		}
+		li := rng.Intn(len(lines))
+		line := lines[li]
+		switch rng.Intn(6) {
+		case 0, 1, 2: // textual edit
+			e := edits[rng.Intn(len(edits))]
+			if strings.Contains(line, e[0]) {
+				lines[li] = strings.Replace(line, e[0], e[1], 1)
+			}
+		case 3: // remove a decreases clause
+			if i := strings.Index(line, "decreases("); i >= 0 {
+				if j := strings.Index(line[i:], ")"); j >= 0 {
+					lines[li] = line[:i] + line[i+j+1:]
+				}
+			}
+		case 4: // write a variable of the line inside the following block
+			w := wordsOf(line)
+			if strings.HasSuffix(strings.TrimSpace(line), "{") && len(w) > 0 {
+				v := w[rng.Intn(len(w))]
+				ops := []string{v + "++", v + "--", v + " = " + v, v + " += 1", v + " = " + v + "[1:]", "_ = &" + v}
+				lines = append(lines[:li+1], append([]string{"\t" + ops[rng.Intn(len(ops))]}, lines[li+1:]...)...)
+			}
+		case 5: // swap an identifier with another identifier of the file
+			ids := identsOf(src)
+			w := wordsOf(line)
+			if len(ids) == 0 || len(w) == 0 {
+				continue
+			}
+			lines[li] = replaceNth(line, w[rng.Intn(len(w))], ids[rng.Intn(len(ids))])
 		}
 	}
 	return strings.Join(lines, "\n")

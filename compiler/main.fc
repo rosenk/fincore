@@ -565,6 +565,20 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 			semaStats = true
 			continue
 		}
+		if bytesEqual(name, strBytes("passes")) && eq < len(ab) {
+			// hidden --passes=types|all|<pass>[,<pass>] (finc0's oracle flag)
+			if !setPasses(ab[eq+1:]) {
+				eb.reset()
+				eb.putStr("finc1 check: invalid --passes value ")
+				putQuoted(eb, ab[eq+1:])
+				eb.putStr(" (want types, all or a list of passes)\n")
+				if err := flushErr(io); err != nil {
+					return err
+				}
+				return ErrParse
+			}
+			continue
+		}
 		if !bytesEqual(name, strBytes("comptime-fuel")) {
 			eb.reset()
 			eb.putStr("flag provided but not defined: -")
@@ -675,6 +689,15 @@ driver func checkPath(fs FS, io Stdio, path string) error {
 	if semaFull || nodes.full {
 		return capacityFail(io, path, semaFullWhat)
 	}
+	// Semantic passes after the type checker run in order on a well-typed
+	// program and stop at the first pass with diagnostics (check.Passes).
+	// The scope pass (compiler/scope.fc) goes here, before totality.
+	if diags.count == 0 && passTotality {
+		totalityProgram()
+		if semaFull || nodes.full {
+			return capacityFail(io, path, semaFullWhat)
+		}
+	}
 	if semaStats {
 		if err := printStats(io); err != nil {
 			return err
@@ -690,6 +713,39 @@ driver func checkPath(fs FS, io Stdio, path string) error {
 }
 
 var semaStats bool
+
+// Enabled semantic passes (hidden flag --passes; default all).
+var passTotality = true
+
+// setPasses applies a --passes value: types (stop after type checking),
+// all, or a comma-separated list of pass names.
+func setPasses(v []byte) bool {
+	if bytesEqual(v, strBytes("types")) {
+		passTotality = false
+		return true
+	}
+	if bytesEqual(v, strBytes("all")) {
+		passTotality = true
+		return true
+	}
+	tot := false
+	n := len(v)
+	st := usize(0)
+	for i := usize(0); i < n+1; i++ {
+		if i < n && v[i] != ',' {
+			continue
+		}
+		w := v[st:i]
+		if bytesEqual(w, strBytes("totality")) {
+			tot = true
+		} else {
+			return false
+		}
+		st = i + 1
+	}
+	passTotality = tot
+	return true
+}
 
 func statLine(o *OutBuf, what string, used usize, capacity usize) {
 	o.putStr(what)
