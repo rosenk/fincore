@@ -36,6 +36,10 @@ type Options struct {
 	// evaluation); the later Passes do not run. Used by the hidden
 	// `finc0 check --passes=types` oracle for finc1's differential tests.
 	TypesOnly bool
+	// Only, if non-empty, restricts the semantic passes to those named
+	// (e.g. ["scope"] or ["totality"]). Used by the hidden
+	// `finc0 check --passes=<name>` oracle.
+	Only []string
 }
 
 // Result is the output of the front end.
@@ -74,6 +78,9 @@ func Run(path string, opts Options) (*Result, error) {
 		return res, nil
 	}
 	for _, p := range Passes {
+		if len(opts.Only) > 0 && !contains(opts.Only, p.Name) {
+			continue
+		}
 		d := p.Run(prog, info)
 		if len(d) > 0 {
 			d.Sort()
@@ -82,4 +89,13 @@ func Run(path string, opts Options) (*Result, error) {
 		}
 	}
 	return res, nil
+}
+
+func contains(xs []string, x string) bool {
+	for _, y := range xs {
+		if y == x {
+			return true
+		}
+	}
+	return false
 }

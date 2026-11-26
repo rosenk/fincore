@@ -11,7 +11,7 @@ func runCheck(env *Env, args []string) int {
 	const usageLine = "check [--comptime-fuel=N] <file.fc | dir>"
 	fs := newFlagSet(env, "check", usageLine)
 	fuel := fs.Uint64("comptime-fuel", 1_000_000, "comptime fuel budget per evaluation")
-	args, typesOnly, ok := passesFlag(env, args)
+	args, typesOnly, only, ok := passesFlag(env, args)
 	if !ok {
 		return ExitUsage
 	}
@@ -26,7 +26,7 @@ func runCheck(env *Env, args []string) int {
 		fmt.Fprintln(env.Stderr, "finc0 check: --comptime-fuel must be positive")
 		return ExitUsage
 	}
-	res, err := check.Run(fs.Arg(0), check.Options{Fuel: *fuel, TypesOnly: typesOnly})
+	res, err := check.Run(fs.Arg(0), check.Options{Fuel: *fuel, TypesOnly: typesOnly, Only: only})
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "finc0: %v\n", err)
 		return ExitError
@@ -38,15 +38,16 @@ func runCheck(env *Env, args []string) int {
 	return ExitOK
 }
 
-// passesFlag extracts the hidden flag --passes=types|all (also -passes=...)
+// passesFlag extracts the hidden flag --passes=types|all|<pass>[,<pass>] (also -passes=...)
 // from the flags before the operand. --passes=types stops after name
 // resolution, type checking and comptime evaluation; it is the oracle for
 // the self-hosted compiler's differential tests (make diff-check). The
 // flag is not part of the documented CLI and does not appear in the usage
 // text.
-func passesFlag(env *Env, args []string) ([]string, bool, bool) {
+func passesFlag(env *Env, args []string) ([]string, bool, []string, bool) {
 	out := make([]string, 0, len(args))
 	typesOnly := false
+	var only []string
 	for i, a := range args {
 		if a == "--" || !strings.HasPrefix(a, "-") {
 			out = append(out, args[i:]...)
@@ -62,13 +63,28 @@ func passesFlag(env *Env, args []string) ([]string, bool, bool) {
 		}
 		switch v {
 		case "types":
-			typesOnly = true
+			typesOnly, only = true, nil
 		case "all":
-			typesOnly = false
+			typesOnly, only = false, nil
 		default:
-			fmt.Fprintf(env.Stderr, "finc0 check: invalid --passes value %q (want types or all)\n", v)
-			return nil, false, false
+			typesOnly, only = false, nil
+			for _, name := range strings.Split(v, ",") {
+				if !knownPass(name) {
+					fmt.Fprintf(env.Stderr, "finc0 check: invalid --passes value %q (want types, all or a list of passes)\n", v)
+					return nil, false, nil, false
+				}
+				only = append(only, name)
+			}
 		}
 	}
-	return out, typesOnly, true
+	return out, typesOnly, only, true
+}
+
+func knownPass(name string) bool {
+	for _, p := range check.Passes {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
 }
