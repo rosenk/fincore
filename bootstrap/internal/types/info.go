@@ -61,6 +61,10 @@ type Info struct {
 	SymTypes []Type
 	// SymValues is the value of each constant symbol, by SymID.
 	SymValues []Value
+	// UntypedConsts marks, by SymID, constants declared without a type
+	// whose value is an untyped constant (`const N = 4`); their SymTypes
+	// entry holds the default type.
+	UntypedConsts []bool
 
 	// Funcs lists every function declaration, method and function literal
 	// of all packages, in dependency/source order (literals follow their
@@ -118,6 +122,12 @@ func (in *Info) SymType(s *resolve.Symbol) Type {
 		return nil
 	}
 	return in.SymTypes[s.ID]
+}
+
+// IsUntypedConst reports whether s is an untyped constant (see
+// UntypedConsts).
+func (in *Info) IsUntypedConst(s *resolve.Symbol) bool {
+	return s != nil && int(s.ID) < len(in.UntypedConsts) && in.UntypedConsts[s.ID]
 }
 
 // SymValue returns the value of a constant symbol (nil if unknown).

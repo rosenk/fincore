@@ -64,8 +64,8 @@ func TestUsage(t *testing.T) {
 		t.Fatal(code)
 	}
 	for _, c := range []string{"build", "run", "test"} {
-		code, _, errs := run(c, "x")
-		if code != ExitUsage || !strings.Contains(errs, "not implemented") {
+		code, _, errs := run(c)
+		if code != ExitUsage || !strings.Contains(errs, "usage: finc0 "+c) {
 			t.Errorf("%s: %d %q", c, code, errs)
 		}
 	}

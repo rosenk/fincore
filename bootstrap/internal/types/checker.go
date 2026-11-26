@@ -734,8 +734,12 @@ func (c *Checker) finish() {
 			c.info.Types[i] = Default(t)
 		}
 	}
+	c.info.UntypedConsts = make([]bool, len(c.info.SymTypes))
 	for i, t := range c.info.SymTypes {
 		if t != nil && IsUntyped(t) {
+			if i < len(c.prog.Syms) && c.prog.Syms[i] != nil && c.prog.Syms[i].Kind == resolve.SymConst {
+				c.info.UntypedConsts[i] = true
+			}
 			c.info.SymTypes[i] = Default(t)
 		}
 	}

@@ -46,9 +46,9 @@ type Command struct {
 var commands = []*Command{
 	{Name: "parse", Usage: "parse [--dump-ast] <file.fc | dir>", Summary: "parse sources and optionally dump the AST", Run: runParse},
 	{Name: "check", Usage: "check [--comptime-fuel=N] <file.fc | dir>", Summary: "type, scope and totality check", Run: runCheck},
-	{Name: "build", Usage: "build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>", Summary: "compile to a Go program and binary", Run: notImplemented("build")},
-	{Name: "run", Usage: "run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]", Summary: "build and run", Run: notImplemented("run")},
-	{Name: "test", Usage: "test <dir>", Summary: "run conformance tests in a directory", Run: notImplemented("test")},
+	{Name: "build", Usage: "build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>", Summary: "compile to a Go program and binary", Run: runBuild},
+	{Name: "run", Usage: "run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]", Summary: "build and run", Run: runRun},
+	{Name: "test", Usage: "test <dir>", Summary: "run conformance tests in a directory", Run: runTest},
 }
 
 func main() {

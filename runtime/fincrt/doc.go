@@ -25,6 +25,7 @@
 //	ExitStatus, CancelFunc    -> fincrt.<same name>
 //
 // Capabilities injected by the generated Go main(): fincrt.DefaultNet(),
-// fincrt.DefaultSignals(), fincrt.DefaultFS(), fincrt.DefaultEnv(),
-// fincrt.DefaultStdio(), fincrt.DefaultExec().
+// fincrt.DefaultSignals(), fincrt.DefaultClock(), fincrt.DefaultFS(),
+// fincrt.DefaultEnv(), fincrt.DefaultStdio(), fincrt.DefaultExec().
+// Clock (no methods in v0.1) maps to fincrt.Clock.
 package fincrt

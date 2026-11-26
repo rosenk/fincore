@@ -1,12 +1,14 @@
+SHELL := /bin/bash
 GO      ?= go
 BIN     := bin
 FINC0   := $(BIN)/finc0
+STAGE   := .stage
 FUEL    ?= 1000000
 
 export CGO_ENABLED ?= 0
 
 .PHONY: all build finc0 test race vet fmt fmt-check lint parse-corpus check-corpus \
-        integration finc1 bootstrap ci clean help
+        integration finc1 diff-parse bootstrap ci clean help
 
 all: vet test build ## vet, test and build finc0
 
@@ -50,7 +52,8 @@ integration: ## end-to-end TCP echo + corpus tests (skips until finc0 can build)
 	$(GO) test -count=1 -v ./testdata/integration/
 
 finc1: finc0 ## build the self-hosted compiler with finc0 (Stage 1)
-	$(FINC0) build --emit-go=$(BIN)/stage1.go -o $(BIN)/finc1 ./compiler
+	@mkdir -p $(STAGE)
+	$(FINC0) build --emit-go=$(STAGE)/stage1.go -o $(BIN)/finc1 ./compiler
 
 bootstrap: finc0 ## full fixed-point bootstrap gate (stage2.go == stage3.go)
 	$(GO) run ./scripts/bootstrap_verify.go
@@ -58,4 +61,9 @@ bootstrap: finc0 ## full fixed-point bootstrap gate (stage2.go == stage3.go)
 ci: lint test build integration ## what CI runs
 
 clean: ## remove build outputs
-	rm -rf $(BIN)
+	rm -rf $(BIN) $(STAGE)
+
+diff-parse: finc1 ## finc0 vs finc1: byte-identical `parse --dump-ast` on the corpus
+	@set -e; for t in examples/tcp_echo.fc compiler/ testdata/pass/*.fc testdata/fail/*.fc; do \
+	  cmp -s <($(FINC0) parse --dump-ast $$t 2>&1) <($(BIN)/finc1 parse --dump-ast $$t 2>&1) || { echo "DIFF: $$t"; exit 1; }; \
+	done; echo "diff-parse: ok"

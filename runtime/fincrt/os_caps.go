@@ -194,3 +194,10 @@ func (Exec) Run(ctx Context, bin string, args []string, env []string, workdir st
 		return ExitStatus{Code: -1}, n, ErrExec
 	}
 }
+
+// Clock is the time capability (spec 4.1). It has no methods in v0.1; it
+// exists so that `main(clk Clock)` can be injected by generated code.
+type Clock struct{}
+
+// DefaultClock returns the Clock capability.
+func DefaultClock() Clock { return Clock{} }

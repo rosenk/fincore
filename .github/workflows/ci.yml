@@ -26,5 +26,7 @@ jobs:
         run: make finc0
       - name: parse corpus
         run: make parse-corpus
+      - name: finc0 vs finc1 differential
+        run: make diff-parse
       - name: integration
         run: make integration
