@@ -59,3 +59,11 @@ The test corpus in testdata/ is written against these decisions. Conventions for
 49. A Linear struct is tracked as one unit. E3004 covers `_ = x`, `_` in `:=`/`=`, Linear-valued expression statements and match-arm expressions.
 50. Error-path refinement recognises only bare `err != nil` / `err == nil`. `panic` ends a path without leak checks.
 51. Pass order: scope, then totality; the pipeline stops at the first pass reporting errors.
+
+## Totality checker decisions (M2b) — see bootstrap/internal/totality/doc.go for exact accepted shapes
+52. Missing measure: E4002 at the func (self-recursion) / E4004 once per SCC (mutual). Non-decreasing in-SCC call: E4002/E4004 at the call. Bad measure (not an unassigned unsigned param) at the `decreases` clause.
+53. Loops with `decreases` → T3 only; `len(s) > 0` loops → T2 only; others → T1.
+54. T1: `<=`/`>=` only with overflow-safe constant bound; step > 1 needs constant/len/cap bound; `i > 0; i -= 2` on unsigned rejected. Bounds reached through pointers/globals are invalidated by any memory-writing call — copy to a local first (`lim := p.ntok`).
+55. T3 loops accept `x++`/`x--`/midpoint `a + (b-a)/k` updates; `(lo+hi)/2` rejected (overflow).
+56. Calls through function values add edges to every escaping total func; inside a cycle they are rejected.
+57. compiler/: 33 Parser methods carry decreases; the Parser SCC has 31 members.
