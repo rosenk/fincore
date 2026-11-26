@@ -62,8 +62,21 @@ fixed point: sha256(stage2.go) == sha256(stage3.go)
 | M4 | IR + deterministic Go codegen — `finc0 build/run/test` | ✅ |
 | M5 | `tcp_echo.fc` end-to-end (static and `--race`) | ✅ |
 | M6 | Self-hosted front end in FinCore (`compiler/`: arenas, lexer, parser, AST dump); `finc1 parse` byte-identical to finc0 | ✅ |
-| M7 | Self-hosted checker + codegen in FinCore | 🚧 in progress |
-| M8 | Fixed-point bootstrap gate | ⏳ |
+| M7 | Self-hosted checker (resolve, types, comptime, scope, totality) + Go codegen in FinCore; `finc1 check/build` byte-identical to finc0 | ✅ |
+| M8 | Fixed-point bootstrap gate: `sha256(stage2.go) == sha256(stage3.go)`, finc2 passes all tests | ✅ |
+
+Reproduce the bootstrap (about 10 seconds):
+
+```sh
+make bootstrap   # go run ./scripts/bootstrap_verify.go
+```
+
+```text
+==> 5. fixed point: sha256(stage2.go) == sha256(stage3.go)
+   stage2.go d04e4c6be6f5e5ec041f8c09a002f0f3e4480ddc1524c2d975efc768d386b09c
+   stage3.go d04e4c6be6f5e5ec041f8c09a002f0f3e4480ddc1524c2d975efc768d386b09c
+BOOTSTRAP OK: fixed point reached (stage2.go == stage3.go)
+```
 
 ## Layout
 
@@ -86,6 +99,7 @@ make            # vet + test + build bin/finc0
 make race       # unit tests with the race detector
 make check-corpus
 make integration
+make bootstrap  # finc0 → finc1 → finc2 → finc3, fixed-point gate
 make help       # all targets
 
 bin/finc0 parse --dump-ast examples/tcp_echo.fc

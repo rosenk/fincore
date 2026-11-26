@@ -36,5 +36,9 @@ jobs:
         run: make diff-check-totality
       - name: finc0 vs finc1 full check differential
         run: make diff-check-all
+      - name: finc0 vs finc1 codegen differential
+        run: make diff-build
+      - name: bootstrap fixed point (finc0 → finc1 → finc2 → finc3)
+        run: make bootstrap
       - name: integration
         run: make integration
