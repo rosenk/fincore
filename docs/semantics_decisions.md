@@ -20,3 +20,11 @@ The test corpus in testdata/ is written against these decisions. Conventions for
 16. `main` params must be a subset of {Net, Signals, Clock, FS, Env, Stdio, Exec}; unused caps allowed.
 17. `--race` requires cgo: finc0 sets CGO_ENABLED=1 for race builds only.
 18. Runtime deviations: see docs/runtime_api.md (`ErrParse` sentinel is part of the universe).
+
+## Parser decisions (M0)
+19. Keywords: exactly the 24 listed in §2.3 (the "27" count is a typo). `Code`/`El` are predeclared identifiers, contextual keywords in type position.
+20. Go-style: no `T{` composite literal at top level of `if/for/match/scope` headers; multi-line arg lists need trailing commas; semicolons may be omitted before `)`/`}`.
+21. Match arm body must be an Expr or Block (`x -> pos++` is invalid; use `x -> { pos++ }`).
+22. Variadic `xs ...T` allowed for the last parameter only.
+23. No decimal literals with leading zero; ASCII identifiers only; compound assign needs exactly one value per side; `for` post clause cannot be `:=`.
+24. AST nodes have dense post-order NodeIDs (shared IDAlloc across files); later passes annotate via side tables indexed by NodeID (see bootstrap/internal/ast/doc.go).

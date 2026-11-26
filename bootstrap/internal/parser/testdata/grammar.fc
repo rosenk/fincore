@@ -1,0 +1,223 @@
+// Exercises every production of the spec section 3 grammar.
+package demo
+
+import "compiler/lexer"
+import (
+	ast "compiler/ast"
+	"compiler/diag"
+)
+
+const MaxDepth usize = 256
+
+const (
+	A = 1
+	B u8 = 0xFF
+	C = "s\n"
+	D = 'x'
+	E = true
+	F = A + B*2
+	G = 0b1010 | 10_000
+	H = nil
+	I = false
+)
+
+const (
+)
+
+type Id = u32
+type NodeID u32
+type Pair struct {
+	a, b u8
+	c    *Pair
+}
+type Empty struct{}
+type Inline struct { x u8; y u16 }
+type Token enum {
+	Ident(Span)
+	Int(u64, Span)
+	EOF
+}
+type Unit enum{}
+type Vec[N usize, T any] struct {
+	data [N]T
+	len  usize
+}
+type Map[K, V any] struct {
+	keys []K
+	vals []V
+}
+type Buf [4096]byte
+type Buf2 [BufSize * 2][N]u8
+type Bytes []byte
+type Handler driver func(buf *[4]byte) error
+type Fn func(a, b u32) (u32, error)
+type Thunk func()
+type Lvl Code 1
+type Lvl2 Code (n + 1)
+type SourceBuf = El(ByteBufCode(MaxSourceBytes))
+type Q = pkg.Type[u8, 4]
+type Nested = Vec[4, Vec[2, u8]]
+type PS = Vec[N * 2, []byte]
+type PT = Vec[4, *u8]
+type FT = Vec[1, func(x u8) bool]
+type DT = Vec[1, driver func()]
+type CT = Vec[1, Code 0]
+type ET = Vec[1, El(Foo(1))]
+type ST = Vec[1, struct{ a u8 }]
+type Constrained[T Number, N usize] struct{ v [N]T }
+
+var g u32
+var h = 5
+var k [4]u8 = x
+var fp *[4]u8
+
+func id[T any](x T) T { return x }
+
+func swap[A, B any](a A, b B) (B, A) {
+	return b, a
+}
+
+func single() (u8) { return 1 }
+
+func (a *Arena) Push(v u32) (u32, error) {
+	if a.len == MaxNodes {
+		return 0, ErrArenaFull
+	}
+	a.items[a.len] = v
+	a.len++
+	return u32(a.len - 1), nil
+}
+
+func (v Vec[N, T]) Len() usize { return v.len }
+
+func (s Scope) AcquireSlot[N usize, T any](ctx Context, pool *[N]T) (Slot[T], error) {
+	return Slot[T]{idx: 0}, nil
+}
+
+func log(format string, args ...u8) {}
+
+func trailing(a u8, b u8,) {}
+
+comptime func ByteBufCode(cap usize) Code 0 {
+	return CodeArray(cap, CodeU8())
+}
+
+func (p *Parser) parseExpr(depth usize) (NodeID, error) decreases(depth) {
+	if depth == 0 {
+		return 0, ErrMaxDepth
+	}
+	return p.parsePrimary(depth - 1)
+}
+
+driver func main(fs FS, env Env, io Stdio, exec Exec) error {
+	x := 1
+	a, b := f()
+	x = 2
+	a, b = b, a
+	x += 1
+	x -= 1
+	x *= 2
+	x /= 2
+	x++
+	x--
+	p.count++
+	arr[i]--
+	*ptr = 3
+	f()
+	const L = 3
+	const (
+		L1 = 1
+		L2 u8 = 2
+	)
+	var y u8
+	var z = T{a: 1, b: 2}
+	var w T = T{}
+	{
+		inner()
+	}
+	if x {
+	} else if y {
+	} else {
+	}
+	if v := f(); v > 0 {
+	}
+	if err := g(); err != nil {
+		return err
+	}
+	if x = 1; x == 1 {
+	}
+	if (T{a: 1}).ok {
+	}
+	if f(T{a: 1}) {
+	}
+	for {
+		break
+	}
+	driver for {
+		continue
+	}
+	for x < 10 {
+		x++
+	}
+	for i := 0; i < n; i++ {
+	}
+	for i := n; i > 0; i -= 1 {
+	}
+	for rem := data; len(rem) > 0; {
+		rem = rem[1:]
+	}
+	for ; ; {
+		break
+	}
+	for lo < hi decreases(hi - lo) {
+	}
+	for i := 0; i < n; i++ decreases(n - i) {
+	}
+	for decreases(n) {
+	}
+	driver for x := 0; x < 1; x++ {
+	}
+	scope conns := NewScope(MaxConns) {
+		conns.Wait()
+	}
+	match tok {
+		Token.Ident(sp) -> handle(sp)
+		Int(v, _) -> {
+			total += v
+		}
+		EOF -> done()
+		_ -> {}
+	}
+	match n {
+		0 -> zero()
+		"s" -> s()
+		'c' -> c()
+		true -> t()
+		false -> f()
+		nil -> n()
+		Red -> r() }
+	match (T{}) {}
+	defer conn.Close()
+	defer func() {
+		cleanup()
+	}()
+	conns.Go(slot, driver func(buf *[BufSize]byte) {
+		handleConn(drainCtx, hardCtx, conn, buf)
+	})
+	e := -x + !b - &pool + *p + **pp
+	e = a.b.c + f(x)(y) + a[i][j] + a[lo:hi] + a[:hi] + a[lo:] + a[:]
+	e = f[T](x) + Vec[4, u8]{len: 0} + pkg.T{a: 1} + pkg.Vec[4]{} + T{} + u32(x)
+	e = []byte(s) + func(x u8) u8 { return x }(1) + (a + b) * c
+	e = El(PoolCode(1, 2))
+	e = f(
+		a,
+		b,
+	)
+	e = T{
+		a: 1,
+		b: 2,
+	}
+	e = a<<1 | b>>2 ^ c&d%e/f
+	e = a == b != c < d <= e > f >= g && h || i
+	return nil
+}
