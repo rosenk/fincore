@@ -59,10 +59,10 @@ fixed point: sha256(stage2.go) == sha256(stage3.go)
 | M1 | Resolver, fuel-bounded comptime, type checker — `finc0 check` | ✅ |
 | M2 | Scope/linearity checker (S1–S5) and totality/effect checker (T1–T4) | ✅ |
 | M3 | Go runtime `runtime/fincrt` (interruptible I/O, structured concurrency, OS caps) | ✅ |
-| M4 | IR + deterministic Go codegen — `finc0 build/run/test` | 🚧 in progress |
-| M5 | `tcp_echo.fc` end-to-end (static and `--race`) | 🚧 in progress |
-| M6 | Self-hosted front end in FinCore (`compiler/`: arenas, lexer, parser, AST dump) | 🟡 front half written |
-| M7 | Self-hosted checker + codegen in FinCore | ⏳ |
+| M4 | IR + deterministic Go codegen — `finc0 build/run/test` | ✅ |
+| M5 | `tcp_echo.fc` end-to-end (static and `--race`) | ✅ |
+| M6 | Self-hosted front end in FinCore (`compiler/`: arenas, lexer, parser, AST dump); `finc1 parse` byte-identical to finc0 | ✅ |
+| M7 | Self-hosted checker + codegen in FinCore | 🚧 in progress |
 | M8 | Fixed-point bootstrap gate | ⏳ |
 
 ## Layout
