@@ -156,7 +156,7 @@ func TestFS(t *testing.T) {
 		t.Fatal("MkdirTemp", err)
 	}
 	defer fs.RemoveAll(dir)
-	for _, name := range []string{"b.fc", "a.fc", "c.go", "B.fc"} {
+	for _, name := range []string{"b.fc", "a.fc", "c.go", "Z.fc"} {
 		if err := fs.WriteFile(filepath.Join(dir, name), []byte("hello")); err != nil {
 			t.Fatal(err)
 		}
@@ -166,7 +166,7 @@ func TestFS(t *testing.T) {
 	}
 	names := make([]string, 8)
 	n, err := fs.ListSourceFiles(dir, names)
-	if err != nil || n != 3 || names[0] != "B.fc" || names[1] != "a.fc" || names[2] != "b.fc" {
+	if err != nil || n != 3 || names[0] != "Z.fc" || names[1] != "a.fc" || names[2] != "b.fc" {
 		t.Fatalf("ListSourceFiles: %v %v %v", n, names, err)
 	}
 	if n, err := fs.ListSourceFiles(dir, names[:2]); err != ErrArenaFull || n != 2 {
