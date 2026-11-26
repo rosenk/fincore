@@ -17,18 +17,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: gofmt
+      - name: lint
         if: runner.os == 'Linux'
-        run: test -z "$(gofmt -l $(git ls-files '*.go'))" || (gofmt -l $(git ls-files '*.go'); exit 1)
-      - name: vet
-        run: go vet ./...
+        run: make lint
       - name: test (race)
-        run: go test -race -count=1 ./...
+        run: make race
       - name: build finc0 (static)
-        if: hashFiles('bootstrap/cmd/finc0/*.go') != ''
-        env:
-          CGO_ENABLED: "0"
-        run: go build -trimpath -o bin/finc0 ./bootstrap/cmd/finc0
+        run: make finc0
+      - name: parse corpus
+        run: make parse-corpus
       - name: integration
-        if: hashFiles('testdata/integration/*.go') != ''
-        run: go test -count=1 -v ./testdata/integration/
+        run: make integration
