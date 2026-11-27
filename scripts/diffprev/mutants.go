@@ -273,3 +273,29 @@ func mutateTotality(src string, rng *rand.Rand) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// linkStd makes the module root's std/ packages visible in the temporary
+// tree root of a tree mutant (treeMutantCases): compiler/ imports
+// std/bytes, std/maps, ..., which resolve against the working directory,
+// so without them both compilers stop at E2001 (cannot find package) and
+// the mutation never reaches the totality and scope checks. Each package
+// is a symlink root/std/<pkg> -> <module root>/std/<pkg>, except the
+// mutated package skip (a std mutant's own copy), so that diagnostics name
+// std files std/<pkg>/... as in the corpus cases run from the module root.
+//
+// Both compilers see the current std/, not the seed's own tree
+// (.stage/seed/<tag>/std): the mutant is a program of the current tree and
+// std/ is part of its input. The seed tree's std/ is what the seed was
+// built from; giving the seed a different std/ would change the input of
+// one side only (the unmutated `compiler` case, run from the module root,
+// also compares both compilers on the current std/).
+func linkStd(root, skip string) {
+	pkgs, _ := filepath.Glob(filepath.Join(rootDir, "std", "*"))
+	for _, p := range pkgs {
+		if st, err := os.Stat(p); err != nil || !st.IsDir() || "std/"+filepath.Base(p) == skip {
+			continue
+		}
+		_ = os.MkdirAll(filepath.Join(root, "std"), 0o755)
+		_ = os.Symlink(p, filepath.Join(root, "std", filepath.Base(p)))
+	}
+}

@@ -55,8 +55,11 @@ and the textual import scan are in testdata/README.md ("SINCE").
 release (`.stage/finc-seed`, compiler/ at the last tag of `bootstrap/SEED`,
 built by `make seed`) on everything the finc0 differential uses: examples,
 testdata, the parser fixtures, `scripts/diff*/cases`, std/, compiler/, the
-FINCROOT cases, the compiler/ and std/ mutants and the FinCore snippets of
-finc0's unit tests (848 cases today). It compares:
+FINCROOT cases, the compiler/ and std/ mutants (copies of the package with
+one textual mutation each, in a temporary tree whose `std/` links the
+module root's std packages, so both compilers check the same program as
+the unmutated case) and the FinCore snippets of finc0's unit tests (about
+900 cases). It compares:
 
 - `parse --dump-ast`;
 - `check --passes=types|scope|totality|all`;
