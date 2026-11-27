@@ -19,6 +19,9 @@ In practice this means:
 - **Every non-`driver` loop and recursion must be proven to terminate.** This uses rules T1–T3 plus `decreases(...)`.
 
 The full specification (in Bulgarian) is [`fincore_language_specification_v0_1.md`](fincore_language_specification_v0_1.md).
+New to FinCore? Start with the tutorial for Go programmers,
+[`docs/tutorial.md`](docs/tutorial.md), and the example programs in
+[`examples/`](examples).
 
 ## Example
 
@@ -106,9 +109,9 @@ compiler/         Self-hosting compiler written in FinCore (data-oriented, fixed
 runtime/fincrt/   Go runtime used by generated code
 std/              Finitist standard library in FinCore: vec, maps, bytes, strconv, path,
                   sort (total, bounded, allocation-free; see docs/stdlib.md)
-examples/         tcp_echo.fc — the reference program
+examples/         tcp_echo.fc (the reference program) and tutorial examples with .out files
 testdata/         pass/ fail/ integration/ conformance suite (see testdata/README.md)
-docs/             Resolved spec ambiguities, runtime API, stdlib reference, self-hosting requirements
+docs/             Tutorial, resolved spec ambiguities, runtime API, stdlib reference, self-hosting requirements
 ```
 
 ## Build and test

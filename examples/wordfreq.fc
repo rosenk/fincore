@@ -1,0 +1,173 @@
+// wordfreq: count the words of a text and print the most frequent ones.
+//
+//	bin/finc1 run examples/wordfreq.fc                     # built-in sample, top 10
+//	bin/finc1 run examples/wordfreq.fc -- README.md 5      # a file, top 5
+//	bin/finc1 run examples/wordfreq.fc -- - 20 < notes.txt # standard input
+//
+// What it shows:
+//   - capabilities: main asks for FS (read the input), Env (arguments) and
+//     Stdio (output) and nothing else;
+//   - bounded containers: the input buffer, the word table and the sort
+//     order all have compile-time capacities; nothing is allocated;
+//   - overflow is a value, not a crash: a word that does not fit into the
+//     table is counted as dropped and reported at the end;
+//   - totality: the tokenizer is a slice-shrink loop (rule T2), the rest
+//     are counting loops (T1); none of them needs a `driver for`;
+//   - std/maps, std/sort, std/strconv and formatTo.
+package main
+
+import (
+	"std/bytes"
+	"std/maps"
+	"std/sort"
+	"std/strconv"
+)
+
+const (
+	MaxInput   = 1 << 20  // bytes of input we are willing to read
+	MaxWords   = 4096     // distinct words
+	WordArena  = 64 << 10 // bytes for the text of the distinct words
+	MaxWordLen = 24       // longer words are cut to this length
+	DefaultTop = 10
+)
+
+const Sample = "The quick brown fox jumps over the lazy dog. The dog sleeps; " +
+	"the fox does not. A fox, a dog and a cat walk into a bar: the cat " +
+	"orders milk, the dog orders water and the fox orders the bill. " +
+	"Supercalifragilisticexpialidocious, says the cat."
+
+// Package-level storage: large fixed arrays live in the data segment, not
+// on the stack. They are Value types, so S1 (no global Scoped values) is
+// satisfied.
+var input [MaxInput]byte
+var counts maps.StrMap[2 * MaxWords, WordArena, MaxWords, u32]
+var order [MaxWords]u32
+
+type Stats struct {
+	total     u64 // words seen
+	dropped   u64 // occurrences of words that did not fit into the table
+	truncated u64 // words longer than MaxWordLen
+}
+
+func isWordByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '\''
+}
+
+// wordLen is the length of the word at the start of s (0 if s does not
+// start with a word byte). T1: i counts up to the invariant bound len(s).
+func wordLen(s []byte) usize {
+	for i := usize(0); i < len(s); i++ {
+		if !isWordByte(s[i]) {
+			return i
+		}
+	}
+	return len(s)
+}
+
+// add counts one word, lower-cased and cut to MaxWordLen bytes.
+func add(w []byte, st *Stats) {
+	var buf [MaxWordLen]byte
+	n := copy(buf[:], w)
+	if n < len(w) {
+		st.truncated++
+	}
+	for i := usize(0); i < n; i++ {
+		if buf[i] >= 'A' && buf[i] <= 'Z' {
+			buf[i] += 'a' - 'A'
+		}
+	}
+	st.total++
+	c, _ := counts.Get(buf[:n])
+	if !counts.Put(buf[:n], c+1) {
+		st.dropped++ // the table is full: keep going, report at the end
+	}
+}
+
+// count tokenizes text. T2: every path to the next iteration shrinks rem
+// by a positive amount (1, or a word length that is known to be > 0).
+func count(text []byte, st *Stats) {
+	for rem := text; len(rem) > 0; {
+		n := wordLen(rem)
+		if n == 0 {
+			rem = rem[1:]
+			continue
+		}
+		add(rem[:n], st)
+		rem = rem[n:]
+	}
+}
+
+// byFreq orders entry IDs by descending count, then alphabetically.
+func byFreq(a u32, b u32) bool {
+	ca := counts.Value(a)
+	cb := counts.Value(b)
+	if ca != cb {
+		return ca > cb
+	}
+	return bytes.Compare(counts.Key(a), counts.Key(b)) < 0
+}
+
+// sorted fills order with the entry IDs 1..Len and sorts them.
+func sorted() []u32 {
+	n := counts.Len()
+	for i := usize(0); i < n; i++ {
+		order[i] = u32(i + 1)
+	}
+	xs := order[:n]
+	sort.Sort[u32](xs, byFreq)
+	return xs
+}
+
+driver func say(io Stdio, line []byte) {
+	_ = io.WriteStdout(line)
+}
+
+driver func main(fs FS, env Env, io Stdio) error {
+	text := input[:0]
+	top := u64(DefaultTop)
+	if env.ArgsCount() > 1 {
+		path := env.Arg(1)
+		if path == "-" {
+			path = "/dev/stdin"
+		}
+		n, err := fs.ReadFileInto(path, input[:])
+		if err != nil { // ErrArenaFull: the input is larger than MaxInput
+
+			return err
+		}
+		text = input[:n]
+	} else {
+		text = input[:copy(input[:], Sample)]
+	}
+	if env.ArgsCount() > 2 {
+		v, ok := strconv.ParseUint(strBytes(env.Arg(2)), 10)
+		if !ok || v == 0 {
+			return ErrParse
+		}
+		top = v
+	}
+
+	var st Stats
+	count(text, &st)
+	xs := sorted()
+
+	var line [128]byte
+	say(io, line[:formatTo(line[:], "%5s  %-24s %s\n", "count", "word", "share")])
+	lim := len(xs) // T1 wants one bound: compute it before the loop
+	if top < u64(lim) {
+		lim = usize(top)
+	}
+	for i := usize(0); i < lim; i++ {
+		id := xs[i]
+		c := counts.Value(id)
+		permille := u64(c) * 1000 / st.total
+		k := formatTo(line[:], "%5d  %-24s %2d.%d%%\n", c, counts.Key(id), permille/10, permille%10)
+		say(io, line[:k])
+	}
+	say(io, line[:formatTo(line[:], "%d words, %d distinct (capacity %d)\n", st.total, counts.Len(), MaxWords)])
+	if st.dropped > 0 || st.truncated > 0 {
+		say(io, line[:formatTo(line[:], "dropped %d occurrences (table full), cut %d long words to %d bytes\n",
+			st.dropped, st.truncated, MaxWordLen)])
+	}
+	return nil
+}

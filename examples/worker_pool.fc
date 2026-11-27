@@ -1,0 +1,145 @@
+// worker_pool: a fixed pool of workers runs a batch of CPU-bound jobs with
+// structured concurrency and shuts down gracefully.
+//
+//	bin/finc1 run examples/worker_pool.fc         # all 24 jobs on 4 workers
+//	bin/finc1 run examples/worker_pool.fc -- 10   # stop accepting after 10
+//
+// Pressing Ctrl-C (SIGINT) or sending SIGTERM does the same as the
+// argument: no new jobs are started, running ones finish within the drain
+// horizon, and the rest are reported as skipped. The output does not
+// depend on scheduling: every job writes only its own result entry and
+// main prints them in job order after the scope has been joined.
+//
+// What it shows:
+//   - `scope workers := NewScope(Workers) { ... }`: no goroutine outlives the
+//     block (the compiler inserts the join);
+//   - slots: AcquireSlot hands each task exclusive use of one element of
+//     `pool`, a per-worker scratch buffer, so the work needs no allocation
+//     and no locking;
+//   - contexts: a signal context for draining, a hard context that is
+//     cancelled when the drain horizon passes, a per-job timeout;
+//   - cooperative cancellation inside a total function (ctx.Done() is a
+//     total capability method).
+package main
+
+import "std/strconv"
+
+const (
+	Workers      = 4
+	Jobs         = 24
+	Words        = 4096 // scratch per worker: a bitset for Words*32 numbers
+	JobTimeout   = 10 * Second
+	DrainHorizon = 2 * Second
+)
+
+type Scratch = [Words]u32
+
+type Outcome enum {
+	Skipped            // never started
+	Done(usize, usize) // limit, number of primes below it
+	Cancelled(usize)   // limit
+}
+
+// Written by the workers, job i only by the task running job i; read by
+// main after the scope has joined every task.
+var results [Jobs]Outcome
+
+// primes counts the primes below n with a sieve of Eratosthenes in the
+// caller's scratch buffer. It checks ctx between rounds, so a cancelled
+// job stops early. All loops are T1 counting loops.
+func primes(ctx Context, n usize, bits *Scratch) Outcome {
+	if n > Words*32 {
+		n = Words * 32
+	}
+	for w := usize(0); w < Words; w++ {
+		bits[w] = 0 // bit set = composite
+	}
+	for p := usize(2); p < n; p++ {
+		if p*p >= n {
+			break
+		}
+		if ctx.Done() {
+			return Outcome.Cancelled(n)
+		}
+		if bits[p/32]&(u32(1)<<(p%32)) != 0 {
+			continue
+		}
+		lim := (n - 1) / p // p*k < n for every k < lim+1
+		for k := p; k < lim+1; k++ {
+			m := p * k
+			bits[m/32] = bits[m/32] | u32(1)<<(m%32)
+		}
+	}
+	count := usize(0)
+	for i := usize(2); i < n; i++ {
+		if bits[i/32]&(u32(1)<<(i%32)) == 0 {
+			count++
+		}
+	}
+	return Outcome.Done(n, count)
+}
+
+driver func main(env Env, sig Signals, io Stdio) error {
+	accept := usize(Jobs)
+	if env.ArgsCount() > 1 {
+		v, ok := strconv.ParseUint(strBytes(env.Arg(1)), 10)
+		if !ok {
+			return ErrParse
+		}
+		if v < u64(accept) {
+			accept = usize(v)
+		}
+	}
+
+	drainCtx, stopSignals := sig.NotifyContext(SIGINT, SIGTERM)
+	defer stopSignals()
+	hardCtx, cancelHard := NewContext()
+	defer cancelHard()
+
+	var pool [Workers]Scratch // one scratch buffer per slot
+
+	scope workers := NewScope(Workers) {
+		for i := usize(0); i < accept; i++ { // a plain, bounded loop
+			if drainCtx.Done() {
+				break
+			}
+			// Blocks until a worker is free, or fails once drainCtx is done.
+			slot, err := workers.AcquireSlot(drainCtx, &pool)
+			if err != nil {
+				break
+			}
+			job := i // captured by value
+			workers.Go(slot, driver func(scratch *Scratch) {
+				ctx := hardCtx.WithTimeout(JobTimeout)
+				results[job] = primes(ctx, 5000*(job+1), scratch)
+			})
+		}
+		// Graceful shutdown: give running jobs DrainHorizon, then cancel.
+		if !workers.WaitTimeout(DrainHorizon) {
+			cancelHard()
+			workers.Wait()
+		}
+	}
+	// Every task has finished here: the scope is a barrier.
+
+	var line [96]byte
+	done, skipped := usize(0), usize(0)
+	for i := usize(0); i < Jobs; i++ {
+		k := match results[i] {
+			Done(n, c) -> formatTo(line[:], "job %2d: %6d primes below %d\n", i, c, n)
+			Cancelled(n) -> formatTo(line[:], "job %2d: cancelled (limit %d)\n", i, n)
+			Skipped -> formatTo(line[:], "job %2d: skipped (shutdown)\n", i)
+		}
+		if results[i] is Done(..) {
+			done++
+		}
+		if results[i] is Skipped {
+			skipped++
+		}
+		if err := io.WriteStdout(line[:k]); err != nil {
+			return err
+		}
+	}
+	k := formatTo(line[:], "%d done, %d skipped, %d workers\n", done, skipped, Workers)
+	return io.WriteStdout(line[:k])
+}

@@ -1,0 +1,151 @@
+// state_machine: the server side of an SMTP session as an explicit state
+// machine, replayed over a recorded transcript.
+//
+//	bin/finc1 run examples/state_machine.fc
+//
+// The whole protocol is one function, step, whose body is a single match
+// over (state, command). The match has no catch-all `_` arm: every state
+// spells out its own fallback. So when the protocol grows, say a state
+// `Auth` after `Greeted`, the program stops compiling until the new state
+// has its transitions:
+//
+//	error[E2012]: non-exhaustive match on (State, Cmd): missing (Auth, _)
+//
+// Also shows: enums with payloads as states, or-patterns with bindings,
+// guards, bounded counters (MaxRcpt) instead of growing lists, `is` tests,
+// and a Format method that makes a State printable with %v.
+package main
+
+import "std/bytes"
+
+const MaxRcpt = 3
+
+type State enum {
+	Connected     // waiting for HELO
+	Greeted       // HELO done, no transaction
+	Mail          // MAIL FROM accepted
+	Rcpt(u8)      // recipients accepted so far
+	Data(u8, u32) // reading the body: recipients, body lines
+	Closed
+}
+
+func (s State) Format(dst []byte) usize {
+	return match s {
+		Connected -> formatTo(dst, "Connected")
+		Greeted -> formatTo(dst, "Greeted")
+		Mail -> formatTo(dst, "Mail")
+		Rcpt(n) -> formatTo(dst, "Rcpt(%d)", n)
+		Data(n, l) -> formatTo(dst, "Data(%d, %d)", n, l)
+		Closed -> formatTo(dst, "Closed")
+	}
+}
+
+type Cmd enum {
+	Helo
+	MailFrom
+	RcptTo
+	DataCmd
+	Rset
+	Quit
+	Line // a body line (only while in Data)
+	Dot  // "." ends the body
+	Bad
+}
+
+type Reply struct {
+	code u16 // 0: no reply (body lines)
+	text string
+}
+
+// parse classifies a line. In the Data state every line except "." is
+// body text, even one that reads "QUIT".
+func parse(s State, line []byte) Cmd {
+	if s is Data(..) {
+		return match bytesEqual(line, ".") { true -> Cmd.Dot, false -> Cmd.Line }
+	}
+	if bytes.HasPrefix(line, "HELO ") || bytes.HasPrefix(line, "EHLO ") {
+		return Cmd.Helo
+	}
+	if bytes.HasPrefix(line, "MAIL FROM:") {
+		return Cmd.MailFrom
+	}
+	if bytes.HasPrefix(line, "RCPT TO:") {
+		return Cmd.RcptTo
+	}
+	if bytesEqual(line, "DATA") {
+		return Cmd.DataCmd
+	}
+	if bytesEqual(line, "RSET") {
+		return Cmd.Rset
+	}
+	if bytesEqual(line, "QUIT") {
+		return Cmd.Quit
+	}
+	return Cmd.Bad
+}
+
+// step is the protocol. Arms are tried in order; the guard on the RcptTo
+// arm falls through to the next arm when the recipient list is full.
+func step(s State, c Cmd) (State, Reply) {
+	match (s, c) {
+		(Closed, _) -> return s, Reply{code: 421, text: "closing"}
+		(Data(n, l), Line) -> return State.Data(n, l+1), Reply{}
+		(Data(n, l), Dot) -> return State.Greeted, Reply{code: 250, text: "message queued"}
+		(Data(..), _) -> return s, Reply{code: 451, text: "internal error"} // parse never yields this
+		(Connected | Greeted, Helo) -> return State.Greeted, Reply{code: 250, text: "hello"}
+		(Connected, Quit) | (Greeted, Quit) | (Mail, Quit) | (Rcpt(_), Quit) ->
+			return State.Closed, Reply{code: 221, text: "bye"}
+		(Connected, _) -> return s, Reply{code: 503, text: "say HELO first"}
+		(Greeted, MailFrom) -> return State.Mail, Reply{code: 250, text: "sender ok"}
+		(Greeted | Mail | Rcpt(_), Rset) -> return State.Greeted, Reply{code: 250, text: "reset"}
+		(Greeted, _) -> return s, Reply{code: 503, text: "need MAIL FROM"}
+		(Mail, RcptTo) -> return State.Rcpt(1), Reply{code: 250, text: "recipient ok"}
+		(Mail, _) -> return s, Reply{code: 503, text: "need RCPT TO"}
+		(Rcpt(n), RcptTo) if n < MaxRcpt -> return State.Rcpt(n + 1), Reply{code: 250, text: "recipient ok"}
+		(Rcpt(_), RcptTo) -> return s, Reply{code: 452, text: "too many recipients"}
+		(Rcpt(n), DataCmd) -> return State.Data(n, 0), Reply{code: 354, text: "end data with ."}
+		(Rcpt(_), _) -> return s, Reply{code: 503, text: "need DATA"}
+	}
+}
+
+const Transcript = "MAIL FROM:<ann@example.org>\n" +
+	"HELO client.example.org\n" +
+	"MAIL FROM:<ann@example.org>\n" +
+	"DATA\n" +
+	"RCPT TO:<bob@example.org>\n" +
+	"RCPT TO:<cy@example.org>\n" +
+	"RCPT TO:<di@example.org>\n" +
+	"RCPT TO:<ed@example.org>\n" +
+	"DATA\n" +
+	"Subject: lunch\n" +
+	"\n" +
+	"QUIT is not a command in here.\n" +
+	".\n" +
+	"MAIL FROM:<bob@example.org>\n" +
+	"RSET\n" +
+	"QUIT\n" +
+	"NOOP\n"
+
+driver func main(io Stdio) error {
+	var line [160]byte
+	s := State.Connected
+	script := strBytes(Transcript)
+	start := usize(0)
+	for i := usize(0); i < len(script); i++ {
+		if script[i] != '\n' {
+			continue
+		}
+		text := script[start:i]
+		start = i + 1
+		next, r := step(s, parse(s, text))
+		k := formatTo(line[:], "C: %-30s %-12v -> %v\n", text, s, next)
+		if r.code != 0 {
+			k = formatTo(line[:], "C: %-30s %-12v -> %-12v S: %d %s\n", text, s, next, r.code, r.text)
+		}
+		if err := io.WriteStdout(line[:k]); err != nil {
+			return err
+		}
+		s = next
+	}
+	return nil
+}

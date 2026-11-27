@@ -1,0 +1,13 @@
+count  word                     share
+    9  the                      20.0%
+    4  a                         8.8%
+    4  dog                       8.8%
+    4  fox                       8.8%
+    3  cat                       6.6%
+    3  orders                    6.6%
+    2  and                       4.4%
+    1  bar                       2.2%
+    1  bill                      2.2%
+    1  brown                     2.2%
+45 words, 23 distinct (capacity 4096)
+dropped 0 occurrences (table full), cut 1 long words to 24 bytes

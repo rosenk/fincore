@@ -1,0 +1,181 @@
+// comptime_tables: lookup tables computed by the compiler.
+//
+//	bin/finc1 run examples/comptime_tables.fc                 # self-test
+//	bin/finc1 run examples/comptime_tables.fc -- a.txt b.bin  # CRC-32 of files
+//
+// Layer 1 of FinCore is a fuel-bounded interpreter that runs `comptime func`
+// bodies during compilation. Here it builds the CRC-32 table (256 entries x
+// 8 shift steps) and a character-class table; the generated Go contains only
+// the finished arrays. The same algorithm is run again at run time and the
+// two tables are compared.
+//
+// A comptime func is not checked for totality: it may loop however it likes,
+// and the fuel (--comptime-fuel, default 1000000; every loop iteration,
+// call and index costs 1) stops it. Each evaluation root gets the whole
+// budget; crcTable needs 2561 units (1 call + 256 + 2048 iterations + 256
+// stores), so
+//
+//	bin/finc1 check --comptime-fuel=2000 examples/comptime_tables.fc
+//
+// fails with E4001 (COMPTIME_OUT_OF_FUEL) at the `var crc ...` line.
+package main
+
+const (
+	Poly     = u32(0xEDB88320) // reflected CRC-32 (IEEE 802.3, zlib, PNG)
+	LogChunk = 16
+	ClsDigit = u8(1)
+	ClsHex   = u8(2)
+	ClsAlpha = u8(4)
+	ClsSpace = u8(8)
+)
+
+// ---- Layer 1: comptime functions ----
+
+comptime func crcTable(poly u32) [256]u32 {
+	var t [256]u32
+	for i := usize(0); i < 256; i++ {
+		c := u32(i)
+		for k := 0; k < 8; k++ {
+			if c&1 == 1 {
+				c = poly ^ (c >> 1)
+			} else {
+				c = c >> 1
+			}
+		}
+		t[i] = c
+	}
+	return t
+}
+
+comptime func classTable() [256]u8 {
+	var t [256]u8
+	for c := usize(0); c < 256; c++ {
+		b := u8(c)
+		t[c] = match b {
+			' ' | '\t' | '\n' | '\r' -> ClsSpace
+			_ -> 0
+		}
+		if b >= '0' && b <= '9' {
+			t[c] = ClsDigit | ClsHex
+		}
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' {
+			t[c] = ClsAlpha
+			if b <= 'f' || b >= 'A' && b <= 'F' {
+				t[c] = t[c] | ClsHex
+			}
+		}
+	}
+	return t
+}
+
+comptime func Pow2(k usize) usize {
+	r := usize(1)
+	for i := usize(0); i < k; i++ {
+		r *= 2
+	}
+	return r
+}
+
+// An intensional type code: El(ChunkCode(n)) folds to [n]uint8 before code
+// generation. Code 0 is the lowest universe level (spec section 5).
+comptime func ChunkCode(n usize) Code 0 {
+	return CodeArray(n, CodeU8())
+}
+
+type Chunk = El(ChunkCode(Pow2(LogChunk))) // [65536]u8
+
+// Package-level vars may be initialized by comptime calls: the values are
+// computed once, by the compiler.
+var crc [256]u32 = crcTable(Poly)
+var class [256]u8 = classTable()
+var chunk Chunk
+
+// ---- Layer 2: total run-time code ----
+
+// buildCrc is crcTable again, at run time, as a cross-check.
+func buildCrc(t *[256]u32) {
+	for i := usize(0); i < 256; i++ {
+		c := u32(i)
+		for k := 0; k < 8; k++ {
+			mask := u32(0) - (c & 1) // all ones if the low bit is set
+			c = (c >> 1) ^ (Poly & mask)
+		}
+		t[i] = c
+	}
+}
+
+// update continues a CRC over more data: table-driven, one lookup per byte.
+func update(c u32, data []byte) u32 {
+	c = c ^ 0xFFFFFFFF
+	for i := usize(0); i < len(data); i++ {
+		c = crc[u8(c)^data[i]] ^ (c >> 8)
+	}
+	return c ^ 0xFFFFFFFF
+}
+
+// counts tallies the character classes of data with the comptime table.
+func counts(data []byte) (u64, u64, u64) {
+	digits, alphas, spaces := u64(0), u64(0), u64(0)
+	for i := usize(0); i < len(data); i++ {
+		cls := class[data[i]]
+		if cls&ClsDigit != 0 {
+			digits++
+		}
+		if cls&ClsAlpha != 0 {
+			alphas++
+		}
+		if cls&ClsSpace != 0 {
+			spaces++
+		}
+	}
+	return digits, alphas, spaces
+}
+
+// ---- Layer 3: the driver ----
+
+driver func say(io Stdio, b []byte) {
+	_ = io.WriteStdout(b)
+}
+
+driver func selfTest(io Stdio) error {
+	var line [128]byte
+	var rt [256]u32
+	buildCrc(&rt)
+	same := usize(0)
+	for i := usize(0); i < 256; i++ {
+		if rt[i] == crc[i] {
+			same++
+		}
+	}
+	say(io, line[:formatTo(line[:], "comptime table == runtime table: %d/256 entries\n", same)])
+	say(io, line[:formatTo(line[:], "crc[1] = %08x, crc[128] = %08x, crc[255] = %08x\n", crc[1], crc[128], crc[255])])
+	say(io, line[:formatTo(line[:], "crc32(%q) = %08x (want cbf43926)\n", "123456789", update(0, "123456789"))])
+	// Streaming: the CRC of the parts equals the CRC of the whole.
+	whole := update(0, "The quick brown fox jumps over the lazy dog")
+	parts := update(update(0, "The quick brown "), "fox jumps over the lazy dog")
+	say(io, line[:formatTo(line[:], "whole %08x, in two parts %08x (want 414fa339)\n", whole, parts)])
+	d, a, s := counts("Version 0.2, built 2026-11-27\n")
+	say(io, line[:formatTo(line[:], "classes: %d digits, %d letters, %d blanks\n", d, a, s)])
+	say(io, line[:formatTo(line[:], "chunk buffer: %d bytes (El(ChunkCode(Pow2(%d))))\n", len(chunk), LogChunk)])
+	return nil
+}
+
+driver func main(fs FS, env Env, io Stdio) error {
+	if env.ArgsCount() < 2 {
+		return selfTest(io)
+	}
+	var line [256]byte
+	n := env.ArgsCount()
+	for i := usize(1); i < n; i++ {
+		k, err := fs.ReadFileInto(env.Arg(i), chunk[:])
+		if err != nil && err != ErrArenaFull {
+			return err
+		}
+		more := ""
+		if err == ErrArenaFull {
+			more = " (first 64 KiB only)"
+		}
+		say(io, line[:formatTo(line[:], "%08x %8d %s%s\n", update(0, chunk[:k]), k, env.Arg(i), more)])
+	}
+	return nil
+}

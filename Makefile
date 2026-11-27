@@ -50,6 +50,16 @@ check-corpus: finc0 ## finc0 check on examples, pass tests, std/ and compiler/ (
 	for f in $$fs; do $(FINC0) check --comptime-fuel=$(FUEL) $$f; done
 	@echo "check-corpus: ok"
 
+.PHONY: examples-test tutorial-check
+examples-test: finc1 ## bin/finc1 builds examples/*.fc; runs those with a .out and compares stdout
+	@set -eo pipefail; mkdir -p $(STAGE); for f in examples/*.fc; do o=$${f%.fc}.out; \
+	  $(BIN)/finc1 build -o $(STAGE)/example $$f; \
+	  if [ -f $$o ]; then $(STAGE)/example | cmp -s - $$o || { echo "examples-test: $$f output differs from $$o"; exit 1; }; fi; \
+	done; echo "examples-test: ok"
+
+tutorial-check: finc1 ## complete snippets of docs/tutorial.md compile; shown compiler output matches
+	$(GO) run ./scripts/tutorialcheck -finc $(BIN)/finc1 docs/tutorial.md
+
 integration: ## end-to-end TCP echo + corpus tests (skips until finc0 can build)
 	$(GO) test -count=1 -v ./testdata/integration/
 
