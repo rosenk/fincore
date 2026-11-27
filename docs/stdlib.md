@@ -109,7 +109,7 @@ xs := vp.Slice()
 
 A flat store of `NI` items holding variable-length runs back to back, plus
 a LIFO scratch stack of `NS` items on which runs are built. This is the
-pattern of compiler/'s `ListStack` + `NodeArena.lists` and of types.fc's
+pattern of compiler/'s `NodeArena.lists` (`NodeLists`) and `ulists`, and of types.fc's
 `tpush`/`tmark`/`tcommitStack`/`tcommit`. Runs under construction may
 nest, as long as marks are committed in LIFO order. Store slot 0 is
 reserved: an empty run is `(0, 0)` and a non-empty run never starts at 0.
@@ -125,6 +125,7 @@ reserved: an empty run is `(0, 0)` and a non-empty run never starts at 0.
 | `Run(start, n u32) []T` | the run as a slice (empty when out of range) | O(1) |
 | `At(i usize) T`, `Set(i usize, x T) bool` | single store slot | O(1) |
 | `Used() usize`, `Depth() usize` | store slots used (incl. slot 0), stack height | O(1) |
+| `Truncate(used usize)` | rolls the store back to an earlier `Used()` (drops later runs; no-op if `used >= Used()`); the stack is untouched | O(1) |
 | `Full() bool` | sticky overflow flag | O(1) |
 | `Reset()` | empties store and stack, clears `Full` | O(1) |
 
@@ -178,7 +179,7 @@ inserted.
 
 Maps byte strings to dense `u32` IDs `1, 2, 3, ...` in insertion order (0
 = none), copying each new string into an internal `NBYTES`-byte arena.
-This is compiler/sema.fc's `NameTable`/`intern`/`nameBytes`.
+compiler/sema.fc's `names` (`intern`/`nameBytes`) is one.
 
 | Method | Result |
 | :--- | :--- |
@@ -270,7 +271,7 @@ func lookupOrAdd(scp u32, name u32) u32 {
 A byte buffer with capacity `N`; the zero value is empty. Writes are
 **all-or-nothing**: a write that does not fit completely is dropped and
 sets the sticky `Truncated` flag; what was written before stays intact
-(compiler/'s `OutBuf` semantics).
+(compiler/'s `OutBuf` is a `Builder`).
 
 | Method | |
 | :--- | :--- |
@@ -279,6 +280,7 @@ sets the sticky `Truncated` flag; what was written before stays intact
 | `WriteRepeat(c byte, n usize)` | `n` copies of `c` (indentation) |
 | `WriteHex(v u64, width usize, upper bool)` | exactly `width` (<= 16) hex digits |
 | `Bytes() []byte` | contents (aliases the buffer) |
+| `Spare() []byte`, `Extend(k usize)` | the unused capacity, to be filled in place (e.g. by a driver reading a file), then `Extend(k)` appends its first `k` bytes (all-or-nothing: `Truncated` when `k > Cap()-Len()`) |
 | `Len()`, `Cap()` | |
 | `Truncate(n usize)` | keep the first `n` bytes (does not clear `Truncated`) |
 | `Reset()` | empty and clear `Truncated` |
@@ -339,7 +341,7 @@ this differs from Go's `strconv.Quote` (no `\a`, `\u`, UTF-8 pass-through).
 ## std/path
 
 Lexical processing of slash-separated paths with the semantics of Go's
-`path` package (compiler/'s `cleanPath`/`cleanJoin`).
+`path` package (used by compiler/'s `joinPath`/`cleanStr`/`dirOf`/`baseOf`).
 
 | Function | Result |
 | :--- | :--- |

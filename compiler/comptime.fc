@@ -16,6 +16,8 @@
 // interpreter state, as finc0 creates a fresh interpreter per root.
 package main
 
+import "std/strconv"
+
 const (
 	DefaultFuel   = 1_000_000
 	CtMaxDepth    = 10_000
@@ -62,7 +64,9 @@ var ifailMsg OutBuf
 func failf(code u32, k usize) {
 	ifail = true
 	ifailCode = code
-	ifailMsg.len = formatTo(ifailMsg.data[:], "comptime evaluation failed: %s", mbuf[:k])
+	o := &ifailMsg
+	o.Reset()
+	o.Extend(formatTo(o.Spare(), "comptime evaluation failed: %s", mbuf[:k]))
 }
 
 func failS(code u32, s string) {
@@ -71,14 +75,14 @@ func failS(code u32, s string) {
 
 // failErr reports the value error in errTxt.
 func failErr(code u32) {
-	failf(code, formatTo(mbuf[:], "%s", errTxt.data[:errTxt.len]))
+	failf(code, formatTo(mbuf[:], "%s", (&errTxt).Bytes()))
 }
 
 // failSilent is a failure that was already reported (EvalError{}).
 func failSilent() {
 	ifail = true
 	ifailCode = 0
-	ifailMsg.len = 0
+	(&ifailMsg).Reset()
 }
 
 // CallStack renders the call stack above frame `base`, innermost first,
@@ -129,7 +133,9 @@ func tick() {
 	if inFuel == 0 {
 		ifail = true
 		ifailCode = E4001
-		ifailMsg.len = formatTo(ifailMsg.data[:], "comptime evaluation ran out of fuel (budget %d steps); %v", inBudget, CallStack(inBase))
+		o := &ifailMsg
+		o.Reset()
+		o.Extend(formatTo(o.Spare(), "comptime evaluation ran out of fuel (budget %d steps); %v", inBudget, CallStack(inBase)))
 		return
 	}
 	inFuel--
@@ -270,7 +276,9 @@ func icall(fn u32, recv Val, hasRecv bool, as usize, ae usize, site u32, dp usiz
 	if nframes-inBase >= CtMaxDepth || nframes >= MaxFrames {
 		ifail = true
 		ifailCode = E4001
-		ifailMsg.len = formatTo(ifailMsg.data[:], "comptime evaluation exceeded the maximum call depth (%d); %v", CtMaxDepth, CallStack(inBase))
+		o := &ifailMsg
+		o.Reset()
+		o.Extend(formatTo(o.Spare(), "comptime evaluation exceeded the maximum call depth (%d); %v", CtMaxDepth, CallStack(inBase)))
 		return z
 	}
 	vbase := nfv
@@ -1470,12 +1478,12 @@ func bytesOfSlice(v Val) bool {
 		return false
 	}
 	t := &tmpBuf
-	t.reset()
+	t.Reset()
 	if v.flag&2 != 0 {
 		n := usize(v.aux2 - v.aux)
 		for i := usize(0); i < n; i++ {
 			b := slotGet(v.ref + v.aux + u32(i))
-			t.putByte(byte(b.lo))
+			t.WriteByte(byte(b.lo))
 		}
 	}
 	return true
@@ -1607,7 +1615,7 @@ func ibuiltin0(b u8, m usize) Val {
 		if !bytesOfSlice(vstack[m]) {
 			return z
 		}
-		return vStr(tmpBuf.data[:tmpBuf.len])
+		return vStr((&tmpBuf).Bytes())
 	} else if b == BFFormatUint {
 		v := vstack[m]
 		u := u64(0)
@@ -1634,22 +1642,7 @@ func ibuiltin0(b u8, m usize) Val {
 		if !bytesOfSlice(vstack[m]) {
 			return z
 		}
-		n := tmpBuf.len
-		okp := n > 0
-		v := u64(0)
-		for i := usize(0); i < n; i++ {
-			c := tmpBuf.data[i]
-			if c < '0' || c > '9' {
-				okp = false
-				break
-			}
-			d := u64(c - '0')
-			if v > (AllOnes-d)/10 {
-				okp = false
-				break
-			}
-			v = v*10 + d
-		}
+		v, okp := strconv.ParseUint((&tmpBuf).Bytes(), 10)
 		if !okp {
 			return tuple2(vIntU(0), vErr(BCErrParse))
 		}

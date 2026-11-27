@@ -72,7 +72,7 @@ func tindex(n u32, lit u32, dp usize) decreases(dp) {
 			st, cnt := slotList(nodes.items[usize(n)], slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				tindex(nodes.lists[usize(st)+j], inner, dp-1)
+				tindex(listAt(st, j), inner, dp-1)
 			}
 		} else {
 			tindex(slotChild(nodes.items[usize(n)], slot), inner, dp-1)

@@ -30,6 +30,12 @@
 // itself (Arg(0)) as a subprocess.
 package main
 
+import (
+	"std/bytes"
+	"std/path"
+	"std/strconv"
+)
+
 const (
 	MaxExecArgs  = 128
 	ExecErrBytes = 1 << 20
@@ -55,75 +61,34 @@ func catStr(a string, b string) string {
 }
 
 func uintStr(v u64) string {
-	var nb [24]byte
-	n, _ := formatUint(v, nb[:])
-	return bytesToStr(nb[:n])
+	var nb [strconv.MaxUintLen]byte
+	return bytesToStr(nb[:strconv.FormatUint(nb[:], v, 10)])
 }
 
-func hasSuffixStr(s string, suf string) bool {
-	b := strBytes(s)
-	x := strBytes(suf)
-	if len(b) < len(x) {
-		return false
-	}
-	return bytesEqual(b[len(b)-len(x):], x)
-}
-
-// joinPath is filepath.Join(dir, name).
+// joinPath is filepath.Join(dir, name) ("" if it is too long).
 func joinPath(dir string, name string) string {
 	var pb [MaxPathBytes]byte
-	k := cleanJoin(strBytes(dir), strBytes(name), pb[:])
-	return bytesToStr(pb[:k])
+	return bytesToStr(pb[:path.Join(pb[:], strBytes(dir), strBytes(name))])
 }
 
 func cleanStr(p string) string {
 	var pb [MaxPathBytes]byte
-	k := cleanPath(strBytes(p), pb[:])
-	return bytesToStr(pb[:k])
+	return bytesToStr(pb[:path.Clean(pb[:], strBytes(p))])
 }
 
-// dirOf is filepath.Dir of a clean path.
+// dirOf is filepath.Dir.
 func dirOf(p string) string {
-	b := strBytes(p)
-	n := len(b)
-	last := n
-	for i := usize(0); i < n; i++ {
-		if b[n-1-i] == '/' {
-			last = n - 1 - i
-			break
-		}
-	}
-	if last == n {
-		return "."
-	}
-	if last == 0 {
-		return "/"
-	}
-	return cleanStr(bytesToStr(b[:last]))
+	var pb [MaxPathBytes]byte
+	return bytesToStr(pb[:path.Dir(pb[:], strBytes(p))])
 }
 
 // baseOf is filepath.Base.
 func baseOf(p string) string {
-	c := strBytes(cleanStr(p))
-	n := len(c)
-	if n == 1 && c[0] == '/' {
-		return "/"
-	}
-	st := usize(0)
-	for i := usize(0); i < n; i++ {
-		if c[i] == '/' {
-			st = i + 1
-		}
-	}
-	return bytesToStr(c[st:n])
+	return bytesToStr(path.Base(strBytes(p)))
 }
 
 func isWordByte(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
-}
-
-func isSpaceByte(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 12 || c == 11
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +238,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 			}
 			continue
 		}
-		v, ok := parseU64(strBytes(val))
+		v, ok := strconv.ParseUint(strBytes(val), 10)
 		if !ok {
 			if err := sayf(io, formatTo(mbuf[:], "invalid value %v for flag -comptime-fuel: parse error\n", Quoted(strBytes(val)))); err != nil {
 				return 0, err
@@ -299,12 +264,11 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 
 // absPath makes p absolute using $PWD ("" if that is impossible).
 driver func absPath(env Env, p string) string {
-	b := strBytes(p)
-	if len(b) > 0 && b[0] == '/' {
+	if path.IsAbs(strBytes(p)) {
 		return cleanStr(p)
 	}
 	wd, ok := env.GetEnv("PWD")
-	if !ok || len(strBytes(wd)) == 0 || strBytes(wd)[0] != '/' {
+	if !ok || !path.IsAbs(strBytes(wd)) {
 		return ""
 	}
 	return joinPath(wd, p)
@@ -317,19 +281,19 @@ func goModWord(line []byte, kw string) (usize, usize, bool) {
 	k := strBytes(kw)
 	n := len(line)
 	m := len(k)
-	if n <= m || !bytesEqual(line[:m], k) || !isSpaceByte(line[m]) {
+	if n <= m || !bytes.HasPrefix(line, k) || !bytes.IsSpace(line[m]) {
 		return 0, 0, false
 	}
 	i := m
 	for g := usize(0); g < n; g++ {
-		if i >= n || !isSpaceByte(line[i]) {
+		if i >= n || !bytes.IsSpace(line[i]) {
 			break
 		}
 		i++
 	}
 	st := i
 	for g := usize(0); g < n; g++ {
-		if i >= n || isSpaceByte(line[i]) {
+		if i >= n || bytes.IsSpace(line[i]) {
 			break
 		}
 		i++
@@ -342,7 +306,7 @@ func goModWord(line []byte, kw string) (usize, usize, bool) {
 		if i >= n {
 			break
 		}
-		if !isSpaceByte(line[i]) {
+		if !bytes.IsSpace(line[i]) {
 			return 0, 0, false
 		}
 		i++
@@ -416,21 +380,14 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 		return abs
 	}
 	wd, okw := env.GetEnv("PWD")
-	if okw && len(strBytes(wd)) > 0 && strBytes(wd)[0] == '/' {
+	if okw && path.IsAbs(strBytes(wd)) {
 		root := findRootFrom(fs, cleanStr(wd))
 		if len(strBytes(root)) > 0 {
 			return root
 		}
 	}
 	exe := env.Arg(0)
-	eb := strBytes(exe)
-	hasSlash := false
-	for i := usize(0); i < len(eb); i++ {
-		if eb[i] == '/' {
-			hasSlash = true
-		}
-	}
-	if hasSlash {
+	if bytes.IndexByte(strBytes(exe), '/') >= 0 {
 		ae := absPath(env, exe)
 		if len(strBytes(ae)) > 0 {
 			root := findRootFrom(fs, dirOf(ae))
@@ -463,11 +420,11 @@ func putStripped(o *OutBuf, data []byte, dir string) {
 		if i >= n {
 			break
 		}
-		if nd > 0 && i+nd+1 <= n && bytesEqual(data[i:i+nd], d) && data[i+nd] == '/' {
+		if nd > 0 && bytes.HasPrefix(data[i:], d) && i+nd < n && data[i+nd] == '/' {
 			i += nd + 1
 			continue
 		}
-		o.putByte(data[i])
+		o.WriteByte(data[i])
 		i++
 	}
 }
@@ -487,7 +444,7 @@ driver func compileGo(fs FS, io Stdio, src string) error {
 		if semaFull {
 			return capacityFail(io, src, semaFullWhat)
 		}
-		if err := sayf(io, formatTo(mbuf[:], "finc1: %s\n", cgErrBuf.data[:cgErrBuf.len])); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc1: %s\n", (&cgErrBuf).Bytes())); err != nil {
 			return err
 		}
 		return ErrParse
@@ -505,14 +462,14 @@ driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []strin
 		return nil
 	}
 	eb := &errBuf
-	eb.reset()
+	eb.Reset()
 	if err != nil {
 		putMsg(eb, formatTo(mbuf[:], "finc1: %s: cannot run %s\n", what, bin))
 	} else {
 		putMsg(eb, formatTo(mbuf[:], "finc1: %s: exit status %d\n", what, st.Code))
 	}
 	putStripped(eb, execErr[:n], strip)
-	eb.putByte('\n')
+	eb.WriteByte('\n')
 	if e := flushErr(io); e != nil {
 		return e
 	}
@@ -523,7 +480,7 @@ driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []strin
 // temporary module directory dir.
 driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string, emitGo string) error {
 	mainGo := joinPath(dir, "main.go")
-	if err := fs.WriteFile(mainGo, outBuf.data[:outBuf.len]); err != nil {
+	if err := fs.WriteFile(mainGo, (&outBuf).Bytes()); err != nil {
 		return ioFail(io, "write ", mainGo, err)
 	}
 	root := findModuleRoot(fs, env, io, true)
@@ -547,13 +504,15 @@ driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string,
 			return err
 		}
 	}
-	n, rerr := fs.ReadFileInto(mainGo, outBuf.data[:])
+	ob := &outBuf
+	ob.Reset()
+	n, rerr := fs.ReadFileInto(mainGo, ob.Spare())
 	if rerr != nil {
 		return ioFail(io, "read ", mainGo, rerr)
 	}
-	outBuf.len = n
+	ob.Extend(n)
 	if len(strBytes(emitGo)) > 0 {
-		if err := fs.WriteFile(emitGo, outBuf.data[:outBuf.len]); err != nil {
+		if err := fs.WriteFile(emitGo, ob.Bytes()); err != nil {
 			return ioFail(io, "write ", emitGo, err)
 		}
 	}
@@ -643,7 +602,7 @@ driver func runBuild(fs FS, env Env, io Stdio, exec Exec) error {
 	if len(strBytes(bOut)) == 0 {
 		base := baseOf(src)
 		o := base
-		if hasSuffixStr(base, ".fc") {
+		if bytes.HasSuffix(strBytes(base), strBytes(".fc")) {
 			bb := strBytes(base)
 			o = bytesToStr(bb[:len(bb)-3])
 		}
@@ -775,7 +734,7 @@ driver func collectDir(fs FS, exec Exec, dir string) error {
 	for g := usize(0); g < nf+nd; g++ {
 		takeFile := false
 		if i < nf && j < nd {
-			takeFile = bytesCompare(strBytes(fileNames[i]), strBytes(subNames[j])) < 0
+			takeFile = bytes.Compare(strBytes(fileNames[i]), strBytes(subNames[j])) < 0
 		} else if i < nf {
 			takeFile = true
 		} else if j >= nd {
@@ -858,17 +817,17 @@ func scanMarkers(base string, lineNo u64, line []byte) {
 		}
 		i := pos + 2
 		for h := usize(0); h < n; h++ {
-			if i >= n || !isSpaceByte(line[i]) {
+			if i >= n || !bytes.IsSpace(line[i]) {
 				break
 			}
 			i++
 		}
-		ok := i+5 <= n && cgBytesIs(line[i:i+5], "ERROR")
+		ok := bytes.HasPrefix(line[i:], strBytes("ERROR"))
 		if ok {
 			i += 5
 			ws := i
 			for h := usize(0); h < n; h++ {
-				if i >= n || !isSpaceByte(line[i]) {
+				if i >= n || !bytes.IsSpace(line[i]) {
 					break
 				}
 				i++
@@ -917,21 +876,7 @@ driver func readHeader(fs FS, nfiles usize) error {
 			ls = i + 1
 			lineNo++
 			if inHeader {
-				st := usize(0)
-				en := len(line)
-				for g := usize(0); g < en; g++ {
-					if st >= en || !isSpaceByte(line[st]) {
-						break
-					}
-					st++
-				}
-				for g := usize(0); g < len(line); g++ {
-					if en <= st || !isSpaceByte(line[en-1]) {
-						break
-					}
-					en--
-				}
-				tl := line[st:en]
+				tl := bytes.TrimSpace(line)
 				if cgBytesHasPrefix(tl, "package ") {
 					inHeader = false
 				} else if cgBytesHasPrefix(tl, "// FLAGS:") {
@@ -942,13 +887,13 @@ driver func readHeader(fs FS, nfiles usize) error {
 						if k >= rn {
 							break
 						}
-						if isSpaceByte(rest[k]) {
+						if bytes.IsSpace(rest[k]) {
 							k++
 							continue
 						}
 						s := k
 						for h := usize(0); h < rn; h++ {
-							if k >= rn || isSpaceByte(rest[k]) {
+							if k >= rn || bytes.IsSpace(rest[k]) {
 								break
 							}
 							k++
@@ -995,7 +940,7 @@ func addDiagLine(line []byte) {
 	n := len(line)
 	ws := n
 	for k := usize(0); k < n; k++ {
-		if isSpaceByte(line[k]) {
+		if bytes.IsSpace(line[k]) {
 			ws = k
 			break
 		}
@@ -1003,7 +948,7 @@ func addDiagLine(line []byte) {
 	// (\S+\.fc):(\d+):(\d+): error\[(E\d{4})\] with the longest path.
 	for g := usize(0); g < ws; g++ {
 		j := ws - g
-		if j < 4 || j >= n || line[j] != ':' || !cgBytesIs(line[j-3:j], ".fc") {
+		if j < 4 || j >= n || line[j] != ':' || !bytes.HasSuffix(line[:j], strBytes(".fc")) {
 			continue
 		}
 		ln, e1 := parseDigits(line, j+1, 20)
@@ -1048,7 +993,7 @@ func (c DiagCode) Format(dst []byte) usize {
 // left in tmpBuf.
 driver func runFailTest(exec Exec, self string, src string) {
 	mb := &tmpBuf
-	mb.reset()
+	mb.Reset()
 	var argv [MaxExecArgs]string
 	k := usize(0)
 	argv[k] = "check"
@@ -1068,15 +1013,15 @@ driver func runFailTest(exec Exec, self string, src string) {
 		return
 	}
 	if st.Code == 0 {
-		mb.putStr("check succeeded; want [")
+		mb.WriteString("check succeeded; want [")
 		nw := nWant
 		for i := usize(0); i < nw; i++ {
 			if i > 0 {
-				mb.putByte(' ')
+				mb.WriteByte(' ')
 			}
 			putMsg(mb, formatTo(mbuf[:], "{%s %d %v}", wantFile[i], wantLine[i], DiagCode(wantCode[i])))
 		}
-		mb.putStr("]")
+		mb.WriteString("]")
 		return
 	}
 	parseDiagLines(n)
@@ -1099,9 +1044,9 @@ driver func runFailTest(exec Exec, self string, src string) {
 			putMsg(mb, formatTo(mbuf[:], "unexpected diagnostic %s:%d: error[%v]\n", gotFile[q], gotLine[q], DiagCode(gotCode[q])))
 		}
 	}
-	if tmpBuf.len > 0 {
-		mb.putStr("check output:\n")
-		mb.putBytes(execErr[:n])
+	if mb.Len() > 0 {
+		mb.WriteString("check output:\n")
+		mb.WriteBytes(execErr[:n])
 	}
 }
 
@@ -1109,7 +1054,7 @@ driver func runFailTest(exec Exec, self string, src string) {
 // message (empty = pass) is left in tmpBuf.
 driver func runPassTest(fs FS, exec Exec, self string, src string, outPath string, work string, idx usize) {
 	mb := &tmpBuf
-	mb.reset()
+	mb.Reset()
 	bin := joinPath(work, catStr("t", uintStr(u64(idx))))
 	var argv [MaxExecArgs]string
 	k := usize(0)
@@ -1130,8 +1075,8 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 	defer cancel()
 	st, n, err := exec.Run(ctx, self, argv[:k], envs[:0], "", execErr[:])
 	if err != nil || st.Code != 0 {
-		mb.putStr("build failed:\n")
-		mb.putBytes(execErr[:n])
+		mb.WriteString("build failed:\n")
+		mb.WriteBytes(execErr[:n])
 		return
 	}
 	if hBuildOnly {
@@ -1151,14 +1096,14 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 	st2, n2, err2 := exec.Run(rctx, "/bin/sh", argv[:4], envs[:0], work, execErr[:])
 	if err2 != nil || st2.Code != 0 {
 		if err2 == ErrTimeout {
-			mb.putStr("run: signal: killed")
+			mb.WriteString("run: signal: killed")
 		} else if err2 != nil {
-			mb.putStr("run: cannot run")
+			mb.WriteString("run: cannot run")
 		} else {
 			putMsg(mb, formatTo(mbuf[:], "run: exit status %d", st2.Code))
 		}
-		mb.putStr("\nstderr:\n")
-		mb.putBytes(execErr[:n2])
+		mb.WriteString("\nstderr:\n")
+		mb.WriteBytes(execErr[:n2])
 		return
 	}
 	gn, gerr := fs.ReadFileInto(stdoutFile, testBuf2[:])
@@ -1166,10 +1111,10 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 		gn = 0
 	}
 	if !bytesEqual(testBuf2[:gn], testBuf[:wn]) {
-		mb.putStr("stdout mismatch\n--- got ---\n")
-		mb.putBytes(testBuf2[:gn])
-		mb.putStr("--- want ---\n")
-		mb.putBytes(testBuf[:wn])
+		mb.WriteString("stdout mismatch\n--- got ---\n")
+		mb.WriteBytes(testBuf2[:gn])
+		mb.WriteString("--- want ---\n")
+		mb.WriteBytes(testBuf[:wn])
 	}
 }
 
@@ -1247,13 +1192,13 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		if nf == 0 {
 			kind = "?"
 			mb := &tmpBuf
-			mb.reset()
-			mb.putStr("no source files")
+			mb.Reset()
+			mb.WriteString("no source files")
 		} else if err := readHeader(fs, nf); err != nil {
 			kind = "?"
 			mb := &tmpBuf
-			mb.reset()
-			mb.putStr("cannot read test sources")
+			mb.Reset()
+			mb.WriteString("cannot read test sources")
 		} else if nWant > 0 {
 			kind = "fail"
 			runFailTest(exec, self, tName[i])
@@ -1267,13 +1212,14 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 			}
 			runPassTest(fs, exec, self, tName[i], outPath, work, i)
 		}
-		bad := tmpBuf.len > 0
+		msg := (&tmpBuf).Bytes()
+		bad := len(msg) > 0
 		if bad {
 			failed++
 		}
 		if bad || verbose {
 			o := &outBuf
-			o.reset()
+			o.Reset()
 			status := "ok"
 			if bad {
 				status = "FAIL"
@@ -1281,25 +1227,25 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 			putMsg(o, formatTo(mbuf[:], "%-4s %s %s\n", status, kind, tName[i]))
 			if bad {
 				// indent the message lines
-				tl := tmpBuf.len
+				tl := len(msg)
 				m := tl
 				for g := usize(0); g < tl; g++ {
-					if m == 0 || tmpBuf.data[m-1] != '\n' {
+					if m == 0 || msg[m-1] != '\n' {
 						break
 					}
 					m--
 				}
-				o.putStr("    ")
+				o.WriteString("    ")
 				for q := usize(0); q < m; q++ {
-					c := tmpBuf.data[q]
-					o.putByte(c)
+					c := msg[q]
+					o.WriteByte(c)
 					if c == '\n' {
-						o.putStr("    ")
+						o.WriteString("    ")
 					}
 				}
-				o.putByte('\n')
+				o.WriteByte('\n')
 			}
-			if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+			if err := io.WriteStdout(o.Bytes()); err != nil {
 				_ = fs.RemoveAll(work)
 				return err
 			}

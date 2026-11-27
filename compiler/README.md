@@ -8,7 +8,7 @@ files (spec 9.5.6); there are no local imports.
 
 | File | Contents |
 | :--- | :--- |
-| `arena.fc` | Capacities, `SourceArena`, `Token`/`TokenArena`, `Node`/`NodeArena`, `ListStack`, `OutBuf` |
+| `arena.fc` | Capacities, `SourceArena`, `Token`/`TokenArena` (`vec.Vec`), `Node`/`NodeArena` with its child lists `NodeLists` (`vec.ListArena`), `OutBuf` (`bytes.Builder`) |
 | `diag.fc` | Diagnostic codes and the `file:line:col: error[E####]: msg` header; UTF-8 decoding and Go-compatible quoting (`strconv.Quote`, `%q`, `%c`) |
 | `lexer.fc` | Token kinds, keyword lookup, total lexer with semicolon insertion, literal/escape validation, E1001/E1002 messages |
 | `ast.fc` | Node kinds, the per-kind slot `layout`, post-order NodeID assignment, the `--dump-ast` dumper and the source printer |
@@ -37,8 +37,10 @@ files (spec 9.5.6); there are no local imports.
 ## Architecture
 
 **Arenas (spec 9.4).** All bulk storage is in package-level `var`s holding
-Value structs with fixed arrays (`sources`, `tokens`, `nodes`,
-`listStack`, `outBuf`, `errBuf`, `tmpBuf`, `fileNames`). Globals may not be
+Value structs with fixed arrays (`sources`, `tokens`, `nodes`, `outBuf`,
+`errBuf`, `tmpBuf`, `fileNames`); where a std container fits (decision
+59, docs/stdlib.md) it is used through a type alias (`type OutBuf =
+bytes.Builder[MaxOutputBytes]`, `TokenArena`, `NodeLists`). Globals may not be
 pointers or Scoped (S1), so the driver takes their addresses (`np :=
 &nodes`) and passes the pointers to Scoped helper structs (`Parser`,
 `Dumper`, `Printer`) that live in the driver's frame or in a callee's
@@ -48,26 +50,26 @@ frame. Capacities:
 | :--- | :--- |
 | `SourceArena` | `MaxFiles = 128` files, `MaxSourceBytes = 4 MiB` in total |
 | `TokenArena` | `MaxTokens = 262_144` tokens (reset per file) |
-| `NodeArena` | `MaxNodes = 524_288` nodes, `MaxListItems = 1_048_576` list items (whole program) |
-| `ListStack` | `MaxListItems` (scratch for lists under construction) |
+| `NodeArena` | `MaxNodes = 524_288` nodes; `lists`: `MaxListItems = 1_048_576` list items (whole program) plus a scratch stack of `MaxListItems` for lists under construction |
 | `OutBuf` | `MaxOutputBytes = 8 MiB` (stdout dump per file, stderr diagnostics, string scratch) |
 
-Overflow never panics: `alloc`/`push`/`commit`/`put*` set a sticky `full`
-flag (writes go to the reserved slot 0 or are dropped) and the driver
+Overflow never panics: `alloc` and the std containers set a sticky flag
+(`full`, `Full()`, `Truncated()`; writes go to the reserved slot 0 or are
+dropped) and the driver
 reports `finc1: <file>: compiler capacity exceeded (...)` and returns
 `ErrArenaFull`. The semantic arenas are listed in "Semantic model" below.
 `finc1 check --stats <path>` (hidden flag) prints the usage of every arena.
 
 **IDs.** `NodeID`, list starts and lengths, token offsets and positions are
 `u32`; arena index 0 means "none". A `Node` has six single-child slots
-(`a`..`f`), two list slots (`l1`, `l2`, ranges in `NodeArena.lists`), two
+(`a`..`f`), two list slots (`l1`, `l2`, runs in `NodeArena.lists`), two
 flag bits, a small `op` field (operator, modifier or literal kind), a text
 span `tOff/tLen` (absolute offset into `SourceArena.bytes`: identifier name
 or literal spelling) and `ival` (integer or char value; for a BinaryExpr
 the operator position `line<<32 | col`, finc0's `OpPos`). The meaning of the
 slots per kind is in the header comment of `ast.fc`. Lists are built
-on the `ListStack` (lists nest in LIFO order) and committed into
-`NodeArena.lists` in one piece when complete.
+on the scratch stack of `NodeArena.lists` (lists nest in LIFO order) and
+committed into its store in one piece when complete.
 
 **Dump identical to finc0.** `finc0 --dump-ast` prints finc0's Go structs by
 reflection: fields in declaration order, scalars inline in the header, nil
@@ -156,10 +158,10 @@ has a type, every CallExpr has a `Call`, every identifier use a symbol.
 
 | Table | Contents |
 | :--- | :--- |
-| `names` | Interned spellings (`NameID`); `idName(identNode)` caches the NameID of an Ident; `nameBytes(id)`, `nameBlank`, `nameMain` |
+| `names` (`maps.Interner`) | Interned spellings (`NameID`); `idName(identNode)` caches the NameID of an Ident; `nameBytes(id)`, `nameBlank`, `nameMain` |
 | `syms.items[SymID]` (`Sym`) | `kind` (SymConst/SymType/SymVar/SymFunc/SymBuiltin/SymTypeParam/SymPackage), `varKind` (VarGlobal/Local/Param/Recv/Binding/Scope), `builtin` (predeclared entity, `BT*`/`BC*`/`BF*` in resolve.fc), `name`, `ident` (defining Ident node), `decl` (declaring node, as `resolve.Symbol.Decl`), `pkg`, `fn` (enclosing FuncDecl/FuncLit node of locals; 0 = package level), `imported` (SymPackage), `recvType` (NameID of the receiver type of methods) |
 | checker fields of `Sym` | `typ` (SymTypes; untyped constants hold their default type), `val` (SymValues: value slot), `untyped` (UntypedConsts), `method` (MethodOf), `objState`/`body` (checker bookkeeping) |
-| `scopes.items[ScopeID]` | `parent`, `kind`, `node`; all bindings are in one open-addressing table keyed by (scope, name): `lookupLocal(scope, name)`, `lookupChain(scope, name)` |
+| `scopes` (`vec.Vec` of `ScopeRec`, by ScopeID) | `parent`, `kind`, `node`; all bindings are in one open-addressing table `symTab` (`maps.Table`) keyed by (scope, name): `lookupLocal(scope, name)`, `lookupChain(scope, name)` |
 | `pkgs.items[PkgID]` (`Pkg`) | `name`, `path` (import path, "" for root), `scp` (package scope), source files `[f0, f1)` (only `sources.files[i].ok` ones belong to it), `impS/impN` (imports), `declS/declN` (package-level symbols in source order, methods included), `methS/methN` (methods); `fileScope[file]`, `filePkg[file]` |
 | `defs[node]`, `uses[node]` | Prog.Defs / Prog.Uses; `symbolOf(ident)` |
 | `litCapHead[funcLit]` | Prog.Captures: cell list of captured outer locals, first-use order |
@@ -239,7 +241,7 @@ sets `semaFull`), and passes `dp-1` inside the SCC; entry points pass
 substitution/instantiation, value copies, terminating statements, AST
 walks) follow the same pattern. Lists under construction use LIFO scratch
 stacks that every function leaves balanced: `typs.stack` (type lists,
-`tpush`/`tcommitStack`/`mk*`), `ustack` (`upush`/`ucommit`), `opStack`
+`tpush`/`tcommitStack`/`mk*`), the `ulists` stack (`umark`/`upush`/`ucommit`), `opStack`
 (operands of calls and assignments), `vstack` (comptime argument values),
 `rstack` (assignment references).
 
@@ -298,7 +300,7 @@ diff-check corpus and snippets plus the 60 cases of finc0's
 | `names` | `MaxNames = 65_536`, `MaxNameBytes = 1 MiB` | 1.9k |
 | `syms` | `MaxSyms = 131_072`, `SymBuckets = 524_288` | 4.9k |
 | `scopes` | `MaxScopes = 524_288` | 6.7k |
-| `ulists`, `ustack` | `MaxULists = 1_048_576` | 3.3k |
+| `ulists` (store + stack) | `MaxULists = 1_048_576` each | 3.3k |
 | `cells` | `MaxCells = 524_288` | 7.7k |
 | `typs` | `MaxTypes = 131_072`, `TypeBuckets = 262_144`, `MaxTypeLists = 1_048_576` | 501 / 1.6k |
 | `meths`, `insts`, `funcs` | 16_384, 8_192, 65_536 | 164, 0, 644 |

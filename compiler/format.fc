@@ -10,6 +10,8 @@
 // and the Format method (Call.fmtS/fmtN: (op, method) pairs in ulists).
 package main
 
+import "std/strconv"
+
 // Write operations (types.FormatOp), aligned with finc0.
 const (
 	FmtNone       = 0
@@ -280,7 +282,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 		opStack.top = mark
 		return opMode(KValue, TyUsize)
 	}
-	umark := ustack.count
+	um := umark()
 	ln := len(s)
 	i := usize(0)
 	k := usize(0)
@@ -318,10 +320,10 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 	}
 	opStack.top = mark
 	if !ok {
-		ustack.count = umark
+		(&ulists).Discard(um)
 		return opMode(KValue, TyUsize)
 	}
-	fs, fn := ucommit(umark)
+	fs, fn := ucommit(um)
 	callTab.items[usize(ci)].fmtOK = true
 	callTab.items[usize(ci)].fmtS = fs
 	callTab.items[usize(ci)].fmtN = fn
@@ -415,7 +417,7 @@ func cgFmtParamType(op u8) string {
 // cgWFmtLit writes strconv.Quote of a literal piece with `%%` unescaped.
 func cgWFmtLit(raw []byte) {
 	o := &cgBuf
-	o.putByte('"')
+	o.WriteByte('"')
 	n := len(raw)
 	st := usize(0)
 	j := usize(0)
@@ -425,7 +427,7 @@ func cgWFmtLit(raw []byte) {
 		}
 		if raw[j] == '%' {
 			putQuotedBody(o, raw[st:j])
-			o.putByte('%')
+			o.WriteByte('%')
 			j += 2
 			st = j
 			continue
@@ -435,7 +437,7 @@ func cgWFmtLit(raw []byte) {
 	if st < n {
 		putQuotedBody(o, raw[st:n])
 	}
-	o.putByte('"')
+	o.WriteByte('"')
 }
 
 // cgWFmtWidth writes strconv.Itoa(FormatWidth()).
@@ -608,74 +610,28 @@ func cfBytes(b []byte, width int) {
 	cfPadRight(n, width)
 }
 
-func cfQuotedLen(c byte) usize {
-	if c == '\n' || c == '\r' || c == '\t' || c == '\\' || c == '"' {
-		return 2
-	}
-	if c < 0x20 || c >= 0x7f {
-		return 4
-	}
-	return 1
-}
-
-func cfHexDigit(v u64) byte {
-	if v < 10 {
-		return byte('0' + v)
-	}
-	return byte('a' + v - 10)
-}
-
-func cfPutQuoted(c byte) {
-	if c == '\n' {
-		cfPut('\\')
-		cfPut('n')
-	} else if c == '\r' {
-		cfPut('\\')
-		cfPut('r')
-	} else if c == '\t' {
-		cfPut('\\')
-		cfPut('t')
-	} else if c == '\\' || c == '"' {
-		cfPut('\\')
-		cfPut(c)
-	} else if c < 0x20 || c >= 0x7f {
-		cfPut('\\')
-		cfPut('x')
-		cfPut(cfHexDigit(u64(c >> 4)))
-		cfPut(cfHexDigit(u64(c & 15)))
-	} else {
-		cfPut(c)
-	}
-}
-
+// cfQuote writes b as strconv.Quote does (FinCore %q escapes), padded.
 func cfQuote(b []byte, width int) {
-	n := len(b)
-	l := usize(2)
-	for i := usize(0); i < n; i++ {
-		l += cfQuotedLen(b[i])
-	}
+	l := strconv.QuotedLen(b)
 	cfPadLeft(l, width)
 	cfPut('"')
+	n := len(b)
+	var q [6]byte
 	for i := usize(0); i < n; i++ {
-		cfPutQuoted(b[i])
+		k := strconv.Quote(q[:], b[i:i+1]) // "c", "\n" or "\xHH" with quotes
+		e := q[1 : k-1]
+		for j := usize(0); j < len(e); j++ {
+			cfPut(e[j])
+		}
 	}
 	cfPut('"')
 	cfPadRight(l, width)
 }
 
 func cfNumber(neg bool, mag u64, base u64, width int, zero bool) {
-	var tmp [24]byte
-	i := usize(24)
-	m := mag
-	for g := usize(0); g < 24; g++ {
-		i--
-		tmp[i] = cfHexDigit(m % base)
-		m = m / base
-		if m == 0 {
-			break
-		}
-	}
-	l := 24 - i
+	var tmp [strconv.MaxUintLen]byte
+	digits := tmp[:strconv.FormatUint(tmp[:], mag, u32(base))]
+	l := len(digits)
 	if neg {
 		l++
 	}
@@ -692,8 +648,8 @@ func cfNumber(neg bool, mag u64, base u64, width int, zero bool) {
 			cfPut('-')
 		}
 	}
-	for j := i; j < 24; j++ {
-		cfPut(tmp[j])
+	for j := usize(0); j < len(digits); j++ {
+		cfPut(digits[j])
 	}
 	cfPadRight(l, width)
 }
@@ -884,9 +840,9 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 				break
 			}
 			if op == FmtBytes {
-				cfBytes(tmpBuf.data[:tmpBuf.len], width)
+				cfBytes((&tmpBuf).Bytes(), width)
 			} else {
-				cfQuote(tmpBuf.data[:tmpBuf.len], width)
+				cfQuote((&tmpBuf).Bytes(), width)
 			}
 		} else if op == FmtByte {
 			cfPadLeft(1, width)

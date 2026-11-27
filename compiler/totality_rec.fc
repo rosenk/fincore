@@ -18,6 +18,11 @@
 // are sorted afterwards.
 package main
 
+import (
+	"std/bytes"
+	"std/sort"
+)
+
 const (
 	MaxGraphEdges = MaxCalls + 2*MaxFuncs
 )
@@ -260,20 +265,12 @@ func checkRecursion() {
 		s1 := usize(sccS[c+1])
 		for i := s0; i < s1; i++ {
 			v := sccMem[i]
-			if v == hub {
-				continue
+			if v != hub {
+				rcMem[nrc] = v
+				nrc++
 			}
-			j := nrc
-			for g := usize(0); g < nrc; g++ {
-				if j == 0 || rcMem[j-1] < v {
-					break
-				}
-				rcMem[j] = rcMem[j-1]
-				j--
-			}
-			rcMem[j] = v
-			nrc++
 		}
+		sort.SortU32(rcMem[:nrc])
 		if nrc == 0 {
 			continue
 		}
@@ -347,7 +344,7 @@ func spanBefore(a u32, b u32) bool {
 	fa := nfile(na0)
 	fb := nfile(nb0)
 	if fa != fb {
-		c := bytesCompare(strBytes(sources.files[fa].path), strBytes(sources.files[fb].path))
+		c := bytes.Compare(strBytes(sources.files[fa].path), strBytes(sources.files[fb].path))
 		if c != 0 {
 			return c < 0
 		}
@@ -366,18 +363,8 @@ func checkSCC(comp u32) {
 		code = E4002
 	}
 	n := nrc
-	for i := usize(0); i < n; i++ {
-		v := rcMem[i]
-		j := i
-		for g := usize(0); g < i; g++ {
-			if j == 0 || !spanBefore(v, rcSorted[j-1]) {
-				break
-			}
-			rcSorted[j] = rcSorted[j-1]
-			j--
-		}
-		rcSorted[j] = v
-	}
+	copy(rcSorted[:n], rcMem[:n])
+	sort.Stable[u32](rcSorted[:n], spanBefore)
 	// every member needs a decreases clause
 	missing := false
 	for i := usize(0); i < n; i++ {

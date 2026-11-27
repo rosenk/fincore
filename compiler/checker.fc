@@ -137,7 +137,7 @@ func writeExprList(o *OutBuf, n u32, dp usize) decreases(dp) {
 	c := l1len(n)
 	for i := usize(0); i < c; i++ {
 		if i > 0 {
-			o.putStr(", ")
+			o.WriteString(", ")
 		}
 		writeExpr(o, l1at(n, i), dp-1)
 	}
@@ -149,65 +149,65 @@ func writeExpr(o *OutBuf, e u32, dp usize) decreases(dp) {
 	}
 	k := nkind(e)
 	if k == NkIdent || k == NkBasicLit {
-		o.putBytes(ntext(e))
+		o.WriteBytes(ntext(e))
 	} else if k == NkBoolLit {
 		if nflag(e) {
-			o.putStr("true")
+			o.WriteString("true")
 		} else {
-			o.putStr("false")
+			o.WriteString("false")
 		}
 	} else if k == NkNilLit {
-		o.putStr("nil")
+		o.WriteString("nil")
 	} else if k == NkBinaryExpr {
 		writeExpr(o, na(e), dp-1)
-		o.putByte(' ')
-		o.putStr(binOpString(nop(e)))
-		o.putByte(' ')
+		o.WriteByte(' ')
+		o.WriteString(binOpString(nop(e)))
+		o.WriteByte(' ')
 		writeExpr(o, nb(e), dp-1)
 	} else if k == NkUnaryExpr {
-		o.putStr(unaryOpString(nop(e)))
+		o.WriteString(unaryOpString(nop(e)))
 		writeExpr(o, na(e), dp-1)
 	} else if k == NkParenExpr {
-		o.putByte('(')
+		o.WriteByte('(')
 		writeExpr(o, na(e), dp-1)
-		o.putByte(')')
+		o.WriteByte(')')
 	} else if k == NkCallExpr {
 		writeExpr(o, na(e), dp-1)
-		o.putByte('(')
+		o.WriteByte('(')
 		writeExprList(o, e, dp-1)
-		o.putByte(')')
+		o.WriteByte(')')
 	} else if k == NkIndexExpr {
 		writeExpr(o, na(e), dp-1)
-		o.putByte('[')
+		o.WriteByte('[')
 		writeExprList(o, e, dp-1)
-		o.putByte(']')
+		o.WriteByte(']')
 	} else if k == NkSliceExpr {
 		writeExpr(o, na(e), dp-1)
-		o.putByte('[')
+		o.WriteByte('[')
 		writeExpr(o, nb(e), dp-1)
-		o.putByte(':')
+		o.WriteByte(':')
 		writeExpr(o, nc(e), dp-1)
-		o.putByte(']')
+		o.WriteByte(']')
 	} else if k == NkSelectorExpr {
 		writeExpr(o, na(e), dp-1)
-		o.putByte('.')
-		o.putBytes(ntext(nb(e)))
+		o.WriteByte('.')
+		o.WriteBytes(ntext(nb(e)))
 	} else if k == NkFuncLit {
-		o.putStr("func literal")
+		o.WriteString("func literal")
 	} else if k == NkStructLit {
 		t := na(e)
 		if na(t) != 0 {
-			o.putBytes(ntext(na(t)))
-			o.putByte('.')
+			o.WriteBytes(ntext(na(t)))
+			o.WriteByte('.')
 		}
-		o.putBytes(ntext(nb(t)))
-		o.putStr("{...}")
+		o.WriteBytes(ntext(nb(t)))
+		o.WriteString("{...}")
 	} else if k == NkTypeExpr {
-		o.putStr("type expression")
+		o.WriteString("type expression")
 	} else if k == NkMatchExpr {
-		o.putStr("match expression")
+		o.WriteString("match expression")
 	} else {
-		o.putStr("expression")
+		o.WriteString("expression")
 	}
 }
 
@@ -1078,7 +1078,7 @@ func funcDeclIn(s u32, d u32, dp usize) decreases(dp) {
 // paramSyms records the parameter types and returns the parameter Ident
 // nodes (FuncInfo.Params; blank `_` params have no symbol).
 func paramSyms(as u32, sig u32) (u32, u32) {
-	mark := ustack.count
+	mark := umark()
 	i := usize(0)
 	np := sigNParams(sig)
 	n := l1len(as)
@@ -1180,7 +1180,7 @@ func methodsOf(n0 u32, dp usize) (u32, u32) decreases(dp) {
 	if typs.items[usize(n)].flag&2 != 0 || namedBuiltin(n) != 0 {
 		return typs.items[usize(n)].l3s, typs.items[usize(n)].l3n
 	}
-	mark := ustack.count
+	mark := umark()
 	ns := namedSym(n)
 	if ns != 0 && syms.items[usize(ns)].pkg != 0 {
 		p := syms.items[usize(ns)].pkg
@@ -1825,7 +1825,7 @@ func addFuncOrder(fi u32, dp usize) decreases(dp) {
 // finishInfo orders Info.Funcs and gives remaining untyped expressions
 // their default types.
 func finishInfo() {
-	mark := ustack.count
+	mark := umark()
 	n := pkgs.norder
 	for i := usize(0); i < n; i++ {
 		p := pkgs.order[i]

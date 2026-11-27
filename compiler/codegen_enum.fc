@@ -200,7 +200,7 @@ func cgComputeLayout(n u32, en u32, dp usize) CgLay decreases(dp) {
 		for j := usize(0); j < np; j++ {
 			m := cgWmark()
 			cgGoType(n, variantPay(en, vi, j), dp-1)
-			gt := cgBuf.data[m:cgBuf.len]
+			gt := (&cgBuf).Bytes()[m:]
 			gi := usize(0)
 			found := false
 			top2 := cgLayGTop
@@ -404,7 +404,7 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 		}
 	}
 	cgHeader++
-	smark := cgStash.len
+	smark := (&cgStash).Len()
 	bTmp := u64(0)
 	if en == 0 {
 		cgW("switch ")
@@ -423,10 +423,10 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 		p := cgWmark()
 		cgPrimary(x, dp-1)
 		o := &cgStash
-		o.putBytes(cgBuf.data[p:cgBuf.len])
+		o.WriteBytes((&cgBuf).Bytes()[p:])
 		cgW("._tag")
 	}
-	bEnd := cgStash.len
+	bEnd := (&cgStash).Len()
 	cgHeader--
 	cgW(" {\n")
 	for i := usize(0); i < cnt; i++ {
@@ -476,7 +476,7 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 	}
 	cgW("}\n")
 	cgArmTop = mark
-	cgStash.len = smark
+	(&cgStash).Truncate(smark)
 	if en != 0 {
 		cgLayRelease(lay)
 	}

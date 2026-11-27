@@ -14,6 +14,11 @@
 // dump) through Scoped helper structs that live in its own frame.
 package main
 
+import (
+	"std/path"
+	"std/strconv"
+)
+
 const (
 	MaxPathBytes = 4096
 )
@@ -22,7 +27,6 @@ const (
 var sources SourceArena
 var tokens TokenArena
 var nodes NodeArena
-var listStack ListStack
 var outBuf OutBuf
 var errBuf OutBuf
 var tmpBuf OutBuf
@@ -36,107 +40,16 @@ func strEq(a string, b string) bool {
 	return bytesEqual(strBytes(a), strBytes(b))
 }
 
-// cleanJoin writes filepath.Join(dir, name) (Go's lexical Clean of
-// dir + "/" + name) into dst and returns its length (0 on overflow).
-func cleanJoin(dir []byte, name []byte, dst []byte) usize {
-	var in [MaxPathBytes]byte
-	nd := len(dir)
-	nn := len(name)
-	if nd+nn+1 > MaxPathBytes {
-		return 0
-	}
-	k := copy(in[:], dir)
-	in[k] = '/'
-	k++
-	k += copy(in[k:], name)
-	return cleanPath(in[:k], dst)
-}
-
-// cleanPath implements Go's path.Clean on bytes; it returns the length
-// written to dst (0 if dst is too small).
-func cleanPath(src []byte, dst []byte) usize {
-	n := len(src)
-	room := len(dst)
-	if n == 0 {
-		if room == 0 {
-			return 0
-		}
-		dst[0] = '.'
-		return 1
-	}
-	if room < n+1 {
-		return 0
-	}
-	rooted := src[0] == '/'
-	w := usize(0)
-	r := usize(0)
-	dotdot := usize(0)
-	if rooted {
-		dst[0] = '/'
-		w = 1
-		r = 1
-		dotdot = 1
-	}
-	for g := usize(0); g < n; g++ {
-		if r >= n {
-			break
-		}
-		if src[r] == '/' {
-			r++
-		} else if src[r] == '.' && (r+1 == n || src[r+1] == '/') {
-			r++
-		} else if src[r] == '.' && src[r+1] == '.' && (r+2 == n || src[r+2] == '/') {
-			r += 2
-			if w > dotdot {
-				w--
-				for h := usize(0); h < n; h++ {
-					if w <= dotdot || dst[w] == '/' {
-						break
-					}
-					w--
-				}
-			} else if !rooted {
-				if w > 0 {
-					dst[w] = '/'
-					w++
-				}
-				dst[w] = '.'
-				dst[w+1] = '.'
-				w += 2
-				dotdot = w
-			}
-		} else {
-			if rooted && w != 1 || !rooted && w != 0 {
-				dst[w] = '/'
-				w++
-			}
-			for h := usize(0); h < n; h++ {
-				if r >= n || src[r] == '/' {
-					break
-				}
-				dst[w] = src[r]
-				w++
-				r++
-			}
-		}
-	}
-	if w == 0 {
-		dst[0] = '.'
-		return 1
-	}
-	return w
-}
-
 // ---------------------------------------------------------------------------
 // output helpers (driver layer)
 
 driver func flushErr(io Stdio) error {
 	eb := &errBuf
-	if errBuf.len == 0 {
+	if eb.Len() == 0 {
 		return nil
 	}
-	err := io.WriteStderr(errBuf.data[:errBuf.len])
-	eb.reset()
+	err := io.WriteStderr(eb.Bytes())
+	eb.Reset()
 	return err
 }
 
@@ -144,7 +57,7 @@ driver func flushErr(io Stdio) error {
 // errBuf followed by flushErr, it leaves errBuf empty.
 driver func sayf(io Stdio, k usize) error {
 	eb := &errBuf
-	eb.reset()
+	eb.Reset()
 	return io.WriteStderr(mbuf[:k])
 }
 
@@ -288,7 +201,7 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 	np := &nodes
 	sources.used = 0
 	sources.nfiles = 0
-	errBuf.len = 0
+	(&errBuf).Truncate(0)
 	f0, f1, ndiag, err := parseSources(fs, io, path, false)
 	if err != nil {
 		return err
@@ -323,12 +236,12 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 		if !sources.files[i].ok {
 			continue
 		}
-		ob.reset()
+		ob.Reset()
 		dp.dumpNode(sources.files[i].root, 0, WalkDepth)
-		if outBuf.full {
+		if ob.Truncated() {
 			return capacityFail(io, sources.files[i].path, "output buffer")
 		}
-		if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+		if err := io.WriteStdout(ob.Bytes()); err != nil {
 			return err
 		}
 	}
@@ -360,13 +273,12 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 		if f0+n > MaxFiles {
 			return f0, f0, 0, capacityFail(io, path, "files")
 		}
-		var pb [MaxPathBytes]byte
 		for i := usize(0); i < n; i++ {
-			k := cleanJoin(strBytes(path), strBytes(fileNames[i]), pb[:])
-			if k == 0 {
+			fp := joinPath(path, fileNames[i])
+			if len(strBytes(fp)) == 0 {
 				return f0, f0, 0, capacityFail(io, path, "path too long")
 			}
-			sources.files[f0+i].path = bytesToStr(pb[:k])
+			sources.files[f0+i].path = fp
 		}
 		nfiles = n
 	} else {
@@ -407,35 +319,36 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 			return f0, f1, ndiag, capacityFail(io, fpath, "tokens")
 		}
 
+		lsp := &nodes.lists
 		nodeMark := nodes.count
-		listMark := nodes.nlist
-		diagMark := errBuf.len
+		listMark := lsp.Used()
+		diagMark := eb.Len()
 		p := Parser{
-			toks: tp,
+			toks: tp.Slice(),
 			na:   np,
-			ls:   &listStack,
+			ls:   lsp,
 			diag: eb,
 			src:  sources.bytes[:],
 			fsrc: sources.bytes[st : st+n],
 			base: u32(st),
 			file: u16(i),
 			path: fpath,
-			ntok: tokens.count,
+			ntok: tp.Len(),
 		}
 		pp := &p
 		root := pp.run()
-		if nodes.full || listStack.full || errBuf.full {
-			errBuf.len = diagMark
+		if nodes.full || lsp.Full() || eb.Truncated() {
+			eb.Truncate(diagMark)
 			return f0, f1, ndiag, capacityFail(io, fpath, "AST nodes")
 		}
 		if root == 0 {
 			nodes.count = nodeMark
-			nodes.nlist = listMark
-			listStack.top = 0
+			lsp.Truncate(listMark)
+			lsp.Discard(0)
 			ndiag++
 			if check {
-				addParseDiag(i, errBuf.data[diagMark:errBuf.len])
-				errBuf.len = diagMark
+				addParseDiag(i, eb.Bytes()[diagMark:])
+				eb.Truncate(diagMark)
 			}
 			continue
 		}
@@ -454,8 +367,8 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 			diagEnd(eb)
 			ndiag++
 			if check {
-				addParseDiag(i, errBuf.data[diagMark:errBuf.len])
-				errBuf.len = diagMark
+				addParseDiag(i, eb.Bytes()[diagMark:])
+				eb.Truncate(diagMark)
 			}
 			continue
 		}
@@ -474,27 +387,6 @@ driver func checkUsage(io Stdio) error {
 		return err
 	}
 	return ErrParse
-}
-
-// parseU64 parses a decimal u64 (false on syntax error or overflow).
-func parseU64(b []byte) (u64, bool) {
-	n := len(b)
-	if n == 0 {
-		return 0, false
-	}
-	v := u64(0)
-	for i := usize(0); i < n; i++ {
-		c := b[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		d := u64(c - '0')
-		if v > (0xFFFFFFFFFFFFFFFF-d)/10 {
-			return 0, false
-		}
-		v = v*10 + d
-	}
-	return v, true
 }
 
 // runCheck implements `check [--comptime-fuel=N] <file.fc | dir>`.
@@ -561,14 +453,14 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 			val = env.Arg(i + 1)
 			skipNext = true
 		} else {
-			eb.reset()
-			eb.putStr("flag needs an argument: -comptime-fuel\n")
+			eb.Reset()
+			eb.WriteString("flag needs an argument: -comptime-fuel\n")
 			if err := flushErr(io); err != nil {
 				return err
 			}
 			return checkUsage(io)
 		}
-		v, ok := parseU64(strBytes(val))
+		v, ok := strconv.ParseUint(strBytes(val), 10)
 		if !ok {
 			if err := sayf(io, formatTo(mbuf[:], "invalid value %v for flag -comptime-fuel: parse error\n", Quoted(strBytes(val)))); err != nil {
 				return err
@@ -594,11 +486,11 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 driver func printDiags(io Stdio) error {
 	eb := &errBuf
 	n := sortDiags()
-	eb.reset()
+	eb.Reset()
 	for i := usize(0); i < n; i++ {
-		eb.putBytes(diagLine(usize(diags.order[i])))
-		eb.putByte('\n')
-		if errBuf.len > MaxOutputBytes/2 {
+		eb.WriteBytes(diagLine(usize(diags.order[i])))
+		eb.WriteByte('\n')
+		if eb.Len() > MaxOutputBytes/2 {
 			if err := flushErr(io); err != nil {
 				return err
 			}
@@ -613,16 +505,14 @@ driver func printDiags(io Stdio) error {
 driver func checkPath(fs FS, io Stdio, path string) error {
 	sources.used = 0
 	sources.nfiles = 0
-	errBuf.len = 0
+	(&errBuf).Truncate(0)
 	nameBlank = internStr("_")
 	nameMain = internStr("main")
 	f0, f1, _, err := parseSources(fs, io, path, true)
 	if err != nil {
 		return err
 	}
-	var kb [MaxPathBytes]byte
-	kn := cleanPath(strBytes(path), kb[:])
-	root, lerr := visitPackage(fs, io, f0, f1, "", bytesToStr(kb[:kn]))
+	root, lerr := visitPackage(fs, io, f0, f1, "", cleanStr(path))
 	if lerr != nil {
 		return lerr
 	}
@@ -678,17 +568,17 @@ func statLine(o *OutBuf, what string, used usize, capacity usize) {
 // planning for compiler/ itself).
 driver func printStats(io Stdio) error {
 	o := &outBuf
-	o.reset()
+	o.Reset()
 	statLine(o, "files", sources.nfiles, MaxFiles)
 	statLine(o, "source bytes", sources.used, MaxSourceBytes)
 	statLine(o, "nodes", nodes.count, MaxNodes)
-	statLine(o, "node list items", nodes.nlist, MaxListItems)
-	statLine(o, "names", names.count, MaxNames)
-	statLine(o, "name bytes", names.used, MaxNameBytes)
+	statLine(o, "node list items", (&nodes.lists).Used(), MaxListItems)
+	statLine(o, "names", (&names).Len(), MaxNames)
+	statLine(o, "name bytes", (&names).Used(), MaxNameBytes)
 	statLine(o, "symbols", syms.count, MaxSyms)
-	statLine(o, "scopes", scopes.count, MaxScopes)
-	statLine(o, "u32 lists", ulists.count, MaxULists)
-	statLine(o, "cells", cells.count, MaxCells)
+	statLine(o, "scopes", (&scopes).Len(), MaxScopes)
+	statLine(o, "u32 lists", (&ulists).Used(), MaxULists)
+	statLine(o, "cells", (&cells).Len(), MaxCells)
 	statLine(o, "types", typs.count, MaxTypes)
 	statLine(o, "type list items", typs.nlists, MaxTypeLists)
 	statLine(o, "methods", meths.count, MaxMethods)
@@ -700,7 +590,7 @@ driver func printStats(io Stdio) error {
 	statLine(o, "constant value slots", vals.ptop, VtabCap)
 	statLine(o, "string pool bytes", nstr, MaxStrBytes)
 	statLine(o, "diagnostics", diags.count, MaxDiags)
-	return io.WriteStdout(outBuf.data[:outBuf.len])
+	return io.WriteStdout(o.Bytes())
 }
 
 // visitPackage registers the package made of sources.files[f0:f1] (state
@@ -766,7 +656,7 @@ driver func visitPackage(fs FS, io Stdio, f0 usize, f1 usize, importPath string,
 			}
 		}
 	}
-	mark := ustack.count
+	mark := umark()
 	for q := usize(0); q < nimps; q++ {
 		upush(imps[q])
 	}
@@ -795,17 +685,13 @@ func validImportPath(ip []byte) bool {
 		return false
 	}
 	var cb [MaxPathBytes]byte
-	k := cleanPath(ip, cb[:])
-	return k == n && bytesEqual(cb[:k], ip)
+	k := path.Clean(cb[:], ip)
+	return bytesEqual(cb[:k], ip)
 }
 
 // isStdImport reports whether ip is "std" or starts with "std/".
 func isStdImport(ip []byte) bool {
-	n := len(ip)
-	if n < 3 || ip[0] != 's' || ip[1] != 't' || ip[2] != 'd' {
-		return false
-	}
-	return n == 3 || ip[3] == '/'
+	return cgBytesIs(ip, "std") || cgBytesHasPrefix(ip, "std/")
 }
 
 // loadImport resolves one import spec (resolve/load.go: importSpec);
@@ -823,12 +709,10 @@ driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
 	// the package's files in diagnostics.
 	dir := ip
 	if len(strBytes(fincRoot)) > 0 && isStdImport(strBytes(ip)) {
-		var db [MaxPathBytes]byte
-		dk := cleanJoin(strBytes(fincRoot), strBytes(ip), db[:])
-		if dk == 0 {
+		dir = joinPath(fincRoot, ip)
+		if len(strBytes(dir)) == 0 {
 			return 0, capacityFail(io, ip, "path too long")
 		}
-		dir = bytesToStr(db[:dk])
 	}
 	n := pkgs.count
 	for p := usize(1); p < n; p++ {

@@ -52,9 +52,9 @@ func exprWith(e u32, t u32, c Ctx, dp usize) Operand decreases(dp) {
 // stringLitVal decodes a STRING BasicLit into a string value.
 func stringLitVal(e u32) Val {
 	t := &tmpBuf
-	t.reset()
+	t.Reset()
 	decodeStringLit(t, ntext(e))
-	return vStr(tmpBuf.data[:tmpBuf.len])
+	return vStr(t.Bytes())
 }
 
 func expr0(e u32, dp usize) Operand decreases(dp) {
@@ -232,7 +232,7 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 	if x.mode == KConst && y.mode == KConst {
 		v, ok := binaryOpVal(op, x.val, y.val)
 		if !ok {
-			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.data[:errTxt.len]))
+			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
 			return invalidOp(e)
 		}
 		if !isUntyped(t) && !representable(v, t) {
@@ -303,7 +303,7 @@ func shiftExpr(e u32, x *Operand, y *Operand) Operand {
 	if x.mode == KConst && y.mode == KConst {
 		v, ok := binaryOpVal(op, x.val, y.val)
 		if !ok {
-			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.data[:errTxt.len]))
+			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
 			return invalidOp(e)
 		}
 		if !isUntyped(x.typ) && !representable(v, x.typ) {
@@ -358,7 +358,7 @@ func comparisonExpr(e u32, x *Operand, y *Operand) Operand {
 	if x.mode == KConst && y.mode == KConst {
 		v, ok := binaryOpVal(op, x.val, y.val)
 		if !ok {
-			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.data[:errTxt.len]))
+			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
 			return invalidOp(e)
 		}
 		return opConst(TyUntypedBool, v)
@@ -422,7 +422,7 @@ func unaryExpr(e u32, dp usize) Operand decreases(dp) {
 	if x.mode == KConst {
 		v, ok := unaryOpVal(op, x.val)
 		if !ok {
-			errAt(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.data[:errTxt.len]))
+			errAt(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
 			return invalidOp(e)
 		}
 		if !isUntyped(x.typ) && !representable(v, x.typ) {
@@ -1093,7 +1093,7 @@ func foldComptime(e u32, fn u32, sig u32, mark usize, ci u32, dp usize) Operand 
 	vtop = vmark
 	if !ok {
 		if ifailCode != 0 {
-			errAt(ifailCode, e, formatTo(mbuf[:], "%s", ifailMsg.data[:ifailMsg.len]))
+			errAt(ifailCode, e, formatTo(mbuf[:], "%s", (&ifailMsg).Bytes()))
 		}
 		return invalidOp(e)
 	}
@@ -1290,7 +1290,7 @@ func containsCall(e u32, dp usize) bool decreases(dp) {
 			start, cnt := slotList(n, slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				if containsCall(nodes.lists[usize(start)+j], dp-1) {
+				if containsCall(listAt(start, j), dp-1) {
 					return true
 				}
 			}

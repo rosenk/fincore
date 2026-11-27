@@ -1029,7 +1029,7 @@ func putTypeList(o *OutBuf, xs []u32, depth usize) decreases(depth) {
 	n := len(xs)
 	for i := usize(0); i < n; i++ {
 		if i > 0 {
-			o.putStr(", ")
+			o.WriteString(", ")
 		}
 		putType(o, xs[i], depth-1)
 	}
@@ -1040,110 +1040,110 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 		return
 	}
 	if t == 0 {
-		o.putStr("<nil>")
+		o.WriteString("<nil>")
 		return
 	}
 	r := typs.items[usize(t)]
 	k := r.kind
 	if k == TCBasic {
-		o.putStr(basicName(r.sub))
+		o.WriteString(basicName(r.sub))
 	} else if k == TCNamed {
 		if r.d != 0 && len(strBytes(pkgs.items[usize(r.d)].path)) > 0 {
-			o.putBytes(nameBytes(pkgs.items[usize(r.d)].name))
-			o.putByte('.')
+			o.WriteBytes(nameBytes(pkgs.items[usize(r.d)].name))
+			o.WriteByte('.')
 		}
-		o.putBytes(nameBytes(u32(r.n)))
+		o.WriteBytes(nameBytes(u32(r.n)))
 		if r.l1n > 0 {
-			o.putByte('[')
+			o.WriteByte('[')
 			putTypeList(o, l1Slice(t), depth-1)
-			o.putByte(']')
+			o.WriteByte(']')
 		}
 	} else if k == TCArray {
-		o.putByte('[')
+		o.WriteByte('[')
 		if r.b != 0 {
-			o.putBytes(nameBytes(u32(typs.items[usize(r.b)].n)))
+			o.WriteBytes(nameBytes(u32(typs.items[usize(r.b)].n)))
 		} else {
-			o.putUint(r.n)
+			o.WriteUint(r.n)
 		}
-		o.putByte(']')
+		o.WriteByte(']')
 		putType(o, r.a, depth-1)
 	} else if k == TCSlice {
-		o.putStr("[]")
+		o.WriteString("[]")
 		putType(o, r.a, depth-1)
 	} else if k == TCPointer {
-		o.putByte('*')
+		o.WriteByte('*')
 		putType(o, r.a, depth-1)
 	} else if k == TCStruct {
-		o.putStr("struct{")
+		o.WriteString("struct{")
 		n := nfields(t)
 		for i := usize(0); i < n; i++ {
 			if i > 0 {
-				o.putStr("; ")
+				o.WriteString("; ")
 			}
-			o.putBytes(nameBytes(fieldName(t, i)))
-			o.putByte(' ')
+			o.WriteBytes(nameBytes(fieldName(t, i)))
+			o.WriteByte(' ')
 			putType(o, fieldType(t, i), depth-1)
 		}
-		o.putByte('}')
+		o.WriteByte('}')
 	} else if k == TCEnum {
-		o.putStr("enum{")
+		o.WriteString("enum{")
 		n := nvariants(t)
 		for i := usize(0); i < n; i++ {
 			if i > 0 {
-				o.putStr("; ")
+				o.WriteString("; ")
 			}
-			o.putBytes(nameBytes(variantName(t, i)))
+			o.WriteBytes(nameBytes(variantName(t, i)))
 			m := variantPayN(t, i)
 			if m > 0 {
-				o.putByte('(')
+				o.WriteByte('(')
 				s := usize(variantPayS(t, i))
 				putTypeList(o, typs.lists[s:s+m], depth-1)
-				o.putByte(')')
+				o.WriteByte(')')
 			}
 		}
-		o.putByte('}')
+		o.WriteByte('}')
 	} else if k == TCSig {
 		if r.sub == EffDriver {
-			o.putStr("driver ")
+			o.WriteString("driver ")
 		} else if r.sub == EffComptime {
-			o.putStr("comptime ")
+			o.WriteString("comptime ")
 		}
-		o.putStr("func(")
+		o.WriteString("func(")
 		n := usize(r.l1n)
 		for i := usize(0); i < n; i++ {
 			if i > 0 {
-				o.putStr(", ")
+				o.WriteString(", ")
 			}
 			if r.flag&1 != 0 && i == n-1 {
-				o.putStr("...")
+				o.WriteString("...")
 			}
 			putType(o, tl1(t, i), depth-1)
 		}
-		o.putByte(')')
+		o.WriteByte(')')
 		m := usize(r.l2n)
 		if m == 1 {
-			o.putByte(' ')
+			o.WriteByte(' ')
 			putType(o, tl2(t, 0), depth-1)
 		} else if m > 1 {
-			o.putStr(" (")
+			o.WriteString(" (")
 			putTypeList(o, l2Slice(t), depth-1)
-			o.putByte(')')
+			o.WriteByte(')')
 		}
 	} else if k == TCCode {
 		if r.n == 0 {
-			o.putStr("Code ?")
+			o.WriteString("Code ?")
 		} else {
-			o.putStr("Code ")
-			o.putUint(r.n - 1)
+			o.WriteString("Code ")
+			o.WriteUint(r.n - 1)
 		}
 	} else if k == TCTypeParam || k == TCOpaque {
-		o.putBytes(nameBytes(u32(r.n)))
+		o.WriteBytes(nameBytes(u32(r.n)))
 	} else if k == TCConstArg {
-		o.putUint(r.n)
+		o.WriteUint(r.n)
 	} else if k == TCTuple {
-		o.putByte('(')
+		o.WriteByte('(')
 		putTypeList(o, l1Slice(t), depth-1)
-		o.putByte(')')
+		o.WriteByte(')')
 	}
 }
 
@@ -1239,7 +1239,7 @@ func mkUnivNamed(b u8, under u32, class u8) u32 {
 	return t
 }
 
-// addUnivMethod pushes one builtin method onto ustack (params/results are
+// addUnivMethod pushes one builtin method onto the ulists stack (params/results are
 // on the type stack [m1:m2] / [m2:top]).
 func addUnivMethod(recv u8, name string, id u8, variadic bool, eff u8, m1 usize, m2 usize) {
 	sig := u32(0)
@@ -1293,7 +1293,7 @@ func initUnivTypes() {
 	bytesT := mkSlice(TyU8)
 	strs := mkSlice(TyString)
 	// Context
-	um := ustack.count
+	um := umark()
 	m := tmark()
 	tpush(TyBool)
 	addUnivMethod(BTContext, "Done", BMContextDone, false, EffTotal, m, m)
@@ -1306,7 +1306,7 @@ func initUnivTypes() {
 	addUnivMethod(BTContext, "WithTimeout", BMContextWithTimeout, false, EffTotal, m, m+1)
 	setUnivMethods(BTContext, um)
 	// Signals
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(signal)
 	tpush(ctx)
@@ -1314,7 +1314,7 @@ func initUnivTypes() {
 	addUnivMethod(BTSignals, "NotifyContext", BMSignalsNotifyCtx, true, EffTotal, m, m+1)
 	setUnivMethods(BTSignals, um)
 	// Net
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(TyString)
 	tpush(univNamed[BTListener])
@@ -1322,7 +1322,7 @@ func initUnivTypes() {
 	addUnivMethod(BTNet, "ListenTCP", BMNetListenTCP, false, EffTotal, m, m+1)
 	setUnivMethods(BTNet, um)
 	// Listener
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(ctx)
 	tpush(univNamed[BTConn])
@@ -1336,7 +1336,7 @@ func initUnivTypes() {
 	addUnivMethod(BTListener, "Close", BMListenerClose, false, EffTotal, m, m)
 	setUnivMethods(BTListener, um)
 	// Conn
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(ctx)
 	tpush(bytesT)
@@ -1357,7 +1357,7 @@ func initUnivTypes() {
 	addUnivMethod(BTConn, "Close", BMConnClose, false, EffTotal, m, m)
 	setUnivMethods(BTConn, um)
 	// Scope
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	addUnivMethod(BTScope, "AcquireSlot", BMScopeAcquireSlot, false, EffTotal, m, m)
 	addUnivMethod(BTScope, "ReleaseSlot", BMScopeReleaseSlot, false, EffTotal, m, m)
@@ -1370,7 +1370,7 @@ func initUnivTypes() {
 	addUnivMethod(BTScope, "Wait", BMScopeWait, false, EffTotal, m, m)
 	setUnivMethods(BTScope, um)
 	// FS
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(TyString)
 	tpush(bytesT)
@@ -1403,7 +1403,7 @@ func initUnivTypes() {
 	addUnivMethod(BTFS, "RemoveAll", BMFSRemoveAll, false, EffTotal, m, m+1)
 	setUnivMethods(BTFS, um)
 	// Env
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(TyUsize)
 	addUnivMethod(BTEnv, "ArgsCount", BMEnvArgsCount, false, EffTotal, m, m)
@@ -1418,7 +1418,7 @@ func initUnivTypes() {
 	addUnivMethod(BTEnv, "GetEnv", BMEnvGetEnv, false, EffTotal, m, m+1)
 	setUnivMethods(BTEnv, um)
 	// Stdio
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(bytesT)
 	tpush(TyError)
@@ -1429,7 +1429,7 @@ func initUnivTypes() {
 	addUnivMethod(BTStdio, "WriteStderr", BMStdioWriteStderr, false, EffTotal, m, m+1)
 	setUnivMethods(BTStdio, um)
 	// Exec
-	um = ustack.count
+	um = umark()
 	m = tmark()
 	tpush(ctx)
 	tpush(TyString)

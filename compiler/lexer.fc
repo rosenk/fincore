@@ -379,50 +379,50 @@ func describeToken(o *OutBuf, t Token, text []byte) {
 	k := t.kind
 	if k == TkSemicolon {
 		if t.semi == SemiNewline {
-			o.putStr("newline")
+			o.WriteString("newline")
 		} else if t.semi == SemiEOF {
-			o.putStr("EOF")
+			o.WriteString("EOF")
 		} else {
-			o.putStr("';'")
+			o.WriteString("';'")
 		}
 		return
 	}
 	if k == TkEOF {
-		o.putStr("EOF")
+		o.WriteString("EOF")
 		return
 	}
 	if k == TkIdent {
-		o.putStr("identifier ")
-		o.putBytes(text)
+		o.WriteString("identifier ")
+		o.WriteBytes(text)
 		return
 	}
 	if k == TkInt {
-		o.putStr("integer literal ")
-		o.putBytes(text)
+		o.WriteString("integer literal ")
+		o.WriteBytes(text)
 		return
 	}
 	if k == TkString {
-		o.putStr("string literal ")
-		o.putBytes(text)
+		o.WriteString("string literal ")
+		o.WriteBytes(text)
 		return
 	}
 	if k == TkChar {
-		o.putStr("char literal ")
-		o.putBytes(text)
+		o.WriteString("char literal ")
+		o.WriteBytes(text)
 		return
 	}
 	if k == TkIllegal {
-		o.putStr("invalid token")
+		o.WriteString("invalid token")
 		return
 	}
 	if isKeyword(k) {
-		o.putStr("keyword ")
-		o.putStr(kindString(k))
+		o.WriteString("keyword ")
+		o.WriteString(kindString(k))
 		return
 	}
-	o.putByte('\'')
-	o.putStr(kindString(k))
-	o.putByte('\'')
+	o.WriteByte('\'')
+	o.WriteString(kindString(k))
+	o.WriteByte('\'')
 }
 
 func isLetter(c byte) bool {
@@ -506,28 +506,28 @@ func checkIntLit(lit []byte) (u64, u8, byte, u64) {
 func putIntLitError(o *OutBuf, lit []byte) {
 	_, st, c, base := checkIntLit(lit)
 	if st == IntBadDigit {
-		o.putStr("invalid digit ")
+		o.WriteString("invalid digit ")
 		putQuotedByte(o, c)
-		o.putStr(" in base-")
-		o.putUint(base)
-		o.putStr(" literal ")
+		o.WriteString(" in base-")
+		o.WriteUint(base)
+		o.WriteString(" literal ")
 		putQuoted(o, lit)
 		return
 	}
 	if st == IntOverflow {
-		o.putStr("integer literal ")
+		o.WriteString("integer literal ")
 		putQuoted(o, lit)
-		o.putStr(" overflows u64")
+		o.WriteString(" overflows u64")
 		return
 	}
-	o.putStr("invalid integer literal ")
+	o.WriteString("invalid integer literal ")
 	putQuoted(o, lit)
 	if st == IntNoDigits {
-		o.putStr(": no digits")
+		o.WriteString(": no digits")
 	} else if st == IntLeadZero {
-		o.putStr(": leading zero (octal literals are not supported)")
+		o.WriteString(": leading zero (octal literals are not supported)")
 	} else {
-		o.putStr(": '_' must separate digits")
+		o.WriteString(": '_' must separate digits")
 	}
 }
 
@@ -544,41 +544,41 @@ func lexErrCode(t Token) u32 {
 func putLexError(o *OutBuf, t Token, text []byte) {
 	k := t.errKind
 	if k == LexErrUntermComment {
-		o.putStr("unterminated block comment")
+		o.WriteString("unterminated block comment")
 	} else if k == LexErrBadUTF8 {
-		o.putStr("invalid UTF-8 byte 0x")
-		o.putHex(u64(t.errByte), 2, true)
+		o.WriteString("invalid UTF-8 byte 0x")
+		o.WriteHex(u64(t.errByte), 2, true)
 	} else if k == LexErrBadChar {
-		o.putStr("invalid character ")
+		o.WriteString("invalid character ")
 		r := t.val
 		if r >= 0x20 && r < 0x7F {
 			putQuotedByte(o, byte(r))
-			o.putStr(" (U+")
+			o.WriteString(" (U+")
 			putHexMin(o, r, 4)
-			o.putByte(')')
+			o.WriteByte(')')
 		} else {
-			o.putStr("U+")
+			o.WriteString("U+")
 			putHexMin(o, r, 4)
 		}
 	} else if k == LexErrBadInt {
 		putIntLitError(o, text)
 	} else if k == LexErrUntermString {
-		o.putStr("unterminated string literal")
+		o.WriteString("unterminated string literal")
 	} else if k == LexErrBadEscape {
-		o.putStr("invalid escape sequence \\")
+		o.WriteString("invalid escape sequence \\")
 		putCharVerb(o, t.errByte)
 	} else if k == LexErrBadHexEscape {
-		o.putStr("invalid \\x escape: need exactly two hex digits")
+		o.WriteString("invalid \\x escape: need exactly two hex digits")
 	} else if k == LexErrUntermChar {
-		o.putStr("unterminated char literal")
+		o.WriteString("unterminated char literal")
 	} else if k == LexErrEmptyChar {
-		o.putStr("empty char literal")
+		o.WriteString("empty char literal")
 	} else if k == LexErrCharMultiByte {
-		o.putStr("char literal must be a single byte (ASCII character or escape)")
+		o.WriteString("char literal must be a single byte (ASCII character or escape)")
 	} else if k == LexErrCharLen {
-		o.putStr("char literal must contain exactly one byte")
+		o.WriteString("char literal must contain exactly one byte")
 	} else {
-		o.putStr("invalid token")
+		o.WriteString("invalid token")
 	}
 }
 
@@ -620,10 +620,10 @@ func decodeStringLit(o *OutBuf, raw []byte) {
 		}
 		if raw[i] == '\\' {
 			b, w := decodeEscapeAt(raw, i)
-			o.putByte(b)
+			o.WriteByte(b)
 			i += w
 		} else {
-			o.putByte(raw[i])
+			o.WriteByte(raw[i])
 			i++
 		}
 	}
@@ -1180,17 +1180,13 @@ func (l *Lexer) skipCharRest() {
 // tokenize scans a whole file into ta. The token list always ends with
 // EOF. It returns false if the token arena overflowed.
 func tokenize(l *Lexer, ta *TokenArena) bool {
-	ta.count = 0
-	ta.full = false
+	ta.Reset()
 	lim := l.n + 2
 	for g := usize(0); g < lim; g++ {
 		t := l.nextToken()
-		if ta.count >= MaxTokens {
-			ta.full = true
+		if !ta.Push(t) {
 			return false
 		}
-		ta.items[ta.count] = t
-		ta.count++
 		if t.kind == TkEOF {
 			return true
 		}

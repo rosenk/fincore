@@ -18,7 +18,7 @@ var fmtBuf OutBuf
 
 // fmtOut copies the scratch text into dst.
 func fmtOut(dst []byte) usize {
-	return copy(dst, fmtBuf.data[:fmtBuf.len])
+	return copy(dst, (&fmtBuf).Bytes())
 }
 
 // TypeRef renders a type (types.TypeString).
@@ -26,7 +26,7 @@ type TypeRef u32
 
 func (t TypeRef) Format(dst []byte) usize {
 	o := &fmtBuf
-	o.reset()
+	o.Reset()
 	putType(o, u32(t), SemaDepth)
 	return fmtOut(dst)
 }
@@ -36,7 +36,7 @@ type ValRef Val
 
 func (v ValRef) Format(dst []byte) usize {
 	o := &fmtBuf
-	o.reset()
+	o.Reset()
 	putVal(o, Val(v), SemaDepth)
 	return fmtOut(dst)
 }
@@ -46,10 +46,10 @@ type Expr u32
 
 func (e Expr) Format(dst []byte) usize {
 	o := &fmtBuf
-	o.reset()
+	o.Reset()
 	writeExpr(o, u32(e), SemaDepth)
-	if fmtBuf.len > 60 {
-		return formatTo(dst, "%s...", fmtBuf.data[:57])
+	if o.Len() > 60 {
+		return formatTo(dst, "%s...", o.Bytes()[:57])
 	}
 	return fmtOut(dst)
 }
@@ -67,7 +67,7 @@ type Quoted []byte
 
 func (q Quoted) Format(dst []byte) usize {
 	o := &fmtBuf
-	o.reset()
+	o.Reset()
 	putQuoted(o, q)
 	return fmtOut(dst)
 }
@@ -82,7 +82,7 @@ func (n PosRef) Format(dst []byte) usize {
 
 // putMsg appends mbuf[:k] (formatted by the caller) to an output buffer.
 func putMsg(o *OutBuf, k usize) {
-	o.putBytes(mbuf[:k])
+	o.WriteBytes(mbuf[:k])
 }
 
 // tooMany is the quantifier of arity messages ("too many arguments ...").

@@ -328,7 +328,7 @@ func cgCountScopes() usize {
 
 func cgStashStr(s string) {
 	o := &cgStash
-	o.putStr(s)
+	o.WriteString(s)
 }
 
 func cgReturnStmt(s u32, dp usize) decreases(dp) {
@@ -352,7 +352,7 @@ func cgReturnStmt(s u32, dp usize) decreases(dp) {
 		return
 	}
 	// Evaluate the results inside the scope, then wait, then return.
-	smark := cgStash.len
+	smark := (&cgStash).Len()
 	if nres == 1 && nw > 1 {
 		r0 := l1at(s, 0)
 		cs := cgConstValueSlot(r0)
@@ -414,9 +414,9 @@ func cgReturnStmt(s u32, dp usize) decreases(dp) {
 	}
 	_ = cgWaitScopes()
 	cgW("return ")
-	cgStashEmit(smark, cgStash.len)
+	cgStashEmit(smark, (&cgStash).Len())
 	cgWc('\n')
-	cgStash.len = smark
+	(&cgStash).Truncate(smark)
 }
 
 func cgIfStmt(s u32, dp usize) decreases(dp) {

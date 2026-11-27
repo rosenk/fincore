@@ -595,7 +595,7 @@ func lnCollectVars(fl u32, n u32, dp usize) decreases(dp) {
 			start, cnt := slotList(nd, slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				lnCollectVars(fl, nodes.lists[usize(start)+j], dp-1)
+				lnCollectVars(fl, listAt(start, j), dp-1)
 			}
 		} else {
 			lnCollectVars(fl, slotChild(nd, slot), dp-1)
