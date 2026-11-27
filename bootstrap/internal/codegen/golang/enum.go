@@ -421,6 +421,8 @@ func (f *fnCtx) patTest(p ast.Pattern, s subject) (cond string, compound bool) {
 			parts[i] = c
 		}
 		return "(" + strings.Join(parts, " || ") + ")", false
+	case *ast.AtPattern:
+		return f.patTest(p.Pattern, s)
 	case *ast.Ident:
 		if v := f.g.info.VariantAt(p); v != nil {
 			return s.paths[0] + "._tag == " + strconv.Itoa(v.Index), false
@@ -473,6 +475,9 @@ func (f *fnCtx) patBindings(p ast.Pattern, t types.Type, region ast.Node, out *[
 		}
 	case *ast.OrPattern:
 		f.patBindings(p.Alts[0], t, region, out)
+	case *ast.AtPattern:
+		f.patBindings(p.Name, t, region, out)
+		f.patBindings(p.Pattern, t, region, out)
 	case *ast.Ident:
 		if sym := f.g.p.Prog.Defs[p.ID()]; sym != nil && f.bindUsed(sym, region) {
 			*out = append(*out, patBinding{sym: sym, name: f.g.p.Name(sym), typ: t})
@@ -534,6 +539,11 @@ func (f *fnCtx) emitBinds(p ast.Pattern, s subject, region ast.Node, assign bool
 			}
 		}
 		f.w.WriteString("}\n")
+	case *ast.AtPattern:
+		// v0.2: x is assigned from the path of its position, before the
+		// bindings of P.
+		f.emitBinds(p.Name, s, region, assign)
+		f.emitBinds(p.Pattern, s, region, assign)
 	case *ast.Ident:
 		if sym := f.g.p.Prog.Defs[p.ID()]; sym != nil && f.bindUsed(sym, region) {
 			op := ":="
@@ -738,6 +748,8 @@ func (f *fnCtx) singleTest(p ast.Pattern) bool {
 	switch p := p.(type) {
 	case *ast.LiteralPattern:
 		return true
+	case *ast.AtPattern:
+		return f.singleTest(p.Pattern)
 	case *ast.CtorPattern:
 		for _, a := range p.Args {
 			switch b := a.(type) {

@@ -1,0 +1,22 @@
+// fail_at_pattern_const (v0.2): the name before '@' is always a binding;
+// a constant there is E2002 (match the constant as the pattern instead).
+package main
+
+type Call enum {
+	Builtin(u8, u32)
+	User(u32)
+}
+
+const BFCopy u8 = 9
+
+func f(c Call) u32 {
+	return match c {
+		Builtin(BFCopy @ 9, n) -> n // ERROR E2002
+		_ -> 0
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(Call.User(1))
+	return nil
+}

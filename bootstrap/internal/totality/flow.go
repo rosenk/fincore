@@ -261,6 +261,9 @@ func (w *walker) killPattern(p ast.Pattern, st *state) {
 		for _, a := range p.Elems {
 			w.killPattern(a, st)
 		}
+	case *ast.AtPattern:
+		w.killPattern(p.Name, st) // v0.2: `x @ P`
+		w.killPattern(p.Pattern, st)
 	}
 }
 

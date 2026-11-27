@@ -914,6 +914,10 @@ func wPatternBindings(p u32, x u32, depth usize) decreases(depth) {
 				wPatternBindings(l1at(p, i), l1at(x, i), depth-1)
 			}
 		}
+	} else if k == NkAtPattern {
+		// v0.2: `x @ P` binds x to the same value as P's position.
+		wPatternBindings(na(p), x, depth-1)
+		wPatternBindings(nb(p), x, depth-1)
 	}
 }
 

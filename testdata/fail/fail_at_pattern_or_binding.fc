@@ -1,0 +1,19 @@
+// fail_at_pattern_or_binding (v0.2): an '@' binding counts like every
+// other binding for or-patterns; the second alternative does not bind w.
+package main
+
+type T enum {
+	A(u32)
+	B(u32)
+}
+
+func f(t T) u32 {
+	return match t {
+		(w @ A(n)) | B(n) -> n // ERROR E2002
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(T.A(1))
+	return nil
+}

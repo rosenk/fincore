@@ -61,11 +61,11 @@ func TestKeywords(t *testing.T) {
 }
 
 func TestOperators(t *testing.T) {
-	src := "+ - * / % & | ^ << >> == != < <= > >= && || ! = := += -= *= /= ++ -- ( ) [ ] { } , . : ; -> ..."
+	src := "+ - * / % & | ^ << >> == != < <= > >= && || ! = := += -= *= /= ++ -- ( ) [ ] { } , . : ; -> ... .. @"
 	toks := lex(t, src)
 	want := []Kind{ADD, SUB, MUL, QUO, REM, AND, OR, XOR, SHL, SHR, EQL, NEQ, LSS, LEQ, GTR, GEQ, LAND, LOR, NOT,
 		ASSIGN, DEFINE, ADD_ASSIGN, SUB_ASSIGN, MUL_ASSIGN, QUO_ASSIGN, INC, DEC,
-		LPAREN, RPAREN, LBRACK, RBRACK, LBRACE, RBRACE, COMMA, PERIOD, COLON, SEMICOLON, ARROW, ELLIPSIS}
+		LPAREN, RPAREN, LBRACK, RBRACK, LBRACE, RBRACE, COMMA, PERIOD, COLON, SEMICOLON, ARROW, ELLIPSIS, DOTDOT, AT}
 	var got []Kind
 	for _, tk := range toks {
 		if tk.Kind == EOF || tk.Kind == SEMICOLON && tk.Lit != ";" {
@@ -231,7 +231,7 @@ func TestErrors(t *testing.T) {
 		{`'a`, "1:1 E1002", "unterminated char"},
 		{"'", "1:1 E1002", "unterminated char"},
 		{"x /* never closed", "1:3 E1002", "unterminated block comment"},
-		{"x @ y", "1:3 E1001", "invalid character '@'"},
+		{"x ~ y", "1:3 E1001", "invalid character '~'"},
 		{"a $", "1:3 E1001", "invalid character"},
 		{"a # b", "1:3 E1001", "invalid character"},
 		{"π", "1:1 E1001", "U+03C0"},
@@ -253,7 +253,7 @@ func TestErrors(t *testing.T) {
 		{"10_", "1:1 E1001", "'_' must separate digits"},
 		{"012", "1:1 E1001", "leading zero"},
 		{"18446744073709551616", "1:1 E1001", "overflows u64"},
-		{"\n\n  @", "3:3 E1001", "invalid character"},
+		{"\n\n  ~", "3:3 E1001", "invalid character"},
 	}
 	for _, c := range cases {
 		toks, diags := Tokenize("t.fc", []byte(c.src))
@@ -281,7 +281,7 @@ func TestErrors(t *testing.T) {
 }
 
 func TestRecoveryAfterError(t *testing.T) {
-	toks, diags := Tokenize("t.fc", []byte("a @ b\n\"x\ny"))
+	toks, diags := Tokenize("t.fc", []byte("a ~ b\n\"x\ny"))
 	if len(diags) != 2 {
 		t.Fatalf("want 2 diags, got %v", diags)
 	}

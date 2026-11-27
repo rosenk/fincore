@@ -735,6 +735,10 @@ func (w *walker) patternBindings(p ast.Pattern, x ast.Expr) {
 				w.patternBindings(a, te.Elems[i])
 			}
 		}
+	case *ast.AtPattern:
+		// v0.2: `x @ P` binds x to the same value as P's position.
+		w.patternBindings(p.Name, x)
+		w.patternBindings(p.Pattern, x)
 	}
 }
 

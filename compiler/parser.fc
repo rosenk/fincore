@@ -1492,10 +1492,12 @@ func (p *Parser) patterns(payload bool, depth usize) u32 decreases(depth) {
 		return p.tooDeep()
 	}
 	s := p.start()
+	bare := p.tok.kind == TkIdent
 	first := p.patternAlt(payload, depth-1)
 	if p.tok.kind != TkOr {
 		return first
 	}
+	p.bareAt(first, bare)
 	op := p.mk(NkOrPattern, s)
 	mark := p.ls.Mark()
 	p.ls.Push(first)
@@ -1505,10 +1507,34 @@ func (p *Parser) patterns(payload bool, depth usize) u32 decreases(depth) {
 			break
 		}
 		p.next()
-		p.ls.Push(p.patternAlt(payload, depth-1))
+		bare = p.tok.kind == TkIdent
+		alt := p.patternAlt(payload, depth-1)
+		p.bareAt(alt, bare)
+		p.ls.Push(alt)
 	}
 	p.setL1(op, mark)
 	return p.finish(op)
+}
+
+// bareAt rejects an unparenthesized `x @ P` alternative of an or-pattern
+// (v0.2): `x @ A | B` must be written `x @ (A | B)` or `(x @ A) | B`.
+// bare is set if the alternative started with an identifier.
+func (p *Parser) bareAt(alt u32, bare bool) {
+	if !bare || alt == 0 || p.kindOf(alt) != NkAtPattern {
+		return
+	}
+	n := p.na.items[usize(alt)]
+	if !p.errBegin(n.sLine, n.sCol, E1001) {
+		return
+	}
+	id := p.na.items[usize(n.a)]
+	name := p.src[usize(id.tOff) : usize(id.tOff)+usize(id.tLen)]
+	p.diag.WriteString("ambiguous '@' pattern in an or-pattern: write ")
+	p.diag.WriteBytes(name)
+	p.diag.WriteString(" @ (P | Q) or (")
+	p.diag.WriteBytes(name)
+	p.diag.WriteString(" @ P) | Q")
+	p.errEnd()
 }
 
 // payloadListPush pushes the patterns between the parentheses of a variant
@@ -1587,6 +1613,7 @@ func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
 // patternAlt parses one alternative (v0.2 grammar):
 //
 //	PatternAlt = "_" | IDENT [ "." IDENT ] [ "(" [ PayloadList ] ")" ]
+//	           | IDENT "@" PatternAlt
 //	           | [ "-" ] Literal | "(" Patterns { "," Patterns } ")" .
 //
 // In a payload position a bare IDENT (not followed by '.' or '(') is an
@@ -1607,6 +1634,15 @@ func (p *Parser) patternAltBody(payload bool, depth usize) u32 decreases(depth) 
 	}
 	s := p.start()
 	k := p.tok.kind
+	if k == TkIdent && p.peek(1).kind == TkAt {
+		// v0.2: `name @ PatternAlt` binds name to the value matched by
+		// the pattern.
+		at := p.mk(NkAtPattern, s)
+		p.setA(at, p.ident())
+		p.next()
+		p.setB(at, p.patternAlt(payload, depth-1))
+		return p.finish(at)
+	}
 	if k == TkIdent {
 		if payload {
 			k1 := p.peek(1).kind

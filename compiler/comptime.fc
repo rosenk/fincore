@@ -841,6 +841,15 @@ func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
 		s := nval[usize(na(p))]
 		return s != 0 && valsEqual(x, slotGet(s))
 	}
+	if k == NkAtPattern {
+		if !imatchPat(nb(p), x, depth-1) {
+			return false
+		}
+		if defs[usize(na(p))] != 0 {
+			define(defs[usize(na(p))], x) // v0.2: `x @ P`
+		}
+		return true
+	}
 	if k == NkOrPattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {

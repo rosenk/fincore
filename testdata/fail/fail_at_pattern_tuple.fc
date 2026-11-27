@@ -1,0 +1,14 @@
+// fail_at_pattern_tuple (v0.2): a tuple scrutinee cannot be bound as a
+// whole, with '@' neither (tuples have no value representation).
+package main
+
+func f(a u32, b u32) u32 {
+	return match (a, b) {
+		t @ (x, _) -> x // ERROR E2002
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(1, 2)
+	return nil
+}

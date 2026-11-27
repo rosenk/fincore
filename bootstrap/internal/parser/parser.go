@@ -1025,16 +1025,30 @@ func (p *parser) pattern() ast.Pattern {
 // enum type, decided by the type checker).
 func (p *parser) patterns(payload bool) ast.Pattern {
 	start := p.start()
+	bare := p.tok.Kind == lexer.IDENT
 	first := p.patternAlt(payload)
 	if p.tok.Kind != lexer.OR {
 		return first
 	}
+	p.bareAt(first, bare)
 	op := &ast.OrPattern{Alts: []ast.Pattern{first}}
 	for p.tok.Kind == lexer.OR {
 		p.next()
-		op.Alts = append(op.Alts, p.patternAlt(payload))
+		bare = p.tok.Kind == lexer.IDENT
+		alt := p.patternAlt(payload)
+		p.bareAt(alt, bare)
+		op.Alts = append(op.Alts, alt)
 	}
 	return finish(p, op, start)
+}
+
+// bareAt rejects an unparenthesized `x @ P` alternative of an or-pattern
+// (v0.2): `x @ A | B` must be written `x @ (A | B)` or `(x @ A) | B`.
+// bare is set if the alternative started with an identifier.
+func (p *parser) bareAt(alt ast.Pattern, bare bool) {
+	if at, ok := alt.(*ast.AtPattern); ok && bare {
+		p.errorAt(at.Range, "ambiguous '@' pattern in an or-pattern: write %s @ (P | Q) or (%s @ P) | Q", at.Name.Name, at.Name.Name)
+	}
 }
 
 // payloadList parses the patterns between the parentheses of a variant
@@ -1099,6 +1113,7 @@ func (p *parser) matchExpr() *ast.MatchExpr {
 // patternAlt parses one alternative (v0.2 grammar):
 //
 //	PatternAlt = "_" | IDENT [ "." IDENT ] [ "(" [ PayloadList ] ")" ]
+//	           | IDENT "@" PatternAlt
 //	           | [ "-" ] Literal | "(" Patterns { "," Patterns } ")" .
 //
 // In a payload position a bare IDENT (not followed by '.' or '(') is an
@@ -1109,6 +1124,14 @@ func (p *parser) patternAlt(payload bool) ast.Pattern {
 	start := p.start()
 	switch p.tok.Kind {
 	case lexer.IDENT:
+		if p.peek(1).Kind == lexer.AT {
+			// v0.2: `name @ PatternAlt` binds name to the value matched
+			// by the pattern.
+			at := &ast.AtPattern{Name: p.ident()}
+			p.next()
+			at.Pattern = p.patternAlt(payload)
+			return finish(p, at, start)
+		}
 		if payload {
 			if k := p.peek(1).Kind; k != lexer.PERIOD && k != lexer.LPAREN {
 				return p.ident()

@@ -746,6 +746,9 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 		cgWc(')')
 		return false
 	}
+	if k == NkAtPattern {
+		return cgPatTest(nb(p), s, sn, dp-1)
+	}
 	if k == NkIdent {
 		if nvarEnum[usize(p)] != 0 {
 			cgWPath(s)
@@ -848,6 +851,9 @@ func cgPatBindings(p u32, t u32, s usize, sn usize, region u32, dp usize) decrea
 		if l1len(p) > 0 {
 			cgPatBindings(l1at(p, 0), t, s, sn, region, dp-1)
 		}
+	} else if k == NkAtPattern {
+		cgPatBindings(na(p), t, s, sn, region, dp-1)
+		cgPatBindings(nb(p), t, s, sn, region, dp-1)
 	} else if k == NkIdent {
 		sym := defs[usize(p)]
 		if sym != 0 && cgBindUsed(sym, region) {
@@ -941,6 +947,11 @@ func cgEmitBinds(p u32, s usize, sn usize, x u32, region u32, assign bool, dp us
 			}
 		}
 		cgW("}\n")
+	} else if k == NkAtPattern {
+		// v0.2: x is assigned from the path of its position, before the
+		// bindings of P.
+		cgEmitBinds(na(p), s, sn, x, region, assign, dp-1)
+		cgEmitBinds(nb(p), s, sn, x, region, assign, dp-1)
 	} else if k == NkIdent {
 		sym := defs[usize(p)]
 		if sym != 0 && cgBindUsed(sym, region) {
@@ -1220,7 +1231,8 @@ func cgIsExpr(e u32, dp usize) decreases(dp) {
 // cgSingleTest reports whether the test of p reads the subject once: a
 // literal, a constant or a variant whose payload patterns are bindings,
 // '_' or '..'.
-func cgSingleTest(p u32) bool {
+func cgSingleTest(p0 u32) bool {
+	p := stripAt(p0) // v0.2: `x @ P` tests P
 	k := nkind(p)
 	if k == NkLiteralPattern {
 		return true

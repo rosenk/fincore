@@ -92,6 +92,7 @@ const (
 	TkArrow     = 77 // ->
 	TkEllipsis  = 78 // ...
 	TkDotDot    = 79 // .. (v0.2 rest pattern)
+	TkAt        = 80 // @ (v0.2 `name @ pattern` binding)
 )
 
 // Lexical error reasons (Token.errKind of ILLEGAL tokens).
@@ -225,6 +226,7 @@ func operatorString(k u8) string {
 		TkArrow -> "->"
 		TkEllipsis -> "..."
 		TkDotDot -> ".."
+		TkAt -> "@"
 		_ -> "Kind(?)"
 	}
 }
@@ -821,6 +823,7 @@ func (l *Lexer) opKind() (u8, usize) {
 		'{' -> return TkLBrace, 1
 		'}' -> return TkRBrace, 1
 		',' -> return TkComma, 1
+		'@' -> return TkAt, 1
 		';' -> return TkSemicolon, 1
 		'.' -> {
 			if n1 == '.' && n2 == '.' {

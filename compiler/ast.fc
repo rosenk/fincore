@@ -37,6 +37,7 @@
 //	WildcardPattern                      CtorPattern a Qual?  b Name  Flag1 HasParens  l1 Args
 //	LiteralPattern  a Lit                OrPattern  l1 Alts  (v0.2)
 //	TuplePattern    l1 Elems             RestPattern  (v0.2)
+//	AtPattern       a Name  b Pattern  (v0.2)
 //	ForStmt         Flag1 Driver  Flag2 ThreeClause  a Init?  b Cond?  c Post?  d Decreases?  e Body
 //	ScopeStmt       a Name  b Value  c Body
 //	DeferStmt       a X   ReturnStmt l1 Results   BreakStmt   ContinueStmt
@@ -124,6 +125,7 @@ const (
 	NkRestPattern  = 78 // v0.2
 	NkTupleExpr    = 79 // v0.2
 	NkIsExpr       = 80 // v0.2
+	NkAtPattern    = 81 // v0.2
 )
 
 // Node slots (see layout).
@@ -326,6 +328,7 @@ func kindName(k u8) string {
 		NkRestPattern -> "RestPattern"
 		NkTupleExpr -> "TupleExpr"
 		NkIsExpr -> "IsExpr"
+		NkAtPattern -> "AtPattern"
 		_ -> "Node?"
 	}
 }
@@ -403,6 +406,7 @@ func layout(k u8, i usize) (u8, string) {
 		NkOrPattern -> return layout1(i, SlotL1, "Alts")
 		NkTuplePattern | NkTupleExpr -> return layout1(i, SlotL1, "Elems")
 		NkIsExpr -> return layout2(i, SlotA, "X", SlotB, "Pattern")
+		NkAtPattern -> return layout2(i, SlotA, "Name", SlotB, "Pattern")
 		_ -> return SlotNone, ""
 	}
 }
@@ -975,7 +979,30 @@ func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
 			pr.printNode(n.b, depth-1)
 		}
 	} else if k == NkOrPattern {
-		pr.printList(n.l1s, n.l1n, " | ", false, depth-1)
+		m := usize(n.l1n)
+		for i := usize(0); i < m; i++ {
+			if i > 0 {
+				o.WriteString(" | ")
+			}
+			a := pr.na.listItem(n.l1s, i)
+			if pr.na.items[usize(a)].kind == NkAtPattern {
+				o.WriteString("(")
+				pr.printNode(a, depth-1)
+				o.WriteString(")")
+			} else {
+				pr.printNode(a, depth-1)
+			}
+		}
+	} else if k == NkAtPattern {
+		pr.name(n.a)
+		o.WriteString(" @ ")
+		if pr.na.items[usize(n.b)].kind == NkOrPattern {
+			o.WriteString("(")
+			pr.printNode(n.b, depth-1)
+			o.WriteString(")")
+		} else {
+			pr.printNode(n.b, depth-1)
+		}
 	} else if k is NkTuplePattern | NkTupleExpr {
 		o.WriteString("(")
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)

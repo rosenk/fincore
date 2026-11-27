@@ -214,6 +214,9 @@ func Children(n Node) []Node {
 			add(a)
 		}
 	case *RestPattern:
+	case *AtPattern:
+		add(n.Name)
+		add(n.Pattern)
 	case *ForStmt:
 		addS(n.Init)
 		addE(n.Cond)

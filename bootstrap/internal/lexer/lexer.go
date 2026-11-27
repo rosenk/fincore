@@ -289,6 +289,8 @@ func (l *Lexer) operator(start diag.Pos) Token {
 		k = RBRACE
 	case ',':
 		k = COMMA
+	case '@':
+		k = AT
 	case ';':
 		k = SEMICOLON
 	case '.':

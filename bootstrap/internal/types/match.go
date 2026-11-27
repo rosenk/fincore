@@ -227,6 +227,14 @@ func MatchValue(info *Info, p ast.Pattern, v Value, bind func(sym *resolve.Symbo
 			}
 		}
 		return true
+	case *ast.AtPattern:
+		if !MatchValue(info, p.Pattern, v, bind) {
+			return false
+		}
+		if sym, _ := info.PatBinding(p.Name); bind != nil && sym != nil {
+			bind(sym, v)
+		}
+		return true
 	}
 	return false
 }
@@ -307,6 +315,21 @@ func walkPattern(p ast.Pattern, f func(ast.Pattern)) {
 		for _, a := range p.Elems {
 			walkPattern(a, f)
 		}
+	case *ast.AtPattern:
+		walkPattern(p.Name, f) // the binding, visited like a payload name
+		walkPattern(p.Pattern, f)
+	}
+}
+
+// stripAt returns the pattern under the `x @` prefixes of p (v0.2): for
+// usefulness and catch-all tests `x @ P` is exactly P.
+func stripAt(p ast.Pattern) ast.Pattern {
+	for {
+		at, ok := p.(*ast.AtPattern)
+		if !ok {
+			return p
+		}
+		p = at.Pattern
 	}
 }
 
@@ -475,6 +498,15 @@ func (c *Checker) pat(p ast.Pattern, t Type, payload bool, out *[]binding) bool 
 		return c.ctorPat(p, t, out)
 	case *ast.OrPattern:
 		return c.orPat(p, t, payload, out)
+	case *ast.AtPattern:
+		// v0.2: the name binds the value at this position (declared by
+		// the resolver unless it was rejected there).
+		c.info.Types[p.Name.ID()] = t
+		valid := c.bindPat(p.Name, t, out)
+		if !c.pat(p.Pattern, t, payload, out) {
+			valid = false
+		}
+		return valid
 	case *ast.TuplePattern:
 		tt, ok := t.(*Tuple)
 		if !ok {
@@ -715,7 +747,7 @@ func (c *Checker) checkCoverage(at diag.SourceSpan, t Type, arms []*ast.MatchArm
 			if _, ok := wild.(*ast.WildcardPattern); ok {
 				c.errorf(diag.E2012, arm.Pattern.Span(), "unreachable match arm: it follows the '_' arm")
 			} else {
-				c.errorf(diag.E2012, arm.Pattern.Span(), "unreachable match arm: it follows the catch-all binding %s", BareName(wild).Name)
+				c.errorf(diag.E2012, arm.Pattern.Span(), "unreachable match arm: it follows the catch-all binding %s", catchAllName(wild).Name)
 			}
 			continue
 		}
@@ -764,15 +796,39 @@ func (c *Checker) checkCoverage(at diag.SourceSpan, t Type, arms []*ast.MatchArm
 // catchAll reports whether a (checked) top-level pattern is '_' or a
 // binding (v0.2), which match every value.
 func (c *Checker) catchAll(p ast.Pattern) bool {
+	p = stripAt(p)
 	if _, ok := p.(*ast.WildcardPattern); ok {
 		return true
 	}
 	return c.info.IsBindingPat(p)
 }
 
+// catchAllName returns the name of a catch-all binding pattern: `x`, or
+// the outermost name of `x @ P`.
+func catchAllName(p ast.Pattern) *ast.Ident {
+	if at, ok := p.(*ast.AtPattern); ok {
+		return at.Name
+	}
+	return BareName(p)
+}
+
 // reportUnreachable reports an alternative that matches no value left by
 // the earlier arms.
 func (c *Checker) reportUnreachable(alt ast.Pattern, t Type) {
+	if at, ok := alt.(*ast.AtPattern); ok {
+		// v0.2: `x @ P` is reported as P, or as the binding x if P
+		// matches every value.
+		if !c.catchAll(at) {
+			c.reportUnreachable(stripAt(at), t)
+			return
+		}
+		if _, ok := t.Underlying().(*Enum); ok {
+			c.errorf(diag.E2012, at.Range, "unreachable binding %s: all variants of %s are covered", at.Name.Name, t)
+		} else {
+			c.errorf(diag.E2012, at.Range, "unreachable binding %s: all values of %s are covered", at.Name.Name, t)
+		}
+		return
+	}
 	switch p := alt.(type) {
 	case *ast.WildcardPattern:
 		if _, ok := t.Underlying().(*Enum); ok {

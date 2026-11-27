@@ -430,6 +430,15 @@ type RestPattern struct {
 	Base
 }
 
+// AtPattern is `Name @ Pattern` (v0.2): Name is bound to the value at its
+// position, which must also match Pattern. Pattern is never an
+// unparenthesized or-pattern alternative (`x @ (A | B)`).
+type AtPattern struct {
+	Base
+	Name    *Ident
+	Pattern Pattern
+}
+
 // ForStmt is `[driver] for [header] [decreases(M)] Body`.
 //
 // Forms: `for {}` (all nil), `for Cond {}` (Cond only), and the three-clause
@@ -734,4 +743,5 @@ func (*LiteralPattern) patternNode()  {}
 func (*OrPattern) patternNode()       {}
 func (*TuplePattern) patternNode()    {}
 func (*RestPattern) patternNode()     {}
+func (*AtPattern) patternNode()       {}
 func (*Ident) patternNode()           {}

@@ -691,9 +691,29 @@ func (b *binder) patternNames(p ast.Pattern, declare bool) {
 			for _, a := range p.Elems {
 				walk(a)
 			}
+		case *ast.AtPattern:
+			// v0.2: the name before '@' is always a binding.
+			id := p.Name
+			switch {
+			case id.Name == "_":
+				b.errorf(diag.E2002, id.Range, "cannot bind _ with '@' (write the pattern alone)")
+			case b.isConstName(id.Name):
+				b.errorf(diag.E2002, id.Range, "cannot bind %s with '@': %s is a constant", id.Name, id.Name)
+			case b.variantNames[id.Name]:
+				b.errorf(diag.E2002, id.Range, "cannot bind %s with '@': %s is the name of a variant", id.Name, id.Name)
+			default:
+				bare(id)
+			}
+			walk(p.Pattern)
 		}
 	}
 	walk(p)
+}
+
+// isConstName reports whether name resolves to a constant in scope.
+func (b *binder) isConstName(name string) bool {
+	sym := b.scope.Lookup(name)
+	return sym != nil && sym.Kind == SymConst
 }
 
 // ifStmt binds an if statement (v0.2 `is` flow bindings): the bindings of

@@ -629,7 +629,7 @@ func TestErrors(t *testing.T) {
 		{"package p\nfunc f() {\n\tif x := 1; {\n\t}\n}", "3:13: error[E1001]: missing condition in if statement"},
 		{"package p\nfunc f() {\n\ts := \"abc\n}", "3:7: error[E1002]: unterminated string literal"},
 		{"package p\n/* open", "2:1: error[E1002]: unterminated block comment"},
-		{"package p\nfunc f() {\n\tx := 1 @ 2\n}", "3:9: error[E1001]: invalid character '@'"},
+		{"package p\nfunc f() {\n\tx := 1 ~ 2\n}", "3:9: error[E1001]: invalid character '~'"},
 		{"package p\nfunc f() {}\nimport \"x\"", "3:1: error[E1001]: imports must appear before other declarations"},
 		{"package p\nfunc f() {\n\ta[]\n}", "3:4: error[E1001]: expected index expression, found ']'"},
 		{"package p\nvar x = T{1}", "2:11: error[E1001]: expected field initializer 'name: value', found integer literal 1"},

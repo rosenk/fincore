@@ -63,11 +63,16 @@ type wtok struct {
 
 // row returns the matrix row of an arm alternative.
 func (u *usefulness) row(alt ast.Pattern, n int, isTuple bool) []ast.Pattern {
+	alt = stripAt(alt)
 	if !isTuple {
 		return []ast.Pattern{alt}
 	}
 	if tp, ok := alt.(*ast.TuplePattern); ok {
-		return append([]ast.Pattern(nil), tp.Elems...)
+		out := make([]ast.Pattern, len(tp.Elems))
+		for i, el := range tp.Elems {
+			out[i] = stripAt(el)
+		}
+		return out
 	}
 	return make([]ast.Pattern, n)
 }
@@ -131,7 +136,7 @@ func (u *usefulness) args(p ast.Pattern, a int) []ast.Pattern {
 			if _, ok := x.(*ast.RestPattern); ok {
 				continue
 			}
-			out[PayloadIndex(cp, i, a)] = x
+			out[PayloadIndex(cp, i, a)] = stripAt(x)
 		}
 	}
 	return out
@@ -141,7 +146,7 @@ func (u *usefulness) args(p ast.Pattern, a int) []ast.Pattern {
 func (u *usefulness) expand(row []ast.Pattern, out *[][]ast.Pattern) {
 	if op, ok := row[0].(*ast.OrPattern); ok {
 		for _, alt := range op.Alts {
-			r := append([]ast.Pattern{alt}, row[1:]...)
+			r := append([]ast.Pattern{stripAt(alt)}, row[1:]...)
 			u.expand(r, out)
 		}
 		return
@@ -223,7 +228,7 @@ func (u *usefulness) useful(rows [][]ast.Pattern, q []ast.Pattern, cols []Type, 
 	switch k {
 	case hOr:
 		for _, alt := range q[0].(*ast.OrPattern).Alts {
-			if u.useful(rows, append([]ast.Pattern{alt}, q[1:]...), cols, depth-1) {
+			if u.useful(rows, append([]ast.Pattern{stripAt(alt)}, q[1:]...), cols, depth-1) {
 				return true
 			}
 		}

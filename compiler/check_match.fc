@@ -279,6 +279,9 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 		s := nval[usize(na(p))]
 		return s != 0 && valsEqual(v, slotGet(s))
 	}
+	if k == NkAtPattern {
+		return matchVal(nb(p), v, depth-1)
+	}
 	if k == NkOrPattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {
@@ -332,6 +335,9 @@ func hasBindings(p u32, depth usize) bool decreases(depth) {
 		return true
 	}
 	k := nkind(p)
+	if k == NkAtPattern {
+		return hasBindings(na(p), depth-1) || hasBindings(nb(p), depth-1)
+	}
 	if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {
@@ -354,7 +360,10 @@ func invalidBindings(p u32, depth usize) decreases(depth) {
 		setSymType(s, TyInvalid)
 	}
 	k := nkind(p)
-	if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
+	if k == NkAtPattern {
+		invalidBindings(na(p), depth-1)
+		invalidBindings(nb(p), depth-1)
+	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {
 			invalidBindings(l1at(p, i), depth-1)
@@ -558,6 +567,16 @@ func pat(p u32, t u32, payload bool, dp usize) bool decreases(dp) {
 	if k == NkOrPattern {
 		return orPat(p, t, payload, dp-1)
 	}
+	if k == NkAtPattern {
+		// v0.2: the name binds the value at this position (declared by
+		// the resolver unless it was rejected there).
+		ntype[usize(na(p))] = t
+		valid := bindPat(na(p), t)
+		if !pat(nb(p), t, payload, dp-1) {
+			valid = false
+		}
+		return valid
+	}
 	if k == NkTuplePattern {
 		if !(trec(t) is Tuple(ts, tn)) {
 			errAt(E2002, p, formatTo(mbuf[:], "tuple pattern %v does not match type %v", PatRef(p), TypeRef(t)))
@@ -746,9 +765,32 @@ func patConst(p u32) u32 {
 }
 
 // catchAll reports whether a (checked) top-level pattern is '_' or a
-// binding (v0.2), which match every value.
+// binding (v0.2), which match every value; `x @ P` is P.
 func catchAll(p u32) bool {
-	return nkind(p) == NkWildcardPattern || isBindingPat(p)
+	q := stripAt(p)
+	return nkind(q) == NkWildcardPattern || isBindingPat(q)
+}
+
+// stripAt returns the pattern under the `x @` prefixes of p (v0.2): for
+// usefulness and catch-all tests `x @ P` is exactly P.
+func stripAt(p u32) u32 {
+	q := p
+	for g := usize(0); g < MaxNodes; g++ {
+		if q == 0 || nkind(q) != NkAtPattern {
+			break
+		}
+		q = nb(q)
+	}
+	return q
+}
+
+// catchAllName returns the name of a catch-all binding pattern: `x`, or
+// the outermost name of `x @ P`.
+func catchAllName(p u32) u32 {
+	if nkind(p) == NkAtPattern {
+		return na(p)
+	}
+	return bareName(p)
 }
 
 // ctorPat checks a variant, constant or binding pattern
@@ -918,7 +960,24 @@ func writePattern(o *OutBuf, p u32, dp usize) decreases(dp) {
 			if i > 0 {
 				o.WriteString(" | ")
 			}
-			writePattern(o, l1at(p, i), dp-1)
+			a := l1at(p, i)
+			if nkind(a) == NkAtPattern {
+				o.WriteString("(")
+				writePattern(o, a, dp-1)
+				o.WriteString(")")
+			} else {
+				writePattern(o, a, dp-1)
+			}
+		}
+	} else if k == NkAtPattern {
+		o.WriteBytes(ntext(na(p)))
+		o.WriteString(" @ ")
+		if nkind(nb(p)) == NkOrPattern {
+			o.WriteString("(")
+			writePattern(o, nb(p), dp-1)
+			o.WriteString(")")
+		} else {
+			writePattern(o, nb(p), dp-1)
 		}
 	} else if k == NkTuplePattern {
 		o.WriteString("(")
@@ -1064,7 +1123,7 @@ func uPushArgs(p u32, a usize) {
 		if nkind(x) == NkRestPattern {
 			continue
 		}
-		uStk[base+payloadIndex(p, i, a)] = x
+		uStk[base+payloadIndex(p, i, a)] = stripAt(x)
 	}
 }
 
@@ -1081,7 +1140,7 @@ func uSpecRow(row usize, w usize, h u32, t u32, kind u8, c usize, v u32, a usize
 		n := usize(0)
 		m := l1len(h)
 		for i := usize(0); i < m; i++ {
-			n += uSpecRow(row, w, l1at(h, i), t, kind, c, v, a, depth-1)
+			n += uSpecRow(row, w, stripAt(l1at(h, i)), t, kind, c, v, a, depth-1)
 		}
 		return n
 	}
@@ -1126,7 +1185,7 @@ func uDefRow(row usize, w usize, h u32, t u32, depth usize) usize decreases(dept
 		n := usize(0)
 		m := l1len(h)
 		for i := usize(0); i < m; i++ {
-			n += uDefRow(row, w, l1at(h, i), t, depth-1)
+			n += uDefRow(row, w, stripAt(l1at(h, i)), t, depth-1)
 		}
 		return n
 	}
@@ -1160,7 +1219,7 @@ func uMarkHead(h u32, t u32, base usize, depth usize) usize decreases(depth) {
 		n := usize(0)
 		m := l1len(h)
 		for i := usize(0); i < m; i++ {
-			n += uMarkHead(l1at(h, i), t, base, depth-1)
+			n += uMarkHead(stripAt(l1at(h, i)), t, base, depth-1)
 		}
 		return n
 	}
@@ -1220,7 +1279,7 @@ func useful(at usize, rows usize, qa usize, w usize, cs usize, depth usize) bool
 		m := l1len(q0)
 		for i := usize(0); i < m; i++ {
 			na2 := uTop
-			uPush(l1at(q0, i))
+			uPush(stripAt(l1at(q0, i)))
 			for j := usize(1); j < w; j++ {
 				uPush(uStk[qa+j])
 			}
@@ -1488,7 +1547,7 @@ func checkCoverage(m u32, t u32, isExpr bool) bool {
 			if nkind(wild) == NkWildcardPattern {
 				errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the '_' arm"))
 			} else {
-				errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the catch-all binding %v", NameRef(idName(bareName(wild)))))
+				errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the catch-all binding %v", NameRef(idName(catchAllName(wild)))))
 			}
 			continue
 		}
@@ -1557,14 +1616,15 @@ func checkCoverage(m u32, t u32, isExpr bool) bool {
 }
 
 // uPushRow pushes the matrix row of an arm alternative.
-func uPushRow(alt u32, w usize, isTuple bool) {
+func uPushRow(alt0 u32, w usize, isTuple bool) {
+	alt := stripAt(alt0)
 	if !isTuple {
 		uPush(alt)
 		return
 	}
 	if nkind(alt) == NkTuplePattern && l1len(alt) == w {
 		for i := usize(0); i < w; i++ {
-			uPush(l1at(alt, i))
+			uPush(stripAt(l1at(alt, i)))
 		}
 		return
 	}
@@ -1575,7 +1635,18 @@ func uPushRow(alt u32, w usize, isTuple bool) {
 
 // reportUnreachable reports an alternative that matches no value left by
 // the earlier arms.
-func reportUnreachable(alt u32, t u32) {
+func reportUnreachable(alt0 u32, t u32) {
+	if nkind(alt0) == NkAtPattern && catchAll(alt0) {
+		// v0.2: `x @ P` is reported as the binding x if P matches every
+		// value, else as P.
+		if isEnumT(underlying(t)) {
+			errAt(E2012, alt0, formatTo(mbuf[:], "unreachable binding %v: all variants of %v are covered", NameRef(idName(na(alt0))), TypeRef(t)))
+		} else {
+			errAt(E2012, alt0, formatTo(mbuf[:], "unreachable binding %v: all values of %v are covered", NameRef(idName(na(alt0))), TypeRef(t)))
+		}
+		return
+	}
+	alt := stripAt(alt0)
 	k := nkind(alt)
 	if k == NkWildcardPattern {
 		if isEnumT(underlying(t)) {

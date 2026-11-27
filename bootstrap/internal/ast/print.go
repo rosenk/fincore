@@ -390,7 +390,13 @@ func (p *printer) node(n Node) {
 			if i > 0 {
 				p.w(" | ")
 			}
-			p.node(a)
+			if _, ok := a.(*AtPattern); ok {
+				p.w("(")
+				p.node(a)
+				p.w(")")
+			} else {
+				p.node(a)
+			}
 		}
 	case *TuplePattern:
 		p.w("(")
@@ -403,6 +409,15 @@ func (p *printer) node(n Node) {
 		p.w(")")
 	case *RestPattern:
 		p.w("..")
+	case *AtPattern:
+		p.w(n.Name.Name, " @ ")
+		if _, ok := n.Pattern.(*OrPattern); ok {
+			p.w("(")
+			p.node(n.Pattern)
+			p.w(")")
+		} else {
+			p.node(n.Pattern)
+		}
 	case *TupleExpr:
 		p.w("(")
 		for i, a := range n.Elems {

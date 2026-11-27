@@ -1,0 +1,22 @@
+// at_patterns_syntax (v0.2): '@' binds a single pattern
+// alternative, and an unparenthesized `x @ A | B` is a syntax error: write
+// `x @ (A | B)` (x bound in both cases) or `(x @ A) | B`.
+package main
+
+type Color enum {
+	Red
+	Green
+	Blue
+}
+
+func f(c Color) u32 {
+	return match c {
+		x @ Red | Green -> 1
+		Blue -> 2
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(Color.Red)
+	return nil
+}

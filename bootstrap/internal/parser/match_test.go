@@ -79,3 +79,54 @@ func TestMatchExprErrors(t *testing.T) {
 		}
 	}
 }
+
+// v0.2: `name @ pattern` bindings in every position; '@' takes a single
+// alternative, so an or-pattern after it (or an '@' pattern inside an
+// or-pattern) needs parentheses.
+func TestAtPattern(t *testing.T) {
+	stmts := parseBody(t, "match v {\n\tw @ B(b @ (K | 2), ..) -> f()\n\t(x @ C) | (x @ D(_)) -> f()\n\t(a @ _, x @ y @ Some(z @ 1)) -> {}\n\tn @ (1 | 2) -> {}\n}")
+	m, ok := stmts[0].(*ast.MatchStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	want := []string{
+		"w @ B(b @ (K | 2), ..) -> f()",
+		"(x @ C) | (x @ D(_)) -> f()",
+		"(a @ _, x @ y @ Some(z @ 1)) -> {}",
+		"n @ (1 | 2) -> {}",
+	}
+	for i, a := range m.Arms {
+		if got := ast.Format(a); got != want[i] {
+			t.Errorf("arm %d: format %q, want %q", i, got, want[i])
+		}
+	}
+	at, ok := m.Arms[0].Pattern.(*ast.AtPattern)
+	if !ok || at.Name.Name != "w" {
+		t.Fatalf("arm 0 pattern %T", m.Arms[0].Pattern)
+	}
+	cp, ok := at.Pattern.(*ast.CtorPattern)
+	if !ok || len(cp.Args) != 2 {
+		t.Fatalf("arm 0 inner %T", at.Pattern)
+	}
+	if inner, ok := cp.Args[0].(*ast.AtPattern); !ok || inner.Name.Name != "b" {
+		t.Fatalf("payload %T", cp.Args[0])
+	} else if _, ok := inner.Pattern.(*ast.OrPattern); !ok {
+		t.Fatalf("payload inner %T", inner.Pattern)
+	}
+	if _, ok := m.Arms[1].Pattern.(*ast.OrPattern); !ok {
+		t.Fatalf("arm 1 pattern %T", m.Arms[1].Pattern)
+	}
+	errs := []struct{ src, want string }{
+		{"package p\nvar x = match y { a @ A | B -> 1 }", "2:19: error[E1001]: ambiguous '@' pattern in an or-pattern: write a @ (P | Q) or (a @ P) | Q"},
+		{"package p\nvar x = match y { A | a @ B -> 1 }", "2:23: error[E1001]: ambiguous '@' pattern in an or-pattern: write a @ (P | Q) or (a @ P) | Q"},
+		{"package p\nvar x = match y { S(a @ 1 | 2) -> 1 }", "2:21: error[E1001]: ambiguous '@' pattern in an or-pattern"},
+		{"package p\nvar x = match y { a @ -> 1 }", "2:23: error[E1001]: expected pattern"},
+		{"package p\nvar x = match y { A.b @ C -> 1 }", "2:23: error[E1001]: expected '->', found '@'"},
+	}
+	for _, tc := range errs {
+		_, d := ParseFile("t.fc", []byte(tc.src), nil)
+		if len(d) != 1 || !strings.HasPrefix(d[0].String(), "t.fc:"+tc.want) {
+			t.Errorf("%q:\n got %v\nwant t.fc:%s", tc.src, d, tc.want)
+		}
+	}
+}

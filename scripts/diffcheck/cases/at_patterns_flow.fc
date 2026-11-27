@@ -1,0 +1,110 @@
+// at_patterns_flow (v0.2): `name @ pattern` in the scope, linearity and
+// totality passes. The name carries the scrutinee's origin like every
+// other binding; every binding is borrowed, so `whole @ Got(c, _)` never
+// owns the Linear Conn twice: closing either is E3003, reading both is
+// fine; `is` bindings via '@' take part in flow and let-else; the
+// totality walker gets no facts from '@' patterns.
+package main
+
+type Res enum {
+	Got(Conn, u32)
+	Nothing
+}
+
+type PtrOpt enum {
+	PSome(*u32)
+	PNone
+}
+
+type Opt enum {
+	Some(u32)
+	None
+}
+
+var global u32
+
+func escape(o PtrOpt) *u32 {
+	var local u32
+	match o {
+		w @ PSome(p) -> {
+			_ = w
+			return p
+		}
+		n @ PNone -> {
+			_ = n
+			return &local
+		}
+	}
+}
+
+func escapeIs(o PtrOpt) PtrOpt {
+	var local u32
+	if !(o is w @ PSome(_)) {
+		return PtrOpt.PSome(&local)
+	}
+	return w
+}
+
+func escapeOrigin() PtrOpt {
+	var local u32
+	o := PtrOpt.PSome(&local)
+	match o {
+		w @ PSome(_) -> return w
+		PNone -> return PtrOpt.PNone
+	}
+}
+
+func borrowed(r Res) u32 {
+	match r {
+		whole @ Got(c, n) -> {
+			_ = whole
+			_ = c.Close()
+			return n
+		}
+		Nothing -> return 0
+	}
+}
+
+func borrowedWhole(r Res) {
+	if r is whole @ Got(_, _) {
+		consume(whole)
+	}
+}
+
+func consume(r Res) {
+	match r {
+		Got(c, _) -> {
+			_ = c.Close()
+		}
+		Nothing -> {}
+	}
+}
+
+func reads(r Res) u32 {
+	return match r {
+		whole @ Got(c, n @ 3) -> n + size(whole)
+		_ -> 0
+	}
+}
+
+func size(r Res) u32 {
+	return 1
+}
+
+func noFacts(o Opt, n u32) u32 {
+	if !(o is Some(k @ 0)) || n == 0 {
+		return 1
+	}
+	return f(k, n - 1)
+}
+
+func f(a u32, n u32) u32 {
+	return match n {
+		z @ 0 -> a + z
+		m @ _ -> f(a, m - 1)
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

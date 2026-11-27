@@ -184,6 +184,8 @@ func (f *flow) collectVars(body *ast.BlockStmt) {
 					ids = append(ids, id)
 				}
 			}
+		case *ast.AtPattern:
+			ids = append(ids, n.Name) // v0.2: `x @ P`
 		}
 		for _, id := range ids {
 			if s := c.varSym(id); s != nil && isDef(c.info, id, s) && types.IsLinear(c.info.SymType(s)) {
@@ -600,6 +602,11 @@ func (f *flow) borrowBindings(p ast.Pattern, a *env) {
 		for _, x := range p.Elems {
 			f.borrowBindings(x, a)
 		}
+	case *ast.AtPattern:
+		// v0.2: x and the bindings of P are all borrowed, so x @ P
+		// never owns a Linear value twice.
+		f.borrowBindings(p.Name, a)
+		f.borrowBindings(p.Pattern, a)
 	}
 }
 

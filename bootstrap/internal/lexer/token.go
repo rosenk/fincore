@@ -84,6 +84,7 @@ const (
 	ARROW      // ->
 	ELLIPSIS   // ...
 	DOTDOT     // .. (v0.2 rest pattern)
+	AT         // @ (v0.2 `name @ pattern` binding)
 	operatorEnd
 )
 
@@ -161,6 +162,7 @@ var kindStrings = [...]string{
 	ARROW:      "->",
 	ELLIPSIS:   "...",
 	DOTDOT:     "..",
+	AT:         "@",
 }
 
 // String returns the source spelling for keywords/operators and the class

@@ -1,0 +1,57 @@
+// at_patterns_resolve (v0.2): resolver errors of `name @ pattern`
+// bindings: '_', constants (local, package-level, predeclared) and variant
+// names before '@' (E2002), and flow-scoped `is` bindings bound by '@'
+// used where they are not visible (E2001).
+package main
+
+type Color enum {
+	Red
+	Green
+	Blue
+}
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+type Val enum {
+	Int(u32, u32)
+	Paint(Color)
+	Opt(Option[u32])
+}
+
+const K = 2
+
+func names(v Val, n u32) u32 {
+	const Local = 3
+	match v {
+		_ @ Int(..) -> return 1
+		K @ Int(_, _) -> return 2
+		Paint(Green @ Red) -> return 3
+		Int(Local @ 4, _) -> return 4
+		Opt(Second @ _) -> return 5
+		_ -> return 0
+	}
+	match n {
+		Millisecond @ 0 -> return 1
+		Some @ _ -> return 2
+	}
+}
+
+func visibility(v Val) u32 {
+	if v is w @ Int(h, _) || h > 0 {
+		return 1
+	}
+	if !(v is w2 @ Paint(_)) {
+		return 2
+	}
+	_ = w2
+	b := v is q @ Opt(_)
+	_ = b
+	return q
+}
+
+driver func main(io Stdio) error {
+	return nil
+}
