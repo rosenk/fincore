@@ -147,14 +147,21 @@ func (c *Checker) assignment(x *operand, t Type, context string) bool {
 	return false
 }
 
-// assignable reports whether a value of type v may be assigned to t.
+// assignable reports whether a value of type v may be assigned to t: v and
+// t are identical, or they have identical underlying types and at least
+// one of them is not named (decision 126). As in Go, the predeclared basic
+// types (u32, string, error, ...) count as named, so a value of `type Name
+// u32` is not assignable to u32 nor the reverse; a conversion is needed.
+// error is an interface in Go, so values of error types (`type E error`)
+// stay mutually assignable.
 func (c *Checker) assignable(v, t Type) bool {
 	if Identical(v, t) {
 		return true
 	}
-	_, vn := v.(*Named)
-	_, tn := t.(*Named)
-	if !vn || !tn {
+	if basicKind(v) == Error && basicKind(t) == Error {
+		return true
+	}
+	if !hasTypeName(v) || !hasTypeName(t) {
 		vu, tu := v.Underlying(), t.Underlying()
 		if _, isTP := vu.(*TypeParam); !isTP && Identical(vu, tu) {
 			if _, ok := vu.(*Opaque); !ok {
@@ -169,6 +176,19 @@ func (c *Checker) assignable(v, t Type) bool {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+// hasTypeName reports whether t is a named type in the sense of Go's
+// assignability rule: a declared or predeclared Named type, or a (typed)
+// predeclared basic type.
+func hasTypeName(t Type) bool {
+	switch t := t.(type) {
+	case *Named:
+		return true
+	case *Basic:
+		return !IsUntyped(t)
 	}
 	return false
 }

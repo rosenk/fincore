@@ -1,7 +1,7 @@
 // Command diffbuild compares the Go code emitted by `finc1 build
 // --emit-go` with the oracle `finc0 build --emit-go`, byte for byte.
 //
-//	go run ./scripts/diffbuild [-finc0 bin/finc0] [-finc1 bin/finc1] [-v] [-keep] [-j N]
+//	go run ./scripts/diffbuild [-finc0 bin/finc0] [-finc1 bin/finc1] [-v] [-keep] [-j N] [-govet]
 //
 // Cases (run from the module root): examples/*.fc, testdata/pass (files and
 // package directories), testdata/integration/*.fc, compiler/,
@@ -15,7 +15,11 @@
 //
 // A case matches when both compilers succeed and the emitted Go files are
 // identical, or when both fail (most unit-test snippets are error cases;
-// their diagnostics are compared by diff-check).
+// their diagnostics are compared by diff-check). A case where a compiler
+// accepted the program but `go build` rejected the emitted Go ("go build
+// failed") is always a mismatch: the type checker is unsound there. With
+// -govet, `go vet` additionally runs on the emitted Go of every case both
+// compilers build (`make diff-build-vet`).
 package main
 
 import (
@@ -41,6 +45,11 @@ type tcase struct {
 	flags []string
 }
 
+var (
+	govet   bool
+	rootDir string
+)
+
 type result struct {
 	ok, both bool // ok: match; both: both compilers failed
 	msg      string
@@ -52,7 +61,9 @@ func main() {
 	verbose := flag.Bool("v", false, "print every case")
 	keep := flag.Bool("keep", false, "keep temporary directories")
 	jobs := flag.Int("j", 8, "parallel cases")
+	flag.BoolVar(&govet, "govet", false, "also run go vet on the emitted Go of every built case")
 	flag.Parse()
+	rootDir, _ = filepath.Abs(".")
 	abs0, _ := filepath.Abs(*finc0)
 	abs1, _ := filepath.Abs(*finc1)
 
@@ -118,6 +129,10 @@ func runCase(finc0, finc1, tmp string, i int, c tcase) result {
 	e0, x0 := run(finc0, c.dir, append(append([]string{"build"}, c.flags...), "--emit-go="+g0, "-o", filepath.Join(out, "bin0"), c.path))
 	e1, x1 := run(finc1, c.dir, append(append([]string{"build"}, c.flags...), "--emit-go="+g1, "-o", filepath.Join(out, "bin1"), c.path))
 	if x0 != 0 || x1 != 0 {
+		if gb0, gb1 := strings.Contains(e0, "go build failed"), strings.Contains(e1, "go build failed"); gb0 || gb1 {
+			// finc accepted the program but Go rejected the emitted code.
+			return result{msg: fmt.Sprintf("  accepted by finc, rejected by go build (finc0 %v, finc1 %v)\n%s%s", gb0, gb1, indent("  finc0: ", e0), indent("  finc1: ", e1))}
+		}
 		if x0 != 0 && x1 != 0 {
 			return result{ok: true, both: true}
 		}
@@ -128,10 +143,44 @@ func runCase(finc0, finc1, tmp string, i int, c tcase) result {
 	if err0 != nil || err1 != nil {
 		return result{msg: fmt.Sprintf("  missing output: %v %v\n", err0, err1)}
 	}
-	if bytes.Equal(a, b) {
-		return result{ok: true}
+	if !bytes.Equal(a, b) {
+		return result{msg: firstDiff(a, b)}
 	}
-	return result{msg: firstDiff(a, b)}
+	if govet {
+		if msg, ok := vet(out, a); !ok {
+			return result{msg: indent("  go vet: ", msg)}
+		}
+	}
+	return result{ok: true}
+}
+
+// vet runs `go vet` on the emitted Go src in a temporary module next to
+// out that requires fincore (like finc0 build does).
+func vet(out string, src []byte) (string, bool) {
+	dir := filepath.Join(out, "vet")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err.Error(), false
+	}
+	goVersion := "1.22"
+	if data, err := os.ReadFile(filepath.Join(rootDir, "go.mod")); err == nil {
+		for _, l := range strings.Split(string(data), "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(l), "go "); ok {
+				goVersion = strings.TrimSpace(v)
+			}
+		}
+	}
+	mod := fmt.Sprintf("module fincprog\n\ngo %s\n\nrequire fincore v0.0.0\n\nreplace fincore => %s\n", goVersion, rootDir)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(mod), 0o644); err != nil {
+		return err.Error(), false
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), src, 0o644); err != nil {
+		return err.Error(), false
+	}
+	cmd := exec.Command("go", "vet", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod", "CGO_ENABLED=0")
+	b, err := cmd.CombinedOutput()
+	return string(b), err == nil
 }
 
 func firstDiff(a, b []byte) string {

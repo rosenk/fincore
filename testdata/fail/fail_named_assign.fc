@@ -1,0 +1,50 @@
+// fail_named_assign: assignability follows Go (decision 126). A value of a
+// named type (`type Name u32`) is not assignable to its underlying basic
+// type nor the reverse: the predeclared basic types count as named, so
+// both sides are named and a conversion is needed. finc used to accept
+// these and the emitted Go failed to compile.
+package main
+
+type Name u32
+
+type Fmt string
+
+const F Fmt = "%d"
+
+type Rec struct {
+	id u32
+}
+
+type Box enum {
+	Full(u32)
+	Empty
+}
+
+func take(x u32) u32 {
+	return x
+}
+
+func give(n Name) u32 {
+	return n // ERROR E2002
+}
+
+func back(x u32) Name {
+	return x // ERROR E2002
+}
+
+driver func main(io Stdio) error {
+	n := Name(1)
+	var u u32 = 2
+	_ = take(n) // ERROR E2002
+	u = n // ERROR E2002
+	n = u // ERROR E2002
+	r := Rec{id: n} // ERROR E2002
+	b := Box.Full(n) // ERROR E2002
+	if n == u { // ERROR E2002
+		u++
+	}
+	var buf [16]byte
+	k := formatTo(buf[:], F, u) // ERROR E2002
+	_, _, _, _ = give(n), back(u), r, b
+	return io.WriteStdout(buf[:k])
+}

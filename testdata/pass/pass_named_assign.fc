@@ -1,0 +1,104 @@
+// pass_named_assign: what stays legal under Go's assignability rule
+// (decision 126): explicit conversions between a named type and its
+// underlying basic type, untyped constants, values of unnamed composite
+// types assigned to named types over them (and back), named types in
+// formatTo (%d, %s, %q on named strings and byte slices, %v with a Format
+// method), constant patterns of the scrutinee's own type, and generic
+// instances over named types; error types (`type Err error`) stay
+// mutually assignable with error (an interface in Go). The emitted Go must
+// compile.
+package main
+
+type Name u32
+
+type Label string
+
+type Buf []u8
+
+type Fmt string
+
+type Err error
+
+const F Fmt = "%d"
+
+const Seven Name = 7
+
+const Plain = 3
+
+type Rec struct {
+	id   Name
+	tag  Label
+	data Buf
+}
+
+type Box enum {
+	Full(Name)
+	Empty
+}
+
+type Temp i32
+
+func (t Temp) Format(dst []byte) usize {
+	return formatTo(dst, "%dC", i32(t))
+}
+
+func take(x u32) u32 {
+	return x + 1
+}
+
+func wrap(x u32) Name {
+	return Name(x)
+}
+
+func check(e error) Err {
+	var x Err = e
+	var y error = x
+	return y
+}
+
+func id[T any](x T) T {
+	return x
+}
+
+func raw(b []u8) usize {
+	return len(b)
+}
+
+func classify(n Name) u32 {
+	match n {
+		Seven -> return 1
+		Plain -> return 2
+		_ -> return 0
+	}
+}
+
+driver func main(io Stdio) error {
+	n := Name(41)
+	var u u32 = take(u32(n))
+	n = Name(u)
+	n = 5 + n
+	var l Label = "lbl"
+	s := string(l)
+	l = Label(s)
+	var bs []u8 = strBytes("xy")
+	var b Buf = bs
+	bs = b
+	r := Rec{id: wrap(u), tag: l, data: b}
+	x := Box.Full(n)
+	k := u32(0)
+	if x is Full(v) && v == Name(47) {
+		k = 1
+	}
+	g := id[Name](n)
+	if n == Name(u) || g == 47 {
+		k = k + 10
+	}
+	if check(nil) != nil {
+		k = 100
+	}
+	var out [128]byte
+	m := formatTo(out[:], string(F), u)
+	m = m + formatTo(out[m:], " %d %s %q %s %q %v", r.id, r.tag, l, r.data, b, Temp(-4))
+	m = m + formatTo(out[m:], " %d %d %d %d\n", k, classify(Seven), classify(Name(Plain)), raw(bs))
+	return io.WriteStdout(out[:m])
+}
