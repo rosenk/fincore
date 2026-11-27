@@ -1,0 +1,23 @@
+// fail_total_format_recursion: Node.Format formats its own type with %v.
+// formatTo resolves %v to Node.Format at compile time, which is a call
+// edge Node.Format -> Node.Format (v0.2): unbounded recursion, E4002 at
+// the method.
+package main
+
+type Node struct {
+	depth u32
+}
+
+func (n Node) Format(dst []byte) usize { // ERROR E4002
+	if n.depth == 0 {
+		return formatTo(dst, "leaf")
+	}
+	child := Node{depth: n.depth - 1}
+	return formatTo(dst, "node(%v)", child)
+}
+
+driver func main(io Stdio) error {
+	var b [64]byte
+	k := formatTo(b[:], "%v", Node{depth: 2})
+	return io.WriteStdout(b[:k])
+}

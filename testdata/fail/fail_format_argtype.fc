@@ -1,0 +1,11 @@
+// fail_format_argtype: %d accepts integers only; a bool argument is E2002
+// at the argument (v0.2 formatTo).
+package main
+
+driver func main(io Stdio) error {
+	var b [32]byte
+	ok := true
+	n := formatTo(b[:], "%s=%d", "ok",
+		ok) // ERROR E2002
+	return io.WriteStdout(b[:n])
+}

@@ -1023,6 +1023,23 @@ func callConflicts(call u32, ai usize) bool {
 	}
 	if ck == CallBuiltin {
 		b := callTab.items[usize(ci)].builtin
+		if b == BFFormatTo {
+			// writes dst (argument 0); a %v Format method is a user call
+			if !callTab.items[usize(ci)].fmtOK || l1len(call) == 0 {
+				return true
+			}
+			nfa := usize(callTab.items[usize(ci)].fmtN) / 2
+			for a := usize(0); a < nfa; a++ {
+				if fmtArgOp(ci, a) == FmtFormat {
+					return true
+				}
+			}
+			u := underlying(ntype[usize(l1at(call, 0))])
+			if tkOf(u) == TCSlice {
+				return containsAnyStr(elemOf(u), ai)
+			}
+			return true
+		}
 		if b == BFCopy || b == BFFormatUint {
 			n := l1len(call)
 			if n == 0 {

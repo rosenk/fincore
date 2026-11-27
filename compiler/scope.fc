@@ -549,7 +549,7 @@ func scCallOrigin(e u32, dp usize) u64 decreases(dp) {
 		o = scOrigin(na(e), dp-1)
 	} else if kind == CallBuiltin {
 		b := callTab.items[usize(ci)].builtin
-		if b == BFStrBytes || b == BFBytesToStr || b == BFNewContext || b == BFNewScope {
+		if b == BFStrBytes || b == BFBytesToStr || b == BFNewContext || b == BFNewScope || b == BFFormatTo {
 			return o // views of immutable strings / fresh runtime resources
 		}
 	}

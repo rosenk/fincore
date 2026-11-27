@@ -1788,6 +1788,9 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		tpush(univNamed[BTScope])
 		return builtinFixed(e, b, ci, m1, m2, dp-1)
 	}
+	if b == BFFormatTo {
+		return formatCall(e, ci, dp-1)
+	}
 	mreset()
 	ms("unsupported builtin ")
 	ms(builtinName(b))

@@ -1,0 +1,9 @@
+// fail_format_verb: %z is not a formatTo verb (v0.2). Malformed formats
+// are E2002 at the format argument.
+package main
+
+driver func main(io Stdio) error {
+	var b [32]byte
+	n := formatTo(b[:], "value %z", 1) // ERROR E2002
+	return io.WriteStdout(b[:n])
+}

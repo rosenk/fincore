@@ -1,0 +1,10 @@
+// fail_format_nonconst: the format of formatTo must be a constant string
+// (v0.2); a variable is E2002 at the format argument.
+package main
+
+driver func main(io Stdio) error {
+	var b [32]byte
+	f := "%d"
+	n := formatTo(b[:], f, 1) // ERROR E2002
+	return io.WriteStdout(b[:n])
+}

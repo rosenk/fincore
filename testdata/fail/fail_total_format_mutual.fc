@@ -1,0 +1,29 @@
+// fail_total_format_mutual: Even.Format and Odd.Format format each other
+// through %v, a two-member SCC in the call graph without decreases
+// clauses (v0.2): E4004 once, at the first member in source order.
+package main
+
+type Even struct {
+	n u32
+}
+
+type Odd struct {
+	n u32
+}
+
+func (e Even) Format(dst []byte) usize { // ERROR E4004
+	if e.n == 0 {
+		return formatTo(dst, "even")
+	}
+	return formatTo(dst, "e%v", Odd{n: e.n - 1})
+}
+
+func (o Odd) Format(dst []byte) usize {
+	return formatTo(dst, "o%v", Even{n: o.n - 1})
+}
+
+driver func main(io Stdio) error {
+	var b [64]byte
+	k := formatTo(b[:], "%v", Even{n: 4})
+	return io.WriteStdout(b[:k])
+}

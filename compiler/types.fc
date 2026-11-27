@@ -1573,6 +1573,9 @@ type Call struct {
 	variantType  u32 // enum type (as written) of CallVariant
 	variantEnum  u32 // its underlying Enum TypeID
 	variant      u32 // variant index
+	fmtOK        bool // formatTo (v0.2) checked without errors: Call.Format != nil
+	fmtS         u32  // its per-argument (op, method) pairs (ulists)
+	fmtN         u32  // 2 * number of formatted arguments
 }
 
 type CallTable struct {

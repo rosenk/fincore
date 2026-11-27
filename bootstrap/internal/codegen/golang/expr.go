@@ -540,10 +540,114 @@ func (f *fnCtx) builtin(e *ast.CallExpr, ci *types.Call) string {
 		return "uint(cap(" + f.expr(e.Args[0]) + "))"
 	case resolve.FPanic:
 		return "panic(" + f.args(e.Args) + ")"
+	case resolve.FFormatTo:
+		return f.formatTo(e, ci)
 	case resolve.FCopy, resolve.FBytesEqual, resolve.FStrBytes, resolve.FBytesToStr, resolve.FFormatUint,
 		resolve.FParseUint, resolve.FNewContext, resolve.FNewScope:
 		return f.g.rt(ci.Builtin.GoName()) + "(" + f.args(e.Args) + ")"
 	}
 	f.g.fail(e, "builtin %s cannot be called at run time", ci.Builtin)
 	return ""
+}
+
+// formatTo expands a formatTo call (v0.2) into an immediately called
+// function literal over fincrt.Fmt. All arguments are evaluated left to
+// right (as the literal's arguments) before anything is written:
+//
+//	func(_fc_d []byte, _fc_a0 int64, ...) uint { _fc_w := fincrt.NewFmt(_fc_d); _fc_w.Lit("x="); _fc_w.Int(_fc_a0, 0, false); return _fc_w.N() }(dst, int64(x), ...)
+//
+// The text is produced in three passes (parameters, body, arguments) in
+// output order, so that finc1 can stream it; Go types and expressions are
+// rendered in that order (it fixes the discovery order of monomorphized
+// instances).
+func (f *fnCtx) formatTo(e *ast.CallExpr, ci *types.Call) string {
+	fi := ci.Format
+	if fi == nil || len(e.Args) != len(fi.Args)+2 {
+		f.g.fail(e, "formatTo without format information")
+	}
+	var b strings.Builder
+	b.WriteString("func(_fc_d []byte")
+	for k, fa := range fi.Args {
+		b.WriteString(", _fc_a" + strconv.Itoa(k) + " ")
+		if fa.Op == types.FmtFormat {
+			a := e.Args[2+k]
+			b.WriteString(f.goType(a, f.typeOf(a)))
+		} else {
+			b.WriteString(formatParamType(fa.Op))
+		}
+	}
+	b.WriteString(") uint { _fc_w := " + f.g.rt("NewFmt") + "(_fc_d); ")
+	k := 0
+	for _, p := range fi.Pieces {
+		if p.Verb == 0 {
+			b.WriteString("_fc_w.Lit(" + strconv.Quote(p.Lit) + "); ")
+			continue
+		}
+		fa := fi.Args[k]
+		name := "_fc_a" + strconv.Itoa(k)
+		k++
+		w := strconv.Itoa(p.FormatWidth())
+		zero := "false"
+		if p.Zero {
+			zero = "true"
+		}
+		switch fa.Op {
+		case types.FmtInt:
+			b.WriteString("_fc_w.Int(" + name + ", " + w + ", " + zero + ")")
+		case types.FmtUint:
+			b.WriteString("_fc_w.Uint(" + name + ", " + w + ", " + zero + ")")
+		case types.FmtHexInt:
+			b.WriteString("_fc_w.HexInt(" + name + ", " + w + ", " + zero + ")")
+		case types.FmtHexUint:
+			b.WriteString("_fc_w.Hex(" + name + ", " + w + ", " + zero + ")")
+		case types.FmtStr:
+			b.WriteString("_fc_w.Str(" + name + ", " + w + ")")
+		case types.FmtBytes:
+			b.WriteString("_fc_w.Bytes(" + name + ", " + w + ")")
+		case types.FmtQuoteStr:
+			b.WriteString("_fc_w.Quote(" + name + ", " + w + ")")
+		case types.FmtQuoteBytes:
+			b.WriteString("_fc_w.QuoteBytes(" + name + ", " + w + ")")
+		case types.FmtByte:
+			b.WriteString("_fc_w.Byte(" + name + ", " + w + ")")
+		case types.FmtBool:
+			b.WriteString("_fc_w.Bool(" + name + ", " + w + ")")
+		case types.FmtFormat:
+			b.WriteString("_fc_w.Advance(" + name + "." + f.g.p.Name(fa.Method.Sym) + "(_fc_w.Dst(" + w + ")), " + w + ")")
+		default:
+			f.g.fail(e, "formatTo argument without a format operation")
+		}
+		b.WriteString("; ")
+	}
+	b.WriteString("return _fc_w.N() }(" + f.expr(e.Args[0]))
+	for k, fa := range fi.Args {
+		a := e.Args[2+k]
+		if fa.Op == types.FmtFormat {
+			b.WriteString(", " + f.expr(a))
+		} else {
+			b.WriteString(", " + formatParamType(fa.Op) + "(" + f.expr(a) + ")")
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// formatParamType is the Go parameter type of a formatTo argument (also
+// used as its conversion).
+func formatParamType(op types.FormatOp) string {
+	switch op {
+	case types.FmtInt, types.FmtHexInt:
+		return "int64"
+	case types.FmtUint, types.FmtHexUint:
+		return "uint64"
+	case types.FmtStr, types.FmtQuoteStr:
+		return "string"
+	case types.FmtBytes, types.FmtQuoteBytes:
+		return "[]byte"
+	case types.FmtByte:
+		return "byte"
+	case types.FmtBool:
+		return "bool"
+	}
+	return "_"
 }

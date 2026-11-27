@@ -780,6 +780,8 @@ func cgBuiltinCall(e u32, c u32, dp usize) decreases(dp) {
 		cgW("panic(")
 		cgArgs(e, dp-1)
 		cgWc(')')
+	} else if b == BFFormatTo {
+		cgFormatTo(e, c, dp-1)
 	} else if b == BFCopy || b == BFBytesEqual || b == BFStrBytes || b == BFBytesToStr || b == BFFormatUint ||
 		b == BFParseUint || b == BFNewContext || b == BFNewScope {
 		cgRt(cgBuiltinGoName(b))

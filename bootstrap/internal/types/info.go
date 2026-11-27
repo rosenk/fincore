@@ -341,6 +341,9 @@ type Call struct {
 	// ConsumesArgs lists argument indices whose Linear values the call
 	// consumes (Scope.ReleaseSlot: 0; Scope.Go: 0, the slot).
 	ConsumesArgs []int
+	// Format is the parsed format and the per-argument lowering of a
+	// formatTo call (set only when the call checked without errors).
+	Format *FormatInfo
 }
 
 // SelKind classifies selector expressions.

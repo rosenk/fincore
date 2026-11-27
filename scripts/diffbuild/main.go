@@ -6,8 +6,8 @@
 // Cases (run from the module root): examples/*.fc, testdata/pass (files and
 // package directories), testdata/integration/*.fc, compiler/,
 // scripts/diffbuild/cases/*.fc (hand-written code generation edge cases)
-// and every FinCore snippet embedded in finc0's codegen, types, comptime
-// and resolve unit tests (string literals starting with "package ", each
+// and every FinCore snippet embedded in finc0's codegen, types, comptime,
+// resolve, scope, totality, ir and check (formatTo) unit tests (string literals starting with "package ", each
 // written to t.fc in its own temporary directory; snippets without a
 // main get `driver func main() error { return nil }`). `// FLAGS:` header
 // directives are honoured.
@@ -248,7 +248,7 @@ func snippetCases(tmp string) ([]tcase, error) {
 	n := 0
 	for _, dir := range []string{"bootstrap/internal/codegen/golang", "bootstrap/internal/types",
 		"bootstrap/internal/comptime", "bootstrap/internal/resolve", "bootstrap/internal/scope",
-		"bootstrap/internal/totality", "bootstrap/internal/ir"} {
+		"bootstrap/internal/totality", "bootstrap/internal/ir", "bootstrap/internal/check"} {
 		files, _ := filepath.Glob(filepath.Join(dir, "*_test.go"))
 		sort.Strings(files)
 		for _, f := range files {

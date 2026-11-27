@@ -77,6 +77,7 @@ const (
 	FNewContext
 	FNewScope
 	FPanic
+	FFormatTo // v0.2: formatTo(dst []byte, format string, args...) usize
 	// Code constructors (comptime only).
 	FCodeEmpty
 	FCodeUnit
@@ -118,6 +119,7 @@ var builtinNames = [numBuiltins]string{
 	FLen: "len", FCap: "cap", FCopy: "copy", FBytesEqual: "bytesEqual",
 	FStrBytes: "strBytes", FBytesToStr: "bytesToStr", FFormatUint: "formatUint",
 	FParseUint: "parseUint", FNewContext: "NewContext", FNewScope: "NewScope", FPanic: "panic",
+	FFormatTo:  "formatTo",
 	FCodeEmpty: "CodeEmpty", FCodeUnit: "CodeUnit", FCodeBool: "CodeBool",
 	FCodeU8: "CodeU8", FCodeU16: "CodeU16", FCodeU32: "CodeU32", FCodeU64: "CodeU64",
 	FCodeI8: "CodeI8", FCodeI16: "CodeI16", FCodeI32: "CodeI32", FCodeI64: "CodeI64",

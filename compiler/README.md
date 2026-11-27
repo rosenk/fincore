@@ -28,6 +28,7 @@ files (spec 9.5.6); there are no local imports.
 | `codegen.fc` | Code generator part 1 (finc0's `ir` + `codegen/golang` gen.go, types.go, values.go): emission buffers, Go names, usage/scope/dead-code analyses, match arm lowering, monomorphization, types, constant values, declarations, entry point |
 | `codegen_expr.fc` | Code generator part 2 (expr.go): expressions and calls |
 | `codegen_stmt.fc` | Code generator part 3 (stmt.go): bodies, statements, scope barriers, labeled breaks, returns through scopes |
+| `format.fc` | The v0.2 builtin `formatTo` (finc0's types/format.go plus the formatTo parts of codegen and comptime): lazy format parser, argument checking, Go lowering over `fincrt.Fmt`, comptime writer (port of runtime/fincrt/fmt.go) |
 | `build.fc` | `build`, `run`, `test` (finc0's build.go / test.go): temporary module, gofmt and `go build` via Exec, test conventions of testdata/README.md |
 
 ## Architecture

@@ -1,0 +1,246 @@
+// pass_extra_format: the v0.2 builtin formatTo — every verb, width and
+// flags, truncation, %v with a Format method (also nested and on a generic
+// type), untyped constants, named integer/string types and formatTo inside
+// a comptime function.
+package main
+
+type Celsius i32
+
+type Name string
+
+type Point struct {
+	x int
+	y int
+}
+
+// Format writes "(x, y)" and obeys the truncation contract.
+func (p Point) Format(dst []byte) usize {
+	return formatTo(dst, "(%d, %d)", p.x, p.y)
+}
+
+type Segment struct {
+	a Point
+	b Point
+}
+
+// Format formats its fields with %v (nested Format calls).
+func (s Segment) Format(dst []byte) usize {
+	return formatTo(dst, "%v->%v", s.a, s.b)
+}
+
+type Color enum {
+	Red
+	Green
+	Rgb(u8, u8, u8)
+}
+
+func (c Color) Format(dst []byte) usize {
+	n := usize(0)
+	match c {
+		Color.Red -> {
+			n = formatTo(dst, "red")
+		}
+		Color.Green -> {
+			n = formatTo(dst, "green")
+		}
+		Color.Rgb(r, g, b) -> {
+			n = formatTo(dst, "#%02x%02x%02x", r, g, b)
+		}
+	}
+	return n
+}
+
+type Pair[T any] struct {
+	n usize
+	v T
+}
+
+func (p Pair[T]) Format(dst []byte) usize {
+	return formatTo(dst, "pair#%d", p.n)
+}
+
+const Answer = 42
+
+const Greeting = "hi"
+
+// render is evaluated at compile time.
+comptime func render(n u64) usize {
+	var b [32]byte
+	return formatTo(b[:], "%5d|%-4x|%q|%v", n, n, "a\n", Point{x: 1, y: 2})
+}
+
+const RenderLen = render(255)
+
+comptime func digitsOf(n u64) usize {
+	var b [24]byte
+	return formatTo(b[:], "%d", n)
+}
+
+var digitTable [digitsOf(1234567)]byte
+
+type Out struct {
+	b [96]byte
+	n usize
+}
+
+func renderAll(k usize) Out {
+	var o Out
+	var raw [3]byte
+	raw[0] = 'a'
+	raw[1] = 0
+	raw[2] = 0xfe
+	o.n = formatTo(o.b[:k], "%5d|%-5x|%05d|%q|%q|%c|%v|%8v|%-8v|%3v|100%%|%s", -42, 255, -7, "t\"\\\n", raw[:], 'Z', false, Point{x: -3, y: 0}, Point{x: 9, y: 1}, Point{x: 12345, y: 2}, raw[:1])
+	return o
+}
+
+comptime func renderCt(k usize) Out {
+	return renderAll(k)
+}
+
+const C0 = renderCt(0)
+const C5 = renderCt(5)
+const C20 = renderCt(20)
+const C50 = renderCt(50)
+const C70 = renderCt(70)
+const C96 = renderCt(96)
+
+driver func sameOut(io Stdio, a Out, b Out) error {
+	if err := line(io, a.b[:], a.n); err != nil {
+		return err
+	}
+	if a.n != b.n || !bytesEqual(a.b[:], b.b[:]) {
+		return io.WriteStdout(strBytes("comptime/runtime MISMATCH\n"))
+	}
+	return nil
+}
+
+driver func line(io Stdio, b []byte, n usize) error {
+	if err := io.WriteStdout(b[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func main(io Stdio) error {
+	var buf [256]byte
+	b := buf[:]
+
+	// integers: every type, signs, %d and %x
+	var i8v i8 = -128
+	var u8v u8 = 255
+	var i64v i64 = -9223372036854775807 - 1
+	var u64v u64 = 18446744073709551615
+	var c Celsius = -40
+	n := formatTo(b, "%d %d %d %d %d %d", i8v, u8v, i64v, u64v, c, usize(7))
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+	n = formatTo(b, "%x %x %x %x", u8v, i8v, u64v, 48879)
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+
+	// untyped constants (int, char, string, bool) and named consts
+	n = formatTo(b, "%d %d %v %v %s %v %c %d", 42, -7, Answer, 'A', Greeting, true, 'z', 'z')
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+
+	// strings, byte slices, named strings, %c, %%
+	var who Name = "world"
+	raw := strBytes("bytes")
+	ch := byte('!')
+	n = formatTo(b, "hello %s, %s%c 100%% %v %v", who, raw, ch, who, raw)
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+
+	// %q escapes
+	n = formatTo(b, "%q %q %q", "tab\there \"q\" back\\slash", "\x00\x1f\x7f\xff", strBytes("nl\ncr\r"))
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+
+	// width and flags
+	n = formatTo(b, "[%5d][%-5d][%05d][%05d][%8x][%08x][%-8x]", 42, 42, 42, -42, 255, 255, 255)
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+	n = formatTo(b, "[%6s][%-6s][%3s][%4c][%-4c][%7q][%6v][%-7v]", "ab", "ab", "toolong", 'x', 'y', "q", true, false)
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+
+	// %v: bool, integers, strings and Format methods
+	p := Point{x: 3, y: -4}
+	seg := Segment{a: p, b: Point{x: 0, y: 0}}
+	n = formatTo(b, "%v %v %v | %v | %v", false, u64v, "str", p, seg)
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+	n = formatTo(b, "%v %v %v %v", Color.Red, Color.Green, Color.Rgb(255, 128, 0), Pair[string]{n: 9, v: "x"})
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+	n = formatTo(b, "[%12v][%-12v][%3v]", p, p, p)
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+
+	// truncation: every byte count from 0 to the full length
+	for k := usize(0); k <= 12; k++ {
+		var small [12]byte
+		m := formatTo(small[:k], "%d=%q", 12345, "ab")
+		var lb [64]byte
+		ln := formatTo(lb[:], "cut %2d: %d ", k, m)
+		if err := io.WriteStdout(lb[:ln]); err != nil {
+			return err
+		}
+		if err := line(io, small[:], m); err != nil {
+			return err
+		}
+	}
+	// truncation inside a padded Format item
+	for k := usize(8); k <= 14; k++ {
+		var small [14]byte
+		m := formatTo(small[:k], "<%10v>", p)
+		if err := line(io, small[:], m); err != nil {
+			return err
+		}
+	}
+	var empty []byte
+	n = formatTo(b, "empty dst: %d", formatTo(empty, "abc%d", 1))
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+
+	// comptime results
+	n = formatTo(b, "comptime: %d %d", RenderLen, len(digitTable))
+	if err := line(io, b, n); err != nil {
+		return err
+	}
+	// the same formatTo call at compile time and at run time, with every
+	// truncation point that matters
+	if err := sameOut(io, C0, renderAll(0)); err != nil {
+		return err
+	}
+	if err := sameOut(io, C5, renderAll(5)); err != nil {
+		return err
+	}
+	if err := sameOut(io, C20, renderAll(20)); err != nil {
+		return err
+	}
+	if err := sameOut(io, C50, renderAll(50)); err != nil {
+		return err
+	}
+	if err := sameOut(io, C70, renderAll(70)); err != nil {
+		return err
+	}
+	if err := sameOut(io, C96, renderAll(96)); err != nil {
+		return err
+	}
+
+	// as a statement
+	formatTo(b, "xy")
+	return line(io, b, 2)
+}

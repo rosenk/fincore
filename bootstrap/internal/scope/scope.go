@@ -411,6 +411,8 @@ func (c *checker) callOrigin(e *ast.CallExpr) origin {
 		switch ci.Builtin {
 		case resolve.FStrBytes, resolve.FBytesToStr, resolve.FNewContext, resolve.FNewScope:
 			return o // views of immutable strings / fresh runtime resources
+		case resolve.FFormatTo:
+			return o // a byte count; dst is only borrowed (v0.2)
 		}
 	}
 	for _, a := range e.Args {
