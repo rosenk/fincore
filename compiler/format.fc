@@ -7,7 +7,8 @@
 // (fmtNext), by the checker, the code generator and the comptime evaluator;
 // finc0 parses it once into a piece list (types.ParseFormat) with the same
 // result. The checker records, per formatted argument, the write operation
-// and the Format method (Call.fmtS/fmtN: (op, method) pairs in ulists).
+// and the Format method ((op, method) pairs in ulists, in the call's
+// CallKind.Builtin).
 package main
 
 import "std/strconv"
@@ -190,12 +191,22 @@ func fmtFormatString(e u32) []byte {
 	return emptyBytes()
 }
 
-func fmtArgOp(c u32, k usize) u8 {
-	return u8(uat(callTab.items[usize(c)].fmtS, 2*k))
+// fmtInfo returns the (op, method) pairs of call c if it is a formatTo
+// call with n arguments that was checked without errors.
+func fmtInfo(c u32, n usize) (u32, bool) {
+	if callTab.items[usize(c)].kind is Builtin(_, true, fs, fn) && n >= 2 && usize(fn) == 2*(n-2) {
+		return fs, true
+	}
+	return 0, false
 }
 
-func fmtArgMethod(c u32, k usize) u32 {
-	return uat(callTab.items[usize(c)].fmtS, 2*k+1)
+// fmtArgOp / fmtArgMethod: the pair of formatted argument k in the run fs.
+func fmtArgOp(fs u32, k usize) u8 {
+	return u8(uat(fs, 2*k))
+}
+
+func fmtArgMethod(fs u32, k usize) u32 {
+	return uat(fs, 2*k+1)
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +247,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 		tooDeep()
 		return invalidOp(e)
 	}
-	ctx := Ctx{kind: CtxArgBuiltin, a: u32(BFFormatTo), b: 0}
+	ctx := Ctx.ArgBuiltin(BFFormatTo)
 	n := l1len(e)
 	if n < 2 {
 		errAt(E2003, e, formatTo(mbuf[:], "not enough arguments in call to formatTo: have %d, want at least 2", n))
@@ -328,9 +339,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 		return opMode(KValue, TyUsize)
 	}
 	fs, fn := ucommit(um)
-	callTab.items[usize(ci)].fmtOK = true
-	callTab.items[usize(ci)].fmtS = fs
-	callTab.items[usize(ci)].fmtN = fn
+	callTab.items[usize(ci)].kind = CallKind.Builtin(BFFormatTo, true, fs, fn)
 	return opMode(KValue, TyUsize)
 }
 
@@ -457,8 +466,8 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 		return
 	}
 	n := l1len(e)
-	ci := callTab.items[usize(c)]
-	if !ci.fmtOK || n < 2 || usize(ci.fmtN) != 2*(n-2) {
+	fs, ok := fmtInfo(c, n)
+	if !ok {
 		cgFail(e, NoFmtInfo)
 		return
 	}
@@ -466,7 +475,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 	cgW("func(_fc_d []byte")
 	for k := usize(0); k < nargs; k++ {
 		cgWf(formatTo(mbuf[:], ", _fc_a%d ", k))
-		op := fmtArgOp(c, k)
+		op := fmtArgOp(fs, k)
 		if op == FmtFormat {
 			a := l1at(e, 2+k)
 			cgGoType(a, ntype[usize(a)], dp-1)
@@ -497,7 +506,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 			cgFail(e, NoFmtInfo)
 			return
 		}
-		op := fmtArgOp(c, k)
+		op := fmtArgOp(fs, k)
 		cgW("_fc_w.")
 		if op == FmtInt {
 			cgW("Int(")
@@ -529,7 +538,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 		cgWu(u64(k))
 		if op == FmtFormat {
 			cgWc('.')
-			cgWSymName(meths.items[usize(fmtArgMethod(c, k))].sym)
+			cgWSymName(meths.items[usize(fmtArgMethod(fs, k))].sym)
 			cgW("(_fc_w.Dst(")
 			cgWFmtWidth(p)
 			cgW(")), ")
@@ -552,7 +561,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 	cgExpr(l1at(e, 0), dp-1)
 	for k2 := usize(0); k2 < nargs; k2++ {
 		a := l1at(e, 2+k2)
-		op := fmtArgOp(c, k2)
+		op := fmtArgOp(fs, k2)
 		cgW(", ")
 		if op == FmtFormat {
 			cgExpr(a, dp-1)
@@ -744,9 +753,9 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 		failSilent()
 		return z
 	}
-	c := ncall[usize(e)]
 	n := vtop - m
-	if c == 0 || !callTab.items[usize(c)].fmtOK || n < 2 || usize(callTab.items[usize(c)].fmtN) != 2*(n-2) {
+	fs, ok := fmtInfo(ncall[usize(e)], n)
+	if !ok {
 		failS(E2002, NoFmtInfo)
 		return z
 	}
@@ -801,8 +810,8 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 			break
 		}
 		v := vstack[m+2+k]
-		op := fmtArgOp(c, k)
-		meth := fmtArgMethod(c, k)
+		op := fmtArgOp(fs, k)
+		meth := fmtArgMethod(fs, k)
 		k++
 		width := int(p.width)
 		if p.left {

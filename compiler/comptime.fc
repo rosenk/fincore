@@ -675,15 +675,6 @@ func icond(e u32, dp usize) bool decreases(dp) {
 	return false
 }
 
-func iequal(a Val, b Val) bool {
-	eq, ok := equalVals(a, b, SemaDepth)
-	if !ok {
-		failErr(E2002)
-		return false
-	}
-	return eq
-}
-
 func imatch(s u32, dp usize) u8 decreases(dp) {
 	if dp == 0 {
 		tooDeep()
@@ -1384,7 +1375,7 @@ func iargs(e u32, dp usize) decreases(dp) {
 	if n == 1 {
 		a0 := l1at(e, 0)
 		t := ntype[usize(a0)]
-		if t != 0 && isTupleT(t) {
+		if isTupleT(t) {
 			v := ieval(a0, dp-1)
 			if ifail {
 				return
@@ -1406,19 +1397,6 @@ func iargs(e u32, dp usize) decreases(dp) {
 	}
 }
 
-func callKindString(k u8) string {
-	return match k {
-		CallFunc -> "func"
-		CallMethod -> "method"
-		CallBuiltinMeth -> "builtin-method"
-		CallBuiltin -> "builtin"
-		CallConversion -> "conversion"
-		CallVariant -> "variant"
-		CallValue -> "value"
-		_ -> "invalid"
-	}
-}
-
 func icallExpr(e u32, dp usize) Val decreases(dp) {
 	var z Val
 	if dp == 0 {
@@ -1431,78 +1409,80 @@ func icallExpr(e u32, dp usize) Val decreases(dp) {
 		failS(E2002, "unchecked call")
 		return z
 	}
-	c := callTab.items[usize(ci)]
-	if c.kind == CallFunc {
-		m := vtop
-		iargs(e, dp-1)
-		if ifail {
+	match callTab.items[usize(ci)].kind {
+		Func(sym, ..) -> {
+			m := vtop
+			iargs(e, dp-1)
+			if ifail {
+				vtop = m
+				return z
+			}
+			r := icall(sym, z, false, m, vtop, e, dp-1)
 			vtop = m
-			return z
+			return r
 		}
-		r := icall(c.callee, z, false, m, vtop, e, dp-1)
-		vtop = m
-		return r
-	}
-	if c.kind == CallMethod {
-		var recv Val
-		if c.autoAddr {
-			// x.M() means (&x).M() (v0.2)
-			r := ilvalue(c.recv, dp-1)
+		Method(sym, mi, rx, autoAddr) -> {
+			var recv Val
+			if autoAddr {
+				// x.M() means (&x).M() (v0.2)
+				r := ilvalue(rx, dp-1)
+				if ifail {
+					return z
+				}
+				markAddr(rx, r)
+				recv = Val.Ptr(r)
+			} else {
+				recv = ieval(rx, dp-1)
+			}
 			if ifail {
 				return z
 			}
-			markAddr(c.recv, r)
-			recv = Val.Ptr(r)
-		} else {
-			recv = ieval(c.recv, dp-1)
+			// the receiver type (*T for x.M() with autoAddr) is a pointer
+			ptr := meths.items[usize(mi)].ptrRecv && (autoAddr || isPointerT(ntype[usize(rx)]))
+			if !ptr && recv is Ptr(_) {
+				r := iderefSlot(recv)
+				if ifail {
+					return z
+				}
+				recv = slotGet(r)
+			}
+			m := vtop
+			iargs(e, dp-1)
+			if ifail {
+				vtop = m
+				return z
+			}
+			r := icall(sym, recv, true, m, vtop, e, dp-1)
+			vtop = m
+			return r
 		}
-		if ifail {
-			return z
-		}
-		ptr := isPointerT(c.recvType) && meths.items[usize(c.method)].ptrRecv
-		if !ptr && recv is Ptr(_) {
-			r := iderefSlot(recv)
+		Conversion(t) -> {
+			v := ieval(l1at(e, 0), dp-1)
 			if ifail {
 				return z
 			}
-			recv = slotGet(r)
+			return wrapVal(v, t)
 		}
-		m := vtop
-		iargs(e, dp-1)
-		if ifail {
+		Variant(_, vi) -> {
+			m := vtop
+			iargs(e, dp-1)
+			if ifail {
+				vtop = m
+				return z
+			}
+			n := vtop - m
+			st := valAlloc(n, true)
+			for i := usize(0); i < n; i++ {
+				slotSet(st+u32(i), copyV(vstack[m+i]))
+			}
 			vtop = m
-			return z
+			return Val.Enum(vi, st, u32(n))
 		}
-		r := icall(c.callee, recv, true, m, vtop, e, dp-1)
-		vtop = m
-		return r
+		Builtin(b, ..) -> return ibuiltin(e, b, dp-1)
+		BuiltinMeth(..) -> failS(E2002, "builtin-method calls are not supported at compile time")
+		Value -> failS(E2002, "value calls are not supported at compile time")
+		Invalid -> failS(E2002, "invalid calls are not supported at compile time")
 	}
-	if c.kind == CallConversion {
-		v := ieval(l1at(e, 0), dp-1)
-		if ifail {
-			return z
-		}
-		return wrapVal(v, c.conv)
-	}
-	if c.kind == CallVariant {
-		m := vtop
-		iargs(e, dp-1)
-		if ifail {
-			vtop = m
-			return z
-		}
-		n := vtop - m
-		st := valAlloc(n, true)
-		for i := usize(0); i < n; i++ {
-			slotSet(st+u32(i), copyV(vstack[m+i]))
-		}
-		vtop = m
-		return Val.Enum(c.variant, st, u32(n))
-	}
-	if c.kind == CallBuiltin {
-		return ibuiltin(e, c.builtin, dp-1)
-	}
-	failf(E2002, formatTo(mbuf[:], "%s calls are not supported at compile time", callKindString(c.kind)))
 	return z
 }
 

@@ -162,12 +162,10 @@ func exprStmt(e u32, what string, dp usize) decreases(dp) {
 	if isInvalidOp(&x) {
 		return
 	}
-	ci := ncall[usize(call)]
-	k := callTab.items[usize(ci)].kind
-	bad := k == CallConversion || k == CallVariant
-	if k == CallBuiltin {
-		b := callTab.items[usize(ci)].builtin
-		bad = b != BFPanic && b != BFCopy && b != BFFormatTo
+	bad := match callTab.items[usize(ncall[usize(call)])].kind {
+		Conversion(_) | Variant(..) -> true
+		Builtin(b, ..) -> b != BFPanic && b != BFCopy && b != BFFormatTo
+		Invalid | Func(..) | Method(..) | BuiltinMeth(..) | Value -> false
 	}
 	if bad {
 		errAt(E2002, e, formatTo(mbuf[:], "%v is not used", Expr(e)))
@@ -205,9 +203,8 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 			return false
 		}
 		tv := u32(0)
-		vs := nval[usize(r0)]
-		if vs != 0 {
-			tv, _ = tupleOf(slotGet(vs))
+		if slotGet(nval[usize(r0)]) is Tuple(ref, _) {
+			tv = ref
 		}
 		for i := usize(0); i < nt; i++ {
 			op := opMode(KValue, tupleAt(x.typ, i))
@@ -254,7 +251,7 @@ func shortVarDecl(s u32, dp usize) decreases(dp) {
 		if def != 0 {
 			t := u32(TyInvalid)
 			if has && opStack.items[xi].mode != KNone {
-				t = defaultTypeOp(&opStack.items[xi], mkCtx(CtxAssign))
+				t = defaultTypeOp(&opStack.items[xi], Ctx.Assign)
 			}
 			setSymType(def, t)
 			continue
@@ -274,7 +271,7 @@ func shortVarDecl(s u32, dp usize) decreases(dp) {
 			continue
 		}
 		if has && opStack.items[xi].mode != KNone && isUntyped(opStack.items[xi].typ) {
-			_ = defaultTypeOp(&opStack.items[xi], mkCtx(CtxAssign))
+			_ = defaultTypeOp(&opStack.items[xi], Ctx.Assign)
 		}
 	}
 	opStack.top = mark
@@ -293,7 +290,7 @@ func assignValue(x *Operand, t u32) {
 			return
 		}
 	}
-	_ = assignment(x, t, mkCtx(CtxAssign))
+	_ = assignment(x, t, Ctx.Assign)
 }
 
 func assignStmt(s u32, dp usize) decreases(dp) {
@@ -323,7 +320,7 @@ func assignStmt(s u32, dp usize) decreases(dp) {
 			errAt(E2002, s, formatTo(mbuf[:], "operator %s not defined on %v (type %v)", assignOpString(op), Expr(l0), TypeRef(l.typ)))
 			return
 		}
-		_ = assignment(&r, l.typ, mkCtx(CtxAssign))
+		_ = assignment(&r, l.typ, Ctx.Assign)
 		return
 	}
 	lmark := opStack.top
@@ -356,7 +353,7 @@ func assignStmt(s u32, dp usize) decreases(dp) {
 		lm := opStack.items[lmark+i].mode
 		if lm == KBlankLHS {
 			if isUntyped(opStack.items[xi].typ) {
-				_ = defaultTypeOp(&opStack.items[xi], mkCtx(CtxAssign))
+				_ = defaultTypeOp(&opStack.items[xi], Ctx.Assign)
 			}
 			continue
 		}
@@ -427,7 +424,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		return
 	}
 	for i := usize(0); i < nr; i++ {
-		_ = exprWith(l1at(s, i), sigResult(sig, i), mkCtx(CtxReturn), dp-1)
+		_ = exprWith(l1at(s, i), sigResult(sig, i), Ctx.Return, dp-1)
 	}
 }
 
@@ -478,8 +475,7 @@ func isPanicCall(e u32) bool {
 	if nkind(call) != NkCallExpr {
 		return false
 	}
-	ci := ncall[usize(call)]
-	return ci != 0 && callTab.items[usize(ci)].kind == CallBuiltin && callTab.items[usize(ci)].builtin == BFPanic
+	return callBuiltin(call) == BFPanic
 }
 
 // hasBreak reports whether a block contains a break that targets the

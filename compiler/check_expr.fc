@@ -782,7 +782,7 @@ func structLit(e u32, dp usize) Operand decreases(dp) {
 		}
 		ft := fieldType(st, idx)
 		ntype[usize(na(fi))] = ft
-		x := exprWith(nb(fi), ft, mkCtx(CtxStructLit), dp-1)
+		x := exprWith(nb(fi), ft, Ctx.StructLit, dp-1)
 		if x.mode != KConst {
 			allConst = false
 		}
@@ -895,7 +895,7 @@ func callExpr(e u32, dp usize) Operand decreases(dp) {
 	}
 	x := call0(e, dp-1)
 	ci := ncall[usize(e)]
-	if ci != 0 && callTab.items[usize(ci)].method != 0 && callTab.items[usize(ci)].sig != 0 {
+	if callTab.items[usize(ci)].kind is Method(..) | BuiltinMeth(..) && callTab.items[usize(ci)].sig != 0 {
 		ntype[usize(na(e))] = callTab.items[usize(ci)].sig
 	}
 	return x
@@ -967,17 +967,12 @@ func call0(e u32, dp usize) Operand decreases(dp) {
 			useArgs(e, 0, dp-1)
 			return invalidOp(e)
 		}
-		callTab.items[usize(ci)].kind = CallFunc
-		callTab.items[usize(ci)].callee = fun.sym
+		inst := ninst[usize(unparen(na(e)))]
+		callTab.items[usize(ci)].kind = CallKind.Func(fun.sym, insts.items[usize(inst)].argS, insts.items[usize(inst)].argN)
 		callTab.items[usize(ci)].sig = sig
 		callTab.items[usize(ci)].effect = sigEffect(sig)
-		inst := ninst[usize(unparen(na(e)))]
-		if inst != 0 {
-			callTab.items[usize(ci)].taS = insts.items[usize(inst)].argS
-			callTab.items[usize(ci)].taN = insts.items[usize(inst)].argN
-		}
 		mark := opStack.top
-		ok := arguments(e, sigParamsSlice(sig), sigVariadic(sig), Ctx{kind: CtxArgExpr, a: na(e), b: 0}, dp-1)
+		ok := arguments(e, sigParamsSlice(sig), sigVariadic(sig), Ctx.ArgExpr(na(e)), dp-1)
 		if !ok {
 			opStack.top = mark
 			return invalidOp(e)
@@ -997,14 +992,14 @@ func call0(e u32, dp usize) Operand decreases(dp) {
 			useArgs(e, 0, dp-1)
 			return invalidOp(e)
 		}
-		callTab.items[usize(ci)].kind = CallValue
+		callTab.items[usize(ci)].kind = CallKind.Value
 		callTab.items[usize(ci)].sig = sig
 		callTab.items[usize(ci)].effect = sigEffect(sig)
 		if builtinOf(fun.typ) == BTCancelFunc {
 			callTab.items[usize(ci)].consumesRecv = true
 		}
 		mark := opStack.top
-		_ = arguments(e, sigParamsSlice(sig), sigVariadic(sig), Ctx{kind: CtxArgExpr, a: na(e), b: 0}, dp-1)
+		_ = arguments(e, sigParamsSlice(sig), sigVariadic(sig), Ctx.ArgExpr(na(e)), dp-1)
 		opStack.top = mark
 		return callResultType(sig)
 	}
@@ -1117,47 +1112,41 @@ func methodCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 	}
 	m := fun.method
 	mr := meths.items[usize(m)]
-	recvType := fun.recvType
-	if mr.ptrRecv && !fun.indirect {
-		// v0.2 ergonomics: x.M() means (&x).M() for an addressable x.
-		if !fun.addressable {
-			errAt(E2002, na(e), formatTo(mbuf[:], "cannot call pointer method %v on %v (type %v): value is not addressable", NameRef(mr.name), Expr(fun.recv), TypeRef(fun.recvType)))
-			useArgs(e, 0, dp-1)
-			return invalidOp(e)
-		}
-		callTab.items[usize(ci)].autoAddr = true
-		recvType = mkPointer(fun.recvType)
+	// v0.2 ergonomics: x.M() means (&x).M() for an addressable x.
+	autoAddr := mr.ptrRecv && !fun.indirect
+	if autoAddr && !fun.addressable {
+		errAt(E2002, na(e), formatTo(mbuf[:], "cannot call pointer method %v on %v (type %v): value is not addressable", NameRef(mr.name), Expr(fun.recv), TypeRef(fun.recvType)))
+		useArgs(e, 0, dp-1)
+		return invalidOp(e)
 	}
-	callTab.items[usize(ci)].method = m
-	callTab.items[usize(ci)].recv = fun.recv
-	callTab.items[usize(ci)].recvType = recvType
 	if mr.builtin != BMNone {
+		callTab.items[usize(ci)].kind = CallKind.BuiltinMeth(m, fun.recv, autoAddr)
 		return builtinMethodCall(e, m, ci, dp-1)
 	}
-	callTab.items[usize(ci)].kind = CallMethod
-	callTab.items[usize(ci)].callee = mr.sym
+	callTab.items[usize(ci)].kind = CallKind.Method(mr.sym, m, fun.recv, autoAddr)
 	sig := mr.sig
 	if sig == 0 {
 		useArgs(e, 0, dp-1)
 		return invalidOp(e)
 	}
-	base, _ := derefType(recvType)
+	base := fun.recvType
+	if trec(base) is Pointer(pt) {
+		base = pt
+	}
 	if namedOrigin(base) != 0 && mr.rtpN > 0 {
 		bs, bn := namedArgList(base)
 		sig = subst(sig, mr.rtpS, mr.rtpN, bs, bn, SemaDepth)
-		callTab.items[usize(ci)].taS = bs
-		callTab.items[usize(ci)].taN = bn
 	}
 	callTab.items[usize(ci)].sig = sig
 	callTab.items[usize(ci)].effect = sigEffect(sig)
 	mark := opStack.top
-	_ = arguments(e, sigParamsSlice(sig), sigVariadic(sig), Ctx{kind: CtxArgMethod, a: m, b: 0}, dp-1)
+	_ = arguments(e, sigParamsSlice(sig), sigVariadic(sig), Ctx.ArgMethod(m), dp-1)
 	opStack.top = mark
 	return callResultType(sig)
 }
 
 func mWrongArgs(e u32, m u32, have usize, want usize) {
-	errAt(E2003, e, formatTo(mbuf[:], "wrong number of arguments in call to %v: have %d, want %d", CallName(Ctx{kind: CtxArgMethod, a: m, b: 0}), have, want))
+	errAt(E2003, e, formatTo(mbuf[:], "wrong number of arguments in call to %v: have %d, want %d", CallName(Ctx.ArgMethod(m)), have, want))
 }
 
 func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
@@ -1166,19 +1155,14 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	b := meths.items[usize(m)].builtin
-	callTab.items[usize(ci)].kind = CallBuiltinMeth
 	callTab.items[usize(ci)].effect = methodEffect(m)
-	if b is BMNetListenTCP | BMListenerAccept | BMContextWithTimeout | BMSignalsNotifyCtx {
-		callTab.items[usize(ci)].resourceCtor = true
-	}
 	if b == BMConnClose || b == BMListenerClose {
 		callTab.items[usize(ci)].consumesRecv = true
 	}
 	ctxT := univNamed[BTContext]
-	c := Ctx{kind: CtxArgMethod, a: m, b: 0}
+	c := Ctx.ArgMethod(m)
 	nargs := l1len(e)
 	if b == BMScopeAcquireSlot {
-		callTab.items[usize(ci)].resourceCtor = true
 		if nargs != 2 {
 			mWrongArgs(e, m, nargs, 2)
 			useArgs(e, 0, dp-1)
@@ -1190,26 +1174,18 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 		if isInvalidOp(&pool) {
 			return invalidOp(e)
 		}
-		arr := u32(0)
-		if trec(underlying(pool.typ)) is Pointer(pt) {
-			arr = underlying(pt)
+		elem := u32(0)
+		if trec(underlying(pool.typ)) is Pointer(pt) && trec(underlying(pt)) is Array(el, 0, _) {
+			elem = el // a constant-length array
 		}
-		alen, lenParam := arrayLenOf(arr)
-		if !isArrayT(arr) || lenParam != 0 {
+		if elem == 0 {
 			errAt(E2002, a1, formatTo(mbuf[:], "cannot use %v (type %v) as pool argument to %v: want *[N]T", Expr(a1), TypeRef(pool.typ), CallName(c)))
 			return invalidOp(e)
 		}
-		elem := elemOf(arr)
 		am := tmark()
 		tpush(elem)
 		as, an := tcommitStack(am)
 		slot := instantiate(univNamed[BTSlot], tlistSlice(as, an), 0, SemaDepth)
-		tm := tmark()
-		tpush(mkConstArg(alen))
-		tpush(elem)
-		ts, tn := tcommitStack(tm)
-		callTab.items[usize(ci)].taS = ts
-		callTab.items[usize(ci)].taN = tn
 		m1 := tmark()
 		tpush(ctxT)
 		tpush(pool.typ)
@@ -1244,11 +1220,6 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 			return invalidOp(e)
 		}
 		elem := namedArg(sn, 0)
-		tm := tmark()
-		tpush(elem)
-		ts, tn := tcommitStack(tm)
-		callTab.items[usize(ci)].taS = ts
-		callTab.items[usize(ci)].taN = tn
 		if b == BMScopeGo {
 			f1 := tmark()
 			tpush(mkPointer(elem))
@@ -1329,7 +1300,7 @@ func builtinFixed(e u32, b u8, ci u32, m1 usize, m2 usize, dp usize) Operand dec
 	sig := mkSig(EffTotal, false, m1, m2, tmark())
 	callTab.items[usize(ci)].sig = sig
 	mark := opStack.top
-	_ = arguments(e, sigParamsSlice(sig), false, Ctx{kind: CtxArgBuiltin, a: u32(b), b: 0}, dp-1)
+	_ = arguments(e, sigParamsSlice(sig), false, Ctx.ArgBuiltin(b), dp-1)
 	opStack.top = mark
 	return callResultType(sig)
 }
@@ -1340,9 +1311,7 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	b := syms.items[usize(sym)].builtin
-	callTab.items[usize(ci)].kind = CallBuiltin
-	callTab.items[usize(ci)].builtin = b
-	callTab.items[usize(ci)].callee = sym
+	callTab.items[usize(ci)].kind = CallKind.Builtin(b, false, 0, 0)
 	if builtinIsCodeCtor(b) {
 		return codeCtor(e, b, ci, dp-1)
 	}
@@ -1405,11 +1374,6 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 			errAt(E2002, e, formatTo(mbuf[:], "arguments to copy must be slices with identical element types (have %v and %v)", TypeRef(d.typ), TypeRef(s.typ)))
 			return invalidOp(e)
 		}
-		tm := tmark()
-		tpush(elemOf(du))
-		ts, tn := tcommitStack(tm)
-		callTab.items[usize(ci)].taS = ts
-		callTab.items[usize(ci)].taN = tn
 		m1 := tmark()
 		tpush(d.typ)
 		tpush(s.typ)
@@ -1425,7 +1389,7 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		}
 		x := exprValue(l1at(e, 0), dp-1)
 		if !isInvalidOp(&x) {
-			_ = defaultTypeOp(&x, Ctx{kind: CtxArgBuiltin, a: u32(b), b: 0})
+			_ = defaultTypeOp(&x, Ctx.ArgBuiltin(b))
 		}
 		return opMode(KNoValue, 0)
 	}
@@ -1465,14 +1429,12 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		return builtinFixed(e, b, ci, m1, m2, dp-1)
 	}
 	if b == BFNewContext {
-		callTab.items[usize(ci)].resourceCtor = true
 		m2 := tmark()
 		tpush(univNamed[BTContext])
 		tpush(univNamed[BTCancelFunc])
 		return builtinFixed(e, b, ci, m1, m2, dp-1)
 	}
 	if b == BFNewScope {
-		callTab.items[usize(ci)].resourceCtor = true
 		tpush(TyUsize)
 		m2 := tmark()
 		tpush(univNamed[BTScope])
@@ -1516,7 +1478,7 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 		want = 1
 	}
 	nargs := l1len(e)
-	c := Ctx{kind: CtxArgBuiltin, a: u32(b), b: 0}
+	c := Ctx.ArgBuiltin(b)
 	if nargs != want {
 		errAt(E2003, e, formatTo(mbuf[:], "wrong number of arguments in call to %s: have %d, want %d", builtinName(b), nargs, want))
 		useArgs(e, 0, dp-1)
@@ -1591,8 +1553,7 @@ func conversion(e u32, t u32, ci u32, dp usize) Operand decreases(dp) {
 		tooDeep()
 		return invalidOp(e)
 	}
-	callTab.items[usize(ci)].kind = CallConversion
-	callTab.items[usize(ci)].conv = t
+	callTab.items[usize(ci)].kind = CallKind.Conversion(t)
 	nargs := l1len(e)
 	if nargs != 1 {
 		errAt(E2003, e, formatTo(mbuf[:], "conversion to %v needs exactly one argument, have %d", TypeRef(t), nargs))
@@ -1661,14 +1622,11 @@ func variantCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 	}
 	en := fun.vEnum
 	vi := usize(fun.vIndex)
-	callTab.items[usize(ci)].kind = CallVariant
-	callTab.items[usize(ci)].variantEnum = en
-	callTab.items[usize(ci)].variant = fun.vIndex
-	callTab.items[usize(ci)].variantType = fun.typ
+	callTab.items[usize(ci)].kind = CallKind.Variant(fun.typ, fun.vIndex)
 	ps := usize(variantPayS(en, vi))
 	pn := variantPayN(en, vi)
 	mark := opStack.top
-	ok := arguments(e, tlistSlice(u32(ps), u32(pn)), false, Ctx{kind: CtxArgVariant, a: fun.typ, b: variantName(en, vi)}, dp-1)
+	ok := arguments(e, tlistSlice(u32(ps), u32(pn)), false, Ctx.ArgVariant(fun.typ, variantName(en, vi)), dp-1)
 	if !ok {
 		opStack.top = mark
 		return opMode(KValue, fun.typ)

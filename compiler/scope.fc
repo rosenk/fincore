@@ -535,28 +535,23 @@ func scCallOrigin(e u32, dp usize) u64 decreases(dp) {
 	if ci == 0 {
 		return o
 	}
-	kind := callTab.items[usize(ci)].kind
 	nargs := l1len(e)
-	if kind == CallConversion {
-		if nargs == 1 {
-			return scOrigin(l1at(e, 0), dp-1)
+	match callTab.items[usize(ci)].kind {
+		Conversion(_) -> {
+			if nargs == 1 {
+				return scOrigin(l1at(e, 0), dp-1)
+			}
+			return o
 		}
-		return o
-	}
-	if kind == CallMethod || kind == CallBuiltinMeth {
-		r := callTab.items[usize(ci)].recv
-		if callTab.items[usize(ci)].autoAddr {
-			o = scStorage(r, dp-1) // x.M() means (&x).M() (v0.2)
-		} else if r != 0 && scTracked(ntype[usize(r)]) {
-			o = scOrigin(r, dp-1)
+		Method(_, _, r, true) | BuiltinMeth(_, r, true) -> o = scStorage(r, dp-1) // x.M() means (&x).M() (v0.2)
+		Method(_, _, r, false) | BuiltinMeth(_, r, false) -> {
+			if r != 0 && scTracked(ntype[usize(r)]) {
+				o = scOrigin(r, dp-1)
+			}
 		}
-	} else if kind == CallValue {
-		o = scOrigin(na(e), dp-1)
-	} else if kind == CallBuiltin {
-		b := callTab.items[usize(ci)].builtin
-		if b is BFStrBytes | BFBytesToStr | BFNewContext | BFNewScope | BFFormatTo {
-			return o // views of immutable strings / fresh runtime resources
-		}
+		Value -> o = scOrigin(na(e), dp-1)
+		Builtin(b, ..) if b is BFStrBytes | BFBytesToStr | BFNewContext | BFNewScope | BFFormatTo -> return o // views of immutable strings / fresh runtime resources
+		Invalid | Func(..) | Builtin(..) | Variant(..) -> {}
 	}
 	for i := usize(0); i < nargs; i++ {
 		a := l1at(e, i)
@@ -858,9 +853,8 @@ func wExpr(e u32, dp usize) decreases(dp) {
 		}
 	} else if k == NkCallExpr {
 		if wCollect {
-			ci := ncall[usize(e)]
-			if ci != 0 && callTab.items[usize(ci)].autoAddr {
-				wAddrOf(callTab.items[usize(ci)].recv) // implicit & of the receiver (v0.2)
+			if callTab.items[usize(ncall[usize(e)])].kind is Method(_, _, r, true) | BuiltinMeth(_, r, true) {
+				wAddrOf(r) // implicit & of the receiver (v0.2)
 			}
 		}
 		wExpr(na(e), dp-1)
@@ -951,15 +945,11 @@ func wFuncLit(lit u32, dp usize) decreases(dp) {
 
 // wCheckGo applies S4 to s.Go(slot, fn).
 func wCheckGo(e u32) {
-	ci := ncall[usize(e)]
-	if ci == 0 || callTab.items[usize(ci)].kind != CallBuiltinMeth {
+	r := scopeGoRecv(e)
+	if r == 0 || l1len(e) < 2 {
 		return
 	}
-	m := callTab.items[usize(ci)].method
-	if m == 0 || meths.items[usize(m)].builtin != BMScopeGo || l1len(e) < 2 {
-		return
-	}
-	so := scOrigin(callTab.items[usize(ci)].recv, SemaDepth)
+	so := scOrigin(r, SemaDepth)
 	fn := unparen(l1at(e, 1))
 	if nkind(fn) != NkFuncLit {
 		o := scOrigin(fn, SemaDepth)

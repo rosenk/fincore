@@ -511,8 +511,7 @@ func lnIsPanic(x u32) bool {
 	if call == 0 || nkind(call) != NkCallExpr {
 		return false
 	}
-	ci := ncall[usize(call)]
-	return ci != 0 && callTab.items[usize(ci)].kind == CallBuiltin && callTab.items[usize(ci)].builtin == BFPanic
+	return callBuiltin(call) == BFPanic
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,29 +1252,25 @@ func lnCall(fl u32, x u32, e u32, deferred bool, dp usize) decreases(dp) {
 	c := callTab.items[usize(ci)]
 	fun := unparen(na(x))
 	funLit := fun != 0 && nkind(fun) == NkFuncLit
-	if c.kind == CallMethod || c.kind == CallBuiltinMeth {
-		i := lnLinVar(fl, c.recv, SemaDepth)
+	if c.kind is Method(_, _, r, _) | BuiltinMeth(_, r, _) {
+		i := lnLinVar(fl, r, SemaDepth)
 		if c.consumesRecv && i != LnNoVar {
-			lnConsume(fl, e, i, lnRootIdent(c.recv), finalize)
+			lnConsume(fl, e, i, lnRootIdent(r), finalize)
 		} else {
-			lnExpr(fl, c.recv, e, dp-1)
+			lnExpr(fl, r, e, dp-1)
 		}
-	} else if c.kind == CallValue {
-		if funLit {
-			lnInlineLit(fl, fun, e, deferred, dp-1)
+	} else if c.kind is Value && !funLit {
+		i := lnLinVar(fl, na(x), SemaDepth)
+		if c.consumesRecv && i != LnNoVar {
+			lnConsume(fl, e, i, lnRootIdent(na(x)), finalize)
 		} else {
-			i := lnLinVar(fl, na(x), SemaDepth)
-			if c.consumesRecv && i != LnNoVar {
-				lnConsume(fl, e, i, lnRootIdent(na(x)), finalize)
-			} else {
-				lnExpr(fl, na(x), e, dp-1)
-			}
+			lnExpr(fl, na(x), e, dp-1)
 		}
 	} else if funLit {
 		lnInlineLit(fl, fun, e, deferred, dp-1)
 	}
-	owned := c.effect == EffDriver && c.kind is CallFunc | CallMethod | CallValue
-	isGo := c.kind == CallBuiltinMeth && c.method != 0 && meths.items[usize(c.method)].builtin == BMScopeGo
+	owned := c.effect == EffDriver && c.kind is Func(..) | Method(..) | Value
+	isGo := scopeGoRecv(x) != 0
 	for k := usize(0); k < nargs; k++ {
 		a := l1at(x, k)
 		if isGo && k == 1 {

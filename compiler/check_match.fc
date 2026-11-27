@@ -39,7 +39,7 @@ func scrutinee(e u32, dp usize) Operand decreases(dp) {
 	if nkind(e) != NkTupleExpr {
 		x := exprValue(e, dp-1)
 		if !isInvalidOp(&x) && isUntyped(x.typ) {
-			_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+			_ = defaultTypeOp(&x, Ctx.Match)
 		}
 		return x
 	}
@@ -49,7 +49,7 @@ func scrutinee(e u32, dp usize) Operand decreases(dp) {
 	for i := usize(0); i < n; i++ {
 		x := exprValue(l1at(e, i), dp-1)
 		if !isInvalidOp(&x) && isUntyped(x.typ) {
-			_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+			_ = defaultTypeOp(&x, Ctx.Match)
 		}
 		if isInvalidOp(&x) {
 			bad = true
@@ -215,15 +215,10 @@ func selectArm(v Val, m u32) usize {
 		if g == 0 {
 			return i
 		}
-		if nval[usize(g)] == 0 {
-			return n
-		}
-		b, ok := boolOf(slotGet(nval[usize(g)]))
-		if !ok {
-			return n
-		}
-		if b {
-			return i
+		match slotGet(nval[usize(g)]) {
+			Bool(true) -> return i
+			Bool(false) -> {}
+			_ -> return n // not a constant
 		}
 	}
 	return n
@@ -298,17 +293,16 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 		return false
 	}
 	if k == NkTuplePattern {
-		ref, tn := tupleOf(v)
 		c := l1len(p)
-		if usize(tn) != c {
-			return false
-		}
-		for i := usize(0); i < c; i++ {
-			if !matchVal(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
-				return false
+		if v is Tuple(ref, tn) && usize(tn) == c {
+			for i := usize(0); i < c; i++ {
+				if !matchVal(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
+					return false
+				}
 			}
+			return true
 		}
-		return true
+		return false
 	}
 	return false
 }
@@ -322,7 +316,7 @@ func isExpr(e u32, dp usize) Operand decreases(dp) {
 	}
 	x := exprValue(na(e), dp-1)
 	if !isInvalidOp(&x) && isUntyped(x.typ) {
-		_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+		_ = defaultTypeOp(&x, Ctx.Match)
 	}
 	if isInvalidOp(&x) {
 		invalidBindings(nb(e), SemaDepth)
@@ -411,7 +405,7 @@ func matchPatterns(m u32, x *Operand, isExpr bool, dp usize) bool decreases(dp) 
 	required := false
 	if !isInvalidOp(x) {
 		u := underlying(x.typ)
-		required = isEnumT(u) || isTupleT(u)
+		required = trec(u) is Enum(..) | Tuple(..)
 	}
 	if !valid {
 		exh := required
@@ -560,7 +554,7 @@ func pat(p u32, t u32, payload bool, dp usize) bool decreases(dp) {
 			errAt(E2002, p, formatTo(mbuf[:], "pattern %v does not match a tuple scrutinee of type %v", Expr(na(p)), TypeRef(t)))
 			return false
 		}
-		if !assignment(&x, t, mkCtx(CtxPattern)) {
+		if !assignment(&x, t, Ctx.Pattern) {
 			return false
 		}
 		if !comparable(t, SemaDepth) {
@@ -689,7 +683,7 @@ func ctorPat(p u32, t u32, dp usize) bool decreases(dp) {
 		x := symOperand(sym, name, dp-1)
 		x.expr = name
 		record(&x)
-		return !isInvalidOp(&x) && assignment(&x, t, mkCtx(CtxPattern))
+		return !isInvalidOp(&x) && assignment(&x, t, Ctx.Pattern)
 	}
 	nm := idName(name)
 	venum := u32(0)
@@ -947,8 +941,7 @@ func uHead(p u32, t u32) (u8, usize, u32) {
 }
 
 func uLitHead(s u32, t u32) (u8, usize, u32) {
-	b, ok := boolOf(slotGet(s))
-	if ok && isBoolean(t) {
+	if slotGet(s) is Bool(b) && isBoolean(t) {
 		if b {
 			return HCtor, 0, 0
 		}

@@ -177,10 +177,6 @@ func cloneState(h u32) u32 {
 	return n
 }
 
-func isDead(h u32) bool {
-	return tst[usize(h)].dead
-}
-
 // lbRoom makes room for one more lb entry of state h.
 func lbRoom(h u32) bool {
 	n := usize(tst[usize(h)].lbN)

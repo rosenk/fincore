@@ -208,7 +208,7 @@ params, results, type args) live in `typs.lists`.
 | `ntype[node]` | `Info.TypeOf`: final type of expressions (untyped constants defaulted), Tuple types of multi-result calls, 0 for calls without results and builtin/package names; the type of type nodes; the instantiated signature for a method selector used as callee |
 | `nmode[node]` | `Info.KindOf` (`KValue`, `KVar`, `KConst`, `KType`, `KNoValue`, `KBuiltin`, `KFunc`, `KPackage`, `KVariantCtor`) |
 | `nval[node]` | `Info.ValueOf`: value slot of constants and folded comptime calls (`VTuple` for multi-result ones) |
-| `ncall[callExpr]` → `callTab.items[CallID]` | `Info.CallOf`: `kind` (CallFunc/CallMethod/CallBuiltinMeth/CallBuiltin/CallConversion/CallVariant/CallValue), `callee` (function/method symbol, or the builtin's universe symbol), `builtin`, `method`, `recv` (receiver expression), `recvType`, `taS/taN` (TypeArgs), `sig` (instantiated signature), `effect` (EffComptime < EffTotal < EffDriver), `folded`, `conv`, `variantType` / `variantEnum` / `variant`, and the scope-checker hints `resourceCtor`, `consumesRecv`, `consumesArg0` (`ConsumesArgs == [0]`) |
+| `ncall[callExpr]` → `callTab.items[CallID]` | `Info.CallOf`: `kind`, a `CallKind` enum carrying the kind-specific fields: `Func(sym, taS, taN)` (callee, TypeArgs), `Method(sym, method, recv, autoAddr)` (`recv` is the receiver expression; `RecvType` is the type of `recv`, `*T` with `autoAddr`), `BuiltinMeth(method, recv, autoAddr)`, `Builtin(id, fmtOK, fmtS, fmtN)` (formatTo: `Format != nil` and its (op, method) pairs), `Conversion(t)`, `Variant(type, index)`, `Value`, `Invalid`; and the common fields `sig` (instantiated signature), `effect` (EffComptime < EffTotal < EffDriver), `folded` and the linearity hints `consumesRecv`, `consumesArg0` (`ConsumesArgs == [0]`). `callBuiltin(e)` and `scopeGoRecv(e)` are the shortcuts the passes use |
 | `nsel[selectorExpr]` → `selTab.items` | `Info.SelectionOf`: `kind` (SelField/SelMethod/SelVariant), `recv` (type of x), `indirect`, `ctype`+`index` (field of a struct type / variant of an enum type), `method`; no entry for package-qualified names |
 | `ninst[node]` → `insts.items[InstID]` | `Info.InstanceOf` / `Info.InstanceList` (records in first-use order): `sym`, `named` (type instances), `argS/argN`, `sig` (function instances), `generic` |
 | `nvarEnum[ctorPattern]`, `nvarIdx` | `Info.VariantOf` |
@@ -224,9 +224,9 @@ params, results, type args) live in `typs.lists`.
 (the `decreases(M)` expression), `body`, `callH/callT` (cell list of the
 CallExpr nodes of the body in source order, excluding nested literals),
 `litH/litT` (cell list of directly nested literal FuncInfos); captures of a
-literal are `litCapHead[lit]`. Call-graph edges: for each call with kind
-CallFunc or CallMethod the callee is `funcOfSym(call.callee)` (methods are
-resolved by receiver type).
+literal are `litCapHead[lit]`. Call-graph edges: for each call of kind
+`Func(sym, ..)` or `Method(sym, ..)` the callee is `funcOfSym(sym)` (methods
+are resolved by receiver type).
 
 ### Values (values.fc)
 
@@ -391,8 +391,9 @@ function; overflow is reported as capacity exceeded.
 - Only `func` (total) and `driver func`; no `comptime`, generics,
   closures, `defer` or `scope`. Sum types (enums with payloads, `match`
   statements and expressions) model compile-time values (`Val`), type
-  forms (`TypeRec`), escape sequences (`Esc`), Linear consumption kinds
-  (`Consume`) and the totality walker mode (`WalkMode`); types.fc uses
+  forms (`TypeRec`), call kinds (`CallKind`), assignment contexts (`Ctx`),
+  escape sequences (`Esc`), Linear consumption kinds (`Consume`) and the
+  totality walker mode (`WalkMode`); types.fc uses
   `std/maps.Table` and `std/vec.ListArena`. The M7 files use free functions
   over package-level arenas instead of methods on Scoped helper structs
   (total functions read and write globals directly); pointers appear only

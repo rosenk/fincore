@@ -331,57 +331,48 @@ func exprAsType(e u32, dp usize) u32 decreases(dp) {
 // ---------------------------------------------------------------------------
 // Assignment contexts ("argument to f", "struct literal", ...)
 
-const (
-	CtxConstDecl  = 1
-	CtxVarDecl    = 2
-	CtxAssign     = 3
-	CtxDecreases  = 4
-	CtxStructLit  = 5
-	CtxReturn     = 6
-	CtxPattern    = 7
-	CtxTypeArg    = 8
-	CtxMatch      = 9
-	CtxArgExpr    = 10 // "argument to " + exprString(a)
-	CtxArgMethod  = 11 // "argument to " + Recv.Name + "." + method (a = method)
-	CtxArgBuiltin = 12 // "argument to " + builtin (a)
-	CtxArgVariant = 13 // "argument to " + type(a) + "." + name(b)
-)
-
-type Ctx struct {
-	kind u8
-	a    u32
-	b    u32
-}
-
-func mkCtx(kind u8) Ctx {
-	return Ctx{kind: kind, a: 0, b: 0}
+// Ctx is an assignment context: where a value is assigned to a type.
+type Ctx enum {
+	ConstDecl
+	VarDecl
+	Assign
+	Decreases
+	StructLit
+	Return
+	Pattern
+	TypeArg
+	Match
+	ArgExpr(u32)         // argument to a call of the function expression (node)
+	ArgMethod(u32)       // argument to a method (MethodID): "Recv.name"
+	ArgBuiltin(u8)       // argument to a builtin
+	ArgVariant(u32, u32) // argument to a variant constructor: enum type, variant name
 }
 
 // CallName renders the callee name of an argument context.
 type CallName Ctx
 
 func (c CallName) Format(dst []byte) usize {
-	return match c.kind {
-		CtxArgExpr -> formatTo(dst, "%v", Expr(c.a))
-		CtxArgMethod -> formatTo(dst, "%v.%v", NameRef(typeName(meths.items[usize(c.a)].recv)), NameRef(meths.items[usize(c.a)].name))
-		CtxArgBuiltin -> formatTo(dst, "%s", builtinName(u8(c.a)))
-		CtxArgVariant -> formatTo(dst, "%v.%v", TypeRef(c.a), NameRef(c.b))
+	return match Ctx(c) {
+		ArgExpr(e) -> formatTo(dst, "%v", Expr(e))
+		ArgMethod(m) -> formatTo(dst, "%v.%v", NameRef(typeName(meths.items[usize(m)].recv)), NameRef(meths.items[usize(m)].name))
+		ArgBuiltin(b) -> formatTo(dst, "%s", builtinName(b))
+		ArgVariant(t, name) -> formatTo(dst, "%v.%v", TypeRef(t), NameRef(name))
 		_ -> 0
 	}
 }
 
 func (c Ctx) Format(dst []byte) usize {
-	return match c.kind {
-		CtxConstDecl -> formatTo(dst, "constant declaration")
-		CtxVarDecl -> formatTo(dst, "variable declaration")
-		CtxAssign -> formatTo(dst, "assignment")
-		CtxDecreases -> formatTo(dst, "decreases clause")
-		CtxStructLit -> formatTo(dst, "struct literal")
-		CtxReturn -> formatTo(dst, "return statement")
-		CtxPattern -> formatTo(dst, "match pattern")
-		CtxTypeArg -> formatTo(dst, "type argument")
-		CtxMatch -> formatTo(dst, "match")
-		_ -> formatTo(dst, "argument to %v", CallName(c))
+	return match c {
+		ConstDecl -> formatTo(dst, "constant declaration")
+		VarDecl -> formatTo(dst, "variable declaration")
+		Assign -> formatTo(dst, "assignment")
+		Decreases -> formatTo(dst, "decreases clause")
+		StructLit -> formatTo(dst, "struct literal")
+		Return -> formatTo(dst, "return statement")
+		Pattern -> formatTo(dst, "match pattern")
+		TypeArg -> formatTo(dst, "type argument")
+		Match -> formatTo(dst, "match")
+		ArgExpr(_) | ArgMethod(_) | ArgBuiltin(_) | ArgVariant(..) -> formatTo(dst, "argument to %v", CallName(c))
 	}
 }
 
@@ -426,7 +417,7 @@ func assignable(v u32, t u32) bool {
 	if !vn || !tn {
 		vu := underlying(v)
 		tu := underlying(t)
-		if !isTypeParamT(vu) && vu == tu && !isOpaqueT(vu) {
+		if vu == tu && !(trec(vu) is TypeParam(..) | Opaque(..)) {
 			return true
 		}
 		if isSigT(vu) && isSigT(tu) && sigEffect(vu) <= sigEffect(tu) && sigVariadic(vu) == sigVariadic(tu) &&
@@ -803,7 +794,7 @@ func constSpecIn(s u32, d u32, dp usize) decreases(dp) {
 		return
 	}
 	if t != 0 {
-		if !assignment(&x, t, mkCtx(CtxConstDecl)) {
+		if !assignment(&x, t, Ctx.ConstDecl) {
 			setSymType(s, TyInvalid)
 			return
 		}
@@ -956,9 +947,9 @@ func varDeclIn(s u32, d u32, dp usize) decreases(dp) {
 		return
 	}
 	if t != 0 {
-		_ = assignment(&x, t, mkCtx(CtxVarDecl))
+		_ = assignment(&x, t, Ctx.VarDecl)
 	} else {
-		t = defaultTypeOp(&x, mkCtx(CtxVarDecl))
+		t = defaultTypeOp(&x, Ctx.VarDecl)
 		if global && isScoped(t) {
 			errAt(E3001, na(d), formatTo(mbuf[:], "package-level variable %v cannot have Scoped type %v", VarName(s), TypeRef(t)))
 		}
@@ -1276,7 +1267,7 @@ func measure(e u32, dp usize) decreases(dp) {
 	if isInvalidOp(&x) {
 		return
 	}
-	_ = assignment(&x, TyUsize, mkCtx(CtxDecreases))
+	_ = assignment(&x, TyUsize, Ctx.Decreases)
 }
 
 // ---------------------------------------------------------------------------
@@ -1647,7 +1638,7 @@ func typeArg(e u32, tp u32, dp usize) u32 decreases(dp) {
 			errAt(E2002, e, formatTo(mbuf[:], "type argument %v for const parameter %v must be an integer constant", Expr(e), NameRef(typeName(tp))))
 			return TyInvalid
 		}
-		if !assignment(&x, tpConstType(tp), mkCtx(CtxTypeArg)) {
+		if !assignment(&x, tpConstType(tp), Ctx.TypeArg) {
 			return TyInvalid
 		}
 		v, ok := valUint64(x.val)

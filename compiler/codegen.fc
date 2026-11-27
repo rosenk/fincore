@@ -180,15 +180,6 @@ func cgWwrap(mark usize) {
 	cgWc(')')
 }
 
-// wbyteAt returns gw.data[i] (0 past the end).
-func cgWbyteAt(i usize) byte {
-	w := cgBuf.Bytes()
-	if i >= len(w) {
-		return 0
-	}
-	return w[i]
-}
-
 func cgWendsWith(mark usize, c byte) bool {
 	w := cgBuf.Bytes()
 	return len(w) > mark && w[len(w)-1] == c
@@ -671,8 +662,7 @@ func cgIsPanicCall(e u32) bool {
 	if x == 0 || nkind(x) != NkCallExpr {
 		return false
 	}
-	c := ncall[usize(x)]
-	return c != 0 && callTab.items[usize(c)].kind == CallBuiltin && callTab.items[usize(c)].builtin == BFPanic
+	return callBuiltin(x) == BFPanic
 }
 
 func cgIsTerm(s u32, dp usize) bool decreases(dp) {
@@ -979,7 +969,7 @@ func cgIsTypeDeclSym(s u32) bool {
 		return false
 	}
 	t := syms.items[usize(s)].typ
-	if t == 0 || !isNamedT(t) {
+	if !isNamedT(t) {
 		return false
 	}
 	return !cgTypeMentionsCode(underlying(t))
@@ -1174,10 +1164,10 @@ func cgWMonoName(i usize) {
 
 // constArg resolves a type argument for a const parameter to its value.
 func cgConstArg(n u32, t u32) u64 {
-	if t != 0 && isConstArgT(t) {
-		return constArgVal(t)
+	if trec(t) is ConstArg(v) {
+		return v
 	}
-	if t != 0 && isTypeParamT(t) {
+	if isTypeParamT(t) {
 		v, ok := cgEnvLookup(t)
 		if ok {
 			return v
@@ -1444,15 +1434,11 @@ func cgTypeParamList(tpS u32, tpN usize, withAny bool) {
 // Values (codegen/golang values.go)
 
 func cgIsUntypedOrInt(t u32) bool {
-	if t == 0 || !isBasicT(t) {
+	if !isBasicT(t) {
 		return false
 	}
 	k := basicKind(t)
 	return k == BkInt || k == BkUntypedInt
-}
-
-func cgIsNamedT(t u32) bool {
-	return t != 0 && isNamedT(t)
 }
 
 // isZeroVal reports whether v is the zero value of its type.
@@ -1529,12 +1515,12 @@ func cgValue(n u32, v Val, t u32, dp usize) decreases(dp) {
 			cgWc(')')
 		}
 		Bool(_) | Str(..) -> {
-			if cgIsNamedT(t) {
+			if isNamedT(t) {
 				cgGoType(n, t, dp-1)
 				cgWc('(')
 			}
 			cgWLit(v)
-			if cgIsNamedT(t) {
+			if isNamedT(t) {
 				cgWc(')')
 			}
 		}

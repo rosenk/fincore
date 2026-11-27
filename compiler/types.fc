@@ -510,16 +510,8 @@ func isTypeParamT(t u32) bool {
 	return trec(t) is TypeParam(..)
 }
 
-func isConstArgT(t u32) bool {
-	return trec(t) is ConstArg(_)
-}
-
 func isTupleT(t u32) bool {
 	return trec(t) is Tuple(..)
-}
-
-func isOpaqueT(t u32) bool {
-	return trec(t) is Opaque(..)
 }
 
 // ---------------------------------------------------------------------------
@@ -634,30 +626,9 @@ func defaultOf(t u32) u32 {
 	}
 }
 
-// derefType returns the element of a pointer type (and true), else t.
-func derefType(t u32) (u32, bool) {
-	if trec(t) is Pointer(e) {
-		return e, true
-	}
-	return t, false
-}
-
 // elemOf returns the element type of an array, slice or pointer type.
 func elemOf(t u32) u32 {
 	return match trec(t) { Array(e, ..) | Slice(e) | Pointer(e) -> e, _ -> 0 }
-}
-
-// arrayLenOf returns the constant length and the length type parameter of
-// an array type.
-func arrayLenOf(t u32) (u64, u32) {
-	if trec(t) is Array(_, p, n) {
-		return n, p
-	}
-	return 0, 0
-}
-
-func constArgVal(t u32) u64 {
-	return match trec(t) { ConstArg(v) -> v, _ -> 0 }
 }
 
 // typeName returns the name of a named type, type parameter or opaque type.
@@ -890,11 +861,6 @@ func builtinOf(t u32) u8 {
 		return namedBuiltin(o)
 	}
 	return namedBuiltin(t) // 0 for other types
-}
-
-func isResource(t u32) bool {
-	b := builtinOf(t)
-	return b >= BTNet && b <= BTExec
 }
 
 func isCapability(t u32) bool {
@@ -1541,18 +1507,6 @@ const (
 	KVariantCtor = 9
 )
 
-// Call kinds (types.CallKind).
-const (
-	CallInvalid     = 0
-	CallFunc        = 1
-	CallMethod      = 2
-	CallBuiltinMeth = 3
-	CallBuiltin     = 4
-	CallConversion  = 5
-	CallVariant     = 6
-	CallValue       = 7
-)
-
 // Selection kinds (types.SelKind).
 const (
 	SelField   = 0
@@ -1606,30 +1560,48 @@ func newFuncInfo(fi FuncInfo) u32 {
 	return u32(id)
 }
 
-// Call describes a CallExpr (types.Call).
+// CallKind is what a CallExpr calls, with the kind-specific parts of
+// types.Call. The variant order fixes the compact layout (u32 x 3, bool,
+// u8: 20 bytes).
+type CallKind enum {
+	Invalid                       // not checked or erroneous
+	Func(u32, u32, u32)           // function symbol, type args (type lists run)
+	Method(u32, u32, u32, bool)   // method symbol, MethodID, receiver node, autoAddr
+	BuiltinMeth(u32, u32, bool)   // MethodID, receiver node, autoAddr (capability methods)
+	Builtin(u8, bool, u32, u32)   // builtin; formatTo (v0.2): checked without errors, (op, method) pairs (ulists)
+	Conversion(u32)               // target type
+	Variant(u32, u32)             // enum type (as written), variant index
+	Value                         // call through a function value
+}
+
+// Call describes a CallExpr (types.Call). For method calls the receiver is
+// the operand x of x.M(...) and autoAddr records that a pointer-receiver
+// method on an addressable x means (&x).M() (v0.2).
 type Call struct {
-	kind         u8
-	builtin      u8
+	kind         CallKind
 	effect       u8
 	folded       bool
-	resourceCtor bool
 	consumesRecv bool
 	consumesArg0 bool // ConsumesArgs == [0]
-	autoAddr     bool // x.M() on an addressable x means (&x).M() (v0.2); recvType is *T
-	callee       u32  // function/method symbol, or the builtin's universe symbol
-	method       u32
-	recv         u32 // receiver expression node
-	recvType     u32
-	taS          u32 // TypeArgs (type lists)
-	taN          u32
 	sig          u32
-	conv         u32
-	variantType  u32 // enum type (as written) of CallVariant
-	variantEnum  u32 // its underlying Enum TypeID
-	variant      u32 // variant index
-	fmtOK        bool // formatTo (v0.2) checked without errors: Call.Format != nil
-	fmtS         u32  // its per-argument (op, method) pairs (ulists)
-	fmtN         u32  // 2 * number of formatted arguments
+}
+
+// callBuiltin returns the builtin that the CallExpr e calls (BNone if it
+// calls something else or was not checked).
+func callBuiltin(e u32) u8 {
+	return match callTab.items[usize(ncall[usize(e)])].kind {
+		Builtin(b, ..) -> b
+		_ -> BNone
+	}
+}
+
+// scopeGoRecv returns the receiver s of the CallExpr e if it is the
+// capability call s.Go(slot, fn), else 0.
+func scopeGoRecv(e u32) u32 {
+	if callTab.items[usize(ncall[usize(e)])].kind is BuiltinMeth(m, r, _) && meths.items[usize(m)].builtin == BMScopeGo {
+		return r
+	}
+	return 0
 }
 
 type CallTable struct {

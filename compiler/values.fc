@@ -865,7 +865,7 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 		slotSet(c, Val.CodeBasic(CKEmpty))
 		return Val.FieldCode(0, 0, c), true
 	}
-	if t != 0 && isNamedT(t) && namedBuiltin(t) != 0 {
+	if isNamedT(t) && namedBuiltin(t) != 0 {
 		etf(formatTo(mbuf[:], "%v has no compile-time value", TypeRef(t)))
 	} else {
 		etf(formatTo(mbuf[:], "%v has no zero value", TypeRef(t)))
@@ -891,14 +891,6 @@ func opNotDefined(op u8, x Val, y Val, two bool) {
 
 func isCompareOp(op u8) bool {
 	return op >= OpEq && op <= OpGe
-}
-
-// boolOf returns the truth value of a Bool (ok == false for other values).
-func boolOf(v Val) (bool, bool) {
-	match v {
-		Bool(b) -> return b, true
-		_ -> return false, false
-	}
 }
 
 func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
@@ -1127,15 +1119,6 @@ func unaryOpVal(op u8, x Val) (Val, bool) {
 // isVariant reports whether v is an enum value of variant vi.
 func isVariant(v Val, vi u32) bool {
 	return match v { Enum(x, _, _) -> x == vi, _ -> false }
-}
-
-// tupleOf returns the first element slot and the length of a tuple
-// ((0, 0) for other values).
-func tupleOf(v Val) (u32, u32) {
-	match v {
-		Tuple(ref, n) -> return ref, n
-		_ -> return 0, 0
-	}
 }
 
 func isCodeVal(v Val) bool {

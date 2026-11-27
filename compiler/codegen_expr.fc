@@ -55,17 +55,14 @@ func cgConstExpr(e u32, v Val, typed bool, dp usize) decreases(dp) {
 		return
 	}
 	if k == NkCallExpr && l1len(e) == 1 {
-		c := ncall[usize(e)]
-		if c != 0 && callTab.items[usize(c)].kind == CallConversion {
-			a0 := cgUnparenNode(l1at(e, 0))
-			rs := cgConstRefSym(a0)
-			if rs != 0 {
-				cgConvType(e, callTab.items[usize(c)].conv, dp-1)
-				cgWc('(')
-				cgWConstRef(a0, rs, false, dp-1)
-				cgWc(')')
-				return
-			}
+		a0 := cgUnparenNode(l1at(e, 0))
+		rs := cgConstRefSym(a0)
+		if callTab.items[usize(ncall[usize(e)])].kind is Conversion(t) && rs != 0 {
+			cgConvType(e, t, dp-1)
+			cgWc('(')
+			cgWConstRef(a0, rs, false, dp-1)
+			cgWc(')')
+			return
 		}
 	}
 	if k == NkParenExpr {
@@ -165,7 +162,7 @@ func cgBasicLit(lit u32, v Val, typed bool, dp usize) decreases(dp) {
 	t := ntype[usize(lit)]
 	op := nop(lit)
 	if op == LitString {
-		named := cgIsNamedT(t)
+		named := isNamedT(t)
 		if named {
 			cgGoType(lit, t, dp-1)
 			cgWc('(')
@@ -648,7 +645,7 @@ func cgTupleValues(e u32, v Val, dp usize) decreases(dp) {
 		return
 	}
 	tt := ntype[usize(e)]
-	if v is Tuple(ref, nv) && tt != 0 && isTupleT(tt) && tupleN(tt) == usize(nv) {
+	if v is Tuple(ref, nv) && isTupleT(tt) && tupleN(tt) == usize(nv) {
 		for i := usize(0); i < usize(nv); i++ {
 			if i > 0 {
 				cgW(", ")
@@ -669,73 +666,81 @@ func cgCall(e u32, dp usize) decreases(dp) {
 		cgFail(e, "call without type information")
 		return
 	}
-	ci := callTab.items[usize(c)]
-	k := ci.kind
-	if k == CallFunc {
-		cgFuncRef(e, ci.callee, ci.taS, usize(ci.taN), dp-1)
-		cgWc('(')
-		cgArgs(e, dp-1)
-		cgWc(')')
-	} else if k == CallMethod {
-		cgPrimary(ci.recv, dp-1)
-		cgWc('.')
-		cgWSymName(ci.callee)
-		cgWc('(')
-		cgArgs(e, dp-1)
-		cgWc(')')
-	} else if k == CallBuiltinMeth {
-		cgBuiltinMethod(e, c, dp-1)
-	} else if k == CallBuiltin {
-		cgBuiltinCall(e, c, dp-1)
-	} else if k == CallConversion {
-		cgConvType(e, ci.conv, dp-1)
-		cgWc('(')
-		cgExpr(l1at(e, 0), dp-1)
-		cgWc(')')
-	} else if k == CallVariant {
-		vi := usize(ci.variant)
-		lay := cgLayout(e, ci.variantType, dp-1)
-		p := cgWmark()
-		cgWc('{')
-		if vi != 0 {
-			cgW("_tag: ")
-			cgWu(u64(vi))
+	match callTab.items[usize(c)].kind {
+		Func(sym, taS, taN) -> {
+			cgFuncRef(e, sym, taS, usize(taN), dp-1)
+			cgCallArgs(e, dp-1)
 		}
-		n := l1len(e)
-		for i := usize(0); i < n; i++ {
-			if vi != 0 || i > 0 {
-				cgW(", ")
-			}
-			cgWSlot(lay, vi, i)
-			cgW(": ")
-			cgExpr(l1at(e, i), dp-1)
+		Method(sym, _, recv, _) -> {
+			cgPrimary(recv, dp-1)
+			cgWc('.')
+			cgWSymName(sym)
+			cgCallArgs(e, dp-1)
 		}
-		cgWc('}')
-		q := cgWmark()
-		cgGoType(e, ci.variantType, dp-1)
-		cgWrotate(p, q)
-		cgComposite(p)
-		cgLayRelease(lay)
-	} else if k == CallValue {
-		cgPrimary(na(e), dp-1)
-		cgWc('(')
-		cgArgs(e, dp-1)
-		cgWc(')')
-	} else {
-		cgFail(e, "unsupported call")
+		BuiltinMeth(m, recv, _) -> cgBuiltinMethod(e, meths.items[usize(m)].builtin, m, recv, dp-1)
+		Builtin(b, ..) -> cgBuiltinCall(e, c, b, dp-1)
+		Conversion(t) -> {
+			cgConvType(e, t, dp-1)
+			cgWc('(')
+			cgExpr(l1at(e, 0), dp-1)
+			cgWc(')')
+		}
+		Variant(t, v) -> cgVariantCall(e, t, usize(v), dp-1)
+		Value -> {
+			cgPrimary(na(e), dp-1)
+			cgCallArgs(e, dp-1)
+		}
+		Invalid -> cgFail(e, "unsupported call")
 	}
 }
 
-func cgBuiltinMethod(e u32, c u32, dp usize) decreases(dp) {
+// cgCallArgs writes the parenthesized arguments of a call.
+func cgCallArgs(e u32, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
-	ci := callTab.items[usize(c)]
-	b := meths.items[usize(ci.method)].builtin
+	cgWc('(')
+	cgArgs(e, dp-1)
+	cgWc(')')
+}
+
+// cgVariantCall writes the construction of variant vi of enum type t.
+func cgVariantCall(e u32, t u32, vi usize, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	lay := cgLayout(e, t, dp-1)
+	p := cgWmark()
+	cgWc('{')
+	if vi != 0 {
+		cgW("_tag: ")
+		cgWu(u64(vi))
+	}
+	n := l1len(e)
+	for i := usize(0); i < n; i++ {
+		if vi != 0 || i > 0 {
+			cgW(", ")
+		}
+		cgWSlot(lay, vi, i)
+		cgW(": ")
+		cgExpr(l1at(e, i), dp-1)
+	}
+	cgWc('}')
+	q := cgWmark()
+	cgGoType(e, t, dp-1)
+	cgWrotate(p, q)
+	cgComposite(p)
+	cgLayRelease(lay)
+}
+
+func cgBuiltinMethod(e u32, b u8, m u32, recv u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
 	if b == BMScopeAcquireSlot {
 		cgRt("AcquireSlot")
 		cgWc('(')
-		cgPrimary(ci.recv, dp-1)
+		cgPrimary(recv, dp-1)
 		// finc0 renders the pool before the context argument.
 		q := cgWmark()
 		a1 := l1at(e, 1)
@@ -757,7 +762,7 @@ func cgBuiltinMethod(e u32, c u32, dp usize) decreases(dp) {
 	if b == BMScopeReleaseSlot {
 		cgRt("ReleaseSlot")
 		cgWc('(')
-		cgPrimary(ci.recv, dp-1)
+		cgPrimary(recv, dp-1)
 		cgW(", ")
 		cgExpr(l1at(e, 0), dp-1)
 		cgWc(')')
@@ -766,7 +771,7 @@ func cgBuiltinMethod(e u32, c u32, dp usize) decreases(dp) {
 	if b == BMScopeGo {
 		cgRt("Go")
 		cgWc('(')
-		cgPrimary(ci.recv, dp-1)
+		cgPrimary(recv, dp-1)
 		cgW(", ")
 		cgExpr(l1at(e, 0), dp-1)
 		cgW(", ")
@@ -774,17 +779,16 @@ func cgBuiltinMethod(e u32, c u32, dp usize) decreases(dp) {
 		cgWc(')')
 		return
 	}
-	cgPrimary(ci.recv, dp-1)
-	cgWf(formatTo(mbuf[:], ".%s(", nameBytes(meths.items[usize(ci.method)].name)))
+	cgPrimary(recv, dp-1)
+	cgWf(formatTo(mbuf[:], ".%s(", nameBytes(meths.items[usize(m)].name)))
 	cgArgs(e, dp-1)
 	cgWc(')')
 }
 
-func cgBuiltinCall(e u32, c u32, dp usize) decreases(dp) {
+func cgBuiltinCall(e u32, c u32, b u8, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
-	b := callTab.items[usize(c)].builtin
 	if b == BFLen {
 		cgW("uint(len(")
 		cgExpr(l1at(e, 0), dp-1)
