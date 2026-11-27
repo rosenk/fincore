@@ -957,7 +957,7 @@ func lnBorrowBindings(fl u32, p u32, a u32, depth usize) decreases(depth) {
 				lnSet(a, vi, StBorrowed, 0)
 			}
 		}
-	} else if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
 			lnBorrowBindings(fl, l1at(p, i), a, depth-1)
@@ -1023,7 +1023,7 @@ func lnAssign(fl u32, e u32, lS usize, lN usize, rS usize, rN usize, dp usize) d
 	errSym := u32(0)
 	if rN == 1 && lN > 1 {
 		t := ntype[usize(lnTmp[rS])]
-		if t != 0 && isTupleT(t) && tupleN(t) == lN && tupleAt(t, lN-1) == TyError {
+		if isTupleT(t) && tupleN(t) == lN && tupleAt(t, lN-1) == TyError {
 			last := lnTmp[lS+lN-1]
 			if nkind(last) == NkIdent {
 				errSym = scVarSym(last)
@@ -1248,12 +1248,8 @@ func lnCall(fl u32, x u32, e u32, deferred bool, dp usize) decreases(dp) {
 		}
 		return
 	}
-	finalize := Consume.Finalize
-	move := Consume.Move
-	if deferred {
-		finalize = Consume.Defer
-		move = Consume.Defer
-	}
+	finalize := match deferred { true -> Consume.Defer, false -> Consume.Finalize }
+	move := match deferred { true -> Consume.Defer, false -> Consume.Move }
 	c := callTab.items[usize(ci)]
 	fun := unparen(na(x))
 	funLit := fun != 0 && nkind(fun) == NkFuncLit
@@ -1278,7 +1274,7 @@ func lnCall(fl u32, x u32, e u32, deferred bool, dp usize) decreases(dp) {
 	} else if funLit {
 		lnInlineLit(fl, fun, e, deferred, dp-1)
 	}
-	owned := c.effect == EffDriver && (c.kind == CallFunc || c.kind == CallMethod || c.kind == CallValue)
+	owned := c.effect == EffDriver && c.kind is CallFunc | CallMethod | CallValue
 	isGo := c.kind == CallBuiltinMeth && c.method != 0 && meths.items[usize(c.method)].builtin == BMScopeGo
 	for k := usize(0); k < nargs; k++ {
 		a := l1at(x, k)
@@ -1342,10 +1338,7 @@ func lnInlineLit(fl u32, lit u32, e u32, deferred bool, dp usize) decreases(dp) 
 	mid := lnNTmp
 	lnPushParams(fi, false)
 	lnRun(g, nb(lit), mark, mid, dp-1)
-	kind := Consume.Finalize
-	if deferred {
-		kind = Consume.Defer
-	}
+	kind := match deferred { true -> Consume.Defer, false -> Consume.Finalize }
 	ex := lnFlows[usize(g)].exits
 	c2 := litCapHead[usize(lit)]
 	for q := usize(0); q < MaxCells; q++ {

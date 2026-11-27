@@ -140,231 +140,93 @@ func isKeyword(k u8) bool {
 // kindString returns the source spelling of keywords and operators and the
 // class name of other kinds (lexer.Kind.String in finc0).
 func kindString(k u8) string {
-	if k == TkIllegal {
-		return "ILLEGAL"
+	return match k {
+		TkIllegal -> "ILLEGAL"
+		TkEOF -> "EOF"
+		TkIdent -> "IDENT"
+		TkInt -> "INT"
+		TkString -> "STRING"
+		TkChar -> "CHAR"
+		_ if k < TkAdd -> keywordString(k)
+		_ -> operatorString(k)
 	}
-	if k == TkEOF {
-		return "EOF"
-	}
-	if k == TkIdent {
-		return "IDENT"
-	}
-	if k == TkInt {
-		return "INT"
-	}
-	if k == TkString {
-		return "STRING"
-	}
-	if k == TkChar {
-		return "CHAR"
-	}
-	if k < TkAdd {
-		return keywordString(k)
-	}
-	return operatorString(k)
 }
 
 func keywordString(k u8) string {
-	if k == TkPackage {
-		return "package"
+	return match k {
+		TkPackage -> "package"
+		TkImport -> "import"
+		TkConst -> "const"
+		TkType -> "type"
+		TkVar -> "var"
+		TkFunc -> "func"
+		TkDriver -> "driver"
+		TkComptime -> "comptime"
+		TkScope -> "scope"
+		TkFor -> "for"
+		TkIf -> "if"
+		TkElse -> "else"
+		TkReturn -> "return"
+		TkBreak -> "break"
+		TkContinue -> "continue"
+		TkDefer -> "defer"
+		TkStruct -> "struct"
+		TkEnum -> "enum"
+		TkMatch -> "match"
+		TkTrue -> "true"
+		TkFalse -> "false"
+		TkNil -> "nil"
+		TkAny -> "any"
+		TkDecreases -> "decreases"
+		TkIs -> "is"
+		_ -> "Kind(?)"
 	}
-	if k == TkImport {
-		return "import"
-	}
-	if k == TkConst {
-		return "const"
-	}
-	if k == TkType {
-		return "type"
-	}
-	if k == TkVar {
-		return "var"
-	}
-	if k == TkFunc {
-		return "func"
-	}
-	if k == TkDriver {
-		return "driver"
-	}
-	if k == TkComptime {
-		return "comptime"
-	}
-	if k == TkScope {
-		return "scope"
-	}
-	if k == TkFor {
-		return "for"
-	}
-	if k == TkIf {
-		return "if"
-	}
-	if k == TkElse {
-		return "else"
-	}
-	if k == TkReturn {
-		return "return"
-	}
-	if k == TkBreak {
-		return "break"
-	}
-	if k == TkContinue {
-		return "continue"
-	}
-	if k == TkDefer {
-		return "defer"
-	}
-	if k == TkStruct {
-		return "struct"
-	}
-	if k == TkEnum {
-		return "enum"
-	}
-	if k == TkMatch {
-		return "match"
-	}
-	if k == TkTrue {
-		return "true"
-	}
-	if k == TkFalse {
-		return "false"
-	}
-	if k == TkNil {
-		return "nil"
-	}
-	if k == TkAny {
-		return "any"
-	}
-	if k == TkDecreases {
-		return "decreases"
-	}
-	if k == TkIs {
-		return "is"
-	}
-	return "Kind(?)"
 }
 
 func operatorString(k u8) string {
-	if k == TkAdd {
-		return "+"
+	return match k {
+		TkAdd -> "+"
+		TkSub -> "-"
+		TkMul -> "*"
+		TkQuo -> "/"
+		TkRem -> "%"
+		TkAnd -> "&"
+		TkOr -> "|"
+		TkXor -> "^"
+		TkShl -> "<<"
+		TkShr -> ">>"
+		TkEql -> "=="
+		TkNeq -> "!="
+		TkLss -> "<"
+		TkLeq -> "<="
+		TkGtr -> ">"
+		TkGeq -> ">="
+		TkLAnd -> "&&"
+		TkLOr -> "||"
+		TkNot -> "!"
+		TkAssign -> "="
+		TkDefine -> ":="
+		TkAddAssign -> "+="
+		TkSubAssign -> "-="
+		TkMulAssign -> "*="
+		TkQuoAssign -> "/="
+		TkInc -> "++"
+		TkDec -> "--"
+		TkLParen -> "("
+		TkRParen -> ")"
+		TkLBrack -> "["
+		TkRBrack -> "]"
+		TkLBrace -> "{"
+		TkRBrace -> "}"
+		TkComma -> ","
+		TkPeriod -> "."
+		TkColon -> ":"
+		TkSemicolon -> ";"
+		TkArrow -> "->"
+		TkEllipsis -> "..."
+		TkDotDot -> ".."
+		_ -> "Kind(?)"
 	}
-	if k == TkSub {
-		return "-"
-	}
-	if k == TkMul {
-		return "*"
-	}
-	if k == TkQuo {
-		return "/"
-	}
-	if k == TkRem {
-		return "%"
-	}
-	if k == TkAnd {
-		return "&"
-	}
-	if k == TkOr {
-		return "|"
-	}
-	if k == TkXor {
-		return "^"
-	}
-	if k == TkShl {
-		return "<<"
-	}
-	if k == TkShr {
-		return ">>"
-	}
-	if k == TkEql {
-		return "=="
-	}
-	if k == TkNeq {
-		return "!="
-	}
-	if k == TkLss {
-		return "<"
-	}
-	if k == TkLeq {
-		return "<="
-	}
-	if k == TkGtr {
-		return ">"
-	}
-	if k == TkGeq {
-		return ">="
-	}
-	if k == TkLAnd {
-		return "&&"
-	}
-	if k == TkLOr {
-		return "||"
-	}
-	if k == TkNot {
-		return "!"
-	}
-	if k == TkAssign {
-		return "="
-	}
-	if k == TkDefine {
-		return ":="
-	}
-	if k == TkAddAssign {
-		return "+="
-	}
-	if k == TkSubAssign {
-		return "-="
-	}
-	if k == TkMulAssign {
-		return "*="
-	}
-	if k == TkQuoAssign {
-		return "/="
-	}
-	if k == TkInc {
-		return "++"
-	}
-	if k == TkDec {
-		return "--"
-	}
-	if k == TkLParen {
-		return "("
-	}
-	if k == TkRParen {
-		return ")"
-	}
-	if k == TkLBrack {
-		return "["
-	}
-	if k == TkRBrack {
-		return "]"
-	}
-	if k == TkLBrace {
-		return "{"
-	}
-	if k == TkRBrace {
-		return "}"
-	}
-	if k == TkComma {
-		return ","
-	}
-	if k == TkPeriod {
-		return "."
-	}
-	if k == TkColon {
-		return ":"
-	}
-	if k == TkSemicolon {
-		return ";"
-	}
-	if k == TkArrow {
-		return "->"
-	}
-	if k == TkEllipsis {
-		return "..."
-	}
-	if k == TkDotDot {
-		return ".."
-	}
-	return "Kind(?)"
 }
 
 // lookupKeyword maps an identifier spelling to its keyword kind, or TkIdent.
@@ -390,13 +252,7 @@ func lookupKeyword(w []byte) u8 {
 func describeToken(o *OutBuf, t Token, text []byte) {
 	k := t.kind
 	if k == TkSemicolon {
-		if t.semi == SemiNewline {
-			o.WriteString("newline")
-		} else if t.semi == SemiEOF {
-			o.WriteString("EOF")
-		} else {
-			o.WriteString("';'")
-		}
+		o.WriteString(match t.semi { SemiNewline -> "newline", SemiEOF -> "EOF", _ -> "';'" })
 		return
 	}
 	if k == TkEOF {
@@ -534,19 +390,17 @@ func putIntLitError(o *OutBuf, lit []byte) {
 	}
 	o.WriteString("invalid integer literal ")
 	putQuoted(o, lit)
-	if st == IntNoDigits {
-		o.WriteString(": no digits")
-	} else if st == IntLeadZero {
-		o.WriteString(": leading zero (octal literals are not supported)")
-	} else {
-		o.WriteString(": '_' must separate digits")
-	}
+	o.WriteString(match st {
+		IntNoDigits -> ": no digits"
+		IntLeadZero -> ": leading zero (octal literals are not supported)"
+		_ -> ": '_' must separate digits"
+	})
 }
 
 // lexErrCode returns the diagnostic code of an ILLEGAL token.
 func lexErrCode(t Token) u32 {
 	k := t.errKind
-	if k == LexErrUntermComment || k == LexErrUntermString || k == LexErrUntermChar {
+	if k is LexErrUntermComment | LexErrUntermString | LexErrUntermChar {
 		return E1002
 	}
 	return E1001
@@ -602,19 +456,13 @@ func decodeEscapeAt(raw []byte, i usize) (byte, usize) {
 		return 0, 1
 	}
 	c := raw[i+1]
-	if c == 'n' {
-		return '\n', 2
+	match c {
+		'n' -> return '\n', 2
+		'r' -> return '\r', 2
+		't' -> return '\t', 2
+		'x' if i+3 < n -> return (hexVal(raw[i+2]) << 4) | hexVal(raw[i+3]), 4
+		_ -> return c, 2
 	}
-	if c == 'r' {
-		return '\r', 2
-	}
-	if c == 't' {
-		return '\t', 2
-	}
-	if c == 'x' && i+3 < n {
-		return (hexVal(raw[i+2]) << 4) | hexVal(raw[i+3]), 4
-	}
-	return c, 2
 }
 
 // decodeStringLit writes the decoded contents of a valid STRING literal
@@ -771,7 +619,7 @@ func (l *Lexer) nextToken() Token {
 			l.advance()
 			continue
 		}
-		if c == ' ' || c == '\t' || c == '\r' {
+		if c is ' ' | '\t' | '\r' {
 			l.advance()
 			continue
 		}
@@ -841,7 +689,7 @@ func (l *Lexer) scan() Token {
 		t := l.finishTok(start)
 		k := lookupKeyword(l.src[start.off:l.off])
 		t.kind = k
-		l.insertSemi = k == TkIdent || k == TkTrue || k == TkFalse || k == TkNil || k == TkBreak || k == TkContinue || k == TkReturn
+		l.insertSemi = k is TkIdent | TkTrue | TkFalse | TkNil | TkBreak | TkContinue | TkReturn
 		return t
 	}
 	if isDigit(c) {
@@ -896,117 +744,95 @@ func (l *Lexer) opKind() (u8, usize) {
 		return TkAdd, 1
 	}
 	if c == '-' {
-		if n1 == '-' {
-			return TkDec, 2
+		match n1 {
+			'-' -> return TkDec, 2
+			'=' -> return TkSubAssign, 2
+			'>' -> return TkArrow, 2
+			_ -> return TkSub, 1
 		}
-		if n1 == '=' {
-			return TkSubAssign, 2
+	}
+	match c {
+		'*' -> {
+			if n1 == '=' {
+				return TkMulAssign, 2
+			}
+			return TkMul, 1
 		}
-		if n1 == '>' {
-			return TkArrow, 2
+		'/' -> {
+			if n1 == '=' {
+				return TkQuoAssign, 2
+			}
+			return TkQuo, 1
 		}
-		return TkSub, 1
-	}
-	if c == '*' {
-		if n1 == '=' {
-			return TkMulAssign, 2
+		'%' -> return TkRem, 1
+		'&' -> {
+			if n1 == '&' {
+				return TkLAnd, 2
+			}
+			return TkAnd, 1
 		}
-		return TkMul, 1
-	}
-	if c == '/' {
-		if n1 == '=' {
-			return TkQuoAssign, 2
+		'|' -> {
+			if n1 == '|' {
+				return TkLOr, 2
+			}
+			return TkOr, 1
 		}
-		return TkQuo, 1
-	}
-	if c == '%' {
-		return TkRem, 1
-	}
-	if c == '&' {
-		if n1 == '&' {
-			return TkLAnd, 2
+		'^' -> return TkXor, 1
+		'<' -> {
+			if n1 == '<' {
+				return TkShl, 2
+			}
+			if n1 == '=' {
+				return TkLeq, 2
+			}
+			return TkLss, 1
 		}
-		return TkAnd, 1
-	}
-	if c == '|' {
-		if n1 == '|' {
-			return TkLOr, 2
+		'>' -> {
+			if n1 == '>' {
+				return TkShr, 2
+			}
+			if n1 == '=' {
+				return TkGeq, 2
+			}
+			return TkGtr, 1
 		}
-		return TkOr, 1
-	}
-	if c == '^' {
-		return TkXor, 1
-	}
-	if c == '<' {
-		if n1 == '<' {
-			return TkShl, 2
+		'=' -> {
+			if n1 == '=' {
+				return TkEql, 2
+			}
+			return TkAssign, 1
 		}
-		if n1 == '=' {
-			return TkLeq, 2
+		'!' -> {
+			if n1 == '=' {
+				return TkNeq, 2
+			}
+			return TkNot, 1
 		}
-		return TkLss, 1
-	}
-	if c == '>' {
-		if n1 == '>' {
-			return TkShr, 2
+		':' -> {
+			if n1 == '=' {
+				return TkDefine, 2
+			}
+			return TkColon, 1
 		}
-		if n1 == '=' {
-			return TkGeq, 2
+		'(' -> return TkLParen, 1
+		')' -> return TkRParen, 1
+		'[' -> return TkLBrack, 1
+		']' -> return TkRBrack, 1
+		'{' -> return TkLBrace, 1
+		'}' -> return TkRBrace, 1
+		',' -> return TkComma, 1
+		';' -> return TkSemicolon, 1
+		'.' -> {
+			if n1 == '.' && n2 == '.' {
+				return TkEllipsis, 3
+			}
+			if n1 == '.' {
+				return TkDotDot, 2
+			}
+			return TkPeriod, 1
 		}
-		return TkGtr, 1
+		_ -> return TkIllegal, 1
 	}
-	if c == '=' {
-		if n1 == '=' {
-			return TkEql, 2
-		}
-		return TkAssign, 1
-	}
-	if c == '!' {
-		if n1 == '=' {
-			return TkNeq, 2
-		}
-		return TkNot, 1
-	}
-	if c == ':' {
-		if n1 == '=' {
-			return TkDefine, 2
-		}
-		return TkColon, 1
-	}
-	if c == '(' {
-		return TkLParen, 1
-	}
-	if c == ')' {
-		return TkRParen, 1
-	}
-	if c == '[' {
-		return TkLBrack, 1
-	}
-	if c == ']' {
-		return TkRBrack, 1
-	}
-	if c == '{' {
-		return TkLBrace, 1
-	}
-	if c == '}' {
-		return TkRBrace, 1
-	}
-	if c == ',' {
-		return TkComma, 1
-	}
-	if c == ';' {
-		return TkSemicolon, 1
-	}
-	if c == '.' {
-		if n1 == '.' && n2 == '.' {
-			return TkEllipsis, 3
-		}
-		if n1 == '.' {
-			return TkDotDot, 2
-		}
-		return TkPeriod, 1
-	}
-	return TkIllegal, 1
 }
 
 func (l *Lexer) scanOperator(start Token) Token {
@@ -1027,7 +853,7 @@ func (l *Lexer) scanOperator(start Token) Token {
 	l.advanceTo(l.off + size)
 	t := l.finishTok(start)
 	t.kind = k
-	l.insertSemi = k == TkRParen || k == TkRBrack || k == TkRBrace || k == TkInc || k == TkDec
+	l.insertSemi = k is TkRParen | TkRBrack | TkRBrace | TkInc | TkDec
 	return t
 }
 
@@ -1101,13 +927,9 @@ func (l *Lexer) scanString(start Token) Token {
 			pc := l.col()
 			bad := u8(LexErrNone)
 			match l.escape('"') {
-				EOF | Newline -> {
-					return l.illegal(start, LexErrUntermString)
-				}
+				EOF | Newline -> return l.illegal(start, LexErrUntermString)
 				Ok(_) -> {}
-				BadHex -> {
-					bad = LexErrBadHexEscape
-				}
+				BadHex -> bad = LexErrBadHexEscape
 				Invalid(bb) -> {
 					bad = LexErrBadEscape
 					if badKind == LexErrNone {
@@ -1150,9 +972,7 @@ func (l *Lexer) scanChar(start Token) Token {
 		pl := l.line
 		pc := l.col()
 		match l.escape('\'') {
-			EOF | Newline -> {
-				return l.illegal(start, LexErrUntermChar)
-			}
+			EOF | Newline -> return l.illegal(start, LexErrUntermChar)
 			BadHex -> {
 				l.skipCharRest()
 				return l.illegalAt(start, LexErrBadHexEscape, pl, pc, 0)
@@ -1161,9 +981,7 @@ func (l *Lexer) scanChar(start Token) Token {
 				l.skipCharRest()
 				return l.illegalAt(start, LexErrBadEscape, pl, pc, bb)
 			}
-			Ok(b) -> {
-				v = b
-			}
+			Ok(b) -> v = b
 		}
 	} else if c >= 0x80 {
 		l.skipCharRest()

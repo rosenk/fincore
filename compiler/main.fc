@@ -44,20 +44,18 @@ func strEq(a string, b string) bool {
 // output helpers (driver layer)
 
 driver func flushErr(io Stdio) error {
-	eb := &errBuf
-	if eb.Len() == 0 {
+	if errBuf.Len() == 0 {
 		return nil
 	}
-	err := io.WriteStderr(eb.Bytes())
-	eb.Reset()
+	err := io.WriteStderr(errBuf.Bytes())
+	errBuf.Reset()
 	return err
 }
 
 // sayf writes mbuf[:k] (formatted by the caller) to stderr; like a reset
 // errBuf followed by flushErr, it leaves errBuf empty.
 driver func sayf(io Stdio, k usize) error {
-	eb := &errBuf
-	eb.Reset()
+	errBuf.Reset()
 	return io.WriteStderr(mbuf[:k])
 }
 
@@ -201,7 +199,7 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 	np := &nodes
 	sources.used = 0
 	sources.nfiles = 0
-	(&errBuf).Truncate(0)
+	errBuf.Truncate(0)
 	f0, f1, ndiag, err := parseSources(fs, io, path, false)
 	if err != nil {
 		return err
@@ -231,13 +229,12 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 		return err
 	}
 	d := Dumper{na: np, sa: &sources, src: sources.bytes[:], out: ob, tmp: &tmpBuf}
-	dp := &d
 	for i := f0; i < f1; i++ {
 		if !sources.files[i].ok {
 			continue
 		}
 		ob.Reset()
-		dp.dumpNode(sources.files[i].root, 0, WalkDepth)
+		d.dumpNode(sources.files[i].root, 0, WalkDepth)
 		if ob.Truncated() {
 			return capacityFail(io, sources.files[i].path, "output buffer")
 		}
@@ -275,7 +272,7 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 		}
 		for i := usize(0); i < n; i++ {
 			fp := joinPath(path, fileNames[i])
-			if len(strBytes(fp)) == 0 {
+			if len(fp) == 0 {
 				return f0, f0, 0, capacityFail(io, path, "path too long")
 			}
 			sources.files[f0+i].path = fp
@@ -335,8 +332,7 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 			path: fpath,
 			ntok: tp.Len(),
 		}
-		pp := &p
-		root := pp.run()
+		root := p.run()
 		if nodes.full || lsp.Full() || eb.Truncated() {
 			eb.Truncate(diagMark)
 			return f0, f1, ndiag, capacityFail(io, fpath, "AST nodes")
@@ -391,7 +387,6 @@ driver func checkUsage(io Stdio) error {
 
 // runCheck implements `check [--comptime-fuel=N] <file.fc | dir>`.
 driver func runCheck(fs FS, env Env, io Stdio) error {
-	eb := &errBuf
 	argc := env.ArgsCount()
 	fuel := u64(DefaultFuel)
 	operand := ""
@@ -427,11 +422,11 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 			}
 		}
 		name := ab[st:eq]
-		if bytesEqual(name, strBytes("stats")) && eq == len(ab) {
+		if bytesEqual(name, "stats") && eq == len(ab) {
 			semaStats = true
 			continue
 		}
-		if bytesEqual(name, strBytes("passes")) && eq < len(ab) {
+		if bytesEqual(name, "passes") && eq < len(ab) {
 			if !parsePasses(ab[eq+1:]) {
 				if err := sayf(io, formatTo(mbuf[:], "finc1 check: invalid --passes value %v (want types, all or a list of passes)\n", Quoted(ab[eq+1:]))); err != nil {
 					return err
@@ -440,7 +435,7 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 			}
 			continue
 		}
-		if !bytesEqual(name, strBytes("comptime-fuel")) {
+		if !bytesEqual(name, "comptime-fuel") {
 			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: -%s\n", name)); err != nil {
 				return err
 			}
@@ -453,8 +448,8 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 			val = env.Arg(i + 1)
 			skipNext = true
 		} else {
-			eb.Reset()
-			eb.WriteString("flag needs an argument: -comptime-fuel\n")
+			errBuf.Reset()
+			errBuf.WriteString("flag needs an argument: -comptime-fuel\n")
 			if err := flushErr(io); err != nil {
 				return err
 			}
@@ -484,13 +479,12 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 
 // printDiags writes the sorted diagnostics to stderr.
 driver func printDiags(io Stdio) error {
-	eb := &errBuf
 	n := sortDiags()
-	eb.Reset()
+	errBuf.Reset()
 	for i := usize(0); i < n; i++ {
-		eb.WriteBytes(diagLine(usize(diags.order[i])))
-		eb.WriteByte('\n')
-		if eb.Len() > MaxOutputBytes/2 {
+		errBuf.WriteBytes(diagLine(usize(diags.order[i])))
+		errBuf.WriteByte('\n')
+		if errBuf.Len() > MaxOutputBytes/2 {
 			if err := flushErr(io); err != nil {
 				return err
 			}
@@ -505,7 +499,7 @@ driver func printDiags(io Stdio) error {
 driver func checkPath(fs FS, io Stdio, path string) error {
 	sources.used = 0
 	sources.nfiles = 0
-	(&errBuf).Truncate(0)
+	errBuf.Truncate(0)
 	nameBlank = internStr("_")
 	nameMain = internStr("main")
 	f0, f1, _, err := parseSources(fs, io, path, true)
@@ -572,13 +566,13 @@ driver func printStats(io Stdio) error {
 	statLine(o, "files", sources.nfiles, MaxFiles)
 	statLine(o, "source bytes", sources.used, MaxSourceBytes)
 	statLine(o, "nodes", nodes.count, MaxNodes)
-	statLine(o, "node list items", (&nodes.lists).Used(), MaxListItems)
-	statLine(o, "names", (&names).Len(), MaxNames)
-	statLine(o, "name bytes", (&names).Used(), MaxNameBytes)
+	statLine(o, "node list items", nodes.lists.Used(), MaxListItems)
+	statLine(o, "names", names.Len(), MaxNames)
+	statLine(o, "name bytes", names.Used(), MaxNameBytes)
 	statLine(o, "symbols", syms.count, MaxSyms)
-	statLine(o, "scopes", (&scopes).Len(), MaxScopes)
-	statLine(o, "u32 lists", (&ulists).Used(), MaxULists)
-	statLine(o, "cells", (&cells).Len(), MaxCells)
+	statLine(o, "scopes", scopes.Len(), MaxScopes)
+	statLine(o, "u32 lists", ulists.Used(), MaxULists)
+	statLine(o, "cells", cells.Len(), MaxCells)
 	statLine(o, "types", typs.count, MaxTypes)
 	statLine(o, "type list items", tlistsUsed(), MaxTypeLists)
 	statLine(o, "methods", meths.count, MaxMethods)
@@ -708,9 +702,9 @@ driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
 	// resolve.StdDir); dir is then the cleaned $FINCROOT/<ip> and names
 	// the package's files in diagnostics.
 	dir := ip
-	if len(strBytes(fincRoot)) > 0 && isStdImport(strBytes(ip)) {
+	if len(fincRoot) > 0 && isStdImport(strBytes(ip)) {
 		dir = joinPath(fincRoot, ip)
-		if len(strBytes(dir)) == 0 {
+		if len(dir) == 0 {
 			return 0, capacityFail(io, ip, "path too long")
 		}
 	}

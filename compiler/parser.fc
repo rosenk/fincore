@@ -243,8 +243,7 @@ func (p *Parser) errorNewlineBrace(what string) {
 // putNode writes the canonical source of a node into the diagnostic.
 func (p *Parser) putNode(id u32) {
 	pr := Printer{na: p.na, src: p.src, out: p.diag, indent: 0}
-	pp := &pr
-	pp.printNode(id, WalkDepth)
+	pr.printNode(id, WalkDepth)
 }
 
 // tooDeep reports nesting overflow (counter or decreases budget).
@@ -496,23 +495,14 @@ func (p *Parser) importSpec() u32 {
 
 func (p *Parser) topDecl() u32 {
 	k := p.tok.kind
-	if k == TkConst {
-		return p.constDecl(ParseDepth)
+	match k {
+		TkConst -> return p.constDecl(ParseDepth)
+		TkType -> return p.typeDecl()
+		TkVar -> return p.varDecl(ParseDepth)
+		TkFunc | TkDriver | TkComptime -> return p.funcDecl()
+		TkImport -> p.errorTok("imports must appear before other declarations")
+		_ -> p.errorExpected("declaration (const, type, var or func)")
 	}
-	if k == TkType {
-		return p.typeDecl()
-	}
-	if k == TkVar {
-		return p.varDecl(ParseDepth)
-	}
-	if k == TkFunc || k == TkDriver || k == TkComptime {
-		return p.funcDecl()
-	}
-	if k == TkImport {
-		p.errorTok("imports must appear before other declarations")
-		return 0
-	}
-	p.errorExpected("declaration (const, type, var or func)")
 	return 0
 }
 
@@ -538,7 +528,7 @@ func (p *Parser) looksLikeTypeParams() bool {
 	if t1.kind != TkIdent {
 		return false
 	}
-	return t2.kind == TkIdent || t2.kind == TkAny || t2.kind == TkComma
+	return t2.kind is TkIdent | TkAny | TkComma
 }
 
 func (p *Parser) funcDecl() u32 {
@@ -812,7 +802,7 @@ func (p *Parser) decreasesClause(depth usize) u32 decreases(depth) {
 // startsType reports whether the current token can begin a Type.
 func (p *Parser) startsType() bool {
 	k := p.tok.kind
-	if k == TkIdent || k == TkLBrack || k == TkMul || k == TkStruct || k == TkEnum || k == TkFunc {
+	if k is TkIdent | TkLBrack | TkMul | TkStruct | TkEnum | TkFunc {
 		return true
 	}
 	if k == TkDriver {
@@ -826,7 +816,7 @@ func (p *Parser) isCodeKeyword() bool {
 		return false
 	}
 	k := p.peek(1).kind
-	return k == TkInt || k == TkIdent || k == TkLParen
+	return k is TkInt | TkIdent | TkLParen
 }
 
 func (p *Parser) isElKeyword() bool {
@@ -960,7 +950,7 @@ func (p *Parser) typeOrExpr(depth usize) u32 decreases(depth) {
 		return p.tooDeep()
 	}
 	k := p.tok.kind
-	isType := k == TkLBrack || k == TkMul || k == TkStruct || k == TkEnum || k == TkFunc
+	isType := k is TkLBrack | TkMul | TkStruct | TkEnum | TkFunc
 	if k == TkDriver && p.peek(1).kind == TkFunc {
 		isType = true
 	}
@@ -1115,20 +1105,13 @@ func (p *Parser) stmtBody(depth usize) u32 decreases(depth) {
 		p.setA(ds, d)
 		return p.finish(ds)
 	}
-	if k == TkIf {
-		return p.ifStmt(depth - 1)
-	}
-	if k == TkMatch {
-		return p.matchStmt(depth - 1)
-	}
-	if k == TkFor {
-		return p.forStmt(depth - 1)
-	}
-	if k == TkDriver && p.peek(1).kind == TkFor {
-		return p.forStmt(depth - 1)
-	}
-	if k == TkScope {
-		return p.scopeStmt(depth - 1)
+	match k {
+		TkIf -> return p.ifStmt(depth - 1)
+		TkMatch -> return p.matchStmt(depth - 1)
+		TkFor -> return p.forStmt(depth - 1)
+		TkDriver if p.peek(1).kind == TkFor -> return p.forStmt(depth - 1)
+		TkScope -> return p.scopeStmt(depth - 1)
+		_ -> {}
 	}
 	if k == TkDefer {
 		p.next()
@@ -1162,7 +1145,7 @@ func (p *Parser) stmtBody(depth usize) u32 decreases(depth) {
 		p.errorUnexpected("; expected statement")
 		return 0
 	}
-	if k == TkType || k == TkImport || k == TkPackage || k == TkComptime {
+	if k is TkType | TkImport | TkPackage | TkComptime {
 		p.errorUnexpected(" in statement position")
 		return 0
 	}
@@ -1221,16 +1204,13 @@ func (p *Parser) simpleStmtOrExpr(depth usize) (u32, u32) decreases(depth) {
 		p.setL2(d, rmark)
 		return p.finish(d), 0
 	}
-	if k == TkAssign || k == TkAddAssign || k == TkSubAssign || k == TkMulAssign || k == TkQuoAssign {
-		op := u8(AsgAssign)
-		if k == TkAddAssign {
-			op = AsgAdd
-		} else if k == TkSubAssign {
-			op = AsgSub
-		} else if k == TkMulAssign {
-			op = AsgMul
-		} else if k == TkQuoAssign {
-			op = AsgQuo
+	if k is TkAssign | TkAddAssign | TkSubAssign | TkMulAssign | TkQuoAssign {
+		var op u8 = match k {
+			TkAddAssign -> AsgAdd
+			TkSubAssign -> AsgSub
+			TkMulAssign -> AsgMul
+			TkQuoAssign -> AsgQuo
+			_ -> AsgAssign
 		}
 		opTok := p.tok
 		p.next()
@@ -1324,12 +1304,10 @@ func (p *Parser) ifStmt(depth usize) u32 decreases(depth) {
 	p.setC(s, p.block(depth-1))
 	if p.tok.kind == TkElse {
 		p.next()
-		if p.tok.kind == TkIf {
-			p.setD(s, p.ifStmt(depth-1))
-		} else if p.tok.kind == TkLBrace {
-			p.setD(s, p.block(depth-1))
-		} else {
-			p.errorExpected("'if' or '{' after else")
+		match p.tok.kind {
+			TkIf -> p.setD(s, p.ifStmt(depth-1))
+			TkLBrace -> p.setD(s, p.block(depth-1))
+			_ -> p.errorExpected("'if' or '{' after else")
 		}
 	}
 	return p.finish(s)
@@ -1456,7 +1434,7 @@ func (p *Parser) matchArm(depth usize) u32 decreases(depth) {
 	k := p.tok.kind
 	if k == TkLBrace {
 		p.setC(a, p.block(depth-1))
-	} else if k == TkReturn || k == TkBreak || k == TkContinue {
+	} else if k is TkReturn | TkBreak | TkContinue {
 		p.setC(a, p.armBlock(p.stmt(depth-1)))
 	} else {
 		st, x := p.simpleStmtOrExpr(depth - 1)
@@ -1658,7 +1636,7 @@ func (p *Parser) patternAltBody(payload bool, depth usize) u32 decreases(depth) 
 		}
 		return p.finish(cp)
 	}
-	if k == TkInt || k == TkString || k == TkChar || k == TkTrue || k == TkFalse || k == TkNil {
+	if k is TkInt | TkString | TkChar | TkTrue | TkFalse | TkNil {
 		lit := p.operand(depth - 1)
 		lp := p.mk(NkLiteralPattern, s)
 		p.setA(lp, lit)
@@ -1733,61 +1711,27 @@ func (p *Parser) expr(depth usize) u32 decreases(depth) {
 
 // binOpOf maps a token kind to a binary operator; ok is false otherwise.
 func binOpOf(k u8) (u8, bool) {
-	if k == TkLOr {
-		return OpLOr, true
+	match k {
+		TkLOr -> return OpLOr, true
+		TkLAnd -> return OpLAnd, true
+		TkEql -> return OpEq, true
+		TkNeq -> return OpNe, true
+		TkLss -> return OpLt, true
+		TkLeq -> return OpLe, true
+		TkGtr -> return OpGt, true
+		TkGeq -> return OpGe, true
+		TkAdd -> return OpAdd, true
+		TkSub -> return OpSub, true
+		TkOr -> return OpOr, true
+		TkXor -> return OpXor, true
+		TkMul -> return OpMul, true
+		TkQuo -> return OpDiv, true
+		TkRem -> return OpRem, true
+		TkAnd -> return OpAnd, true
+		TkShl -> return OpShl, true
+		TkShr -> return OpShr, true
+		_ -> return 0, false
 	}
-	if k == TkLAnd {
-		return OpLAnd, true
-	}
-	if k == TkEql {
-		return OpEq, true
-	}
-	if k == TkNeq {
-		return OpNe, true
-	}
-	if k == TkLss {
-		return OpLt, true
-	}
-	if k == TkLeq {
-		return OpLe, true
-	}
-	if k == TkGtr {
-		return OpGt, true
-	}
-	if k == TkGeq {
-		return OpGe, true
-	}
-	if k == TkAdd {
-		return OpAdd, true
-	}
-	if k == TkSub {
-		return OpSub, true
-	}
-	if k == TkOr {
-		return OpOr, true
-	}
-	if k == TkXor {
-		return OpXor, true
-	}
-	if k == TkMul {
-		return OpMul, true
-	}
-	if k == TkQuo {
-		return OpDiv, true
-	}
-	if k == TkRem {
-		return OpRem, true
-	}
-	if k == TkAnd {
-		return OpAnd, true
-	}
-	if k == TkShl {
-		return OpShl, true
-	}
-	if k == TkShr {
-		return OpShr, true
-	}
-	return 0, false
 }
 
 // binary parses a left-associative chain of operators with precedence >= prec.
@@ -2057,7 +2001,7 @@ func (p *Parser) operand(depth usize) u32 decreases(depth) {
 	k := p.tok.kind
 	tuple := p.tupleOK
 	p.tupleOK = false
-	if k == TkInt || k == TkString || k == TkChar {
+	if k is TkInt | TkString | TkChar {
 		return p.basicLit()
 	}
 	if k == TkTrue || k == TkFalse {
@@ -2138,7 +2082,7 @@ func (p *Parser) operand(depth usize) u32 decreases(depth) {
 		p.setA(te, ft)
 		return p.finish(te)
 	}
-	if k == TkLBrack || k == TkStruct || k == TkEnum {
+	if k is TkLBrack | TkStruct | TkEnum {
 		t := p.parseType(depth - 1)
 		te := p.mk(NkTypeExpr, s)
 		p.setA(te, t)

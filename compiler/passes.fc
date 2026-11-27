@@ -16,10 +16,10 @@ var passOnly u32       // 0 = all passes, else the selected pass bits
 
 // passBit returns the bit of a pass name (0 = unknown).
 func passBit(name []byte) u32 {
-	if bytesEqual(name, strBytes("scope")) {
+	if bytesEqual(name, "scope") {
 		return PassScope
 	}
-	if bytesEqual(name, strBytes("totality")) {
+	if bytesEqual(name, "totality") {
 		return PassTotality
 	}
 	return 0
@@ -27,14 +27,14 @@ func passBit(name []byte) u32 {
 
 // parsePasses applies the value of --passes=types|all|<pass>[,<pass>].
 func parsePasses(v []byte) bool {
-	if bytesEqual(v, strBytes("types")) {
+	if bytesEqual(v, "types") {
 		passTypesOnly = true
 		passOnly = 0
 		return true
 	}
 	passTypesOnly = false
 	passOnly = 0
-	if bytesEqual(v, strBytes("all")) {
+	if bytesEqual(v, "all") {
 		return true
 	}
 	n := len(v)

@@ -755,7 +755,7 @@ func addLess(x u32, y u32, strict bool, st u32, dp usize) decreases(dp) {
 // The walker
 
 func isExprKind(k u8) bool {
-	return k >= NkIdent && k <= NkStructLit || k == NkTypeExpr || k == NkMatchExpr || k == NkTupleExpr || k == NkIsExpr
+	return k >= NkIdent && k <= NkStructLit || k is NkTypeExpr | NkMatchExpr | NkTupleExpr | NkIsExpr
 }
 
 func asgPush(n u32) {
@@ -951,7 +951,7 @@ func killPattern(p u32, st u32, depth usize) decreases(depth) {
 	k := nkind(p)
 	if k == NkIdent {
 		kill(symbolOf(p), st)
-	} else if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
 			killPattern(l1at(p, i), st, depth-1)
@@ -1078,7 +1078,7 @@ func twExpr(e u32, st u32, dp usize) decreases(dp) {
 		killPattern(nb(e), st, SemaDepth)
 		return
 	}
-	if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) {
+	if k == NkBinaryExpr && nop(e) is OpLAnd | OpLOr {
 		twExpr(na(e), st, dp-1)
 		r := cloneState(st)
 		wCond(na(e), nop(e) == OpLAnd, r, dp-1)

@@ -201,107 +201,57 @@ const (
 )
 
 func binOpString(op u8) string {
-	if op == OpLOr {
-		return "||"
+	return match op {
+		OpLOr -> "||"
+		OpLAnd -> "&&"
+		OpEq -> "=="
+		OpNe -> "!="
+		OpLt -> "<"
+		OpLe -> "<="
+		OpGt -> ">"
+		OpGe -> ">="
+		OpAdd -> "+"
+		OpSub -> "-"
+		OpOr -> "|"
+		OpXor -> "^"
+		OpMul -> "*"
+		OpDiv -> "/"
+		OpRem -> "%"
+		OpAnd -> "&"
+		OpShl -> "<<"
+		_ -> ">>"
 	}
-	if op == OpLAnd {
-		return "&&"
-	}
-	if op == OpEq {
-		return "=="
-	}
-	if op == OpNe {
-		return "!="
-	}
-	if op == OpLt {
-		return "<"
-	}
-	if op == OpLe {
-		return "<="
-	}
-	if op == OpGt {
-		return ">"
-	}
-	if op == OpGe {
-		return ">="
-	}
-	if op == OpAdd {
-		return "+"
-	}
-	if op == OpSub {
-		return "-"
-	}
-	if op == OpOr {
-		return "|"
-	}
-	if op == OpXor {
-		return "^"
-	}
-	if op == OpMul {
-		return "*"
-	}
-	if op == OpDiv {
-		return "/"
-	}
-	if op == OpRem {
-		return "%"
-	}
-	if op == OpAnd {
-		return "&"
-	}
-	if op == OpShl {
-		return "<<"
-	}
-	return ">>"
 }
 
 // binOpPrec is the binding strength (1 = loosest) of a binary operator.
 func binOpPrec(op u8) u8 {
-	if op == OpLOr {
-		return 1
+	return match op {
+		OpLOr -> 1
+		OpLAnd -> 2
+		OpEq | OpNe -> 3
+		_ if op >= OpLt && op <= OpGe -> 4
+		_ if op >= OpAdd && op <= OpXor -> 5
+		_ -> 6
 	}
-	if op == OpLAnd {
-		return 2
-	}
-	if op == OpEq || op == OpNe {
-		return 3
-	}
-	if op >= OpLt && op <= OpGe {
-		return 4
-	}
-	if op >= OpAdd && op <= OpXor {
-		return 5
-	}
-	return 6
 }
 
 func unaryOpString(op u8) string {
-	if op == OpNot {
-		return "!"
+	return match op {
+		OpNot -> "!"
+		OpNeg -> "-"
+		OpAddr -> "&"
+		_ -> "*"
 	}
-	if op == OpNeg {
-		return "-"
-	}
-	if op == OpAddr {
-		return "&"
-	}
-	return "*"
 }
 
 func assignOpString(op u8) string {
-	if op == AsgAdd {
-		return "+="
+	return match op {
+		AsgAdd -> "+="
+		AsgSub -> "-="
+		AsgMul -> "*="
+		AsgQuo -> "/="
+		_ -> "="
 	}
-	if op == AsgSub {
-		return "-="
-	}
-	if op == AsgMul {
-		return "*="
-	}
-	if op == AsgQuo {
-		return "/="
-	}
-	return "="
 }
 
 func litKindString(op u8) string {
@@ -316,367 +266,151 @@ func litKindString(op u8) string {
 
 // kindName returns the finc0 Go type name of a node kind.
 func kindName(k u8) string {
-	if k == NkFile {
-		return "File"
+	return match k {
+		NkFile -> "File"
+		NkImportDecl -> "ImportDecl"
+		NkImportSpec -> "ImportSpec"
+		NkConstDecl -> "ConstDecl"
+		NkConstSpec -> "ConstSpec"
+		NkTypeDecl -> "TypeDecl"
+		NkVarDecl -> "VarDecl"
+		NkFuncDecl -> "FuncDecl"
+		NkReceiver -> "Receiver"
+		NkTypeParamList -> "TypeParamList"
+		NkTypeParam -> "TypeParam"
+		NkSignature -> "Signature"
+		NkParam -> "Param"
+		NkDecreasesClause -> "DecreasesClause"
+		NkNamedType -> "NamedType"
+		NkArrayType -> "ArrayType"
+		NkSliceType -> "SliceType"
+		NkPointerType -> "PointerType"
+		NkStructType -> "StructType"
+		NkFieldDecl -> "FieldDecl"
+		NkEnumType -> "EnumType"
+		NkVariant -> "Variant"
+		NkFuncType -> "FuncType"
+		NkCodeType -> "CodeType"
+		NkElType -> "ElType"
+		NkAnyType -> "AnyType"
+		NkBlockStmt -> "BlockStmt"
+		NkDeclStmt -> "DeclStmt"
+		NkShortVarDecl -> "ShortVarDecl"
+		NkAssignStmt -> "AssignStmt"
+		NkIncDecStmt -> "IncDecStmt"
+		NkExprStmt -> "ExprStmt"
+		NkIfStmt -> "IfStmt"
+		NkMatchStmt -> "MatchStmt"
+		NkMatchArm -> "MatchArm"
+		NkWildcardPattern -> "WildcardPattern"
+		NkCtorPattern -> "CtorPattern"
+		NkLiteralPattern -> "LiteralPattern"
+		NkForStmt -> "ForStmt"
+		NkScopeStmt -> "ScopeStmt"
+		NkDeferStmt -> "DeferStmt"
+		NkReturnStmt -> "ReturnStmt"
+		NkBreakStmt -> "BreakStmt"
+		NkContinueStmt -> "ContinueStmt"
+		NkIdent -> "Ident"
+		NkBasicLit -> "BasicLit"
+		NkBoolLit -> "BoolLit"
+		NkNilLit -> "NilLit"
+		NkBinaryExpr -> "BinaryExpr"
+		NkUnaryExpr -> "UnaryExpr"
+		NkParenExpr -> "ParenExpr"
+		NkCallExpr -> "CallExpr"
+		NkIndexExpr -> "IndexExpr"
+		NkSliceExpr -> "SliceExpr"
+		NkSelectorExpr -> "SelectorExpr"
+		NkFuncLit -> "FuncLit"
+		NkStructLit -> "StructLit"
+		NkFieldInit -> "FieldInit"
+		NkTypeExpr -> "TypeExpr"
+		NkMatchExpr -> "MatchExpr"
+		NkOrPattern -> "OrPattern"
+		NkTuplePattern -> "TuplePattern"
+		NkRestPattern -> "RestPattern"
+		NkTupleExpr -> "TupleExpr"
+		NkIsExpr -> "IsExpr"
+		_ -> "Node?"
 	}
-	if k == NkImportDecl {
-		return "ImportDecl"
-	}
-	if k == NkImportSpec {
-		return "ImportSpec"
-	}
-	if k == NkConstDecl {
-		return "ConstDecl"
-	}
-	if k == NkConstSpec {
-		return "ConstSpec"
-	}
-	if k == NkTypeDecl {
-		return "TypeDecl"
-	}
-	if k == NkVarDecl {
-		return "VarDecl"
-	}
-	if k == NkFuncDecl {
-		return "FuncDecl"
-	}
-	if k == NkReceiver {
-		return "Receiver"
-	}
-	if k == NkTypeParamList {
-		return "TypeParamList"
-	}
-	if k == NkTypeParam {
-		return "TypeParam"
-	}
-	if k == NkSignature {
-		return "Signature"
-	}
-	if k == NkParam {
-		return "Param"
-	}
-	if k == NkDecreasesClause {
-		return "DecreasesClause"
-	}
-	if k == NkNamedType {
-		return "NamedType"
-	}
-	if k == NkArrayType {
-		return "ArrayType"
-	}
-	if k == NkSliceType {
-		return "SliceType"
-	}
-	if k == NkPointerType {
-		return "PointerType"
-	}
-	if k == NkStructType {
-		return "StructType"
-	}
-	if k == NkFieldDecl {
-		return "FieldDecl"
-	}
-	if k == NkEnumType {
-		return "EnumType"
-	}
-	if k == NkVariant {
-		return "Variant"
-	}
-	if k == NkFuncType {
-		return "FuncType"
-	}
-	if k == NkCodeType {
-		return "CodeType"
-	}
-	if k == NkElType {
-		return "ElType"
-	}
-	if k == NkAnyType {
-		return "AnyType"
-	}
-	if k == NkBlockStmt {
-		return "BlockStmt"
-	}
-	if k == NkDeclStmt {
-		return "DeclStmt"
-	}
-	if k == NkShortVarDecl {
-		return "ShortVarDecl"
-	}
-	if k == NkAssignStmt {
-		return "AssignStmt"
-	}
-	if k == NkIncDecStmt {
-		return "IncDecStmt"
-	}
-	if k == NkExprStmt {
-		return "ExprStmt"
-	}
-	if k == NkIfStmt {
-		return "IfStmt"
-	}
-	if k == NkMatchStmt {
-		return "MatchStmt"
-	}
-	if k == NkMatchArm {
-		return "MatchArm"
-	}
-	if k == NkWildcardPattern {
-		return "WildcardPattern"
-	}
-	if k == NkCtorPattern {
-		return "CtorPattern"
-	}
-	if k == NkLiteralPattern {
-		return "LiteralPattern"
-	}
-	if k == NkForStmt {
-		return "ForStmt"
-	}
-	if k == NkScopeStmt {
-		return "ScopeStmt"
-	}
-	if k == NkDeferStmt {
-		return "DeferStmt"
-	}
-	if k == NkReturnStmt {
-		return "ReturnStmt"
-	}
-	if k == NkBreakStmt {
-		return "BreakStmt"
-	}
-	if k == NkContinueStmt {
-		return "ContinueStmt"
-	}
-	if k == NkIdent {
-		return "Ident"
-	}
-	if k == NkBasicLit {
-		return "BasicLit"
-	}
-	if k == NkBoolLit {
-		return "BoolLit"
-	}
-	if k == NkNilLit {
-		return "NilLit"
-	}
-	if k == NkBinaryExpr {
-		return "BinaryExpr"
-	}
-	if k == NkUnaryExpr {
-		return "UnaryExpr"
-	}
-	if k == NkParenExpr {
-		return "ParenExpr"
-	}
-	if k == NkCallExpr {
-		return "CallExpr"
-	}
-	if k == NkIndexExpr {
-		return "IndexExpr"
-	}
-	if k == NkSliceExpr {
-		return "SliceExpr"
-	}
-	if k == NkSelectorExpr {
-		return "SelectorExpr"
-	}
-	if k == NkFuncLit {
-		return "FuncLit"
-	}
-	if k == NkStructLit {
-		return "StructLit"
-	}
-	if k == NkFieldInit {
-		return "FieldInit"
-	}
-	if k == NkTypeExpr {
-		return "TypeExpr"
-	}
-	if k == NkMatchExpr {
-		return "MatchExpr"
-	}
-	if k == NkOrPattern {
-		return "OrPattern"
-	}
-	if k == NkTuplePattern {
-		return "TuplePattern"
-	}
-	if k == NkRestPattern {
-		return "RestPattern"
-	}
-	if k == NkTupleExpr {
-		return "TupleExpr"
-	}
-	if k == NkIsExpr {
-		return "IsExpr"
-	}
-	return "Node?"
 }
 
 // layout returns the slot and field name of the i-th node-valued field of a
 // node kind (SlotNone past the last one).
 func layout(k u8, i usize) (u8, string) {
-	if k == NkFile {
-		return layout3(i, SlotA, "Package", SlotL1, "Imports", SlotL2, "Decls")
-	}
-	if k == NkImportDecl || k == NkConstDecl {
-		return layout1(i, SlotL1, "Specs")
-	}
-	if k == NkImportSpec {
-		return layout2(i, SlotA, "Name", SlotB, "Path")
-	}
-	if k == NkConstSpec {
-		return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
-	}
-	if k == NkTypeDecl {
-		return layout3(i, SlotA, "Name", SlotB, "TypeParams", SlotC, "Type")
-	}
-	if k == NkVarDecl {
-		return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
-	}
-	if k == NkFuncDecl {
-		if i < 3 {
-			return layout3(i, SlotA, "Recv", SlotB, "Name", SlotC, "TypeParams")
+	match k {
+		NkFile -> return layout3(i, SlotA, "Package", SlotL1, "Imports", SlotL2, "Decls")
+		NkImportDecl | NkConstDecl -> return layout1(i, SlotL1, "Specs")
+		NkImportSpec -> return layout2(i, SlotA, "Name", SlotB, "Path")
+		NkConstSpec -> return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
+		NkTypeDecl -> return layout3(i, SlotA, "Name", SlotB, "TypeParams", SlotC, "Type")
+		NkVarDecl -> return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
+		NkFuncDecl -> {
+			if i < 3 {
+				return layout3(i, SlotA, "Recv", SlotB, "Name", SlotC, "TypeParams")
+			}
+			return layout3(i-3, SlotD, "Sig", SlotE, "Decreases", SlotF, "Body")
 		}
-		return layout3(i-3, SlotD, "Sig", SlotE, "Decreases", SlotF, "Body")
-	}
-	if k == NkReceiver {
-		return layout3(i, SlotA, "Name", SlotB, "TypeName", SlotL1, "TypeParams")
-	}
-	if k == NkTypeParamList {
-		return layout1(i, SlotL1, "Params")
-	}
-	if k == NkTypeParam {
-		return layout2(i, SlotL1, "Names", SlotA, "Constraint")
-	}
-	if k == NkSignature {
-		return layout2(i, SlotL1, "Params", SlotL2, "Results")
-	}
-	if k == NkParam {
-		return layout2(i, SlotL1, "Names", SlotA, "Type")
-	}
-	if k == NkDecreasesClause {
-		return layout1(i, SlotA, "Measure")
-	}
-	if k == NkNamedType {
-		return layout3(i, SlotA, "Pkg", SlotB, "Name", SlotL1, "Args")
-	}
-	if k == NkArrayType {
-		return layout2(i, SlotA, "Len", SlotB, "Elem")
-	}
-	if k == NkSliceType || k == NkPointerType {
-		return layout1(i, SlotA, "Elem")
-	}
-	if k == NkStructType {
-		return layout1(i, SlotL1, "Fields")
-	}
-	if k == NkFieldDecl {
-		return layout2(i, SlotL1, "Names", SlotA, "Type")
-	}
-	if k == NkEnumType {
-		return layout1(i, SlotL1, "Variants")
-	}
-	if k == NkVariant {
-		return layout2(i, SlotA, "Name", SlotL1, "Payload")
-	}
-	if k == NkFuncType {
-		return layout1(i, SlotA, "Sig")
-	}
-	if k == NkCodeType {
-		return layout1(i, SlotA, "Level")
-	}
-	if k == NkElType {
-		return layout1(i, SlotA, "Code")
-	}
-	if k == NkBlockStmt {
-		return layout1(i, SlotL1, "Stmts")
-	}
-	if k == NkDeclStmt {
-		return layout1(i, SlotA, "Decl")
-	}
-	if k == NkShortVarDecl {
-		return layout2(i, SlotL1, "Names", SlotL2, "Values")
-	}
-	if k == NkAssignStmt {
-		return layout2(i, SlotL1, "LHS", SlotL2, "RHS")
-	}
-	if k == NkIncDecStmt || k == NkExprStmt || k == NkDeferStmt || k == NkParenExpr || k == NkUnaryExpr {
-		return layout1(i, SlotA, "X")
-	}
-	if k == NkIfStmt {
-		if i < 2 {
-			return layout2(i, SlotA, "Init", SlotB, "Cond")
+		NkReceiver -> return layout3(i, SlotA, "Name", SlotB, "TypeName", SlotL1, "TypeParams")
+		NkTypeParamList -> return layout1(i, SlotL1, "Params")
+		NkTypeParam -> return layout2(i, SlotL1, "Names", SlotA, "Constraint")
+		NkSignature -> return layout2(i, SlotL1, "Params", SlotL2, "Results")
+		NkParam -> return layout2(i, SlotL1, "Names", SlotA, "Type")
+		NkDecreasesClause -> return layout1(i, SlotA, "Measure")
+		NkNamedType -> return layout3(i, SlotA, "Pkg", SlotB, "Name", SlotL1, "Args")
+		NkArrayType -> return layout2(i, SlotA, "Len", SlotB, "Elem")
+		NkSliceType | NkPointerType -> return layout1(i, SlotA, "Elem")
+		NkStructType -> return layout1(i, SlotL1, "Fields")
+		NkFieldDecl -> return layout2(i, SlotL1, "Names", SlotA, "Type")
+		NkEnumType -> return layout1(i, SlotL1, "Variants")
+		NkVariant -> return layout2(i, SlotA, "Name", SlotL1, "Payload")
+		NkFuncType -> return layout1(i, SlotA, "Sig")
+		NkCodeType -> return layout1(i, SlotA, "Level")
+		NkElType -> return layout1(i, SlotA, "Code")
+		NkBlockStmt -> return layout1(i, SlotL1, "Stmts")
+		NkDeclStmt -> return layout1(i, SlotA, "Decl")
+		NkShortVarDecl -> return layout2(i, SlotL1, "Names", SlotL2, "Values")
+		NkAssignStmt -> return layout2(i, SlotL1, "LHS", SlotL2, "RHS")
+		NkIncDecStmt | NkExprStmt | NkDeferStmt | NkParenExpr | NkUnaryExpr -> return layout1(i, SlotA, "X")
+		NkIfStmt -> {
+			if i < 2 {
+				return layout2(i, SlotA, "Init", SlotB, "Cond")
+			}
+			return layout2(i-2, SlotC, "Then", SlotD, "Else")
 		}
-		return layout2(i-2, SlotC, "Then", SlotD, "Else")
-	}
-	if k == NkMatchStmt {
-		return layout2(i, SlotA, "X", SlotL1, "Arms")
-	}
-	if k == NkMatchArm {
-		if i < 2 {
-			return layout2(i, SlotA, "Pattern", SlotD, "Guard")
+		NkMatchStmt -> return layout2(i, SlotA, "X", SlotL1, "Arms")
+		NkMatchArm -> {
+			if i < 2 {
+				return layout2(i, SlotA, "Pattern", SlotD, "Guard")
+			}
+			return layout2(i-2, SlotB, "Expr", SlotC, "Block")
 		}
-		return layout2(i-2, SlotB, "Expr", SlotC, "Block")
-	}
-	if k == NkCtorPattern {
-		return layout3(i, SlotA, "Qual", SlotB, "Name", SlotL1, "Args")
-	}
-	if k == NkLiteralPattern {
-		return layout1(i, SlotA, "Lit")
-	}
-	if k == NkForStmt {
-		if i < 3 {
-			return layout3(i, SlotA, "Init", SlotB, "Cond", SlotC, "Post")
+		NkCtorPattern -> return layout3(i, SlotA, "Qual", SlotB, "Name", SlotL1, "Args")
+		NkLiteralPattern -> return layout1(i, SlotA, "Lit")
+		NkForStmt -> {
+			if i < 3 {
+				return layout3(i, SlotA, "Init", SlotB, "Cond", SlotC, "Post")
+			}
+			return layout2(i-3, SlotD, "Decreases", SlotE, "Body")
 		}
-		return layout2(i-3, SlotD, "Decreases", SlotE, "Body")
+		NkScopeStmt -> return layout3(i, SlotA, "Name", SlotB, "Value", SlotC, "Body")
+		NkReturnStmt -> return layout1(i, SlotL1, "Results")
+		NkBinaryExpr -> return layout2(i, SlotA, "X", SlotB, "Y")
+		NkCallExpr -> return layout2(i, SlotA, "Fun", SlotL1, "Args")
+		NkIndexExpr -> return layout2(i, SlotA, "X", SlotL1, "Indices")
+		NkSliceExpr -> return layout3(i, SlotA, "X", SlotB, "Lo", SlotC, "Hi")
+		NkSelectorExpr -> return layout2(i, SlotA, "X", SlotB, "Sel")
+		NkFuncLit -> return layout2(i, SlotA, "Sig", SlotB, "Body")
+		NkStructLit -> return layout2(i, SlotA, "Type", SlotL1, "Fields")
+		NkFieldInit -> return layout2(i, SlotA, "Name", SlotB, "Value")
+		NkTypeExpr -> return layout1(i, SlotA, "Type")
+		NkMatchExpr -> return layout2(i, SlotA, "X", SlotL1, "Arms")
+		NkOrPattern -> return layout1(i, SlotL1, "Alts")
+		NkTuplePattern | NkTupleExpr -> return layout1(i, SlotL1, "Elems")
+		NkIsExpr -> return layout2(i, SlotA, "X", SlotB, "Pattern")
+		_ -> return SlotNone, ""
 	}
-	if k == NkScopeStmt {
-		return layout3(i, SlotA, "Name", SlotB, "Value", SlotC, "Body")
-	}
-	if k == NkReturnStmt {
-		return layout1(i, SlotL1, "Results")
-	}
-	if k == NkBinaryExpr {
-		return layout2(i, SlotA, "X", SlotB, "Y")
-	}
-	if k == NkCallExpr {
-		return layout2(i, SlotA, "Fun", SlotL1, "Args")
-	}
-	if k == NkIndexExpr {
-		return layout2(i, SlotA, "X", SlotL1, "Indices")
-	}
-	if k == NkSliceExpr {
-		return layout3(i, SlotA, "X", SlotB, "Lo", SlotC, "Hi")
-	}
-	if k == NkSelectorExpr {
-		return layout2(i, SlotA, "X", SlotB, "Sel")
-	}
-	if k == NkFuncLit {
-		return layout2(i, SlotA, "Sig", SlotB, "Body")
-	}
-	if k == NkStructLit {
-		return layout2(i, SlotA, "Type", SlotL1, "Fields")
-	}
-	if k == NkFieldInit {
-		return layout2(i, SlotA, "Name", SlotB, "Value")
-	}
-	if k == NkTypeExpr {
-		return layout1(i, SlotA, "Type")
-	}
-	if k == NkMatchExpr {
-		return layout2(i, SlotA, "X", SlotL1, "Arms")
-	}
-	if k == NkOrPattern {
-		return layout1(i, SlotL1, "Alts")
-	}
-	if k == NkTuplePattern || k == NkTupleExpr {
-		return layout1(i, SlotL1, "Elems")
-	}
-	if k == NkIsExpr {
-		return layout2(i, SlotA, "X", SlotB, "Pattern")
-	}
-	return SlotNone, ""
 }
 
 func layout1(i usize, s0 u8, n0 string) (u8, string) {
@@ -697,39 +431,25 @@ func layout2(i usize, s0 u8, n0 string, s1 u8, n1 string) (u8, string) {
 }
 
 func layout3(i usize, s0 u8, n0 string, s1 u8, n1 string, s2 u8, n2 string) (u8, string) {
-	if i == 0 {
-		return s0, n0
+	match i {
+		0 -> return s0, n0
+		1 -> return s1, n1
+		2 -> return s2, n2
+		_ -> return SlotNone, ""
 	}
-	if i == 1 {
-		return s1, n1
-	}
-	if i == 2 {
-		return s2, n2
-	}
-	return SlotNone, ""
 }
 
 // slotChild returns the single child stored in a slot (0 if none).
 func slotChild(n Node, slot u8) u32 {
-	if slot == SlotA {
-		return n.a
+	return match slot {
+		SlotA -> n.a
+		SlotB -> n.b
+		SlotC -> n.c
+		SlotD -> n.d
+		SlotE -> n.e
+		SlotF -> n.f
+		_ -> 0
 	}
-	if slot == SlotB {
-		return n.b
-	}
-	if slot == SlotC {
-		return n.c
-	}
-	if slot == SlotD {
-		return n.d
-	}
-	if slot == SlotE {
-		return n.e
-	}
-	if slot == SlotF {
-		return n.f
-	}
-	return 0
 }
 
 // slotList returns the (start, length) of the list stored in a list slot.
@@ -1207,7 +927,7 @@ func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
 			pr.nl()
 		}
 		o.WriteString("}")
-	} else if k == NkDeclStmt || k == NkExprStmt || k == NkLiteralPattern || k == NkTypeExpr {
+	} else if k is NkDeclStmt | NkExprStmt | NkLiteralPattern | NkTypeExpr {
 		pr.printNode(n.a, depth-1)
 	} else if k == NkShortVarDecl {
 		pr.names(n.l1s, n.l1n)

@@ -346,7 +346,7 @@ func hasBindings(p u32, depth usize) bool decreases(depth) {
 	if k == NkIdent {
 		return !isBlank(p) && nvarEnum[usize(p)] == 0
 	}
-	if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+	if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {
 			if hasBindings(l1at(p, i), depth-1) {
@@ -369,7 +369,7 @@ func invalidBindings(p u32, depth usize) decreases(depth) {
 		if s != 0 && syms.items[usize(s)].typ == 0 {
 			setSymType(s, TyInvalid)
 		}
-	} else if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {
 			invalidBindings(l1at(p, i), depth-1)
@@ -718,7 +718,7 @@ func ctorPat(p u32, t u32, dp usize) bool decreases(dp) {
 		// v0.2: a generic enum qualifies patterns on its instances
 		// (Option.Some(x) on an Option[u32]); the variant comes from the
 		// instance.
-		if isNamedT(t) && namedOrigin(t) != 0 && namedOrigin(t) == qt && isEnum {
+		if namedOrigin(t) == qt && isEnum { // qt != 0
 			qe = en
 		} else if qt != t {
 			errAt(E2002, p, formatTo(mbuf[:], "pattern of type %v does not match scrutinee of type %v", TypeRef(qt), TypeRef(t)))
@@ -903,23 +903,15 @@ func uColPush(t u32) {
 // uCtorCount returns the number of constructors of a finite column type (0
 // for infinite domains).
 func uCtorCount(t u32) usize {
-	u := underlying(t)
-	if isEnumT(u) {
-		return nvariants(u)
-	}
 	if isBoolean(t) {
 		return 2
 	}
-	return 0
+	return nvariants(underlying(t)) // 0 for other types
 }
 
 // uArity returns the number of payloads of constructor c of t.
 func uArity(t u32, c usize) usize {
-	u := underlying(t)
-	if isEnumT(u) {
-		return variantPayN(u, c)
-	}
-	return 0
+	return variantPayN(underlying(t), c) // 0 for other types
 }
 
 func uArgType(t u32, c usize, j usize) u32 {
@@ -1337,11 +1329,7 @@ func renderTok(o *OutBuf, h u32, top bool, depth usize) u32 decreases(depth) {
 	c := usize(wC[usize(h)])
 	u := underlying(t)
 	if !isEnumT(u) {
-		if c == 0 {
-			o.WriteString("true")
-		} else {
-			o.WriteString("false")
-		}
+		o.WriteString(match c { 0 -> "true", _ -> "false" })
 		return next
 	}
 	a := variantPayN(u, c)

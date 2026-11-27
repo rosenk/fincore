@@ -153,44 +153,37 @@ func trec(t u32) TypeRec {
 }
 
 func tlist(s u32, i usize) u32 {
-	la := &typs.lists
-	return la.At(usize(s) + i)
+	return typs.lists.At(usize(s) + i)
 }
 
 // tlistSlice returns the run (s, n) as a slice.
 func tlistSlice(s u32, n u32) []u32 {
-	la := &typs.lists
-	return la.Run(s, n)
+	return typs.lists.Run(s, n)
 }
 
 func tpush(x u32) {
-	la := &typs.lists
-	la.Push(x)
-	if la.Full() {
+	typs.lists.Push(x)
+	if typs.lists.Full() {
 		setFull("type lists")
 	}
 }
 
 func tmark() usize {
-	la := &typs.lists
-	return la.Depth()
+	return typs.lists.Depth()
 }
 
 // tslice returns the pending list stack[a:top].
 func tslice(a usize) []u32 {
-	la := &typs.lists
-	return la.Pending(a)
+	return typs.lists.Pending(a)
 }
 
 // tdiscard pops the list stack back to mark.
 func tdiscard(mark usize) {
-	la := &typs.lists
-	la.Discard(mark)
+	typs.lists.Discard(mark)
 }
 
 func tlistsUsed() usize {
-	la := &typs.lists
-	return la.Used()
+	return typs.lists.Used()
 }
 
 func hashList(xs []u32) u64 {
@@ -205,27 +198,25 @@ func hashList(xs []u32) u64 {
 // tcommitStack interns stack[mark:top], pops it and returns its run: equal
 // lists get the same run.
 func tcommitStack(mark usize) (u32, u32) {
-	la := &typs.lists
-	xs := la.Pending(mark)
+	xs := typs.lists.Pending(mark)
 	if len(xs) == 0 {
-		la.Discard(mark)
+		typs.lists.Discard(mark)
 		return 0, 0
 	}
-	tp := &typs.listTab
-	s := tp.Start(hashList(xs))
-	lim := tp.Cap()
+	s := typs.listTab.Start(hashList(xs))
+	lim := typs.listTab.Cap()
 	for g := usize(0); g < lim; g++ {
-		id := tp.At(s)
+		id := typs.listTab.At(s)
 		if id == 0 {
 			if typs.nlrec == 0 {
 				typs.nlrec = 1
 			}
 			if typs.nlrec >= MaxListRecs {
 				setFull("type lists")
-				la.Discard(mark)
+				typs.lists.Discard(mark)
 				return 0, 0
 			}
-			st, n := la.Commit(mark)
+			st, n := typs.lists.Commit(mark)
 			if n == 0 {
 				setFull("type lists")
 				return 0, 0
@@ -234,17 +225,17 @@ func tcommitStack(mark usize) (u32, u32) {
 			typs.nlrec++
 			typs.listS[r] = st
 			typs.listN[r] = n
-			tp.Set(s, u32(r))
+			typs.listTab.Set(s, u32(r))
 			return st, n
 		}
-		if u32sEqual(la.Run(typs.listS[usize(id)], typs.listN[usize(id)]), xs) {
-			la.Discard(mark)
+		if u32sEqual(typs.lists.Run(typs.listS[usize(id)], typs.listN[usize(id)]), xs) {
+			typs.lists.Discard(mark)
 			return typs.listS[usize(id)], typs.listN[usize(id)]
 		}
-		s = tp.Next(s)
+		s = typs.listTab.Next(s)
 	}
 	setFull("type lists")
-	la.Discard(mark)
+	typs.lists.Discard(mark)
 	return 0, 0
 }
 
@@ -333,45 +324,36 @@ func boolU64(b bool) u64 {
 
 // sameType reports whether x and r are the same hash-consed type.
 func sameType(x TypeRec, r TypeRec) bool {
-	match r {
-		Named(rn) -> {
-			return match x {
-				Named(xn) -> typs.named[usize(xn)].origin == typs.named[usize(rn)].origin && typs.named[usize(xn)].argS == typs.named[usize(rn)].argS && typs.named[usize(xn)].argN == typs.named[usize(rn)].argN
-				_ -> false
-			}
-		}
-		_ -> {
-			return x == r
-		}
+	if x is Named(xn) && r is Named(rn) {
+		a := typs.named[usize(xn)]
+		b := typs.named[usize(rn)]
+		return a.origin == b.origin && a.argS == b.argS && a.argN == b.argN
 	}
+	return x == r
 }
 
 // internType returns the canonical TypeID of r (whose lists are interned)
 // and whether it is new. An instance's NamedRec must be the last one
 // allocated; it is released if the instance already exists.
 func internType(r TypeRec) (u32, bool) {
-	tp := &typs.table
-	s := tp.Start(typeHash(r))
-	lim := tp.Cap()
+	s := typs.table.Start(typeHash(r))
+	lim := typs.table.Cap()
 	for g := usize(0); g < lim; g++ {
-		id := tp.At(s)
+		id := typs.table.At(s)
 		if id == 0 {
 			nid := newTypeRec(r)
 			if nid != TyInvalid {
-				tp.Set(s, nid)
+				typs.table.Set(s, nid)
 			}
 			return nid, true
 		}
 		if sameType(typs.items[usize(id)], r) {
-			match r {
-				Named(_) -> {
-					typs.nnamed--
-				}
-				_ -> {}
+			if r is Named(_) {
+				typs.nnamed--
 			}
 			return id, false
 		}
-		s = tp.Next(s)
+		s = typs.table.Next(s)
 	}
 	setFull("type table")
 	return TyInvalid, false
@@ -489,55 +471,55 @@ func newOpaque(name u32, builtin u8) u32 {
 // Type forms
 
 func isBasicT(t u32) bool {
-	return match trec(t) { Basic(_) -> true, _ -> false }
+	return trec(t) is Basic(_)
 }
 
 func isNamedT(t u32) bool {
-	return match trec(t) { Named(_) -> true, _ -> false }
+	return trec(t) is Named(_)
 }
 
 func isArrayT(t u32) bool {
-	return match trec(t) { Array(_, _, _) -> true, _ -> false }
+	return trec(t) is Array(..)
 }
 
 func isSliceT(t u32) bool {
-	return match trec(t) { Slice(_) -> true, _ -> false }
+	return trec(t) is Slice(_)
 }
 
 func isPointerT(t u32) bool {
-	return match trec(t) { Pointer(_) -> true, _ -> false }
+	return trec(t) is Pointer(_)
 }
 
 func isStructT(t u32) bool {
-	return match trec(t) { Struct(_, _) -> true, _ -> false }
+	return trec(t) is Struct(..)
 }
 
 func isEnumT(t u32) bool {
-	return match trec(t) { Enum(_, _) -> true, _ -> false }
+	return trec(t) is Enum(..)
 }
 
 func isSigT(t u32) bool {
-	return match trec(t) { Sig(_, _, _, _, _, _, _, _) -> true, _ -> false }
+	return trec(t) is Sig(..)
 }
 
 func isCodeT(t u32) bool {
-	return match trec(t) { Code(_) -> true, _ -> false }
+	return trec(t) is Code(_)
 }
 
 func isTypeParamT(t u32) bool {
-	return match trec(t) { TypeParam(_, _, _, _) -> true, _ -> false }
+	return trec(t) is TypeParam(..)
 }
 
 func isConstArgT(t u32) bool {
-	return match trec(t) { ConstArg(_) -> true, _ -> false }
+	return trec(t) is ConstArg(_)
 }
 
 func isTupleT(t u32) bool {
-	return match trec(t) { Tuple(_, _) -> true, _ -> false }
+	return trec(t) is Tuple(..)
 }
 
 func isOpaqueT(t u32) bool {
-	return match trec(t) { Opaque(_, _) -> true, _ -> false }
+	return trec(t) is Opaque(..)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,18 +531,14 @@ func namedID(t u32) u32 {
 }
 
 func underlying(t u32) u32 {
-	match trec(t) {
-		Named(id) -> {
-			u := typs.named[usize(id)].under
-			if u == 0 {
-				return TyInvalid
-			}
-			return u
+	if trec(t) is Named(id) {
+		u := typs.named[usize(id)].under
+		if u == 0 {
+			return TyInvalid
 		}
-		_ -> {
-			return t
-		}
+		return u
 	}
+	return t
 }
 
 // namedUnder returns the underlying type of a named type as recorded (0 =
@@ -627,31 +605,17 @@ func isString(t u32) bool {
 // intInfo returns bit width and signedness of an integer type.
 func intInfo(t u32) (u32, bool, bool) {
 	k := basicKind(t)
-	if k == BkU8 {
-		return 8, false, true
+	match k {
+		BkU8 -> return 8, false, true
+		BkU16 -> return 16, false, true
+		BkU32 -> return 32, false, true
+		BkU64 | BkUsize -> return 64, false, true
+		BkI8 -> return 8, true, true
+		BkI16 -> return 16, true, true
+		BkI32 -> return 32, true, true
+		BkI64 | BkInt -> return 64, true, true
+		_ -> return 0, false, false
 	}
-	if k == BkU16 {
-		return 16, false, true
-	}
-	if k == BkU32 {
-		return 32, false, true
-	}
-	if k == BkU64 || k == BkUsize {
-		return 64, false, true
-	}
-	if k == BkI8 {
-		return 8, true, true
-	}
-	if k == BkI16 {
-		return 16, true, true
-	}
-	if k == BkI32 {
-		return 32, true, true
-	}
-	if k == BkI64 || k == BkInt {
-		return 64, true, true
-	}
-	return 0, false, false
 }
 
 func isPolyCode(t u32) bool {
@@ -660,58 +624,36 @@ func isPolyCode(t u32) bool {
 
 // defaultOf returns the default type of an untyped type (types.Default).
 func defaultOf(t u32) u32 {
-	k := basicKind(t)
-	if k == BkUntypedInt {
-		return TyInt
+	return match basicKind(t) {
+		BkUntypedInt -> TyInt
+		BkUntypedChar -> TyU8
+		BkUntypedBool -> TyBool
+		BkUntypedString -> TyString
+		_ if isPolyCode(t) -> mkCode(0)
+		_ -> t
 	}
-	if k == BkUntypedChar {
-		return TyU8
-	}
-	if k == BkUntypedBool {
-		return TyBool
-	}
-	if k == BkUntypedString {
-		return TyString
-	}
-	if isPolyCode(t) {
-		return mkCode(0)
-	}
-	return t
 }
 
 // derefType returns the element of a pointer type (and true), else t.
 func derefType(t u32) (u32, bool) {
-	match trec(t) {
-		Pointer(e) -> {
-			return e, true
-		}
-		_ -> {
-			return t, false
-		}
+	if trec(t) is Pointer(e) {
+		return e, true
 	}
+	return t, false
 }
 
 // elemOf returns the element type of an array, slice or pointer type.
 func elemOf(t u32) u32 {
-	return match trec(t) {
-		Array(e, _, _) -> e
-		Slice(e) -> e
-		Pointer(e) -> e
-		_ -> 0
-	}
+	return match trec(t) { Array(e, ..) | Slice(e) | Pointer(e) -> e, _ -> 0 }
 }
 
 // arrayLenOf returns the constant length and the length type parameter of
 // an array type.
 func arrayLenOf(t u32) (u64, u32) {
-	match trec(t) {
-		Array(_, p, n) -> {
-			return n, p
-		}
-		_ -> {
-			return 0, 0
-		}
+	if trec(t) is Array(_, p, n) {
+		return n, p
 	}
+	return 0, 0
 }
 
 func constArgVal(t u32) u64 {
@@ -722,7 +664,7 @@ func constArgVal(t u32) u64 {
 func typeName(t u32) u32 {
 	return match trec(t) {
 		Named(id) -> typs.named[usize(id)].name
-		TypeParam(nm, _, _, _) -> nm
+		TypeParam(nm, ..) -> nm
 		Opaque(nm, _) -> nm
 		_ -> 0
 	}
@@ -730,13 +672,13 @@ func typeName(t u32) u32 {
 
 // Type parameters.
 func tpSym(t u32) u32 {
-	return match trec(t) { TypeParam(_, sym, _, _) -> sym, _ -> 0 }
+	return match trec(t) { TypeParam(_, sym, ..) -> sym, _ -> 0 }
 }
 
 // tpConstType returns the type of a const type parameter (0 for a type
 // parameter).
 func tpConstType(t u32) u32 {
-	return match trec(t) { TypeParam(_, _, _, ct) -> ct, _ -> 0 }
+	return match trec(t) { TypeParam(.., ct) -> ct, _ -> 0 }
 }
 
 func tpIsConst(t u32) bool {
@@ -808,55 +750,51 @@ func tupleAt(t u32, i usize) u32 {
 
 // Signatures.
 func sigEffect(s u32) u8 {
-	return match trec(s) { Sig(eff, _, _, _, _, _, _, _) -> eff, _ -> EffComptime }
+	return match trec(s) { Sig(eff, ..) -> eff, _ -> EffComptime }
 }
 
 func sigVariadic(s u32) bool {
-	return match trec(s) { Sig(_, va, _, _, _, _, _, _) -> va, _ -> false }
+	return match trec(s) { Sig(_, va, ..) -> va, _ -> false }
 }
 
 func sigNParams(s u32) usize {
-	return match trec(s) { Sig(_, _, _, pn, _, _, _, _) -> usize(pn), _ -> 0 }
+	return match trec(s) { Sig(_, _, _, pn, ..) -> usize(pn), _ -> 0 }
 }
 
 func sigParam(s u32, i usize) u32 {
-	return match trec(s) { Sig(_, _, ps, _, _, _, _, _) -> tlist(ps, i), _ -> 0 }
+	return match trec(s) { Sig(_, _, ps, ..) -> tlist(ps, i), _ -> 0 }
 }
 
 func sigParamsSlice(s u32) []u32 {
-	return match trec(s) { Sig(_, _, ps, pn, _, _, _, _) -> tlistSlice(ps, pn), _ -> emptyU32() }
+	return match trec(s) { Sig(_, _, ps, pn, ..) -> tlistSlice(ps, pn), _ -> emptyU32() }
 }
 
 func sigNResults(s u32) usize {
-	return match trec(s) { Sig(_, _, _, _, _, rn, _, _) -> usize(rn), _ -> 0 }
+	return match trec(s) { Sig(_, _, _, _, _, rn, ..) -> usize(rn), _ -> 0 }
 }
 
 func sigResult(s u32, i usize) u32 {
-	return match trec(s) { Sig(_, _, _, _, rs, _, _, _) -> tlist(rs, i), _ -> 0 }
+	return match trec(s) { Sig(_, _, _, _, rs, ..) -> tlist(rs, i), _ -> 0 }
 }
 
 func sigResultsSlice(s u32) []u32 {
-	return match trec(s) { Sig(_, _, _, _, rs, rn, _, _) -> tlistSlice(rs, rn), _ -> emptyU32() }
+	return match trec(s) { Sig(_, _, _, _, rs, rn, ..) -> tlistSlice(rs, rn), _ -> emptyU32() }
 }
 
 // sigTParamList returns the type parameter list of a generic signature.
 func sigTParamList(s u32) (u32, u32) {
-	match trec(s) {
-		Sig(_, _, _, _, _, _, ts, tn) -> {
-			return ts, tn
-		}
-		_ -> {
-			return 0, 0
-		}
+	if trec(s) is Sig(.., ts, tn) {
+		return ts, tn
 	}
+	return 0, 0
 }
 
 func sigNTParams(s u32) usize {
-	return match trec(s) { Sig(_, _, _, _, _, _, _, tn) -> usize(tn), _ -> 0 }
+	return match trec(s) { Sig(.., tn) -> usize(tn), _ -> 0 }
 }
 
 func sigTParam(s u32, i usize) u32 {
-	return match trec(s) { Sig(_, _, _, _, _, _, ts, _) -> tlist(ts, i), _ -> 0 }
+	return match trec(s) { Sig(.., ts, _) -> tlist(ts, i), _ -> 0 }
 }
 
 // sigResultType: 0 for no results, the result, or a Tuple.
@@ -945,21 +883,13 @@ func setNamedMethods(t u32, s u32, n u32) {
 	}
 }
 
-func isGenericNamed(t u32) bool {
-	return isNamedT(t) && namedNTParams(t) > 0
-}
-
 // builtinOf returns the predeclared identity of a named type (origin for
 // instances), 0 if none.
 func builtinOf(t u32) u8 {
-	if t == 0 || !isNamedT(t) {
-		return 0
+	if o := namedOrigin(t); o != 0 {
+		return namedBuiltin(o)
 	}
-	n := t
-	if namedOrigin(n) != 0 {
-		n = namedOrigin(n)
-	}
-	return namedBuiltin(n)
+	return namedBuiltin(t) // 0 for other types
 }
 
 func isResource(t u32) bool {
@@ -969,7 +899,7 @@ func isResource(t u32) bool {
 
 func isCapability(t u32) bool {
 	b := builtinOf(t)
-	return b == BTNet || b == BTSignals || b == BTClock || b == BTFS || b == BTEnv || b == BTStdio || b == BTExec
+	return b is BTNet | BTSignals | BTClock | BTFS | BTEnv | BTStdio | BTExec
 }
 
 // maxClassOf returns the largest class of the n types in the run at s.
@@ -1006,16 +936,9 @@ func classOf(t u32, depth usize) u8 decreases(depth) {
 			typs.named[usize(id)].cls = c
 			return c
 		}
-		Pointer(_) | Sig(_, _, _, _, _, _, _, _) -> {
-			return ClassScoped
-		}
-		Array(e, _, _) -> {
-			return classOf(e, depth-1)
-		}
-		Slice(e) -> {
-			return classOf(e, depth-1)
-		}
-		Struct(_, _) -> {
+		Pointer(_) | Sig(..) -> return ClassScoped
+		Array(e, ..) | Slice(e) -> return classOf(e, depth-1)
+		Struct(..) -> {
 			c := u8(ClassValue)
 			nf := nfields(t)
 			for i := usize(0); i < nf; i++ {
@@ -1026,7 +949,7 @@ func classOf(t u32, depth usize) u8 decreases(depth) {
 			}
 			return c
 		}
-		Enum(_, _) -> {
+		Enum(..) -> {
 			c := u8(ClassValue)
 			nv := nvariants(t)
 			for i := usize(0); i < nv; i++ {
@@ -1037,12 +960,8 @@ func classOf(t u32, depth usize) u8 decreases(depth) {
 			}
 			return c
 		}
-		Tuple(s, n) -> {
-			return maxClassOf(s, n, depth-1)
-		}
-		NoType | Basic(_) | Code(_) | TypeParam(_, _, _, _) | ConstArg(_) | Opaque(_, _) -> {
-			return ClassValue
-		}
+		Tuple(s, n) -> return maxClassOf(s, n, depth-1)
+		NoType | Basic(_) | Code(_) | TypeParam(..) | ConstArg(_) | Opaque(..) -> return ClassValue
 	}
 }
 
@@ -1064,16 +983,10 @@ func comparable(t u32, depth usize) bool decreases(depth) {
 	}
 	u := underlying(t)
 	match trec(u) {
-		Basic(b) -> {
-			return b != BkUntypedNil && b != BkInvalid
-		}
-		Pointer(_) | Code(_) -> {
-			return true
-		}
-		Array(e, _, _) -> {
-			return comparable(e, depth-1)
-		}
-		Struct(_, _) -> {
+		Basic(b) -> return b != BkUntypedNil && b != BkInvalid
+		Pointer(_) | Code(_) -> return true
+		Array(e, ..) -> return comparable(e, depth-1)
+		Struct(..) -> {
 			n := nfields(u)
 			for i := usize(0); i < n; i++ {
 				if !comparable(fieldType(u, i), depth-1) {
@@ -1082,7 +995,7 @@ func comparable(t u32, depth usize) bool decreases(depth) {
 			}
 			return true
 		}
-		Enum(_, _) -> {
+		Enum(..) -> {
 			n := nvariants(u)
 			for i := usize(0); i < n; i++ {
 				m := variantPayN(u, i)
@@ -1094,9 +1007,7 @@ func comparable(t u32, depth usize) bool decreases(depth) {
 			}
 			return true
 		}
-		NoType | Sig(_, _, _, _, _, _, _, _) | Named(_) | Slice(_) | TypeParam(_, _, _, _) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {
-			return false
-		}
+		NoType | Sig(..) | Named(_) | Slice(_) | TypeParam(..) | ConstArg(_) | Tuple(..) | Opaque(..) -> return false
 	}
 }
 
@@ -1119,25 +1030,12 @@ func hasTypeParam(t u32, depth usize) bool decreases(depth) {
 		return false
 	}
 	match trec(t) {
-		TypeParam(_, _, _, _) -> {
-			return true
-		}
-		Named(id) -> {
-			return listHasTypeParam(typs.named[usize(id)].argS, typs.named[usize(id)].argN, depth-1)
-		}
-		Tuple(s, n) -> {
-			return listHasTypeParam(s, n, depth-1)
-		}
-		Array(e, p, _) -> {
-			return p != 0 || hasTypeParam(e, depth-1)
-		}
-		Slice(e) -> {
-			return hasTypeParam(e, depth-1)
-		}
-		Pointer(e) -> {
-			return hasTypeParam(e, depth-1)
-		}
-		Struct(_, _) -> {
+		TypeParam(..) -> return true
+		Named(id) -> return listHasTypeParam(typs.named[usize(id)].argS, typs.named[usize(id)].argN, depth-1)
+		Tuple(s, n) -> return listHasTypeParam(s, n, depth-1)
+		Array(e, p, _) -> return p != 0 || hasTypeParam(e, depth-1)
+		Slice(e) | Pointer(e) -> return hasTypeParam(e, depth-1)
+		Struct(..) -> {
 			n := nfields(t)
 			for i := usize(0); i < n; i++ {
 				if hasTypeParam(fieldType(t, i), depth-1) {
@@ -1146,7 +1044,7 @@ func hasTypeParam(t u32, depth usize) bool decreases(depth) {
 			}
 			return false
 		}
-		Enum(_, _) -> {
+		Enum(..) -> {
 			n := nvariants(t)
 			for i := usize(0); i < n; i++ {
 				if listHasTypeParam(variantPayS(t, i), u32(variantPayN(t, i)), depth-1) {
@@ -1155,12 +1053,8 @@ func hasTypeParam(t u32, depth usize) bool decreases(depth) {
 			}
 			return false
 		}
-		Sig(_, _, ps, pn, rs, rn, _, _) -> {
-			return listHasTypeParam(ps, pn, depth-1) || listHasTypeParam(rs, rn, depth-1)
-		}
-		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(_, _) -> {
-			return false
-		}
+		Sig(_, _, ps, pn, rs, rn, ..) -> return listHasTypeParam(ps, pn, depth-1) || listHasTypeParam(rs, rn, depth-1)
+		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(..) -> return false
 	}
 }
 
@@ -1178,31 +1072,17 @@ func anyTypeParam(xs []u32) bool {
 // Type strings (types.Type.String)
 
 func basicName(k u8) string {
-	if k == BkInvalid {
-		return "invalid type"
+	return match k {
+		BkInvalid -> "invalid type"
+		BkUntypedInt -> "untyped int"
+		BkUntypedChar -> "untyped char"
+		BkUntypedBool -> "untyped bool"
+		BkUntypedString -> "untyped string"
+		BkUntypedNil -> "untyped nil"
+		BkError -> "error"
+		BkString -> "string"
+		_ -> builtinTypeName(k)
 	}
-	if k == BkUntypedInt {
-		return "untyped int"
-	}
-	if k == BkUntypedChar {
-		return "untyped char"
-	}
-	if k == BkUntypedBool {
-		return "untyped bool"
-	}
-	if k == BkUntypedString {
-		return "untyped string"
-	}
-	if k == BkUntypedNil {
-		return "untyped nil"
-	}
-	if k == BkError {
-		return "error"
-	}
-	if k == BkString {
-		return "string"
-	}
-	return builtinTypeName(k)
 }
 
 func putTypeList(o *OutBuf, xs []u32, depth usize) decreases(depth) {
@@ -1231,7 +1111,7 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 		Basic(k) -> o.WriteString(basicName(k))
 		Named(id) -> {
 			r := typs.named[usize(id)]
-			if r.pkg != 0 && len(strBytes(pkgs.items[usize(r.pkg)].path)) > 0 {
+			if r.pkg != 0 && len(pkgs.items[usize(r.pkg)].path) > 0 {
 				o.WriteBytes(nameBytes(pkgs.items[usize(r.pkg)].name))
 				o.WriteByte('.')
 			}
@@ -1260,7 +1140,7 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 			o.WriteByte('*')
 			putType(o, e, depth-1)
 		}
-		Struct(_, _) -> {
+		Struct(..) -> {
 			o.WriteString("struct{")
 			n := nfields(t)
 			for i := usize(0); i < n; i++ {
@@ -1273,7 +1153,7 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 			}
 			o.WriteByte('}')
 		}
-		Enum(_, _) -> {
+		Enum(..) -> {
 			o.WriteString("enum{")
 			n := nvariants(t)
 			for i := usize(0); i < n; i++ {
@@ -1290,7 +1170,7 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 			}
 			o.WriteByte('}')
 		}
-		Sig(eff, va, ps, pn, rs, rn, _, _) -> {
+		Sig(eff, va, ps, pn, rs, rn, ..) -> {
 			if eff == EffDriver {
 				o.WriteString("driver ")
 			} else if eff == EffComptime {
@@ -1325,8 +1205,7 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 				o.WriteUint(u64(l - 1))
 			}
 		}
-		TypeParam(nm, _, _, _) -> o.WriteBytes(nameBytes(nm))
-		Opaque(nm, _) -> o.WriteBytes(nameBytes(nm))
+		TypeParam(nm, ..) | Opaque(nm, _) -> o.WriteBytes(nameBytes(nm))
 		ConstArg(v) -> o.WriteUint(v)
 		Tuple(s, n) -> {
 			o.WriteByte('(')
@@ -1457,7 +1336,7 @@ func initUnivTypes() {
 	tpush(TyInt)
 	_ = mkUnivNamed(BTExitStatus, mkStruct(sm), ClassValue)
 	for b := u8(BTNet); b <= BTExec; b++ {
-		if b == BTNet || b == BTSignals || b == BTClock || b == BTContext || b == BTScope || b == BTFS || b == BTEnv || b == BTStdio || b == BTExec {
+		if b is BTNet | BTSignals | BTClock | BTContext | BTScope | BTFS | BTEnv | BTStdio | BTExec {
 			_ = mkUnivNamed(b, newOpaque(internStr(builtinName(b)), b), ClassScoped)
 		}
 	}
@@ -1637,16 +1516,12 @@ func predeclaredType(b u8) u32 {
 	if b >= BTBool && b <= BTUsize {
 		return u32(b) + 1 // BTBool..BTUsize line up with BkBool..BkUsize
 	}
-	if b == BTString {
-		return TyString
+	return match b {
+		BTString -> TyString
+		BTError -> TyError
+		BTCode | BTEl -> 0
+		_ -> univNamed[usize(b)]
 	}
-	if b == BTError {
-		return TyError
-	}
-	if b == BTCode || b == BTEl {
-		return 0
-	}
-	return univNamed[usize(b)]
 }
 
 // ---------------------------------------------------------------------------
@@ -1931,7 +1806,7 @@ func completeInstance(inst u32, depth usize) decreases(depth) {
 	}
 	o := namedOrigin(inst)
 	u := namedUnder(o)
-	if u != 0 && isOpaqueT(u) {
+	if trec(u) is Opaque(..) {
 		setNamedUnder(inst, u)
 		return
 	}
@@ -1976,7 +1851,7 @@ func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreas
 		return t
 	}
 	match trec(t) {
-		TypeParam(_, _, _, _) -> {
+		TypeParam(..) -> {
 			b := substLookup(t, tpS, tpN, argS, argN)
 			if b != 0 {
 				return b
@@ -2009,22 +1884,17 @@ func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreas
 			elem := subst(e, tpS, tpN, argS, argN, depth-1)
 			if p != 0 {
 				b := substLookup(p, tpS, tpN, argS, argN)
-				if b != 0 && isConstArgT(b) {
-					return mkArray(constArgVal(b), 0, elem)
-				}
-				if b != 0 && isTypeParamT(b) {
-					return mkArray(0, b, elem)
+				match trec(b) {
+					ConstArg(v) -> return mkArray(v, 0, elem)
+					TypeParam(..) -> return mkArray(0, b, elem)
+					_ -> {}
 				}
 			}
 			return mkArray(n, p, elem)
 		}
-		Slice(e) -> {
-			return mkSlice(subst(e, tpS, tpN, argS, argN, depth-1))
-		}
-		Pointer(e) -> {
-			return mkPointer(subst(e, tpS, tpN, argS, argN, depth-1))
-		}
-		Struct(_, _) -> {
+		Slice(e) -> return mkSlice(subst(e, tpS, tpN, argS, argN, depth-1))
+		Pointer(e) -> return mkPointer(subst(e, tpS, tpN, argS, argN, depth-1))
+		Struct(..) -> {
 			m := tmark()
 			n := nfields(t)
 			for i := usize(0); i < n; i++ {
@@ -2035,7 +1905,7 @@ func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreas
 			}
 			return mkStruct(m)
 		}
-		Enum(_, _) -> {
+		Enum(..) -> {
 			m := tmark()
 			n := nvariants(t)
 			for i := usize(0); i < n; i++ {
@@ -2051,7 +1921,7 @@ func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreas
 			}
 			return mkEnum(m)
 		}
-		Sig(eff, va, ps, pn, rs, rn, _, _) -> {
+		Sig(eff, va, ps, pn, rs, rn, ..) -> {
 			m1 := tmark()
 			for i := usize(0); i < usize(pn); i++ {
 				tpush(subst(tlist(ps, i), tpS, tpN, argS, argN, depth-1))
@@ -2070,8 +1940,6 @@ func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreas
 			}
 			return mkTupleStack(m)
 		}
-		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(_, _) -> {
-			return t
-		}
+		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(..) -> return t
 	}
 }

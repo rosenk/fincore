@@ -13,7 +13,7 @@ func rawExpr(e u32, dp usize) Operand decreases(dp) {
 	x := expr0(e, dp-1)
 	x.expr = e
 	m := x.mode
-	if m == KValue || m == KVar || m == KConst || m == KType {
+	if m is KValue | KVar | KConst | KType {
 		if x.typ == 0 || isInvalid(x.typ) {
 			x.mode = KNone
 		}
@@ -63,76 +63,54 @@ func expr0(e u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	k := nkind(e)
-	if k == NkIdent {
-		sym := uses[usize(e)]
-		if sym == 0 {
+	match k {
+		NkIdent -> {
+			sym := uses[usize(e)]
+			if sym == 0 {
+				return invalidOp(e)
+			}
+			return symOperand(sym, e, dp-1)
+		}
+		NkBasicLit -> {
+			lk := nop(e)
+			if lk == LitInt {
+				return opConst(TyUntypedInt, vIntU(nival(e)))
+			}
+			if lk == LitChar {
+				return opConst(TyUntypedChar, vIntU(nival(e)))
+			}
+			return opConst(TyUntypedString, stringLitVal(e))
+		}
+		NkBoolLit -> return opConst(TyUntypedBool, vBool(nflag(e)))
+		NkNilLit -> return opConst(TyUntypedNil, Val.Nil)
+		NkParenExpr -> {
+			x := rawExpr(na(e), dp-1)
+			x.expr = e
+			return x
+		}
+		NkBinaryExpr -> return binaryExpr(e, dp-1)
+		NkUnaryExpr -> return unaryExpr(e, dp-1)
+		NkCallExpr -> return callExpr(e, dp-1)
+		NkIndexExpr -> return indexExpr(e, dp-1)
+		NkSliceExpr -> return sliceExpr(e, dp-1)
+		NkSelectorExpr -> return selectorExpr(e, dp-1)
+		NkFuncLit -> return funcLit(e, dp-1)
+		NkStructLit -> return structLit(e, dp-1)
+		NkTypeExpr -> {
+			t := typExpr(na(e), dp-1)
+			if isInvalid(t) {
+				return invalidOp(e)
+			}
+			return opMode(KType, t)
+		}
+		NkMatchExpr -> return matchExpr(e, dp-1)
+		NkIsExpr -> return isExpr(e, dp-1)
+		NkTupleExpr -> {
+			errAt(E2002, e, formatTo(mbuf[:], "tuple %v can only be the scrutinee of a match", Expr(e)))
 			return invalidOp(e)
 		}
-		return symOperand(sym, e, dp-1)
+		_ -> return invalidOp(e)
 	}
-	if k == NkBasicLit {
-		lk := nop(e)
-		if lk == LitInt {
-			return opConst(TyUntypedInt, vIntU(nival(e)))
-		}
-		if lk == LitChar {
-			return opConst(TyUntypedChar, vIntU(nival(e)))
-		}
-		return opConst(TyUntypedString, stringLitVal(e))
-	}
-	if k == NkBoolLit {
-		return opConst(TyUntypedBool, vBool(nflag(e)))
-	}
-	if k == NkNilLit {
-		return opConst(TyUntypedNil, Val.Nil)
-	}
-	if k == NkParenExpr {
-		x := rawExpr(na(e), dp-1)
-		x.expr = e
-		return x
-	}
-	if k == NkBinaryExpr {
-		return binaryExpr(e, dp-1)
-	}
-	if k == NkUnaryExpr {
-		return unaryExpr(e, dp-1)
-	}
-	if k == NkCallExpr {
-		return callExpr(e, dp-1)
-	}
-	if k == NkIndexExpr {
-		return indexExpr(e, dp-1)
-	}
-	if k == NkSliceExpr {
-		return sliceExpr(e, dp-1)
-	}
-	if k == NkSelectorExpr {
-		return selectorExpr(e, dp-1)
-	}
-	if k == NkFuncLit {
-		return funcLit(e, dp-1)
-	}
-	if k == NkStructLit {
-		return structLit(e, dp-1)
-	}
-	if k == NkTypeExpr {
-		t := typExpr(na(e), dp-1)
-		if isInvalid(t) {
-			return invalidOp(e)
-		}
-		return opMode(KType, t)
-	}
-	if k == NkMatchExpr {
-		return matchExpr(e, dp-1)
-	}
-	if k == NkIsExpr {
-		return isExpr(e, dp-1)
-	}
-	if k == NkTupleExpr {
-		errAt(E2002, e, formatTo(mbuf[:], "tuple %v can only be the scrutinee of a match", Expr(e)))
-		return invalidOp(e)
-	}
-	return invalidOp(e)
 }
 
 func symOperand(sym u32, id u32, dp usize) Operand decreases(dp) {
@@ -165,13 +143,13 @@ func symOperand(sym u32, id u32, dp usize) Operand decreases(dp) {
 	}
 	if k == SymTypeParam {
 		tp := symType(sym, dp-1)
-		if tp == 0 || !isTypeParamT(tp) {
-			return invalidOp(id)
+		if trec(tp) is TypeParam(.., ct) {
+			if ct != 0 {
+				return opMode(KValue, ct)
+			}
+			return opMode(KType, tp)
 		}
-		if tpIsConst(tp) {
-			return opMode(KValue, tpConstType(tp))
-		}
-		return opMode(KType, tp)
+		return invalidOp(id)
 	}
 	if k == SymFunc {
 		t := symType(sym, dp-1)
@@ -242,7 +220,7 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 	if x.mode == KConst && y.mode == KConst {
 		v, ok := binaryOpVal(op, x.val, y.val)
 		if !ok {
-			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
+			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.Bytes()))
 			return invalidOp(e)
 		}
 		if !isUntyped(t) && !representable(v, t) {
@@ -270,7 +248,7 @@ func concatExpr(e u32, x *Operand, y *Operand) Operand {
 	}
 	v, ok := binaryOpVal(OpAdd, x.val, y.val)
 	if !ok {
-		errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
+		errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.Bytes()))
 		return invalidOp(e)
 	}
 	return opConst(x.typ, v)
@@ -335,7 +313,7 @@ func shiftExpr(e u32, x *Operand, y *Operand) Operand {
 	if x.mode == KConst && y.mode == KConst {
 		v, ok := binaryOpVal(op, x.val, y.val)
 		if !ok {
-			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
+			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.Bytes()))
 			return invalidOp(e)
 		}
 		if !isUntyped(x.typ) && !representable(v, x.typ) {
@@ -390,7 +368,7 @@ func comparisonExpr(e u32, x *Operand, y *Operand) Operand {
 	if x.mode == KConst && y.mode == KConst {
 		v, ok := binaryOpVal(op, x.val, y.val)
 		if !ok {
-			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
+			errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.Bytes()))
 			return invalidOp(e)
 		}
 		return opConst(TyUntypedBool, v)
@@ -428,12 +406,11 @@ func unaryExpr(e u32, dp usize) Operand decreases(dp) {
 		if isInvalidOp(&x) {
 			return invalidOp(e)
 		}
-		u := underlying(x.typ)
-		if !isPointerT(u) {
-			errAt(E2002, e, formatTo(mbuf[:], "cannot dereference %v (type %v is not a pointer)", Expr(na(e)), TypeRef(x.typ)))
-			return invalidOp(e)
+		if trec(underlying(x.typ)) is Pointer(elem) {
+			return opMode(KVar, elem)
 		}
-		return opMode(KVar, elemOf(u))
+		errAt(E2002, e, formatTo(mbuf[:], "cannot dereference %v (type %v is not a pointer)", Expr(na(e)), TypeRef(x.typ)))
+		return invalidOp(e)
 	}
 	x := exprValue(na(e), dp-1)
 	if isInvalidOp(&x) {
@@ -454,7 +431,7 @@ func unaryExpr(e u32, dp usize) Operand decreases(dp) {
 	if x.mode == KConst {
 		v, ok := unaryOpVal(op, x.val)
 		if !ok {
-			errAt(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
+			errAt(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.Bytes()))
 			return invalidOp(e)
 		}
 		if !isUntyped(x.typ) && !representable(v, x.typ) {
@@ -539,14 +516,12 @@ func indexExpr(e u32, dp usize) Operand decreases(dp) {
 	}
 	t := x.typ
 	mode := x.mode
-	u := underlying(t)
-	if isPointerT(u) && isArrayT(underlying(elemOf(u))) {
-		t = elemOf(u)
+	if trec(underlying(t)) is Pointer(pt) && isArrayT(underlying(pt)) {
+		t = pt
 		mode = KVar
 	}
-	u = underlying(t)
-	if isArrayT(u) {
-		alen, lenParam := arrayLenOf(u)
+	u := underlying(t)
+	if trec(u) is Array(elem, lenParam, alen) {
 		if has && lenParam == 0 {
 			n, _ := valUint64(idx)
 			if n >= alen {
@@ -557,12 +532,12 @@ func indexExpr(e u32, dp usize) Operand decreases(dp) {
 		if mode != KVar {
 			mode = KValue
 		}
-		return opMode(mode, elemOf(u))
+		return opMode(mode, elem)
 	}
-	if isSliceT(u) {
-		return opMode(KVar, elemOf(u))
+	if trec(u) is Slice(elem) {
+		return opMode(KVar, elem)
 	}
-	if isBasicT(u) && isString(u) {
+	if isString(u) {
 		if x.mode == KConst && has {
 			sb := strOf(x.val)
 			n, _ := valUint64(idx)
@@ -614,18 +589,16 @@ func sliceExpr(e u32, dp usize) Operand decreases(dp) {
 	}
 	t := x.typ
 	addressable := x.mode == KVar
-	u := underlying(t)
-	if isPointerT(u) && isArrayT(underlying(elemOf(u))) {
-		t = elemOf(u)
+	if trec(underlying(t)) is Pointer(pt) && isArrayT(underlying(pt)) {
+		t = pt
 		addressable = true
 	}
-	u = underlying(t)
-	if isArrayT(u) {
+	u := underlying(t)
+	if trec(u) is Array(elem, lenParam, alen) {
 		if !addressable {
 			errAt(E2002, e, formatTo(mbuf[:], "cannot slice %v (value not addressable)", Expr(na(e))))
 			return invalidOp(e)
 		}
-		alen, lenParam := arrayLenOf(u)
 		if lenParam == 0 {
 			for q := usize(0); q < 2; q++ {
 				b := lo
@@ -644,12 +617,12 @@ func sliceExpr(e u32, dp usize) Operand decreases(dp) {
 				}
 			}
 		}
-		return opMode(KValue, mkSlice(elemOf(u)))
+		return opMode(KValue, mkSlice(elem))
 	}
 	if isSliceT(u) {
 		return opMode(KValue, t)
 	}
-	if isBasicT(u) && isString(u) {
+	if isString(u) {
 		if isUntyped(x.typ) {
 			_ = convertUntyped(&x, TyString)
 			t = TyString
@@ -726,8 +699,8 @@ func selectorExpr(e u32, dp usize) Operand decreases(dp) {
 	}
 	t := x.typ
 	indirect := false
-	if isPointerT(underlying(t)) {
-		t = elemOf(underlying(t))
+	if trec(underlying(t)) is Pointer(pt) {
+		t = pt
 		indirect = true
 	}
 	st := underlying(t)
@@ -985,7 +958,7 @@ func call0(e u32, dp usize) Operand decreases(dp) {
 			return methodCall(e, &fun, ci, dp-1)
 		}
 		sig := fun.typ
-		if sig == 0 || !isSigT(sig) {
+		if !isSigT(sig) {
 			useArgs(e, 0, dp-1)
 			return invalidOp(e)
 		}
@@ -1057,7 +1030,7 @@ func arguments(e u32, params []u32, variadic bool, c Ctx, dp usize) bool decreas
 	}
 	if nargs == 1 && opStack.items[mark].mode == KValue {
 		t0 := opStack.items[mark].typ
-		if t0 != 0 && isTupleT(t0) {
+		if isTupleT(t0) {
 			first := opStack.items[mark]
 			opStack.top = mark
 			nt := tupleN(t0)
@@ -1072,7 +1045,7 @@ func arguments(e u32, params []u32, variadic bool, c Ctx, dp usize) bool decreas
 	top := opStack.top
 	for i := mark; i < top; i++ {
 		t := opStack.items[i].typ
-		if t != 0 && isTupleT(t) && nargs == 1 {
+		if isTupleT(t) && nargs == 1 {
 			continue
 		}
 		singleValue(&opStack.items[i])
@@ -1121,7 +1094,7 @@ func foldComptime(e u32, fn u32, sig u32, mark usize, ci u32, dp usize) Operand 
 	vtop = vmark
 	if !ok {
 		if ifailCode != 0 {
-			errAt(ifailCode, e, formatTo(mbuf[:], "%s", (&ifailMsg).Bytes()))
+			errAt(ifailCode, e, formatTo(mbuf[:], "%s", ifailMsg.Bytes()))
 		}
 		return invalidOp(e)
 	}
@@ -1169,7 +1142,7 @@ func methodCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	base, _ := derefType(recvType)
-	if isNamedT(base) && namedOrigin(base) != 0 && mr.rtpN > 0 {
+	if namedOrigin(base) != 0 && mr.rtpN > 0 {
 		bs, bn := namedArgList(base)
 		sig = subst(sig, mr.rtpS, mr.rtpN, bs, bn, SemaDepth)
 		callTab.items[usize(ci)].taS = bs
@@ -1195,7 +1168,7 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 	b := meths.items[usize(m)].builtin
 	callTab.items[usize(ci)].kind = CallBuiltinMeth
 	callTab.items[usize(ci)].effect = methodEffect(m)
-	if b == BMNetListenTCP || b == BMListenerAccept || b == BMContextWithTimeout || b == BMSignalsNotifyCtx {
+	if b is BMNetListenTCP | BMListenerAccept | BMContextWithTimeout | BMSignalsNotifyCtx {
 		callTab.items[usize(ci)].resourceCtor = true
 	}
 	if b == BMConnClose || b == BMListenerClose {
@@ -1218,15 +1191,11 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 			return invalidOp(e)
 		}
 		arr := u32(0)
-		pu := underlying(pool.typ)
-		if isPointerT(pu) {
-			au := underlying(elemOf(pu))
-			if isArrayT(au) {
-				arr = au
-			}
+		if trec(underlying(pool.typ)) is Pointer(pt) {
+			arr = underlying(pt)
 		}
 		alen, lenParam := arrayLenOf(arr)
-		if arr == 0 || lenParam != 0 {
+		if !isArrayT(arr) || lenParam != 0 {
 			errAt(E2002, a1, formatTo(mbuf[:], "cannot use %v (type %v) as pool argument to %v: want *[N]T", Expr(a1), TypeRef(pool.typ), CallName(c)))
 			return invalidOp(e)
 		}
@@ -1269,7 +1238,7 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 			return invalidOp(e)
 		}
 		sn := s.typ
-		if !isNamedT(sn) || namedOrigin(sn) == 0 || namedBuiltin(namedOrigin(sn)) != BTSlot {
+		if namedBuiltin(namedOrigin(sn)) != BTSlot { // 0 unless sn is a Slot instance
 			errAt(E2002, a0, formatTo(mbuf[:], "cannot use %v (type %v) as Slot argument to %v", Expr(a0), TypeRef(s.typ), CallName(c)))
 			useArgs(e, 1, dp-1)
 			return invalidOp(e)
@@ -1389,14 +1358,12 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		}
 		t := x.typ
 		viaPtr := false
-		u := underlying(t)
-		if isPointerT(u) && isArrayT(underlying(elemOf(u))) {
-			t = elemOf(u)
+		if trec(underlying(t)) is Pointer(pt) && isArrayT(underlying(pt)) {
+			t = pt
 			viaPtr = true
 		}
-		u = underlying(t)
-		if isArrayT(u) {
-			alen, lenParam := arrayLenOf(u)
+		u := underlying(t)
+		if trec(u) is Array(_, lenParam, alen) {
 			if lenParam == 0 && !viaPtr && !containsCall(a0, SemaDepth) {
 				return opConst(TyUsize, vIntU(alen))
 			}
@@ -1405,7 +1372,7 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		if isSliceT(u) {
 			return opMode(KValue, TyUsize)
 		}
-		if isBasicT(u) && isString(u) && b == BFLen {
+		if isString(u) && b == BFLen {
 			if isUntyped(x.typ) {
 				_ = convertUntyped(&x, TyString)
 			}
@@ -1545,7 +1512,7 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 	want := usize(0)
 	if b == BFCodeArray || b == BFCodeField {
 		want = 2
-	} else if b == BFCodeSlice || b == BFCodeStruct || b == BFCodeUniv {
+	} else if b is BFCodeSlice | BFCodeStruct | BFCodeUniv {
 		want = 1
 	}
 	nargs := l1len(e)
@@ -1681,10 +1648,10 @@ func convertible(v u32, t u32) bool {
 	if isInteger(vu) && isInteger(tu) {
 		return true
 	}
-	if isPointerT(vu) && isPointerT(tu) {
-		return underlying(elemOf(vu)) == underlying(elemOf(tu))
+	return match (trec(vu), trec(tu)) {
+		(Pointer(ve), Pointer(te)) -> underlying(ve) == underlying(te)
+		_ -> false
 	}
-	return false
 }
 
 func variantCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
@@ -1729,7 +1696,7 @@ func funcInstance(e u32, x *Operand, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	sig := x.typ
-	if sig == 0 || !isSigT(sig) || sigNTParams(sig) == 0 {
+	if sigNTParams(sig) == 0 { // also for non-signatures
 		errAt(E2002, e, formatTo(mbuf[:], "%v is not a generic function", Expr(na(e))))
 		return invalidOp(e)
 	}
