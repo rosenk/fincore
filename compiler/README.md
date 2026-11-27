@@ -20,7 +20,7 @@ files (spec 9.5.6); there are no local imports.
 | `checker.fc` | Type checker part 1: operands, assignability and untyped constants, package-level declarations, type expressions, recursive types, `main`, finishing |
 | `check_expr.fc` | Type checker part 2: expressions and calls (builtins, conversions, methods, capability methods, variants, generic instances, comptime folding) |
 | `check_stmt.fc` | Type checker part 3: statements, match patterns, terminating statements |
-| `check_match.fc` | Type checker part 4 (v0.2 sum types and patterns, finc0's types/match.go and types/usefulness.go): match statements and expressions, tuple scrutinees, nested/or/rest/tuple patterns with bindings, constant patterns and top-level/tuple-element bindings in every position, guards, `is`, untyped match expressions, reachability and exhaustiveness (E2012) by pattern usefulness with witnesses |
+| `check_match.fc` | Type checker part 4 (v0.2 sum types and patterns, finc0's types/match.go and types/usefulness.go): match statements and expressions, tuple scrutinees, nested/or/rest/tuple patterns with bindings, constant patterns and top-level/tuple-element bindings in every position, guards, `is`, untyped match expressions, reachability and exhaustiveness (E2012) by pattern usefulness with witnesses; v0.3 string patterns on `[]byte` and multi-value match expressions (docs/v0_3.md) |
 | `comptime.fc` | Fuel-bounded comptime interpreter (the checker's evaluator) |
 | `totality.fc` | Totality checker part 1 (finc0's `totality`: totality.go, invariant.go, loops.go): pre-order program index, E5001 effects, root facts, loop invariance, T1, T2 setup |
 | `totality_flow.fc` | Totality checker part 2 (flow.go, T2/T3 walks): abstract states, bounds, the path-sensitive walker |

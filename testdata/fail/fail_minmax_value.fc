@@ -1,0 +1,14 @@
+// SINCE: v0.3
+// fail_minmax_value (v0.3): min is a builtin and must be called; it is
+// not a function value.
+package main
+
+func f() u32 {
+	g := min // ERROR E2002
+	_ = g
+	return 0
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

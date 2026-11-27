@@ -1,0 +1,12 @@
+// SINCE: v0.3
+// fail_minmax_unordered (v0.3): min and max need an ordered type
+// (integers or strings); bool is not ordered.
+package main
+
+func either(a bool, b bool) bool {
+	return max(a, b) // ERROR E2002
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

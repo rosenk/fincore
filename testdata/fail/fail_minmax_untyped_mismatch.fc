@@ -1,0 +1,10 @@
+// SINCE: v0.3
+// fail_minmax_untyped_mismatch (v0.3): untyped constants of different
+// kinds (int and string) cannot be operands of one min call.
+package main
+
+const Bad = min(1, "a") // ERROR E2002
+
+driver func main(io Stdio) error {
+	return nil
+}

@@ -29,9 +29,9 @@ const (
 // tests whose `// SINCE: vX.Y` header names a newer version. finc0 is
 // frozen at v0.2; bump these when compiler/ starts a new language version.
 const (
-	LangVersion = "0.2"
+	LangVersion = "0.3"
 	LangMajor   = 0
-	LangMinor   = 2
+	LangMinor   = 3
 )
 
 // Package-level arenas (Value types only, rule S1).

@@ -503,6 +503,18 @@ func scOrigin(e0 u32, dp usize) u64 decreases(dp) {
 			o = scJoin(o, scOrigin(nb(l1at(e, i)), dp-1))
 		}
 		return o
+	} else if k == NkTupleExpr {
+		// v0.3: the values of a multi-value match arm; the targets of a
+		// multi-value assignment all get the join of the values.
+		o := u64(0)
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			v := l1at(e, i)
+			if scTracked(ntype[usize(v)]) {
+				o = scJoin(o, scOrigin(v, dp-1))
+			}
+		}
+		return o
 	} else if k == NkFuncLit {
 		o := u64(0)
 		if nfunc[usize(e)] == 0 {

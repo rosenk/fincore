@@ -1,0 +1,16 @@
+// SINCE: v0.3
+// fail_match_multi_single (v0.3): a multi-value match cannot be used
+// where one value is expected.
+package main
+
+func f(n u32) u32 {
+	x := match n { // ERROR E2003
+		0 -> 1, 2
+		_ -> 3, 4
+	}
+	return x
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

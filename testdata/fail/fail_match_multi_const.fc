@@ -1,0 +1,10 @@
+// SINCE: v0.3
+// fail_match_multi_const (v0.3): a multi-value match is never a constant
+// and cannot initialize one.
+package main
+
+const C = match 1 { 1 -> 2, 3; _ -> 4, 5 } // ERROR E2003
+
+driver func main(io Stdio) error {
+	return nil
+}

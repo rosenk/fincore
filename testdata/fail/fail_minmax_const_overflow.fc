@@ -1,0 +1,10 @@
+// SINCE: v0.3
+// fail_minmax_const_overflow (v0.3): a min of untyped constants is an
+// untyped constant; its value must fit the declared type.
+package main
+
+const Small u8 = max(3, 256) // ERROR E2002
+
+driver func main(io Stdio) error {
+	return nil
+}

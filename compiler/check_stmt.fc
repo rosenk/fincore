@@ -283,7 +283,11 @@ func exprStmt(e u32, what string, dp usize) decreases(dp) {
 
 // rhsValues pushes the operands of an assignment's right-hand side (list
 // l2 of s) onto opStack, expanding a single multi-valued call.
-func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
+//
+// want is the Tuple of the targets' types for a multi-value match
+// expression (v0.3; TyInvalid elements: new variables or `_`), 0 if
+// unknown.
+func rhsValues(s u32, nl usize, want u32, dp usize) bool decreases(dp) {
 	if dp == 0 {
 		tooDeep()
 		return false
@@ -294,7 +298,9 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 	}
 	r0 := l2at(s, 0)
 	if nr == 1 && nl > 1 {
+		setMatchWant(r0, want)
 		x := rawExpr(r0, dp-1)
+		mwWant = 0
 		if isInvalidOp(&x) {
 			return false
 		}
@@ -349,8 +355,23 @@ func shortVarDecl(s u32, dp usize) decreases(dp) {
 		return
 	}
 	nn := l1len(s)
+	want := u32(0)
+	if nn > 1 && l2len(s) == 1 && nkind(unparen(l2at(s, 0))) == NkMatchExpr {
+		// v0.3: the types of the variables a multi-value match assigns
+		m := tmark()
+		for i := usize(0); i < nn; i++ {
+			id := l1at(s, i)
+			t := u32(TyInvalid)
+			use := uses[usize(id)]
+			if defs[usize(id)] == 0 && use != 0 && symKind(use) == SymVar {
+				t = symType(use, dp-1)
+			}
+			tpush(t)
+		}
+		want = mkTupleStack(m)
+	}
 	mark := opStack.top
-	ok := rhsValues(s, nn, dp-1)
+	ok := rhsValues(s, nn, want, dp-1)
 	cnt := opStack.top - mark
 	for i := usize(0); i < nn; i++ {
 		id := l1at(s, i)
@@ -390,7 +411,7 @@ func shortVarDecl(s u32, dp usize) decreases(dp) {
 // operands only assignability is checked.
 func assignValue(x *Operand, t u32) {
 	e := x.expr
-	if nkind(e) == NkCallExpr {
+	if nkind(e) == NkCallExpr || nkind(unparen(e)) == NkMatchExpr {
 		rt := ntype[usize(e)]
 		if isTupleT(rt) {
 			if !assignable(x.typ, t) && !isInvalid(t) {
@@ -449,7 +470,20 @@ func assignStmt(s u32, dp usize) decreases(dp) {
 		opPush(x)
 	}
 	rmark := opStack.top
-	ok := rhsValues(s, nl, dp-1)
+	want := u32(0)
+	if nl > 1 && nr == 1 && nkind(unparen(l2at(s, 0))) == NkMatchExpr {
+		// v0.3: the targets' types for a multi-value match
+		m := tmark()
+		for i := usize(0); i < nl; i++ {
+			t := u32(TyInvalid)
+			if opStack.items[lmark+i].mode == KVar {
+				t = opStack.items[lmark+i].typ
+			}
+			tpush(t)
+		}
+		want = mkTupleStack(m)
+	}
+	ok := rhsValues(s, nl, want, dp-1)
 	if !ok {
 		opStack.top = lmark
 		return
@@ -500,7 +534,11 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		return
 	}
 	if nr == 1 && want > 1 {
+		if nkind(unparen(r0)) == NkMatchExpr {
+			mwWant = sigResultType(sig) // v0.3 multi-value match
+		}
 		x := rawExpr(r0, dp-1)
+		mwWant = 0
 		if isInvalidOp(&x) {
 			return
 		}

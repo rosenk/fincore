@@ -1,0 +1,15 @@
+// SINCE: v0.3
+// fail_match_bytes_nil (v0.3): only string constants match a []byte
+// position; nil is not a pattern for it.
+package main
+
+func empty(b []byte) bool {
+	return match b {
+		nil -> true // ERROR E2002
+		_ -> false
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

@@ -800,6 +800,13 @@ func cgBuiltinCall(e u32, c u32, b u8, dp usize) decreases(dp) {
 			cgWc(')')
 		}
 		BFFormatTo -> cgFormatTo(e, c, dp-1)
+		BFMin | BFMax -> {
+			// v0.3: Go's min/max builtins (user names min/max are
+			// renamed _fc_u_min/_fc_u_max, so these always resolve).
+			cgW(match b { BFMin -> "min(", _ -> "max(" })
+			cgArgs(e, dp-1)
+			cgWc(')')
+		}
 		BFCopy | BFBytesEqual | BFStrBytes | BFBytesToStr | BFFormatUint | BFParseUint | BFNewContext | BFNewScope -> {
 			cgRt(cgBuiltinGoName(b))
 			cgWc('(')

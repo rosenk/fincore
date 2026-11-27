@@ -594,6 +594,16 @@ func atomsOf(e u32, fnode u32, dp usize) bool decreases(dp) {
 		if l1len(e) == 1 && callKind(e) is Conversion(_) | Builtin(BFLen | BFCap, ..) {
 			return atomsOf(l1at(e, 0), fnode, dp-1)
 		}
+		if callKind(e) is Builtin(BFMin | BFMax, ..) {
+			// v0.3: min/max of invariant operands is invariant
+			n := l1len(e)
+			for i := usize(0); i < n; i++ {
+				if !atomsOf(l1at(e, i), fnode, dp-1) {
+					return false
+				}
+			}
+			return true
+		}
 		return false
 	}
 	if k == NkIdent && symKind(symbolOf(e)) == SymTypeParam {

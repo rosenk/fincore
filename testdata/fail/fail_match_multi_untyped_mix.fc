@@ -1,0 +1,17 @@
+// SINCE: v0.3
+// fail_match_multi_untyped_mix (v0.3): untyped values of different kinds
+// at one position of a multi-value match do not mix.
+package main
+
+func f(n u32) u32 {
+	a, b := match n {
+		0 -> 1, n
+		_ -> "one", n // ERROR E2002
+	}
+	_ = a
+	return b
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

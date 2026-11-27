@@ -1438,8 +1438,128 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 	if b == BFFormatTo {
 		return formatCall(e, ci, dp-1)
 	}
+	if b is BFMin | BFMax {
+		return minMaxCall(e, b, dp-1)
+	}
 	errAt(E2002, e, formatTo(mbuf[:], "unsupported builtin %s", builtinName(b)))
 	return invalidOp(e)
+}
+
+// minMaxCall checks `min(x, y, ...)` / `max(x, y, ...)` (v0.3): two or
+// more operands of one ordered type (integers or strings), typed like the
+// operands of a comparison: untyped constants take the type of the typed
+// operands; if all operands are untyped constants their kinds must agree
+// (untyped int and untyped char mix to untyped char). The result has that
+// type; it is a constant (folded) if every operand is a constant.
+func minMaxCall(e u32, b u8, dp usize) Operand decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return invalidOp(e)
+	}
+	n := l1len(e)
+	if n < 2 {
+		errAt(E2003, e, formatTo(mbuf[:], "not enough arguments in call to %s: have %d, want at least 2", builtinName(b), n))
+		useArgs(e, 0, dp-1)
+		return invalidOp(e)
+	}
+	mark := opStack.top
+	bad := false
+	for i := usize(0); i < n; i++ {
+		x := exprValue(l1at(e, i), dp-1)
+		if isInvalidOp(&x) {
+			bad = true
+		}
+		opPush(x)
+	}
+	if bad {
+		opStack.top = mark
+		return invalidOp(e)
+	}
+	// The operands' type: the first typed one, else the untyped kind.
+	t := u32(0)
+	for i := usize(0); i < n; i++ {
+		if !isUntyped(opStack.items[mark+i].typ) {
+			t = opStack.items[mark+i].typ
+			break
+		}
+	}
+	for i := usize(0); i < n; i++ {
+		if isTypeParamT(opStack.items[mark+i].typ) {
+			errAt(E2011, e, formatTo(mbuf[:], "%s inspects a value of type parameter type %v", builtinName(b), TypeRef(opStack.items[mark+i].typ)))
+			opStack.top = mark
+			return invalidOp(e)
+		}
+	}
+	if t != 0 {
+		for i := usize(0); i < n; i++ {
+			x := &opStack.items[mark+i]
+			if isUntyped(x.typ) {
+				if basicKind(x.typ) == BkUntypedNil {
+					errAt(E2002, x.expr, formatTo(mbuf[:], "invalid argument %v for %s (untyped nil is not ordered)", Expr(x.expr), builtinName(b)))
+					bad = true
+				} else if !convertUntyped(x, t) {
+					bad = true
+				}
+			} else if x.typ != t {
+				errAt(E2002, x.expr, formatTo(mbuf[:], "mismatched types %v and %v in call to %s", TypeRef(t), TypeRef(x.typ), builtinName(b)))
+				bad = true
+			}
+		}
+	} else {
+		t = opStack.items[mark].typ
+		for i := usize(1); i < n; i++ {
+			x := &opStack.items[mark+i]
+			if x.typ == t {
+				continue
+			}
+			if isUntypedNumeric(x.typ) && isUntypedNumeric(t) {
+				t = TyUntypedChar
+				continue
+			}
+			errAt(E2002, x.expr, formatTo(mbuf[:], "mismatched types %v and %v in call to %s", TypeRef(t), TypeRef(x.typ), builtinName(b)))
+			bad = true
+			break
+		}
+	}
+	if bad {
+		opStack.top = mark
+		return invalidOp(e)
+	}
+	if !isInteger(t) && !isString(t) {
+		a0 := opStack.items[mark].expr
+		errAt(E2002, a0, formatTo(mbuf[:], "invalid argument %v for %s (type %v is not ordered)", Expr(a0), builtinName(b), TypeRef(t)))
+		opStack.top = mark
+		return invalidOp(e)
+	}
+	allConst := true
+	for i := usize(0); i < n; i++ {
+		if opStack.items[mark+i].mode != KConst {
+			allConst = false
+		}
+	}
+	if !allConst {
+		opStack.top = mark
+		return opMode(KValue, t)
+	}
+	r := opStack.items[mark].val
+	for i := usize(1); i < n; i++ {
+		v := opStack.items[mark+i].val
+		op := u8(OpLt)
+		if b == BFMax {
+			op = OpGt
+		}
+		c, ok := binaryOpVal(op, v, r)
+		if !ok {
+			errAt(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", errTxt.Bytes()))
+			opStack.top = mark
+			return invalidOp(e)
+		}
+		if c is Bool(true) {
+			r = v
+		}
+	}
+	opStack.top = mark
+	return opConst(t, r)
 }
 
 // codeArg checks a Code argument of a Code constructor.

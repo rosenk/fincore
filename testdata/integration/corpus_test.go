@@ -276,7 +276,7 @@ func TestSinceSkip(t *testing.T) {
 	future := write("pass/future.fc", "// A test of a future language version.\n// SINCE: v9.9\npackage main\n\nnot v0.2 syntax\n")
 	cur := write("pass/hello.fc", "// SINCE: v0.2\npackage main\n\ndriver func main(io Stdio) error {\n\treturn io.WriteStdout(strBytes(\"hi\\n\"))\n}\n")
 	write("pass/hello.out", "hi\n")
-	write("fail/future.fc", "// SINCE: v0.3\npackage main\n\nvar g u32 // ERROR E9999\n")
+	write("fail/future.fc", "// SINCE: v9.9\npackage main\n\nvar g u32 // ERROR E9999\n")
 	// v9.9 in a non-first file of a directory test
 	write("pass/second/a.fc", "package main\n\nnot v0.2 syntax\n")
 	second := filepath.Dir(write("pass/second/b.fc", "// SINCE: v9.9\npackage main\n"))

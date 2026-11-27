@@ -735,6 +735,9 @@ func runCase(c tcase, out string) result {
 		o.out, n.out = "", ""
 		cls, why := classify(o, n, newer, c.failTest)
 		r.add("build", cls, why, outcomeDetail(o, n))
+		if n.ok() {
+			newOnly(&r, c, out, gNew, bNew)
+		}
 		return r
 	}
 	a, errA := os.ReadFile(gOld)
@@ -767,6 +770,31 @@ func runCase(c tcase, out string) result {
 		}
 	}
 	return r
+}
+
+// newOnly checks a program that only the current compiler builds (a new
+// feature, usually EXPECTED): there is nothing to compare with, so its
+// emitted Go must pass `go vet` and, if the case has a .out file, its run
+// output must match it. Either failure is a REGRESSION.
+func newOnly(r *result, c tcase, out, gNew, bNew string) {
+	if govet && !c.mutant {
+		b, err := os.ReadFile(gNew)
+		if err != nil {
+			r.add("build", regression, "missing emitted Go: "+err.Error(), "")
+			return
+		}
+		if msg, ok := vet(out, b); !ok {
+			r.add("go vet", regression, "go vet rejects the current compiler's emitted Go (new program)", indent("    ", msg))
+		}
+	}
+	if runOut && c.outFile != "" {
+		rn := runBinary(bNew, out)
+		want, _ := os.ReadFile(c.outFile)
+		if rn.out != string(want) || !rn.ok() {
+			r.add("run", regression, "run output of a new program differs from "+c.outFile,
+				fmt.Sprintf("  want:\n%s  current (exit %d):\n%s", indent("    ", string(want)), rn.code, indent("    ", rn.out)))
+		}
+	}
 }
 
 func runBinary(bin, dir string) outcome {

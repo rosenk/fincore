@@ -720,7 +720,39 @@ func imatchExpr(e u32, dp usize) Val decreases(dp) {
 		failS(E2002, "no match arm for the value")
 		return z
 	}
-	return ieval(nb(l1at(e, i)), dp-1)
+	a := nb(l1at(e, i))
+	if nkind(a) == NkTupleExpr {
+		// v0.3: a multi-value arm gives a Tuple of copies of its values
+		return ivalueList(a, dp-1)
+	}
+	return ieval(a, dp-1)
+}
+
+// ivalueList evaluates the values of a multi-value match arm (v0.3) left
+// to right into a Tuple value.
+func ivalueList(e u32, dp usize) Val decreases(dp) {
+	var z Val
+	if dp == 0 {
+		tooDeep()
+		failSilent()
+		return z
+	}
+	n := l1len(e)
+	m := vtop
+	for i := usize(0); i < n; i++ {
+		v := ieval(l1at(e, i), dp-1)
+		if ifail {
+			vtop = m
+			return z
+		}
+		vpush(copyV(v))
+	}
+	st := valAlloc(n, true)
+	for i := usize(0); i < n; i++ {
+		slotSet(st+u32(i), vstack[m+i])
+	}
+	vtop = m
+	return Val.Tuple(st, u32(n))
 }
 
 // iscrutinee evaluates the scrutinee of a match (a tuple scrutinee to a
@@ -1582,6 +1614,25 @@ func ibuiltin0(b u8, m usize) Val {
 			(_, NilSlice) -> return vIntU(0)
 			_ -> {}
 		}
+	} else if b is BFMin | BFMax {
+		// v0.3: the first least (greatest) operand.
+		r := vstack[m]
+		n := vtop - m
+		op := u8(OpLt)
+		if b == BFMax {
+			op = OpGt
+		}
+		for i := usize(1); i < n; i++ {
+			c, ok := compareVals(op, vstack[m+i], r)
+			if !ok {
+				failS(E2002, "cannot compare the operands of min/max")
+				return z
+			}
+			if c is Bool(true) {
+				r = vstack[m+i]
+			}
+		}
+		return r
 	} else if b == BFCopy {
 		d := vstack[m]
 		s := vstack[m+1]

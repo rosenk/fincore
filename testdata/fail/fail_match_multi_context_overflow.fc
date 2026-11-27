@@ -1,0 +1,15 @@
+// SINCE: v0.3
+// fail_match_multi_context_overflow (v0.3): values that are untyped in
+// every arm take the result type from the context and must fit it.
+package main
+
+func small(n u32) (u8, u32) {
+	return match n {
+		0 -> 1, n
+		_ -> 300, n // ERROR E2002
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}
