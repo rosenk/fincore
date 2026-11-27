@@ -214,6 +214,15 @@ func TestEnvStdio(t *testing.T) {
 	if _, ok := e.GetEnv("FINCRT_TEST_NO_SUCH_VAR"); ok {
 		t.Fatal("GetEnv missing")
 	}
+	// ExecutableKey is answered by the runtime, never by the environment.
+	t.Setenv(ExecutableKey, "/not/this")
+	exe, ok := e.GetEnv(ExecutableKey)
+	if !ok || exe != Executable() || !filepath.IsAbs(exe) {
+		t.Fatalf("GetEnv(ExecutableKey) = %q, %v", exe, ok)
+	}
+	if fi, err := os.Stat(exe); err != nil || fi.IsDir() {
+		t.Fatalf("Executable %q: %v", exe, err)
+	}
 	if DefaultStdio().WriteStdout(nil) != nil || DefaultStdio().WriteStderr(nil) != nil {
 		t.Fatal("Stdio")
 	}

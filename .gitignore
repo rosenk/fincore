@@ -8,3 +8,4 @@ stage*.go
 /finc3
 /.stage/
 /.claude/
+/dist/

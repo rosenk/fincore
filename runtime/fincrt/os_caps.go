@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -126,8 +127,38 @@ func (Env) Arg(i uint) string {
 	return os.Args[i]
 }
 
-// GetEnv looks up an environment variable.
-func (Env) GetEnv(key string) (string, bool) { return os.LookupEnv(key) }
+// ExecutableKey is the one key that Env.GetEnv answers itself instead of
+// looking it up in the process environment: the value is Executable().
+// It lets FinCore programs (the self-hosted compiler locating its install
+// directory) learn their own path through the existing Env capability.
+const ExecutableKey = "FINCRT_EXECUTABLE"
+
+// GetEnv looks up an environment variable. The key ExecutableKey is not
+// read from the environment: it returns Executable() (false if unknown).
+func (Env) GetEnv(key string) (string, bool) {
+	if key == ExecutableKey {
+		p := Executable()
+		return p, p != ""
+	}
+	return os.LookupEnv(key)
+}
+
+// Executable returns the absolute path of the running executable with
+// symlinks resolved (os.Executable + filepath.EvalSymlinks), or "" if the
+// OS cannot tell.
+func Executable() string {
+	p, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	if !filepath.IsAbs(p) {
+		return ""
+	}
+	return filepath.Clean(p)
+}
 
 func (Stdio) WriteStdout(data []byte) error { return writeAllTo(os.Stdout, data) }
 func (Stdio) WriteStderr(data []byte) error { return writeAllTo(os.Stderr, data) }

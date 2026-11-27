@@ -130,7 +130,9 @@ is still available as `Node.id`).
    imported packages are named `importpath/file.fc`. `std/...` imports
    resolve against `$FINCROOT` when it is set (read once by `main` into
    `fincRoot`; files are then named `<cleaned $FINCROOT/importpath>/file.fc`),
-   like finc0's `resolve.StdDir` (decision 58). `pkgs.order` is the
+   like finc0's `resolve.StdDir` (decision 58). Without `$FINCROOT` and
+   without `./std`, an installed release (module root with a `VERSION`
+   file, docs/release.md) serves `std/` from its root. `pkgs.order` is the
    dependency order (root last), `pkgs.root` the root package.
 2. If any diagnostic exists, print them (sorted) and stop. Otherwise
    `resolveProgram` (resolve.fc): universe, `declarePackage` for all
@@ -510,7 +512,8 @@ build then writes `go.mod` (`replace fincore => <root>`, go version of the
 root go.mod), `zz_race.go` for `--race`, and runs `go build -C <tmp>` with
 workdir = module root (so mise-style shims resolve the toolchain), env
 `GOWORK=off GOFLAGS=-mod=mod CGO_ENABLED=0|1`. Root: `$FINCORE_ROOT`, else
-walk up from `$PWD` (FS has no Getwd), else from Arg(0). `$FINC_GO`
+walk up from `$PWD` (FS has no Getwd), else from the running executable
+(`env.GetEnv("FINCRT_EXECUTABLE")`, answered by fincrt), else from Arg(0). `$FINC_GO`
 overrides the go command.
 
 `make diff-build` (scripts/diffbuild) compares `finc0 build --emit-go` and

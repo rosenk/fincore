@@ -10,7 +10,7 @@ export CGO_ENABLED ?= 0
 
 .PHONY: all build finc0 test race vet fmt fmt-check lint parse-corpus check-corpus \
         integration finc1 diff-parse diff-check diff-check-scope diff-check-totality diff-check-all \
-        diff-check-fuzz diff-build diff-build-vet finc2 bootstrap ci clean help
+        diff-check-fuzz diff-build diff-build-vet finc2 bootstrap ci clean help dist dist-test
 
 all: vet test build ## vet, test and build finc0
 
@@ -66,10 +66,24 @@ bootstrap: finc0 ## fixed-point gate: finc0 -> finc-seed -> finc1 -> finc2 -> fi
 	$(GO) run ./scripts/bootstrap_verify.go
 # --- end bootstrap chain
 
+# --- release archive (docs/release.md): dist/fincore-<version>-<os>-<arch>.tar.gz
+# with the finc2 of a fresh bootstrap. VERSION defaults to the exact tag of
+# HEAD, else `git describe`. The archive is reproducible (SOURCE_DATE_EPOCH,
+# default: commit time of HEAD).
+DIST    := dist
+VERSION ?= $(shell git describe --tags --exact-match HEAD 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo dev)
+dist: ## build $(DIST)/fincore-<version>-<os>-<arch>.tar.gz from a fresh bootstrap (finc2)
+	$(GO) run ./scripts/bootstrap_verify.go -skip-integration
+	$(GO) run ./scripts/dist -version $(VERSION) -finc $(STAGE)/finc2 -out $(DIST)
+
+dist-test: ## smoke-test the archive: unpack, then build/run/test from another directory with no env vars
+	$(GO) run ./scripts/dist -test -version $(VERSION) -out $(DIST)
+# --- end release archive
+
 ci: lint test build integration ## what CI runs
 
 clean: ## remove build outputs
-	rm -rf $(BIN) $(STAGE)
+	rm -rf $(BIN) $(STAGE) $(DIST)
 
 # --- finc0 vs finc1 differential: regression checks of the FROZEN v0.2 subset.
 # finc0 implements only v0.2. Inputs that need a newer version say

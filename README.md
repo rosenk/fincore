@@ -41,6 +41,34 @@ func writeAll(ctx Context, conn Conn, data []byte) error {
 
 The full TCP echo server with graceful shutdown is in [`examples/tcp_echo.fc`](examples/tcp_echo.fc).
 
+## Install
+
+Download the archive for your platform from the
+[GitHub Releases](https://github.com/rosenk/fincore/releases) page, e.g.
+`fincore-0.2.0-linux-amd64.tar.gz` (also `linux-arm64`, `darwin-arm64`,
+and `darwin-amd64` when available), check it against `SHA256SUMS`, unpack
+it anywhere and put its `bin/` on `PATH`:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS      # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
+tar -xzf fincore-0.2.0-linux-amd64.tar.gz -C "$HOME/.local"   # creates ~/.local/fincore
+export PATH="$HOME/.local/fincore/bin:$PATH"
+
+finc run hello.fc                              # from any directory
+finc build -o echo examples/tcp_echo.fc
+```
+
+**finc needs a Go toolchain** (Go 1.27 or newer, `go` on `PATH`): it
+compiles FinCore to Go and runs `go build` and gofmt. The archive holds
+`bin/finc`, the runtime (`go.mod` + `runtime/fincrt`), `std/`, the
+examples and the docs; finc finds the runtime and `std/` next to its own
+executable (also through a symlink), so no environment variables are
+needed. `FINCORE_ROOT` (runtime) and `FINCROOT` (std) still override.
+Layout, reproducibility and the release workflow:
+[`docs/release.md`](docs/release.md); changes: [`CHANGELOG.md`](CHANGELOG.md).
+
+To build from source instead, see Bootstrap and Build and test below.
+
 ## Bootstrap
 
 ```text
@@ -122,6 +150,8 @@ make check-corpus
 make integration
 make seed       # .stage/finc-seed: finc0 builds compiler/ at the bootstrap/SEED tag
 make bootstrap  # finc0 → finc-seed → finc1 → finc2 → finc3, fixed-point gate
+make dist       # release archive dist/fincore-<version>-<os>-<arch>.tar.gz (finc2)
+make dist-test  # smoke-test it from another directory, no env vars
 make help       # all targets
 
 bin/finc0 parse --dump-ast examples/tcp_echo.fc
@@ -132,5 +162,5 @@ bin/finc0 check examples/tcp_echo.fc
 
 - [`docs/semantics_decisions.md`](docs/semantics_decisions.md) lists every place where the spec was ambiguous and how it was resolved. The compilers and tests follow it.
 - [`docs/runtime_api.md`](docs/runtime_api.md) describes the `fincrt` API that generated code targets.
-- [`docs/stdlib.md`](docs/stdlib.md) is the reference for the `std/` packages (`import "std/maps"`; resolved against `$FINCROOT` when set, else the module root).
+- [`docs/stdlib.md`](docs/stdlib.md) is the reference for the `std/` packages (`import "std/maps"`; resolved against `$FINCROOT` when set, else the module root; an installed finc uses its install directory).
 - [`docs/compiler_requirements.md`](docs/compiler_requirements.md) lists the language features the self-hosted compiler relies on.
