@@ -7,7 +7,7 @@ Key deviations from the spec:
 - `fincrt.AcquireSlot(conns, ctx, pool[:])`, `fincrt.ReleaseSlot(conns, slot)`, `fincrt.Go(conns, slot, func(buf *T){...})`.
 - `Context.DoneChan()` returns `(<-chan struct{}, stop func())`.
 - Extra sentinel `ErrParse` (returned by `ParseUint`) — must be in the FinCore universe.
-- Builtins exported as `fincrt.Copy`, `BytesEqual`, `StrBytes`, `BytesToStr`, `FormatUint`, `ParseUint`.
+- Builtins exported as `fincrt.Copy`, `BytesEqual`, `StrBytes`, `BytesToStr`, `FormatUint`, `ParseUint`. `StrBytes` returns a fresh, writable copy (decision 90); it used to return a read-only zero-copy view, which made writes to it crash.
 - `Duration uint64`, `Signal uint8`, `ExitStatus{Code int}`; usize → `uint`.
 - `ListSourceFiles` returns base names (sorted); `Exec.Run` env entries extend the parent env.
 - Zero-value Conn/Listener behave as closed; zero Context never cancelled.

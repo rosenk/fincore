@@ -3,7 +3,6 @@ package fincrt
 import (
 	"bytes"
 	"strconv"
-	"unsafe"
 )
 
 // Copy copies min(len(dst), len(src)) elements and returns the count.
@@ -12,13 +11,13 @@ func Copy[T any](dst, src []T) uint { return uint(copy(dst, src)) }
 // BytesEqual reports whether a and b hold the same bytes.
 func BytesEqual(a, b []byte) bool { return bytes.Equal(a, b) }
 
-// StrBytes returns a read-only, zero-copy view of s's bytes.
-// Writing to the result is undefined behaviour.
+// StrBytes returns a fresh copy of s's bytes (decision 90): writing to
+// the result never affects s or any other value.
 func StrBytes(s string) []byte {
 	if len(s) == 0 {
 		return nil
 	}
-	return unsafe.Slice(unsafe.StringData(s), len(s))
+	return []byte(s)
 }
 
 // BytesToStr copies b into a new string.

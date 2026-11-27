@@ -1,0 +1,18 @@
+// pass_strbytes_copy: strBytes returns a fresh, writable copy (decision 90);
+// writing to it affects neither the string nor other copies.
+package main
+
+driver func main(io Stdio) error {
+	s := "hello"
+	b := strBytes(s)
+	c := strBytes(s)
+	b[0] = 'J'
+	copy(c[1:], "ELL")
+	_ = io.WriteStdout(b)
+	_ = io.WriteStdout("\n")
+	_ = io.WriteStdout(c)
+	_ = io.WriteStdout("\n")
+	_ = io.WriteStdout(strBytes(s))
+	_ = io.WriteStdout("\n")
+	return nil
+}
