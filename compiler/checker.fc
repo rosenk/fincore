@@ -11,8 +11,9 @@
 package main
 
 const (
-	MaxOpStack = 65_536
-	MaxNamed   = 32_768
+	MaxOpStack  = 65_536 // comptime value and reference stacks
+	MaxOperands = 16_384 // operand lists of nested calls and assignments
+	MaxNamed    = 32_768
 )
 
 // Checker state (types.Checker): the current function and its context.
@@ -41,14 +42,14 @@ type Operand struct {
 // opStack holds operand lists (call arguments, assignment sides) in LIFO
 // order.
 type OpStack struct {
-	items [MaxOpStack]Operand
+	items [MaxOperands]Operand
 	top   usize
 }
 
 var opStack OpStack
 
 func opPush(x Operand) {
-	if opStack.top >= MaxOpStack {
+	if opStack.top >= MaxOperands {
 		setFull("operand stack")
 		return
 	}

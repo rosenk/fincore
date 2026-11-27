@@ -78,7 +78,7 @@ var strPool [MaxStrBytes]byte
 var nstr usize
 
 // errTxt receives the text of value-operation errors (Go's error values).
-var errTxt OutBuf
+var errTxt MsgBuf
 
 // etf sets errTxt to the first k bytes of mbuf:
 // etf(formatTo(mbuf[:], "...", ...)).

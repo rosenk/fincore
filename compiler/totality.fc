@@ -29,8 +29,8 @@
 package main
 
 const (
-	TotMaxAtoms   = 65_536  // atoms of one loop-invariance query
-	TotMaxScratch = 262_144 // path/type lists of those atoms
+	TotMaxAtoms   = 8192   // atoms of one loop-invariance query
+	TotMaxScratch = 32_768 // path/type lists of those atoms
 )
 
 // ---------------------------------------------------------------------------

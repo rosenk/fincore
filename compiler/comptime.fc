@@ -60,7 +60,7 @@ var inBase usize // first frame of the current root
 // Failure state.
 var ifail bool
 var ifailCode u32
-var ifailMsg OutBuf
+var ifailMsg MsgBuf
 
 // failf fails with "comptime evaluation failed: " + mbuf[:k]; callers
 // format the detail with formatTo(mbuf[:], ...).

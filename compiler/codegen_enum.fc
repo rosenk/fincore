@@ -21,9 +21,9 @@
 package main
 
 const (
-	CgMaxLayBytes  = 1_048_576
-	CgMaxLayGroups = 65_536
-	CgMaxLayPay    = 262_144
+	CgMaxLayBytes  = 262_144
+	CgMaxLayGroups = 16_384
+	CgMaxLayPay    = 65_536
 )
 
 var cgLayBytes [CgMaxLayBytes]byte
@@ -644,7 +644,7 @@ func cgFlatMatch(m u32) bool {
 // Pattern conditions are written to gw (nothing written: always matches);
 // the bindings of a pattern are collected on the binding stack.
 
-const CgMaxSub = 65_536
+const CgMaxSub = 16_384
 
 var cgSubA [CgMaxSub]u32 // path: span in cgStash
 var cgSubB [CgMaxSub]u32

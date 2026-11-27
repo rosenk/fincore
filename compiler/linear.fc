@@ -23,12 +23,12 @@ package main
 const (
 	MaxLnVars      = 65_536
 	MaxLnFlows     = 8192
-	MaxLnFrames    = 262_144
-	MaxLnFrameVals = 262_144
-	MaxLnLoops     = 65_536
-	MaxLnTmp       = 262_144
-	MaxLnEnvs      = 1 << 20
-	MaxLnSlots     = 1 << 22
+	MaxLnFrames    = 16_384
+	MaxLnFrameVals = 65_536
+	MaxLnLoops     = 8192
+	MaxLnTmp       = 65_536
+	MaxLnEnvs      = 1 << 16 // per declaration (reset)
+	MaxLnSlots     = 1 << 18 // per declaration (reset)
 
 	LnNoVar = 0xFFFF_FFFF
 

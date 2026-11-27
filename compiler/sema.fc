@@ -23,13 +23,14 @@ const (
 	MaxNameBytes = 1 << 20
 	NameBuckets  = 131_072
 
-	MaxSyms     = 131_072
-	SymBuckets  = 524_288 // key (scp, name)
-	MaxScopes   = 524_288
-	MaxPkgs     = 64
-	MaxULists   = 1 << 20
-	MaxCells    = 524_288
-	MaxFuncNest = 4096
+	MaxSyms       = 65_536
+	SymBuckets    = 262_144 // key (scp, name)
+	MaxScopes     = 131_072
+	MaxPkgs       = 64
+	MaxULists     = 1 << 18
+	MaxUListStack = 65_536 // u32 lists under construction
+	MaxCells      = 131_072
+	MaxFuncNest   = 4096
 
 	MaxDiags     = 8192
 	MaxDiagBytes = 1 << 21
@@ -370,7 +371,7 @@ func scopeInsert(scp u32, sym u32) u32 {
 // (lists that grow interleaved: calls, literals and captures of functions).
 
 // ulists stores the u32 lists, built on its scratch stack in LIFO order.
-var ulists vec.ListArena[MaxULists, MaxULists, u32]
+var ulists vec.ListArena[MaxULists, MaxUListStack, u32]
 
 func upush(v u32) {
 	ulists.Push(v)
@@ -517,7 +518,7 @@ var diags DiagList
 
 // mbuf holds the message of the diagnostic being built: callers format it
 // with formatTo(mbuf[:], ...) and pass the length to errAt (msg.fc).
-var mbuf [MaxOutputBytes]byte
+var mbuf [MaxMsgBytes]byte
 
 // addDiag records "file:line:col: error[E####]: <msg>".
 func addDiag(file usize, line u32, col u32, code u32, msg []byte) {

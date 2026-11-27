@@ -20,6 +20,24 @@ workflow publishes it; docs/release.md).
   dispatch and the Go keyword tables, multi-value `match` in the AST
   layout helpers. The files that do are marked `// SINCE: v0.3`, so the
   finc0 differentials (`make diff-*`) skip compiler/.
+- Compiler memory: the fixed-capacity arenas of compiler/ are right-sized
+  from measured high-water marks (self-compile and the whole test corpus;
+  compiler/README.md, "Capacities and memory"). `.bss` of finc 548 MB ->
+  385 MB; RSS of a self-compile 207 MB -> 137 MB and of `finc check` on a
+  small program 147 MB -> 100 MB with transparent huge pages (without THP
+  RSS was and stays proportional to use: 40 / 7 MB). Program-sized tables
+  keep at least 5x headroom over compiler/ itself (`MaxSyms` 65_536,
+  `MaxScopes` 131_072, `MaxTypes` 32_768, `MaxTypeLists` 1 << 18,
+  `MaxFuncs` 16_384, `MaxCalls` 131_072, `MaxSels` 65_536, `MaxCells`
+  131_072, `MaxNamedRecs` 8192); per-function scratch (totality, linearity,
+  pattern matrices, codegen frames and arms) shrinks to at least 30x the
+  largest use; list scratch stacks get their own smaller capacities; the
+  message buffers (`mbuf`, value/comptime/codegen error texts) are 2 MiB
+  (`MaxDiagBytes`) instead of 8 MiB; a call or assignment may have at most
+  16_384 operands (`MaxOperands`). User-visible limits (source size,
+  tokens, nodes, 8 MiB output, comptime value slots) are unchanged. A
+  program that exceeds a capacity still fails with `compiler capacity
+  exceeded (<arena>)` (new integration test `TestCapacityExceeded`).
 
 ## v0.3.0
 
