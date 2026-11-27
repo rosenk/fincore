@@ -1246,6 +1246,11 @@ func cgSingleTest(p u32) bool {
 // number + 1 (0 = not renamed); cgWSymName writes `_fc_tN_<name>`.
 var cgSymTmp [MaxSyms]u64
 
+// cgHoistGen numbers the statements whose `is` bindings are hoisted
+// (incremented by cgStmt before cgHoistIs).
+var cgHoistGen u32
+var cgSymHoist [MaxSyms]u32
+
 // cgHoistIs writes, before statement s, the declarations of the variables
 // bound by the `is` expressions of s that are read anywhere (v0.2 flow
 // bindings): `var _fc_tN_x T`, in source order (finc0's hoistIs). Each
@@ -1253,7 +1258,10 @@ var cgSymTmp [MaxSyms]u64
 // nor shadow other variables; the is test assigns them (cgIsExpr). The
 // expressions of s are those outside its nested blocks and function
 // literals, including the conditions of an else-if chain and a for
-// statement's init, condition and post.
+// statement's init, condition and post. Intersected bindings of one name
+// (v0.2) are one symbol: declared once, at its first test (cgSymHoist
+// holds the cgHoistGen of the statement that declared it), and assigned
+// by every test that binds it.
 func cgHoistIs(s u32, dp usize) decreases(dp) {
 	if dp == 0 || s == 0 {
 		return
@@ -1323,6 +1331,10 @@ func cgHoistExpr(e u32, dp usize) decreases(dp) {
 		btop := cgBindTop
 		for i := bmark; i < btop; i++ {
 			sym := cgBindSym[i]
+			if cgSymHoist[usize(sym)] == cgHoistGen {
+				continue // intersected with an earlier test (one variable)
+			}
+			cgSymHoist[usize(sym)] = cgHoistGen
 			cgSymTmp[usize(sym)] = cgNewTemp() + 1
 			cgW("var ")
 			cgWSymName(sym)

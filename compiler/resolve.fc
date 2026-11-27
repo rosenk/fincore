@@ -296,6 +296,7 @@ func resolveProgram() {
 	for i := usize(0); i < n; i++ {
 		bindPackage(pkgs.order[i], SemaDepth)
 	}
+	bApplyMerges()
 }
 
 // pkgAddDecl declares one package-level symbol (resolve's `add`).
@@ -1111,14 +1112,17 @@ func bIfStmt(s u32, inList bool, depth usize) decreases(depth) {
 //
 //	e is P      t = bindings of P, f = {}
 //	!A          t = f(A), f = t(A)
-//	A && B      t = t(A) + t(B), f = {}; t(A) is visible in B
-//	A || B      t = {}, f = f(A) + f(B); f(A) is visible in B
+//	A && B      t = t(A) + t(B), f = f(A) * (t(A) + f(B)); t(A) is visible in B
+//	A || B      t = t(A) * (f(A) + t(B)), f = f(A) + f(B); f(A) is visible in B
 //	(A)         those of A
 //	otherwise   {}, {}
 //
-// The symbols of an `is` pattern are declared in a scope of their own and
-// become visible only where flow makes them visible. A name in both
-// operand sets of a union is E2001.
+// where + is a union and * an intersection by name. The symbols of an
+// `is` pattern are declared in a scope of their own and become visible
+// only where flow makes them visible. A name in both operand sets of a
+// union is E2001. The true and false set of an expression never share a
+// name, so the intersections are f(A) * f(B) and t(A) * t(B)
+// (bFlowIntersect).
 func bFlow(e u32, depth usize) (usize, usize) decreases(depth) {
 	if depth == 0 || e == 0 {
 		return 0, 0
@@ -1172,51 +1176,147 @@ func bFlow(e u32, depth usize) (usize, usize) decreases(depth) {
 		}
 		tb, fb := bFlow(nb(e), depth-1)
 		bScope = outer
-		// the union keeps the left set x and appends the right set y
-		xs := base
-		xn := ta
-		ys := base + ta + fa
-		yn := tb
-		if !and {
-			xs = base + ta
-			xn = fa
-			ys = base + ta + fa + tb
-			yn = fb
-		}
-		for i := usize(0); i < xn; i++ {
-			bFlowTmp[i] = bFlowSyms[xs+i]
-		}
-		for i := usize(0); i < yn; i++ {
-			bFlowTmp[xn+i] = bFlowSyms[ys+i]
+		// the four sets ta, fa, tb, fb are copied to bFlowTmp (in that
+		// order) and replaced by the result sets
+		n4 := ta + fa + tb + fb
+		for i := usize(0); i < n4; i++ {
+			bFlowTmp[i] = bFlowSyms[base+i]
 		}
 		bFlowTop = base
-		for i := usize(0); i < xn; i++ {
-			bFlowPush(bFlowTmp[i])
-		}
-		n := xn
-		for i := usize(0); i < yn; i++ {
-			sym := bFlowTmp[xn+i]
-			dup := false
-			for j := usize(0); j < xn; j++ {
-				if symName(bFlowTmp[j]) == symName(sym) {
-					dup = true
-					break
-				}
-			}
-			if dup {
-				errAt(E2001, syms.items[usize(sym)].ident, formatTo(mbuf[:], "%v redeclared in this condition", NameRef(symName(sym))))
-				continue
-			}
-			bFlowPush(sym)
-			n++
-		}
 		if and {
-			return n, 0
+			nt := bFlowUnion(0, ta, ta+fa, tb)
+			nf := bFlowIntersect(ta, fa, ta+fa+tb, fb)
+			return nt, nf
 		}
-		return 0, n
+		nt := bFlowIntersect(0, ta, ta+fa, tb)
+		nf := bFlowUnion(ta, fa, ta+fa+tb, fb)
+		return nt, nf
 	}
 	bindExpr(e, depth-1)
 	return 0, 0
+}
+
+// bFlowUnion pushes the union of the sets bFlowTmp[xs:xs+xn] and
+// bFlowTmp[ys:ys+yn]: x followed by the symbols of y; a name of y already
+// in x is E2001 (one outcome set binds it twice) and is dropped.
+func bFlowUnion(xs usize, xn usize, ys usize, yn usize) usize {
+	for i := usize(0); i < xn; i++ {
+		bFlowPush(bFlowTmp[xs+i])
+	}
+	n := xn
+	for i := usize(0); i < yn; i++ {
+		sym := bFlowTmp[ys+i]
+		dup := false
+		for j := usize(0); j < xn; j++ {
+			if symName(bFlowTmp[xs+j]) == symName(sym) {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			errAt(E2001, syms.items[usize(sym)].ident, formatTo(mbuf[:], "%v redeclared in this condition", NameRef(symName(sym))))
+			continue
+		}
+		bFlowPush(sym)
+		n++
+	}
+	return n
+}
+
+// bFlowIntersect pushes the symbols of bFlowTmp[xs:xs+xn] whose name is
+// also bound in bFlowTmp[ys:ys+yn], in the order of x (v0.2 flow
+// intersections: a name is bound in an outcome if it is bound on every
+// path to it). The binding of y is merged into the one of x: both name
+// one variable, which either `is` test assigns (bApplyMerges). The type
+// checker requires identical types.
+func bFlowIntersect(xs usize, xn usize, ys usize, yn usize) usize {
+	n := usize(0)
+	for i := usize(0); i < xn; i++ {
+		sym := bFlowTmp[xs+i]
+		for j := usize(0); j < yn; j++ {
+			o := bFlowTmp[ys+j]
+			if symName(o) == symName(sym) {
+				bMerged[usize(o)] = sym
+				bNMerged++
+				bFlowPush(sym)
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// bMerged maps an `is` binding to the binding of the same name it was
+// intersected with (0: none); bApplyMerges unifies them.
+var bMerged [MaxSyms]u32
+var bNMerged usize
+
+// bMergedRoot returns the symbol sym was (transitively) merged into.
+func bMergedRoot(sym u32) u32 {
+	s := sym
+	for k := usize(0); k < MaxSyms; k++ {
+		m := bMerged[usize(s)]
+		if m == 0 {
+			return s
+		}
+		s = m
+	}
+	return s
+}
+
+// bApplyMerges replaces every merged `is` binding by its root in defs,
+// uses and the captures of function literals, so the intersected
+// bindings of a name are one symbol for every later pass (like the
+// alternatives of an or-pattern).
+func bApplyMerges() {
+	if bNMerged == 0 {
+		return
+	}
+	nn := nodes.count
+	for i := usize(1); i < nn; i++ {
+		if defs[i] != 0 {
+			defs[i] = bMergedRoot(defs[i])
+		}
+		if uses[i] != 0 {
+			uses[i] = bMergedRoot(uses[i])
+		}
+		if nodes.items[i].kind == NkFuncLit && litCapHead[i] != 0 {
+			bRemapCaptures(i)
+		}
+	}
+}
+
+// bRemapCaptures rebuilds the capture list of function literal lit with
+// merged symbols replaced by their roots (without duplicates).
+func bRemapCaptures(lit usize) {
+	h := u32(0)
+	t := u32(0)
+	c := litCapHead[lit]
+	for g := usize(0); g < MaxCells; g++ {
+		if c == 0 {
+			break
+		}
+		sym := bMergedRoot(cellVal(c))
+		dup := false
+		d := h
+		for g2 := usize(0); g2 < MaxCells; g2++ {
+			if d == 0 {
+				break
+			}
+			if cellVal(d) == sym {
+				dup = true
+				break
+			}
+			d = cellNext(d)
+		}
+		if !dup {
+			h, t = cellAppend(h, t, sym)
+		}
+		c = cellNext(c)
+	}
+	litCapHead[lit] = h
+	litCapTail[lit] = t
 }
 
 // bVisible opens a scope holding bFlowSyms[from:to] (none if empty); the
