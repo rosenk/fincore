@@ -1,0 +1,357 @@
+// pass_sum_types (v0.2): sum types. Exhaustive matches without `_`,
+// match expressions in many positions (return, :=, =, typed var, argument,
+// condition, nested, struct field, const initializer, comptime), or-patterns
+// on variants and literals, unqualified variant patterns (qualified ones
+// still work), generic Option/Result with explicit type arguments, methods
+// with value and pointer receivers, enums in fixed arrays and structs, and
+// equality after a variant change (compact layout zeroes unused slots).
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+type Color enum {
+	Red
+	Green
+	Blue
+}
+
+type NodeID u32
+
+// Expr models an arena-allocated AST node: payloads include an ID newtype.
+type Expr enum {
+	Lit(u64)
+	Add(NodeID, NodeID)
+	Neg(NodeID)
+	Var(u32)
+}
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+type Result[T any] enum {
+	Ok(T)
+	Err(error)
+}
+
+type Tagged struct {
+	name  string
+	shape Shape
+}
+
+const MaxNodes = 8
+
+var nodes [MaxNodes]Expr
+
+// const initializer: a constant scrutinee selects a constant arm.
+const Code = match Color.Green {
+	Red -> 1
+	Green | Blue -> 2
+}
+
+comptime func classify(n u32) u32 {
+	return match n {
+		0 -> 10
+		1 | 2 | 3 -> 20
+		_ -> 30
+	}
+}
+
+comptime func shapeCode(s Shape) u32 {
+	return match s {
+		Circle(r) -> r
+		Rect(w, h) -> w * h
+		Empty -> 0
+	}
+}
+
+const C2 = classify(2)
+const C9 = classify(9)
+const SC = shapeCode(Shape.Rect(3, 4))
+
+// value receiver, match expression as the result
+func (s Shape) area() u64 {
+	return match s {
+		Circle(r) -> 3 * u64(r) * u64(r)
+		Rect(w, h) -> u64(w) * u64(h)
+		Empty -> 0
+	}
+}
+
+// pointer receiver, the enum is replaced through the pointer
+func (s *Shape) scale(k u32) {
+	*s = match *s {
+		Circle(r) -> Shape.Circle(r * k)
+		Rect(w, h) -> Shape.Rect(w*k, h*k)
+		Empty -> Shape.Empty
+	}
+}
+
+func (c Color) next() Color {
+	return match c {
+		Color.Red -> Color.Green
+		Color.Green -> Color.Blue
+		Color.Blue -> Color.Red
+	}
+}
+
+// exhaustive statement match without `_` (it terminates: no final return)
+func colorCode(c Color) u32 {
+	match c {
+		Red -> {
+			return 100
+		}
+		Green | Blue -> {
+			return 200
+		}
+	}
+}
+
+func isWarm(c Color) bool {
+	return match c { Red -> true; Green | Blue -> false }
+}
+
+func digitKind(b byte) u32 {
+	return match b {
+		'0' | '2' | '4' | '6' | '8' -> 2
+		'1' | '3' | '5' | '7' | '9' -> 1
+		_ -> 0
+	}
+}
+
+func nameLen(s string) u32 {
+	return match s { "a" | "b" -> 1, "cc" -> 2, _ -> 99 }
+}
+
+func parseDigit(b byte) Result[u32] {
+	if b < '0' || b > '9' {
+		return Result[u32].Err(ErrParse)
+	}
+	return Result[u32].Ok(u32(b - '0'))
+}
+
+func unwrapOr[T any](o Option[T], d T) T {
+	return match o {
+		Some(x) -> x
+		None -> d
+	}
+}
+
+func (o Option[T]) isSome() bool {
+	return match o {
+		Some(_) -> true
+		None -> false
+	}
+}
+
+func sum2(a Option[u32], b Option[u32]) u32 {
+	return match a {
+		Some(x) -> match b {
+			Some(y) -> x + y
+			None -> x
+		}
+		None -> unwrapOr[u32](b, 0)
+	}
+}
+
+func eval(id NodeID, depth usize) u64 decreases(depth) {
+	if depth == 0 {
+		return 0
+	}
+	return match nodes[usize(id)] {
+		Lit(v) -> v
+		Add(a, b) -> eval(a, depth-1) + eval(b, depth-1)
+		Neg(a) -> 1000 - eval(a, depth-1)
+		Var(k) -> u64(k) * 10
+	}
+}
+
+func bump(t Tagged) Tagged {
+	ps := &t.shape
+	ps.scale(2)
+	return t
+}
+
+driver func putStr(io Stdio, s string) error {
+	return io.WriteStdout(strBytes(s))
+}
+
+driver func putUint(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+driver func putBool(io Stdio, label string, b bool) error {
+	return putStr(io, match b {
+		true -> label
+		_ -> "false\n"
+	})
+}
+
+driver func main(io Stdio) error {
+	// constants and comptime
+	if err := putUint(io, "Code: ", Code); err != nil {
+		return err
+	}
+	if err := putUint(io, "classify: ", u64(C2*100+C9)); err != nil {
+		return err
+	}
+	if err := putUint(io, "shapeCode: ", u64(SC)); err != nil {
+		return err
+	}
+
+	// methods, match expressions in return position
+	c := Shape.Circle(2)
+	r := Shape.Rect(3, 5)
+	if err := putUint(io, "area circle: ", c.area()); err != nil {
+		return err
+	}
+	if err := putUint(io, "area rect: ", r.area()); err != nil {
+		return err
+	}
+	p := &r
+	p.scale(2)
+	if err := putUint(io, "area scaled: ", r.area()); err != nil {
+		return err
+	}
+
+	// equality after variant change
+	s := Shape.Rect(3, 0)
+	t := Shape.Circle(3)
+	if err := putUint(io, "rect==circle: ", match s == t { true -> 1; _ -> 0 }); err != nil {
+		return err
+	}
+	s = Shape.Circle(3)
+	if err := putUint(io, "after change: ", match s == t { true -> 1; _ -> 0 }); err != nil {
+		return err
+	}
+	s = Shape.Empty
+	if s == Shape.Empty {
+		if err := putStr(io, "empty equal\n"); err != nil {
+			return err
+		}
+	}
+
+	// assignment, typed var (untyped arms fixed by context), argument
+	col := Color.Red
+	var small u8 = match col { Red -> 7; _ -> 9 }
+	big := match col {
+		Red -> u64(1) << 40
+		_ -> 0
+	}
+	col = col.next()
+	n := 0
+	n = match col { Red -> 1; Green -> 2; Blue -> 3 }
+	if err := putUint(io, "small: ", u64(small)); err != nil {
+		return err
+	}
+	if err := putUint(io, "big: ", big); err != nil {
+		return err
+	}
+	if err := putUint(io, "n: ", u64(n)); err != nil {
+		return err
+	}
+	if err := putUint(io, "code green: ", u64(colorCode(col))); err != nil {
+		return err
+	}
+	if match col { Green -> true; _ -> false } {
+		if err := putStr(io, "is green\n"); err != nil {
+			return err
+		}
+	}
+	if !isWarm(col) {
+		if err := putStr(io, "not warm\n"); err != nil {
+			return err
+		}
+	}
+
+	// literal or-patterns
+	if err := putUint(io, "digits: ", u64(digitKind('4')*100+digitKind('7')*10+digitKind('x'))); err != nil {
+		return err
+	}
+	if err := putUint(io, "names: ", u64(nameLen("b")+nameLen("cc")+nameLen("zzz"))); err != nil {
+		return err
+	}
+
+	// generics: Option and Result
+	o := Option[u32].Some(40)
+	none := Option[u32].None
+	if err := putUint(io, "sum2: ", u64(sum2(o, Option[u32].Some(2))+sum2(none, o)+sum2(none, none))); err != nil {
+		return err
+	}
+	if o.isSome() && !none.isSome() {
+		if err := putStr(io, "isSome ok\n"); err != nil {
+			return err
+		}
+	}
+	name := unwrapOr[string](Option[string].None, "dflt\n")
+	if err := putStr(io, name); err != nil {
+		return err
+	}
+	var total u32
+	digits := strBytes("4x2")
+	for i := usize(0); i < len(digits); i++ {
+		total = total*10 + match parseDigit(digits[i]) {
+			Ok(v) -> v
+			Err(_) -> 9
+		}
+	}
+	if err := putUint(io, "parsed: ", u64(total)); err != nil {
+		return err
+	}
+	match parseDigit('z') {
+		Result.Ok(v) -> {
+			_ = v
+		}
+		Result.Err(e) -> {
+			if e == ErrParse {
+				if err := putStr(io, "ErrParse\n"); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// enums in fixed arrays (an arena), copied and passed
+	nodes[1] = Expr.Lit(5)
+	nodes[2] = Expr.Var(4)
+	nodes[3] = Expr.Add(NodeID(1), NodeID(2))
+	nodes[4] = Expr.Neg(NodeID(3))
+	if err := putUint(io, "eval: ", eval(NodeID(4), MaxNodes)); err != nil {
+		return err
+	}
+	var local [3]Shape
+	local[0] = Shape.Rect(1, 2)
+	local[1] = local[0]
+	local[0] = Shape.Circle(1)
+	var sum u64
+	for i := usize(0); i < 3; i++ {
+		sum += local[i].area()
+	}
+	if err := putUint(io, "array areas: ", sum); err != nil {
+		return err
+	}
+
+	// enums in structs, copied by value
+	tg := Tagged{name: "t", shape: Shape.Circle(1)}
+	tg2 := bump(tg)
+	if err := putUint(io, "struct areas: ", tg.shape.area()*100+tg2.shape.area()); err != nil {
+		return err
+	}
+	return putBool(io, "done\n", tg.shape != tg2.shape)
+}

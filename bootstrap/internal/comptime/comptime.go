@@ -376,39 +376,68 @@ func (in *interp) cond(e ast.Expr) bool {
 }
 
 func (in *interp) match(s *ast.MatchStmt) ctl {
-	x := in.eval(s.X)
-	for _, arm := range s.Arms {
-		ok := false
-		switch p := arm.Pattern.(type) {
-		case *ast.WildcardPattern:
-			ok = true
-		case *ast.LiteralPattern:
-			ok = in.equal(x, in.eval(p.Lit))
-		case *ast.CtorPattern:
-			if v := in.info.VariantOf(p); v != nil {
-				ev, isEnum := x.(*types.EnumVal)
-				if isEnum && ev.Variant == v.Index {
-					ok = true
-					for i, b := range p.Bindings {
-						if sym := in.info.Prog.Defs[b.ID()]; sym != nil && i < len(ev.Payload) {
-							in.define(sym, ev.Payload[i])
-						}
-					}
-				}
-			} else if cv := in.info.ValueOf(p.Name); cv != nil {
-				ok = in.equal(x, cv)
+	arm := in.selectArm(in.eval(s.X), s.Arms)
+	if arm == nil {
+		return ctlNone
+	}
+	if arm.Expr != nil {
+		in.eval(arm.Expr)
+		return ctlNone
+	}
+	return in.block(arm.Block.Stmts)
+}
+
+// matchExpr evaluates a match expression (v0.2).
+func (in *interp) matchExpr(e *ast.MatchExpr) types.Value {
+	arm := in.selectArm(in.eval(e.X), e.Arms)
+	if arm == nil {
+		in.fail(diag.E2002, "no match arm for the value")
+	}
+	return in.eval(arm.Expr)
+}
+
+// selectArm returns the first arm whose pattern (or one of whose
+// or-pattern alternatives) matches x, defining its payload bindings; nil
+// if none matches.
+func (in *interp) selectArm(x types.Value, arms []*ast.MatchArm) *ast.MatchArm {
+	for _, arm := range arms {
+		alts := []ast.Pattern{arm.Pattern}
+		if op, ok := arm.Pattern.(*ast.OrPattern); ok {
+			alts = op.Alts
+		}
+		for _, alt := range alts {
+			if in.patternMatches(x, alt) {
+				return arm
 			}
 		}
-		if !ok {
-			continue
-		}
-		if arm.Expr != nil {
-			in.eval(arm.Expr)
-			return ctlNone
-		}
-		return in.block(arm.Block.Stmts)
 	}
-	return ctlNone
+	return nil
+}
+
+func (in *interp) patternMatches(x types.Value, p ast.Pattern) bool {
+	switch p := p.(type) {
+	case *ast.WildcardPattern:
+		return true
+	case *ast.LiteralPattern:
+		return in.equal(x, in.eval(p.Lit))
+	case *ast.CtorPattern:
+		if v := in.info.VariantOf(p); v != nil {
+			ev, isEnum := x.(*types.EnumVal)
+			if !isEnum || ev.Variant != v.Index {
+				return false
+			}
+			for i, b := range p.Bindings {
+				if sym := in.info.Prog.Defs[b.ID()]; sym != nil && i < len(ev.Payload) {
+					in.define(sym, ev.Payload[i])
+				}
+			}
+			return true
+		}
+		if cv := in.info.ValueOf(p.Name); cv != nil {
+			return in.equal(x, cv)
+		}
+	}
+	return false
 }
 
 func (in *interp) equal(a, b types.Value) bool {
@@ -572,6 +601,8 @@ func (in *interp) eval(e ast.Expr) types.Value {
 		return sv
 	case *ast.FuncLit:
 		in.fail(diag.E2002, "function literals are not supported at compile time")
+	case *ast.MatchExpr:
+		return in.matchExpr(e)
 	}
 	in.fail(diag.E2002, "unsupported expression at compile time")
 	return nil

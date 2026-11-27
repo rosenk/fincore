@@ -122,6 +122,9 @@ func expr0(e u32, dp usize) Operand decreases(dp) {
 		}
 		return opMode(KType, t)
 	}
+	if k == NkMatchExpr {
+		return matchExpr(e, dp-1)
+	}
 	return invalidOp(e)
 }
 

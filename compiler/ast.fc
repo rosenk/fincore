@@ -35,7 +35,7 @@
 //	IfStmt          a Init?  b Cond  c Then  d Else?
 //	MatchStmt       a X  l1 Arms         MatchArm   a Pattern  b Expr?  c Block?
 //	WildcardPattern                      CtorPattern a Qual?  b Name  Flag1 HasParens  l1 Bindings
-//	LiteralPattern  a Lit
+//	LiteralPattern  a Lit                OrPattern  l1 Alts  (v0.2)
 //	ForStmt         Flag1 Driver  Flag2 ThreeClause  a Init?  b Cond?  c Post?  d Decreases?  e Body
 //	ScopeStmt       a Name  b Value  c Body
 //	DeferStmt       a X   ReturnStmt l1 Results   BreakStmt   ContinueStmt
@@ -49,6 +49,7 @@
 //	FuncLit         Flag1 Driver  a Sig  b Body
 //	StructLit       a Type  l1 Fields    FieldInit  a Name  b Value
 //	TypeExpr        a Type
+//	MatchExpr       a X  l1 Arms  (v0.2; every arm has an Expr)
 package main
 
 // Node kinds.
@@ -115,6 +116,8 @@ const (
 	NkStructLit    = 72
 	NkFieldInit    = 73
 	NkTypeExpr     = 74
+	NkMatchExpr    = 75 // v0.2
+	NkOrPattern    = 76 // v0.2
 )
 
 // Node slots (see layout).
@@ -484,6 +487,12 @@ func kindName(k u8) string {
 	if k == NkTypeExpr {
 		return "TypeExpr"
 	}
+	if k == NkMatchExpr {
+		return "MatchExpr"
+	}
+	if k == NkOrPattern {
+		return "OrPattern"
+	}
 	return "Node?"
 }
 
@@ -633,6 +642,12 @@ func layout(k u8, i usize) (u8, string) {
 	}
 	if k == NkTypeExpr {
 		return layout1(i, SlotA, "Type")
+	}
+	if k == NkMatchExpr {
+		return layout2(i, SlotA, "X", SlotL1, "Arms")
+	}
+	if k == NkOrPattern {
+		return layout1(i, SlotL1, "Alts")
 	}
 	return SlotNone, ""
 }
@@ -1214,6 +1229,15 @@ func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
 		} else {
 			pr.printNode(n.b, depth-1)
 		}
+	} else if k == NkOrPattern {
+		pr.printList(n.l1s, n.l1n, " | ", false, depth-1)
+	} else if k == NkMatchExpr {
+		// one line, so that diagnostics embedding it stay single-line
+		o.putStr("match ")
+		pr.printNode(n.a, depth-1)
+		o.putStr(" { ")
+		pr.printList(n.l1s, n.l1n, "; ", false, depth-1)
+		o.putStr(" }")
 	} else if k == NkWildcardPattern {
 		o.putStr("_")
 	} else if k == NkCtorPattern {

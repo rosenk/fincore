@@ -158,9 +158,9 @@ driver func main(io Stdio) error {
 }
 `,
 			patterns: []string{
-				`type Shape struct \{ _tag uint8 _Circle_0 uint32 _Rect_0 uint32 _Rect_1 uint32 \}`,
-				`switch s\._tag \{ case 0: r := s\._Circle_0 return 3 \* uint64\(r\) \* uint64\(r\) case 1: w := s\._Rect_0 return uint64\(w\) default: return 0 \}`,
-				`s := Shape\{_tag: 1, _Rect_0: uint32\(2\), _Rect_1: uint32\(3\)\}`,
+				`type Shape struct \{ _tag uint8 _u32_0 uint32 _u32_1 uint32 \}`,
+				`switch s\._tag \{ case 0: r := s\._u32_0 return 3 \* uint64\(r\) \* uint64\(r\) case 1: w := s\._u32_0 return uint64\(w\) default: return 0 \}`,
+				`s := Shape\{_tag: 1, _u32_0: uint32\(2\), _u32_1: uint32\(3\)\}`,
 				`if s == \(Shape\{_tag: 2\}\) \|\| area\(s\) == 0 \{`,
 			},
 		},

@@ -455,6 +455,26 @@ func (b *binder) bindExpr(e ast.Expr) {
 		}
 	case *ast.TypeExpr:
 		b.bindType(e.Type)
+	case *ast.MatchExpr:
+		b.bindExpr(e.X)
+		for _, arm := range e.Arms {
+			b.matchArm(arm)
+		}
+	}
+}
+
+// ctorPattern resolves the names of a constructor pattern.
+func (b *binder) ctorPattern(cp *ast.CtorPattern) {
+	switch {
+	case cp.Qual != nil:
+		// Qual.Name: a package member, or Type.Variant (the variant is
+		// resolved by the type checker).
+		b.qualified(cp.Qual, cp.Name)
+	case !cp.HasParens:
+		// A constant, or an unqualified variant of the scrutinee's enum.
+		if sym := b.scope.Lookup(cp.Name.Name); sym != nil && sym.Kind == SymConst {
+			b.prog.Uses[cp.Name.ID()] = sym
+		}
 	}
 }
 
@@ -566,20 +586,19 @@ func (b *binder) stmt(s ast.Stmt) {
 
 func (b *binder) matchArm(arm *ast.MatchArm) {
 	defer b.openScope(arm)()
-	if cp, ok := arm.Pattern.(*ast.CtorPattern); ok {
-		switch {
-		case cp.Qual != nil:
-			// Qual.Name: a package member, or Type.Variant (the variant is
-			// resolved by the type checker).
-			b.qualified(cp.Qual, cp.Name)
-		case !cp.HasParens:
-			// A constant, or an unqualified variant of the scrutinee's enum.
-			if sym := b.scope.Lookup(cp.Name.Name); sym != nil && sym.Kind == SymConst {
-				b.prog.Uses[cp.Name.ID()] = sym
-			}
+	switch p := arm.Pattern.(type) {
+	case *ast.CtorPattern:
+		b.ctorPattern(p)
+		for _, id := range p.Bindings {
+			b.declare(SymVar, VarBinding, id, p)
 		}
-		for _, id := range cp.Bindings {
-			b.declare(SymVar, VarBinding, id, cp)
+	case *ast.OrPattern:
+		// Alternatives bind nothing (bindings are rejected by the type
+		// checker and are not declared).
+		for _, a := range p.Alts {
+			if cp, ok := a.(*ast.CtorPattern); ok {
+				b.ctorPattern(cp)
+			}
 		}
 	}
 	if arm.Expr != nil {

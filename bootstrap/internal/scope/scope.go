@@ -373,6 +373,14 @@ func (c *checker) origin(e ast.Expr) origin {
 			}
 		}
 		return o
+	case *ast.MatchExpr:
+		// v0.2: the join of the arm values (bindings carry the
+		// scrutinee's origin, see walker.expr).
+		var o origin
+		for _, arm := range e.Arms {
+			o = join(o, c.origin(arm.Expr))
+		}
+		return o
 	case *ast.FuncLit:
 		var o origin
 		fi := c.info.FuncOf(e)
@@ -544,14 +552,7 @@ func (w *walker) stmt(s ast.Stmt) {
 	case *ast.MatchStmt:
 		w.expr(s.X)
 		for _, arm := range s.Arms {
-			if p, ok := arm.Pattern.(*ast.CtorPattern); ok {
-				for _, b := range p.Bindings {
-					if b.Name == "_" {
-						continue
-					}
-					w.flow(w.define(b), s.X)
-				}
-			}
+			w.patternBindings(arm.Pattern, s.X)
 			if arm.Expr != nil {
 				w.expr(arm.Expr)
 				if t := c.info.TypeOf(arm.Expr); !w.collect && t != nil && types.IsLinear(t) {
@@ -678,6 +679,25 @@ func (w *walker) expr(e ast.Expr) {
 		}
 	case *ast.FuncLit:
 		w.funcLit(e)
+	case *ast.MatchExpr:
+		w.expr(e.X)
+		for _, arm := range e.Arms {
+			w.patternBindings(arm.Pattern, e.X)
+			w.expr(arm.Expr)
+		}
+	}
+}
+
+// patternBindings defines the payload bindings of a match-arm pattern;
+// their values flow from the scrutinee x.
+func (w *walker) patternBindings(p ast.Pattern, x ast.Expr) {
+	if cp, ok := p.(*ast.CtorPattern); ok {
+		for _, b := range cp.Bindings {
+			if b.Name == "_" {
+				continue
+			}
+			w.flow(w.define(b), x)
+		}
 	}
 }
 

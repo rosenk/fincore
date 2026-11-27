@@ -104,6 +104,10 @@ func assertComplete(t *testing.T, info *types.Info) {
 					}
 				case *ast.FieldInit:
 					skip[n.Name] = true
+				case *ast.NamedType:
+					if n.Pkg != nil {
+						skip[n.Pkg] = true // package name of pkg.T
+					}
 				case *ast.CtorPattern:
 					skip[n.Name] = true
 					if n.Qual != nil {
@@ -123,11 +127,6 @@ func assertComplete(t *testing.T, info *types.Info) {
 					}
 				case *ast.ScopeStmt:
 					skip[n.Name] = true
-				case *ast.NamedType:
-					// package qualifier of an imported type (`vec.Vec[4, u8]`)
-					if n.Pkg != nil {
-						skip[n.Pkg] = true
-					}
 				case *ast.FuncType:
 					// parameter names of a function type declare nothing
 					for _, p := range n.Sig.Params {

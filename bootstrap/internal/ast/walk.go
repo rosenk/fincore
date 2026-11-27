@@ -202,6 +202,10 @@ func Children(n Node) []Node {
 		idents(n.Bindings)
 	case *LiteralPattern:
 		addE(n.Lit)
+	case *OrPattern:
+		for _, a := range n.Alts {
+			add(a)
+		}
 	case *ForStmt:
 		addS(n.Init)
 		addE(n.Cond)
@@ -250,6 +254,11 @@ func Children(n Node) []Node {
 		addE(n.Value)
 	case *TypeExpr:
 		addT(n.Type)
+	case *MatchExpr:
+		addE(n.X)
+		for _, a := range n.Arms {
+			add(a)
+		}
 	}
 	return out
 }

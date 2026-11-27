@@ -376,6 +376,25 @@ func (p *printer) node(n Node) {
 		}
 	case *LiteralPattern:
 		p.node(n.Lit)
+	case *OrPattern:
+		for i, a := range n.Alts {
+			if i > 0 {
+				p.w(" | ")
+			}
+			p.node(a)
+		}
+	case *MatchExpr:
+		// one line, so that diagnostics embedding it stay single-line
+		p.w("match ")
+		p.node(n.X)
+		p.w(" { ")
+		for i, a := range n.Arms {
+			if i > 0 {
+				p.w("; ")
+			}
+			p.node(a)
+		}
+		p.w(" }")
 	case *ForStmt:
 		if n.Driver {
 			p.w("driver ")

@@ -217,6 +217,17 @@ func (p *Parser) errorAfter(context string) {
 	p.errEnd()
 }
 
+// errorAfterArm reports a missing separator after a match-expression arm.
+func (p *Parser) errorAfterArm() {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	p.diag.putStr("unexpected ")
+	p.describe(p.tok)
+	p.diag.putStr(" after match arm; expected ';', ',' or newline")
+	p.errEnd()
+}
+
 // errorNewlineBrace reports a '{' that was moved to the next line.
 func (p *Parser) errorNewlineBrace(what string) {
 	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
@@ -1433,7 +1444,75 @@ func (p *Parser) matchArm(depth usize) u32 decreases(depth) {
 	return p.finish(a)
 }
 
+// pattern parses `Pattern { "|" Pattern }` (v0.2 or-patterns); a single
+// alternative is returned unwrapped.
 func (p *Parser) pattern(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	s := p.start()
+	first := p.patternAlt(depth - 1)
+	if p.tok.kind != TkOr {
+		return first
+	}
+	op := p.mk(NkOrPattern, s)
+	mark := p.ls.top
+	p.ls.push(first)
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed || p.tok.kind != TkOr {
+			break
+		}
+		p.next()
+		p.ls.push(p.patternAlt(depth - 1))
+	}
+	p.setL1(op, mark)
+	return p.finish(op)
+}
+
+// matchExpr parses a match expression (v0.2):
+//
+//	MatchExpr = "match" Expr "{" ExprArm { ( ";" | "," ) ExprArm } [ ";" | "," ] "}" .
+//	ExprArm   = Patterns "->" Expr .
+func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	m := p.mk(NkMatchExpr, p.start())
+	p.expect(TkMatch)
+	old := p.exprLev
+	p.exprLev = -1
+	p.setA(m, p.expr(depth-1))
+	p.exprLev = 0
+	p.expectOpenBrace("a match expression")
+	mark := p.ls.top
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed {
+			break
+		}
+		a := p.mk(NkMatchArm, p.start())
+		p.setA(a, p.pattern(depth-1))
+		p.expect(TkArrow)
+		p.setB(a, p.expr(depth-1))
+		p.ls.push(p.finish(a))
+		k := p.tok.kind
+		if k == TkSemicolon || k == TkComma {
+			p.next()
+		} else if k != TkRBrace {
+			p.errorAfterArm()
+		}
+		if p.tok.kind == TkRBrace {
+			break
+		}
+	}
+	p.setL1(m, mark)
+	p.next()
+	p.exprLev = old
+	return p.finish(m)
+}
+
+func (p *Parser) patternAlt(depth usize) u32 decreases(depth) {
 	if depth == 0 {
 		return p.tooDeep()
 	}
@@ -1885,6 +1964,9 @@ func (p *Parser) operand(depth usize) u32 decreases(depth) {
 		te := p.mk(NkTypeExpr, s)
 		p.setA(te, t)
 		return p.finish(te)
+	}
+	if k == TkMatch {
+		return p.matchExpr(depth - 1)
 	}
 	p.errorExpected("expression")
 	return 0

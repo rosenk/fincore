@@ -753,3 +753,60 @@ driver func f(net Net, n u32) {
 }`, "E3004@4,E3004@5"},
 	})
 }
+
+// v0.2 sum types: match expressions are branches; payload bindings are
+// borrowed (decisions 46, 49).
+func TestMatchExprLinear(t *testing.T) {
+	runCases(t, []tcase{
+		{"match expr picks one of two listeners", `
+driver func f(net Net, b bool) error {
+	a, err := net.ListenTCP("x")
+	if err != nil {
+		return err
+	}
+	c, err2 := net.ListenTCP("y")
+	if err2 != nil {
+		_ = a.Close()
+		return err2
+	}
+	k := match b { true -> a; _ -> c }
+	return k.Close()
+}`, "E3005@3,E3005@7"},
+		{"match expr closes on every arm ok", `
+driver func f(net Net, n u32) error {
+	a, err := net.ListenTCP("x")
+	if err != nil {
+		return err
+	}
+	return match n { 0 | 1 -> a.Close(); _ -> a.Close() }
+}`, ""},
+		{"consume borrowed payload binding", `
+type Res enum {
+	Open(Listener)
+	Closed
+}
+
+func g(r Res) error {
+	return match r {
+		Open(l) -> l.Close()
+		Closed -> nil
+	}
+}`, "E3003@9"},
+		{"use after move in arm", `
+driver func f(net Net, b bool) error {
+	a, err := net.ListenTCP("x")
+	if err != nil {
+		return err
+	}
+	k := match b { true -> a; _ -> a }
+	_ = a.Addr()
+	return k.Close()
+}`, "E3003@8"},
+		{"scoped value escapes through match expr", `
+func f(b bool) *u32 {
+	var x u32
+	var y u32
+	return match b { true -> &x; _ -> &y }
+}`, "E3002@5"},
+	})
+}

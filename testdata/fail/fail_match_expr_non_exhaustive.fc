@@ -1,0 +1,21 @@
+// fail_match_expr_non_exhaustive (v0.2): match expressions must be
+// exhaustive; this one misses the Blue variant.
+package main
+
+type Color enum {
+	Red
+	Green
+	Blue
+}
+
+func code(c Color) u32 {
+	return match c { // ERROR E2012
+		Red -> 1
+		Green -> 2
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = code(Color.Red)
+	return nil
+}

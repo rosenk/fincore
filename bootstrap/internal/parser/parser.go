@@ -975,7 +975,58 @@ func (p *parser) matchArm() *ast.MatchArm {
 	return finish(p, a, start)
 }
 
+// pattern parses `Pattern { "|" Pattern }` (v0.2 or-patterns); a single
+// alternative is returned unwrapped.
 func (p *parser) pattern() ast.Pattern {
+	start := p.start()
+	first := p.patternAlt()
+	if p.tok.Kind != lexer.OR {
+		return first
+	}
+	op := &ast.OrPattern{Alts: []ast.Pattern{first}}
+	for p.tok.Kind == lexer.OR {
+		p.next()
+		op.Alts = append(op.Alts, p.patternAlt())
+	}
+	return finish(p, op, start)
+}
+
+// matchExpr parses a match expression (v0.2):
+//
+//	MatchExpr = "match" Expr "{" ExprArm { ( ";" | "," ) ExprArm } [ ";" | "," ] "}" .
+//	ExprArm   = Patterns "->" Expr .
+func (p *parser) matchExpr() *ast.MatchExpr {
+	start := p.start()
+	p.expect(lexer.MATCH)
+	m := &ast.MatchExpr{}
+	old := p.exprLev
+	p.exprLev = -1
+	m.X = p.expr()
+	p.exprLev = 0
+	p.expectOpenBrace("a match expression")
+	for {
+		armStart := p.start()
+		a := &ast.MatchArm{Pattern: p.pattern()}
+		p.expect(lexer.ARROW)
+		a.Expr = p.expr()
+		m.Arms = append(m.Arms, finish(p, a, armStart))
+		switch p.tok.Kind {
+		case lexer.SEMICOLON, lexer.COMMA:
+			p.next()
+		case lexer.RBRACE:
+		default:
+			p.errorAt(p.tok.Span, "unexpected %s after match arm; expected ';', ',' or newline", p.tok.Describe())
+		}
+		if p.tok.Kind == lexer.RBRACE {
+			break
+		}
+	}
+	p.next()
+	p.exprLev = old
+	return finish(p, m, start)
+}
+
+func (p *parser) patternAlt() ast.Pattern {
 	start := p.start()
 	switch p.tok.Kind {
 	case lexer.IDENT:
@@ -1303,6 +1354,8 @@ func (p *parser) operand() ast.Expr {
 	case lexer.LBRACK, lexer.STRUCT, lexer.ENUM:
 		t := p.parseType()
 		return finish(p, &ast.TypeExpr{Type: t}, start)
+	case lexer.MATCH:
+		return p.matchExpr()
 	}
 	p.errorExpected("expression")
 	return nil

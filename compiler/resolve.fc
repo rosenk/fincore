@@ -957,6 +957,12 @@ func bindExpr(e u32, depth usize) decreases(depth) {
 		}
 	} else if k == NkTypeExpr {
 		bindType(na(e), depth-1)
+	} else if k == NkMatchExpr {
+		bindExpr(na(e), depth-1)
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			bMatchArm(l1at(e, i), depth-1)
+		}
 	}
 }
 
@@ -1083,6 +1089,18 @@ func bStmt(s u32, depth usize) decreases(depth) {
 	}
 }
 
+// bCtorPattern resolves the names of a constructor pattern.
+func bCtorPattern(cp u32) {
+	if na(cp) != 0 {
+		_ = bQualified(na(cp), nb(cp))
+	} else if !nflag(cp) {
+		sym := lookupChain(bScope, idName(nb(cp)))
+		if sym != 0 && symKind(sym) == SymConst {
+			uses[usize(nb(cp))] = sym
+		}
+	}
+}
+
 func bMatchArm(arm u32, depth usize) decreases(depth) {
 	if depth == 0 {
 		return
@@ -1091,17 +1109,19 @@ func bMatchArm(arm u32, depth usize) decreases(depth) {
 	bScope = newScope(outer, ScopeBlock, arm)
 	cp := na(arm)
 	if nkind(cp) == NkCtorPattern {
-		if na(cp) != 0 {
-			_ = bQualified(na(cp), nb(cp))
-		} else if !nflag(cp) {
-			sym := lookupChain(bScope, idName(nb(cp)))
-			if sym != 0 && symKind(sym) == SymConst {
-				uses[usize(nb(cp))] = sym
-			}
-		}
+		bCtorPattern(cp)
 		n := l1len(cp)
 		for i := usize(0); i < n; i++ {
 			_ = bDeclare(SymVar, VarBinding, l1at(cp, i), cp)
+		}
+	} else if nkind(cp) == NkOrPattern {
+		// Alternatives bind nothing (bindings are rejected by the type
+		// checker and are not declared).
+		n := l1len(cp)
+		for i := usize(0); i < n; i++ {
+			if nkind(l1at(cp, i)) == NkCtorPattern {
+				bCtorPattern(l1at(cp, i))
+			}
 		}
 	}
 	if nb(arm) != 0 {

@@ -501,6 +501,15 @@ func scOrigin(e0 u32, dp usize) u64 decreases(dp) {
 			}
 		}
 		return o
+	} else if k == NkMatchExpr {
+		// v0.2: the join of the arm values (bindings carry the
+		// scrutinee's origin, see wExpr).
+		o := u64(0)
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			o = scJoin(o, scOrigin(nb(l1at(e, i)), dp-1))
+		}
+		return o
 	} else if k == NkFuncLit {
 		o := u64(0)
 		if nfunc[usize(e)] == 0 {
@@ -807,17 +816,7 @@ func wMatch(s u32, dp usize) decreases(dp) {
 	n := l1len(s)
 	for i := usize(0); i < n; i++ {
 		arm := l1at(s, i)
-		p := na(arm)
-		if p != 0 && nkind(p) == NkCtorPattern {
-			nbind := l1len(p)
-			for j := usize(0); j < nbind; j++ {
-				b := l1at(p, j)
-				if isBlank(b) {
-					continue
-				}
-				wFlow(wDefine(b), x)
-			}
-		}
+		wPatternBindings(na(arm), x)
 		ae := nb(arm)
 		if ae != 0 {
 			wExpr(ae, dp-1)
@@ -893,6 +892,30 @@ func wExpr(e u32, dp usize) decreases(dp) {
 		}
 	} else if k == NkFuncLit {
 		wFuncLit(e, dp-1)
+	} else if k == NkMatchExpr {
+		x := na(e)
+		wExpr(x, dp-1)
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			arm := l1at(e, i)
+			wPatternBindings(na(arm), x)
+			wExpr(nb(arm), dp-1)
+		}
+	}
+}
+
+// wPatternBindings defines the payload bindings of a match-arm pattern;
+// their values flow from the scrutinee x.
+func wPatternBindings(p u32, x u32) {
+	if p != 0 && nkind(p) == NkCtorPattern {
+		nbind := l1len(p)
+		for j := usize(0); j < nbind; j++ {
+			b := l1at(p, j)
+			if isBlank(b) {
+				continue
+			}
+			wFlow(wDefine(b), x)
+		}
 	}
 }
 

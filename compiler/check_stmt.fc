@@ -551,37 +551,12 @@ func bindInvalid(p u32) {
 	}
 }
 
-func matchStmt(s u32, dp usize) decreases(dp) {
+// pattern checks a single (non-or) pattern against the scrutinee type t
+// and reports whether it is valid.
+func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 	if dp == 0 {
 		tooDeep()
-		return
-	}
-	x := exprValue(na(s), dp-1)
-	if !isInvalidOp(&x) && isUntyped(x.typ) {
-		_ = defaultTypeOp(&x, mkCtx(CtxMatch))
-	}
-	n := l1len(s)
-	for i := usize(0); i < n; i++ {
-		arm := l1at(s, i)
-		pat := na(arm)
-		if !isInvalidOp(&x) {
-			pattern(pat, x.typ, dp-1)
-		} else if nkind(pat) == NkCtorPattern {
-			bindInvalid(pat)
-		}
-		if nb(arm) != 0 {
-			exprStmt(nb(arm), "match arm", dp-1)
-		}
-		if nc(arm) != 0 {
-			stmtList(nc(arm), dp-1)
-		}
-	}
-}
-
-func pattern(p u32, t u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		return
+		return false
 	}
 	en := underlying(t)
 	isEnum := tk(en) == TCEnum
@@ -589,22 +564,33 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 	if k == NkLiteralPattern {
 		x := exprValue(na(p), dp-1)
 		if !isInvalidOp(&x) {
-			if assignment(&x, t, mkCtx(CtxPattern)) && !comparable(t, SemaDepth) {
+			if !assignment(&x, t, mkCtx(CtxPattern)) {
+				return false
+			}
+			if !comparable(t, SemaDepth) {
 				mreset()
 				ms("cannot match values of type ")
 				mtype(t)
 				ms(" against literals")
 				errAt(E2002, p)
+				return false
 			}
+			return true
 		}
-		return
+		return false
 	}
 	if k != NkCtorPattern {
-		return
+		return true
 	}
 	name := nb(p)
 	sym := uses[usize(name)]
-	if sym != 0 && symKind(sym) == SymConst {
+	// A constant pattern (pkg.Const or Const). An unqualified name that is
+	// a variant of the scrutinee's enum is that variant (v0.2).
+	isVariant := false
+	if na(p) == 0 && isEnum {
+		_, isVariant = variantByName(en, idName(name))
+	}
+	if sym != 0 && symKind(sym) == SymConst && !isVariant {
 		if nflag(p) {
 			mreset()
 			ms("constant ")
@@ -612,15 +598,21 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 			ms(" cannot have bindings")
 			errAt(E2002, p)
 			bindInvalid(p)
-			return
+			return false
+		}
+		if isEnum {
+			mreset()
+			ms("constant ")
+			mname(symName(sym))
+			ms(" cannot be a pattern for enum type ")
+			mtype(t)
+			errAt(E2002, p)
+			return false
 		}
 		x := symOperand(sym, name, dp-1)
 		x.expr = name
 		record(&x)
-		if !isInvalidOp(&x) {
-			_ = assignment(&x, t, mkCtx(CtxPattern))
-		}
-		return
+		return !isInvalidOp(&x) && assignment(&x, t, mkCtx(CtxPattern))
 	}
 	nm := idName(name)
 	venum := u32(0)
@@ -630,7 +622,7 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 		qs := uses[usize(q)]
 		if qs == 0 {
 			bindInvalid(p)
-			return
+			return false
 		}
 		if symKind(qs) != SymType {
 			mreset()
@@ -638,14 +630,14 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 			ms(" is not an enum type")
 			errAt(E2002, q)
 			bindInvalid(p)
-			return
+			return false
 		}
 		qt := typeSym(qs, q, dp-1)
 		ntype[usize(q)] = qt
 		nmode[usize(q)] = KType
 		if isInvalid(qt) {
 			bindInvalid(p)
-			return
+			return false
 		}
 		qe := underlying(qt)
 		if tk(qe) != TCEnum {
@@ -654,9 +646,14 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 			ms(" is not an enum type")
 			errAt(E2002, q)
 			bindInvalid(p)
-			return
+			return false
 		}
-		if qt != t {
+		// v0.2: a generic enum qualifies patterns on its instances
+		// (Option.Some(x) on an Option[u32]); the variant comes from the
+		// instance.
+		if tk(t) == TCNamed && namedOrigin(t) != 0 && namedOrigin(t) == qt && isEnum {
+			qe = en
+		} else if qt != t {
 			mreset()
 			ms("pattern of type ")
 			mtype(qt)
@@ -664,7 +661,7 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 			mtype(t)
 			errAt(E2002, p)
 			bindInvalid(p)
-			return
+			return false
 		}
 		v, found := variantByName(qe, nm)
 		if !found {
@@ -675,7 +672,7 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 			mname(nm)
 			errAt(E2001, name)
 			bindInvalid(p)
-			return
+			return false
 		}
 		venum = qe
 		vi = v
@@ -690,7 +687,7 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 			ms(")")
 			errAt(E2001, name)
 			bindInvalid(p)
-			return
+			return false
 		}
 		venum = en
 		vi = v
@@ -700,7 +697,7 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 		mname(nm)
 		errAt(E2001, name)
 		bindInvalid(p)
-		return
+		return false
 	}
 	nvarEnum[usize(p)] = venum
 	nvarIdx[usize(p)] = u32(vi)
@@ -717,7 +714,7 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 		mu(u64(nbind))
 		errAt(E2003, p)
 		bindInvalid(p)
-		return
+		return false
 	}
 	for i := usize(0); i < nbind; i++ {
 		b := l1at(p, i)
@@ -728,6 +725,7 @@ func pattern(p u32, t u32, dp usize) decreases(dp) {
 			ntype[usize(b)] = variantPay(venum, vi, i)
 		}
 	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +763,8 @@ func isTerminating(s u32, dp usize) bool decreases(dp) {
 		return isTerminatingList(nc(s), dp-1)
 	}
 	if k == NkMatchStmt {
+		// v0.2: a match on an enum is exhaustive (E2012 otherwise), so it
+		// terminates if all arms do; other matches need a '_' arm.
 		exhaustive := false
 		n := l1len(s)
 		for i := usize(0); i < n; i++ {
@@ -780,40 +780,13 @@ func isTerminating(s u32, dp usize) bool decreases(dp) {
 				return false
 			}
 		}
-		if !exhaustive {
+		if !exhaustive && n > 0 {
 			t := ntype[usize(na(s))]
-			if t != 0 {
-				en := underlying(t)
-				nv := u32(0)
-				if tk(en) == TCEnum {
-					nv = u32(nvariants(en))
-				}
-				if nv > 0 {
-					exhaustive = true
-					for v := usize(0); v < usize(nv); v++ {
-						if !variantCovered(s, variantName(en, v)) {
-							exhaustive = false
-						}
-					}
-				}
+			if t != 0 && tk(underlying(t)) == TCEnum {
+				exhaustive = true
 			}
 		}
 		return exhaustive
-	}
-	return false
-}
-
-// variantCovered reports whether some constructor pattern of the match
-// matched a variant with this name.
-func variantCovered(s u32, name u32) bool {
-	n := l1len(s)
-	for i := usize(0); i < n; i++ {
-		pat := na(l1at(s, i))
-		if nkind(pat) == NkCtorPattern && nvarEnum[usize(pat)] != 0 {
-			if variantName(nvarEnum[usize(pat)], usize(nvarIdx[usize(pat)])) == name {
-				return true
-			}
-		}
 	}
 	return false
 }

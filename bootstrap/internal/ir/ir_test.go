@@ -150,17 +150,11 @@ type E enum {
 
 func f(e E, n u32) u32 {
 	match n {
-		1 -> {
+		1 | 2 -> {
 			return 1
-		}
-		1 -> {
-			return 2
 		}
 		_ -> {
 			return 3
-		}
-		4 -> {
-			return 4
 		}
 	}
 }
@@ -182,12 +176,12 @@ driver func main(io Stdio) error {
 `}, "m.fc")
 	fns := p.Packages[0].Funcs
 	m1 := fns[0].Info.Body.Stmts[0].(*ast.MatchStmt)
-	arms := MatchArms(p.Info, m1)
+	arms := MatchArms(p.Info, m1.X, m1.Arms)
 	if len(arms.Arms) != 2 || !arms.HasDefault || arms.Enum != nil {
 		t.Fatalf("int match: %d arms default=%v", len(arms.Arms), arms.HasDefault)
 	}
 	m2 := fns[1].Info.Body.Stmts[0].(*ast.MatchStmt)
-	arms = MatchArms(p.Info, m2)
+	arms = MatchArms(p.Info, m2.X, m2.Arms)
 	if len(arms.Arms) != 2 || !arms.HasDefault || arms.Enum == nil {
 		t.Fatalf("enum match: %d arms default=%v", len(arms.Arms), arms.HasDefault)
 	}

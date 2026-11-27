@@ -1,0 +1,22 @@
+// fail_match_unreachable (v0.2): an arm whose pattern repeats a variant that
+// an earlier arm (here an or-pattern) already covers is unreachable.
+package main
+
+type Tok enum {
+	Ident
+	Number
+	Punct
+}
+
+func weight(t Tok) u32 {
+	return match t {
+		Ident | Number -> 1
+		Number -> 2 // ERROR E2012
+		Punct -> 3
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = weight(Tok.Punct)
+	return nil
+}

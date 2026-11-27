@@ -260,6 +260,8 @@ func (c *Checker) updateType(e ast.Expr, t Type) {
 	switch e := e.(type) {
 	case *ast.ParenExpr:
 		c.updateType(e.X, t)
+	case *ast.MatchExpr:
+		c.convertMatchArms(e, t)
 	case *ast.UnaryExpr:
 		if e.Op == ast.OpNeg || e.Op == ast.OpNot {
 			c.updateType(e.X, t)
@@ -317,6 +319,8 @@ func (c *Checker) expr0(e ast.Expr) operand {
 		return c.funcLit(e)
 	case *ast.StructLit:
 		return c.structLit(e)
+	case *ast.MatchExpr:
+		return c.matchExpr(e)
 	case *ast.TypeExpr:
 		t := c.typExpr(e.Type)
 		if IsInvalid(t) {

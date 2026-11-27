@@ -1,0 +1,57 @@
+// pass_sum_types_pkg (directory test, v0.2): generic enums declared in an
+// imported package: construction with explicit type arguments,
+// unqualified patterns, methods with value and pointer receivers, a
+// two-parameter generic enum, and equality of instances.
+package main
+
+import "testdata/pass/pass_sum_types_pkg/opt"
+
+driver func putUint(io Stdio, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+func describe(r opt.Result[u32]) u64 {
+	return match r {
+		Ok(v) -> u64(v)
+		Err(e) -> match e == ErrParse { true -> 1000; _ -> 2000 }
+	}
+}
+
+driver func main(io Stdio) error {
+	a := opt.Option[u32].Some(7)
+	b := opt.Option[u32].None
+	if err := putUint(io, u64(a.Or(1)+b.Or(2))); err != nil {
+		return err
+	}
+	pa := &a
+	taken := pa.Take()
+	if err := putUint(io, u64(taken.Or(0)*10+a.Or(3))); err != nil {
+		return err
+	}
+	if a == b {
+		if err := putUint(io, 1); err != nil {
+			return err
+		}
+	}
+	if err := putUint(io, describe(opt.Half(10))+describe(opt.Half(3))); err != nil {
+		return err
+	}
+	l := opt.Lift[u32](opt.Half(8))
+	if err := putUint(io, u64(l.Or(0))); err != nil {
+		return err
+	}
+	p1 := opt.Pair[u32, string].Both(1, "x")
+	p2 := opt.Pair[u32, string].Right("y")
+	if err := putUint(io, u64(opt.Count[u32, string](p1)*10+opt.Count[u32, string](p2))); err != nil {
+		return err
+	}
+	return nil
+}

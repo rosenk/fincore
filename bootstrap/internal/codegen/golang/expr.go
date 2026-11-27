@@ -153,6 +153,8 @@ func (f *fnCtx) expr(e ast.Expr) string {
 		return f.funcLit(e)
 	case *ast.StructLit:
 		return f.structLit(e)
+	case *ast.MatchExpr:
+		return f.matchExpr(e)
 	case *ast.BasicLit, *ast.BoolLit, *ast.NilLit:
 		f.g.fail(e, "literal without a recorded value")
 	}
@@ -501,11 +503,9 @@ func (f *fnCtx) call(e *ast.CallExpr) string {
 	case types.CallConversion:
 		return f.convType(e, ci.Conv) + "(" + f.expr(e.Args[0]) + ")"
 	case types.CallVariant:
-		payload := make([]string, len(e.Args))
-		for i, a := range e.Args {
-			payload[i] = f.expr(a)
-		}
-		return f.composite(f.g.variantLit(e, ci.VariantType, ci.Variant, payload, f.env))
+		return f.composite(f.g.variantLit(e, ci.VariantType, ci.Variant, len(e.Args), func(i int) string {
+			return f.expr(e.Args[i])
+		}, f.env))
 	case types.CallValue:
 		return f.primary(e.Fun) + "(" + f.args(e.Args) + ")"
 	}

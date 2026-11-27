@@ -24,6 +24,7 @@ const (
 	E2006 = 2006 // IMPORT_CYCLE
 	E2010 = 2010 // UNIVERSE_LEVEL_MISMATCH
 	E2011 = 2011 // NON_PARAMETRIC_OP
+	E2012 = 2012 // NON_EXHAUSTIVE_MATCH (v0.2; also unreachable match arms)
 	E3001 = 3001 // GLOBAL_SCOPED_VAR
 	E3002 = 3002 // SCOPE_ESCAPE
 	E3003 = 3003 // USE_AFTER_MOVE
@@ -68,6 +69,9 @@ func codeName(code u32) string {
 	}
 	if code == E2011 {
 		return "NON_PARAMETRIC_OP"
+	}
+	if code == E2012 {
+		return "NON_EXHAUSTIVE_MATCH"
 	}
 	if code == E3001 {
 		return "GLOBAL_SCOPED_VAR"
