@@ -28,7 +28,7 @@ seed; it is closed (finc0 gets no new features).
 14. Caps: fs.IsDir/ListSourceFiles/ReadFileInto, env.ArgsCount/Arg, io.WriteStdout/WriteStderr; unused `exec` param.
 15. Plain `for` in driver funcs must pass T1.
 16. T1 shapes: `for i := usize(<init>); i < <bound>; i++` with invariant local/param/const bound, non-zero init, break/continue in body.
-17. T3 SCCs: the *Parser SCC (every recursive *Parser method; the counts are pinned by `TestCompilerSCCs` in bootstrap/internal/totality/totality_test.go), 4-method *Printer SCC, 2 self-recursive methods; each `decreases(depth)` with `if depth == 0 { return ... }` guard first and `depth - 1` on in-SCC calls; entry calls pass constants (ParseDepth=65536, WalkDepth=MaxNodes+1). Call graph needs method resolution by receiver type.
+17. T3 SCCs: the *Parser SCC (every recursive *Parser method; the counts were pinned by `TestCompilerSCCs` in bootstrap/internal/totality/totality_test.go up to v0.3.0; since compiler/ uses v0.3 the frozen finc0 cannot load it and the test is skipped), 4-method *Printer SCC, 2 self-recursive methods; each `decreases(depth)` with `if depth == 0 { return ... }` guard first and `depth - 1` on in-SCC calls; entry calls pass constants (ParseDepth=65536, WalkDepth=MaxNodes+1). Call graph needs method resolution by receiver type.
 
 ## Added by M7 part A (semantic phases: sema/resolve/types/values/checker/check_expr/check_stmt/comptime.fc)
 

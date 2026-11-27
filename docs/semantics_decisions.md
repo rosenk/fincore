@@ -68,7 +68,7 @@ The test corpus in testdata/ is written against these decisions. Conventions for
 54. T1: `<=`/`>=` only with overflow-safe constant bound; step > 1 needs constant/len/cap bound; `i > 0; i -= 2` on unsigned rejected. Bounds reached through pointers/globals are invalidated by any memory-writing call — copy to a local first (`lim := p.ntok`).
 55. T3 loops accept `x++`/`x--`/midpoint `a + (b-a)/k` updates; `(lo+hi)/2` rejected (overflow).
 56. Calls through function values add edges to every escaping total func; inside a cycle they are rejected.
-57. compiler/: all recursive Parser methods carry `decreases(depth)`; they form one Parser SCC (the current counts are pinned by `TestCompilerSCCs` in bootstrap/internal/totality/totality_test.go; at M6: 33 methods, 31 SCC members).
+57. compiler/: all recursive Parser methods carry `decreases(depth)`; they form one Parser SCC (`TestCompilerSCCs` in bootstrap/internal/totality/totality_test.go pinned the counts up to v0.3.0, last 40 methods / 38 SCC members; at M6: 33 / 31. It is skipped since compiler/ uses v0.3, which the frozen finc0 cannot load; the totality checker of finc1 still checks every SCC).
 
 ## v0.2 additions — see docs/v0_2.md and docs/stdlib.md
 
