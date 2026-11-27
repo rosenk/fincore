@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // main.fc — the finc command-line driver (spec 9.6).
 //
 //	finc parse [--dump-ast] <file.fc | dir>
@@ -108,7 +109,8 @@ driver func usage(io Stdio, toStderr bool) error {
 	return say(io, toStderr, "  finc version\n      print the FinCore language version\n")
 }
 
-// ioFail reports "finc: <what> <path>: <reason>" for an I/O error.
+// ioFail reports "finc: <what> <path>: <reason>" for an I/O error and
+// returns ErrReported.
 driver func ioFail(io Stdio, what string, path string, err error) error {
 	reason := "I/O error"
 	if err == ErrNotFound {
@@ -119,24 +121,26 @@ driver func ioFail(io Stdio, what string, path string, err error) error {
 	if e := sayf(io, formatTo(mbuf[:], "finc: %s%s: %s\n", what, path, reason)); e != nil {
 		return e
 	}
-	return err
+	return ErrReported
 }
 
-// capacityFail reports an exhausted compiler arena.
+// capacityFail reports an exhausted compiler arena and returns ErrReported.
 driver func capacityFail(io Stdio, path string, what string) error {
 	if e := sayf(io, formatTo(mbuf[:], "finc: %s: compiler capacity exceeded (%s)\n", path, what)); e != nil {
 		return e
 	}
-	return ErrArenaFull
+	return ErrReported
 }
 
 // ---------------------------------------------------------------------------
 // main
 
-// TODO(seed v0.3.0): failures are reported on stderr and then returned as
-// ErrParse, so the generated main prints a misleading
-// `error: fincore: invalid number`. Once bootstrap/SEED is v0.3.0, return
-// ErrReported (decision 156) for already-reported failures instead.
+// main and the commands it runs report every failure on stderr (or, for
+// `test` and `fmt --check`, in their stdout listing) and then return
+// ErrReported (decision 156): the generated Go main exits 1 without adding
+// a line. Any other error (an I/O error writing the output, a failed
+// exec, a non-zero exit status of the program under `finc run`) has not
+// been reported and is printed by the generated main as `error: <err>`.
 driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	if r, ok := env.GetEnv("FINCROOT"); ok && len(r) > 0 {
 		fincRoot = r
@@ -154,38 +158,26 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 		if err := usage(io, true); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	cmd := env.Arg(1)
-	if strEq(cmd, "-h") || strEq(cmd, "--help") || strEq(cmd, "help") {
-		return usage(io, false)
-	}
-	if strEq(cmd, "parse") {
-		return runParse(fs, env, io)
-	}
-	if strEq(cmd, "check") {
-		return runCheck(fs, env, io)
-	}
-	if strEq(cmd, "build") {
-		return runBuild(fs, env, io, exec)
-	}
-	if strEq(cmd, "run") {
-		return runRun(fs, env, io, exec)
-	}
-	if strEq(cmd, "test") {
-		return runTest(fs, env, io, exec)
-	}
-	if strEq(cmd, "fmt") {
-		return runFmt(fs, env, io, exec)
-	}
-	if strEq(cmd, "version") || strEq(cmd, "--version") {
-		if argc != 2 {
-			if err := say(io, true, "usage: finc version\n"); err != nil {
-				return err
+	match cmd {
+		"-h" | "--help" | "help" -> return usage(io, false)
+		"parse" -> return runParse(fs, env, io)
+		"check" -> return runCheck(fs, env, io)
+		"build" -> return runBuild(fs, env, io, exec)
+		"run" -> return runRun(fs, env, io, exec)
+		"test" -> return runTest(fs, env, io, exec)
+		"fmt" -> return runFmt(fs, env, io, exec)
+		"version" | "--version" -> {
+			if argc != 2 {
+				if err := say(io, true, "usage: finc version\n"); err != nil {
+					return err
+				}
+				return ErrReported
 			}
-			return ErrParse
+			return say(io, false, catStr(catStr("finc language v", LangVersion), "\n"))
 		}
-		return say(io, false, catStr(catStr("finc language v", LangVersion), "\n"))
 	}
 	if err := sayf(io, formatTo(mbuf[:], "finc: unknown command %v\n", Quoted(strBytes(cmd)))); err != nil {
 		return err
@@ -193,14 +185,14 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	if err := usage(io, true); err != nil {
 		return err
 	}
-	return ErrParse
+	return ErrReported
 }
 
 driver func parseUsage(io Stdio) error {
 	if err := say(io, true, "usage: finc parse [--dump-ast] <file.fc | dir>\n  -dump-ast\n    \tprint the AST\n"); err != nil {
 		return err
 	}
-	return ErrParse
+	return ErrReported
 }
 
 // runParse implements `parse [--dump-ast] <file.fc | dir>` (Go flag
@@ -215,18 +207,17 @@ driver func runParse(fs FS, env Env, io Stdio) error {
 		a := env.Arg(i)
 		ab := strBytes(a)
 		isFlag := !flagsDone && nops == 0 && len(ab) > 1 && ab[0] == '-'
-		if isFlag && strEq(a, "--") {
-			flagsDone = true
-		} else if isFlag {
-			if strEq(a, "-dump-ast") || strEq(a, "--dump-ast") || strEq(a, "-dump-ast=true") || strEq(a, "--dump-ast=true") {
-				dump = true
-			} else if strEq(a, "-dump-ast=false") || strEq(a, "--dump-ast=false") {
-				dump = false
-			} else {
-				if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
-					return err
+		if isFlag {
+			match a {
+				"--" -> flagsDone = true
+				"-dump-ast" | "--dump-ast" | "-dump-ast=true" | "--dump-ast=true" -> dump = true
+				"-dump-ast=false" | "--dump-ast=false" -> dump = false
+				_ -> {
+					if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
+						return err
+					}
+					return parseUsage(io)
 				}
-				return parseUsage(io)
 			}
 		} else {
 			operand = a
@@ -255,7 +246,7 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 		if err := flushErr(io); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	if !dump {
 		return nil
@@ -312,7 +303,7 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 			if e := sayf(io, formatTo(mbuf[:], "finc: %s: no .fc files in directory\n", path)); e != nil {
 				return f0, f0, 0, e
 			}
-			return f0, f0, 0, ErrNotFound
+			return f0, f0, 0, ErrReported
 		}
 		if f0+n > MaxFiles {
 			return f0, f0, 0, capacityFail(io, path, "files")
@@ -429,7 +420,7 @@ driver func checkUsage(io Stdio) error {
 	if err := say(io, true, "usage: finc check [--comptime-fuel=N] [--context] <file.fc | dir>\n  -comptime-fuel uint\n    \tcomptime fuel budget per evaluation (default 1000000)\n  -context\n    \tshow the source line, a caret span and a hint after each diagnostic (also FINC_DIAG=context)\n"); err != nil {
 		return err
 	}
-	return ErrParse
+	return ErrReported
 }
 
 // runCheck implements `check [--comptime-fuel=N] <file.fc | dir>`.
@@ -482,7 +473,7 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 				if err := sayf(io, formatTo(mbuf[:], "finc check: invalid --passes value %v (want types, all or a list of passes)\n", Quoted(ab[eq+1:]))); err != nil {
 					return err
 				}
-				return ErrParse
+				return ErrReported
 			}
 			continue
 		}
@@ -522,7 +513,7 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 		if err := say(io, true, "finc check: --comptime-fuel must be positive\n"); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	evalFuel = fuel
 	return checkPath(fs, io, operand)
@@ -572,7 +563,7 @@ driver func checkPath(fs FS, io Stdio, path string) error {
 		if err := printDiags(io); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	resolveProgram()
 	if semaFull || nodes.full {
@@ -582,7 +573,7 @@ driver func checkPath(fs FS, io Stdio, path string) error {
 		if err := printDiags(io); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	checkProgram()
 	if semaFull || nodes.full {
@@ -601,7 +592,7 @@ driver func checkPath(fs FS, io Stdio, path string) error {
 		if err := printDiags(io); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	return nil
 }

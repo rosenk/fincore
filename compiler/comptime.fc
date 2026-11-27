@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // comptime.fc — the fuel-bounded compile-time interpreter (port of finc0's
 // bootstrap/internal/comptime, spec 5.3).
 //
@@ -1644,10 +1645,7 @@ func ibuiltin0(b u8, m usize) Val {
 		if isSliceVal(d) && isSliceVal(s) {
 			dref, dn := sliceElems(d)
 			sref, sn := sliceElems(s)
-			n := usize(dn)
-			if usize(sn) < n {
-				n = usize(sn)
-			}
+			n := usize(min(dn, sn))
 			tmp := valAlloc(n, true)
 			for i := usize(0); i < n; i++ {
 				slotSet(tmp+u32(i), copyV(slotGet(sref+u32(i))))

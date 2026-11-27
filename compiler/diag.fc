@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // diag.fc — diagnostics in the spec section 11 format
 //
 //	file.fc:line:col: error[E####]: message
@@ -113,10 +114,7 @@ func putHexMin(o *OutBuf, v u64, width usize) {
 		t = t >> 4
 		digits++
 	}
-	if digits < width {
-		digits = width
-	}
-	o.WriteHex(v, digits, true)
+	o.WriteHex(v, max(digits, width), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -369,10 +367,7 @@ var diagContext bool
 // diagVisual returns the display width of the first n bytes of a line
 // (a tab counts 4, UTF-8 continuation bytes 0).
 func diagVisual(text []byte, n usize) usize {
-	m := n
-	if m > len(text) {
-		m = len(text)
-	}
+	m := min(n, len(text))
 	w := usize(0)
 	for i := usize(0); i < m; i++ {
 		c := text[i]
@@ -549,15 +544,10 @@ func putDiagContext(o *OutBuf, i usize) {
 					}
 					te--
 				}
-				if te > c1 {
-					c1 = te
-				}
+				c1 = max(c1, te)
 			}
 			v0 := diagVisual(text, c0)
-			v1 := diagVisual(text, c1)
-			if v1 <= v0 {
-				v1 = v0 + 1
-			}
+			v1 := max(diagVisual(text, c1), v0+1)
 			diagGutter(o, width, 0)
 			o.WriteRepeat(' ', v0)
 			o.WriteRepeat('^', v1-v0)

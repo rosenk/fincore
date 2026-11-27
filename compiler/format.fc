@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // format.fc — the v0.2 builtin formatTo(dst []byte, format string,
 // args...) usize (port of finc0's types/format.go, the formatTo parts of
 // codegen/golang/expr.go and comptime.go, and runtime/fincrt/fmt.go for the
@@ -668,10 +669,7 @@ func cfSigned(v Val, base u64, width int, zero bool) {
 
 // cfDst is fincrt.Fmt.Dst: the slice a Format method writes into.
 func cfDst(width int) Val {
-	w := width
-	if w > MaxFormatWidth {
-		w = MaxFormatWidth
-	}
+	w := min(width, MaxFormatWidth)
 	if w > 0 && usize(w) > cfLen-cfN {
 		if cfScr == 0 {
 			cfScr = valAlloc(MaxFormatWidth, true)
@@ -690,10 +688,7 @@ func cfDst(width int) Val {
 func cfAdvance(n0 u64, width int) {
 	if cfInScr {
 		cfInScr = false
-		w := width
-		if w > MaxFormatWidth {
-			w = MaxFormatWidth
-		}
+		w := min(width, MaxFormatWidth)
 		n := usize(0)
 		if w > 0 {
 			n = usize(w)
@@ -723,10 +718,7 @@ func cfAdvance(n0 u64, width int) {
 			}
 		}
 		cfFill(' ', pad)
-		cfN = start + pad + l
-		if cfN > cfLen {
-			cfN = cfLen
-		}
+		cfN = min(start+pad+l, cfLen)
 		return
 	}
 	cfN += l

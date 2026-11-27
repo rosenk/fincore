@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // totality_flow.fc — the totality checker, part 2 (port of finc0's
 // totality/flow.go and the T2/T3 halves of loops.go): a structured,
 // path-sensitive walk over a function or loop body.
@@ -383,11 +384,7 @@ func join(a u32, b u32) u32 {
 	for i := usize(0); i < an; i++ {
 		j, ok := lbFind(b, lbSym[as+i])
 		if ok {
-			v := lbVal[as+i]
-			if lbVal[j] < v {
-				v = lbVal[j]
-			}
-			lbPut(n, lbSym[as+i], v)
+			lbPut(n, lbSym[as+i], min(lbVal[as+i], lbVal[j]))
 		}
 	}
 	abs := usize(tst[usize(a)].bS)

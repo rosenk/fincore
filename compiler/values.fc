@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // values.fc — compile-time values (port of finc0's types/value.go).
 //
 // A Val is a small by-value record. Integers are exact 128-bit two's
@@ -94,9 +95,7 @@ func valAlloc(n usize, heap bool) u32 {
 	}
 	st := usize(0)
 	if heap {
-		if vals.htop < VtabCap {
-			vals.htop = VtabCap
-		}
+		vals.htop = max(vals.htop, VtabCap)
 		if vals.htop+n > MaxValSlots {
 			setFull("comptime heap")
 			return 0
@@ -1137,10 +1136,7 @@ func codeLevelOf(v Val, depth usize) int decreases(depth) {
 			l := -1
 			for i := u32(0); i < n; i++ {
 				if slotGet(ref + i) is FieldCode(_, _, c) {
-					x := codeLevelOf(slotGet(c), depth-1)
-					if x > l {
-						l = x
-					}
+					l = max(l, codeLevelOf(slotGet(c), depth-1))
 				}
 			}
 			return l

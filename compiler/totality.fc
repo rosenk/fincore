@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // totality.fc — the Layer-2 effect and totality checker, part 1 (port of
 // finc0's bootstrap/internal/totality: totality.go, invariant.go,
 // loops.go; the accepted shapes are documented in totality/doc.go).
@@ -834,10 +835,7 @@ func writeConflicts(w u32, ai usize) bool {
 		// prefixRelated(path, a.path)
 		ps := usize(atoms[ai].pathS)
 		pn := usize(atoms[ai].pathN)
-		m := nlpath
-		if pn < m {
-			m = pn
-		}
+		m := min(nlpath, pn)
 		rel := true
 		for i := usize(0); i < m; i++ {
 			if lpath[i] != atomPath[ps+i] {

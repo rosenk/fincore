@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // build.fc — `finc build`, `finc run` and `finc test` (port of finc0's
 // bootstrap/cmd/finc0 build.go and test.go).
 //
@@ -130,14 +131,14 @@ driver func buildUsage(io Stdio, name string, withOut bool) error {
 	return nil
 }
 
+// parseBoolStr parses a boolean flag value like Go's strconv.ParseBool:
+// the value and whether it is valid.
 func parseBoolStr(b []byte) (bool, bool) {
-	if cgBytesIs(b, "1") || cgBytesIs(b, "t") || cgBytesIs(b, "T") || cgBytesIs(b, "true") || cgBytesIs(b, "TRUE") || cgBytesIs(b, "True") {
-		return true, true
+	return match b {
+		"1" | "t" | "T" | "true" | "TRUE" | "True" -> true, true
+		"0" | "f" | "F" | "false" | "FALSE" | "False" -> false, true
+		_ -> false, false
 	}
-	if cgBytesIs(b, "0") || cgBytesIs(b, "f") || cgBytesIs(b, "F") || cgBytesIs(b, "false") || cgBytesIs(b, "FALSE") || cgBytesIs(b, "False") {
-		return false, true
-	}
-	return false, false
 }
 
 // parseBuildFlags parses the flags of build/run in env args [from, to) and
@@ -184,9 +185,9 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 			val = bytesToStr(ab[eq+1:])
 		}
 		i++
-		isBool := cgBytesIs(fname, "race") || cgBytesIs(fname, "context") || (withOut && cgBytesIs(fname, "trimpath"))
-		isStr := withOut && (cgBytesIs(fname, "o") || cgBytesIs(fname, "emit-go"))
-		isFuel := cgBytesIs(fname, "comptime-fuel")
+		isBool := fname is "race" | "context" || withOut && fname is "trimpath"
+		isStr := withOut && fname is "o" | "emit-go"
+		isFuel := fname is "comptime-fuel"
 		if !isBool && !isStr && !isFuel {
 			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: -%s\n", fname)); err != nil {
 				return 0, err
@@ -194,7 +195,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 			if err := buildUsage(io, name, withOut); err != nil {
 				return 0, err
 			}
-			return 0, ErrParse
+			return 0, ErrReported
 		}
 		if isBool {
 			v := true
@@ -207,16 +208,14 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 					if err := buildUsage(io, name, withOut); err != nil {
 						return 0, err
 					}
-					return 0, ErrParse
+					return 0, ErrReported
 				}
 				v = bv
 			}
-			if cgBytesIs(fname, "race") {
-				bRace = v
-			} else if cgBytesIs(fname, "context") {
-				diagContext = v
-			} else {
-				bTrim = v
+			match fname {
+				"race" -> bRace = v
+				"context" -> diagContext = v
+				_ -> bTrim = v
 			}
 			continue
 		}
@@ -228,16 +227,15 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 				if err := buildUsage(io, name, withOut); err != nil {
 					return 0, err
 				}
-				return 0, ErrParse
+				return 0, ErrReported
 			}
 			val = env.Arg(i)
 			i++
 		}
 		if isStr {
-			if cgBytesIs(fname, "o") {
-				bOut = val
-			} else {
-				bEmitGo = val
+			match fname {
+				"o" -> bOut = val
+				_ -> bEmitGo = val
 			}
 			continue
 		}
@@ -249,7 +247,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 			if err := buildUsage(io, name, withOut); err != nil {
 				return 0, err
 			}
-			return 0, ErrParse
+			return 0, ErrReported
 		}
 		evalFuel = v
 	}
@@ -257,7 +255,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 		if err := sayf(io, formatTo(mbuf[:], "finc %s: --comptime-fuel must be positive\n", name)); err != nil {
 			return 0, err
 		}
-		return 0, ErrParse
+		return 0, ErrReported
 	}
 	return i, nil
 }
@@ -469,7 +467,7 @@ driver func compileGo(fs FS, io Stdio, src string) error {
 		if err := sayf(io, formatTo(mbuf[:], "finc: %s\n", cgErrBuf.Bytes())); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	return nil
 }
@@ -495,7 +493,7 @@ driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []strin
 	if e := flushErr(io); e != nil {
 		return e
 	}
-	return ErrExec
+	return ErrReported
 }
 
 // buildIn formats, emits and builds the program in outBuf inside the
@@ -539,12 +537,12 @@ driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string,
 	}
 	if len(root) == 0 {
 		_ = findModuleRoot(fs, env, io, false)
-		return ErrNotFound
+		return ErrReported
 	}
 	absOut := absPath(env, out)
 	if len(absOut) == 0 {
 		_ = sayf(io, formatTo(mbuf[:], "finc: cannot make %s absolute ($PWD is not set)\n", out))
-		return ErrNotFound
+		return ErrReported
 	}
 	_, goVer := goModInfo(fs, root)
 	if len(goVer) == 0 {
@@ -617,7 +615,7 @@ driver func runBuild(fs FS, env Env, io Stdio, exec Exec) error {
 		if err := emsg(io, "usage: finc build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n"); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	src := env.Arg(first)
 	if len(bOut) == 0 {
@@ -656,7 +654,7 @@ driver func runRun(fs FS, env Env, io Stdio, exec Exec) error {
 		if err := emsg(io, "usage: finc run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n"); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	dir, merr := fs.MkdirTemp("finc1-run-")
 	if merr != nil {
@@ -689,6 +687,7 @@ driver func runRun(fs FS, env Env, io Stdio, exec Exec) error {
 		return rerr
 	}
 	if st.Code != 0 {
+		// not reported yet: main prints `error: fincore: exec failed`
 		return ErrExec
 	}
 	return nil
@@ -1430,7 +1429,7 @@ driver func testUsage(io Stdio) error {
 	if err := emsg(io, "usage: finc test [-v] [--context] <dir>\n  -context\n    \tshow source context in the diagnostics of failing tests\n  -v\tprint every test result\n"); err != nil {
 		return err
 	}
-	return ErrParse
+	return ErrReported
 }
 
 // runTest implements `test [-v] <dir>`.
@@ -1441,15 +1440,17 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 	nops := usize(0)
 	for i := usize(2); i < argc; i++ {
 		a := env.Arg(i)
-		if nops == 0 && (strEq(a, "-v") || strEq(a, "--v") || strEq(a, "-v=true") || strEq(a, "--v=true")) {
-			verbose = true
-		} else if nops == 0 && (strEq(a, "-context") || strEq(a, "--context")) {
-			diagContext = true
-		} else if nops == 0 && len(a) > 1 && strBytes(a)[0] == '-' {
-			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
-				return err
+		if nops == 0 && len(a) > 1 && strBytes(a)[0] == '-' {
+			match a {
+				"-v" | "--v" | "-v=true" | "--v=true" -> verbose = true
+				"-context" | "--context" -> diagContext = true
+				_ -> {
+					if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
+						return err
+					}
+					return testUsage(io)
+				}
 			}
-			return testUsage(io)
 		} else {
 			dir = a
 			nops++
@@ -1462,7 +1463,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		if err := sayf(io, formatTo(mbuf[:], "finc test: %s is not a directory\n", dir)); err != nil {
 			return err
 		}
-		return ErrParse
+		return ErrReported
 	}
 	nTests = 0
 	failDir := joinPath(dir, "fail")
@@ -1487,7 +1488,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		if err := sayf(io, formatTo(mbuf[:], "finc test: no tests in %s\n", dir)); err != nil {
 			return err
 		}
-		return ErrNotFound
+		return ErrReported
 	}
 	work, werr := fs.MkdirTemp("finc1-test-")
 	if werr != nil {
@@ -1588,7 +1589,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		return err
 	}
 	if failed > 0 {
-		return ErrExec
+		return ErrReported
 	}
 	return nil
 }

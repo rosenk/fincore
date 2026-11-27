@@ -741,6 +741,9 @@ func TestCompilerSCCs(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "compiler")); err != nil {
 		t.Skip("no compiler/")
 	}
+	if !finc0Can(t, root, "compiler") {
+		t.Skip("compiler/ needs a newer language version than finc0 (// SINCE:)")
+	}
 	t.Chdir(root)
 	prog, diags, err := resolve.Load("compiler", resolve.Options{})
 	if err != nil || len(diags) > 0 {

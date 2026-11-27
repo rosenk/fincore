@@ -37,7 +37,8 @@ func passInputs(t *testing.T) []string {
 			ins = append(ins, "testdata/pass/"+e.Name())
 		}
 	}
-	if _, err := os.Stat("compiler"); err == nil {
+	// compiler/ uses v0.3 since the seed bump (its files say SINCE: v0.3).
+	if _, err := os.Stat("compiler"); err == nil && finc0Can(t, ".", "compiler") {
 		ins = append(ins, "compiler")
 	}
 	return ins

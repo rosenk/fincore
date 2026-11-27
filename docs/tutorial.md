@@ -178,7 +178,6 @@ driver func main(io Stdio) error {
 ```text
 $ finc1 check index.fc
 index.fc:7:2: error[E4002]: cannot prove termination of for loop: not a counting loop (no post statement), slice-shrink loop, or loop with decreases clause
-error: fincore: invalid number
 ```
 
 (The last line is the compiler's exit status. It always reads `invalid
@@ -338,7 +337,6 @@ driver func main(net Net, io Stdio) error {
 ```text
 $ finc1 check leak.fc
 leak.fc:5:2: error[E3005]: Linear resource ln (Listener) is not closed, released or moved on every path
-error: fincore: invalid number
 ```
 
 The early `return err` leaks the listener. Note what the checker does *not*
@@ -397,7 +395,6 @@ driver func main(io Stdio) error {
 $ finc1 check borrow.fc
 borrow.fc:11:2: error[E3002]: scope escape: a value referring to the storage of parameter src cannot be stored in the storage of parameter l: each parameter is its own region, and memory reached through one parameter must not refer to another parameter's storage
 borrow.fc:18:2: error[E3002]: scope escape: a value referring to the storage of parameter line (depth 0) cannot be stored in package-level storage, which outlives it
-error: fincore: invalid number
 ```
 
 Each parameter is its own region: the checker cannot know that `lx` and
@@ -530,7 +527,6 @@ driver func main(io Stdio) error {
 ```text
 $ finc1 check shapes.fc
 shapes.fc:12:9: error[E2012]: non-exhaustive match on Shape: missing Triangle
-error: fincore: invalid number
 ```
 
 Variants are constructed qualified (`Shape.Rect(3, 4)`) and matched
@@ -715,7 +711,6 @@ driver func main(io Stdio) error {
 ```text
 $ finc1 check fuel.fc
 fuel.fc:12:13: error[E4001]: comptime evaluation ran out of fuel (budget 1000000 steps); call stack (innermost first): spin
-error: fincore: invalid number
 ```
 
 `Code n` / `El` are FinCore's answer to "types as values" without
@@ -860,14 +855,6 @@ The targets you will use:
 
 The examples are part of the corpus: `make diff-prev` compares their
 output with the `.out` files under both compilers.
-
-A note on the output of a failed `finc1 check`: the diagnostics are followed
-by `error: fincore: invalid number`. That line is the compiler's own exit
-error (it reports every failed check with the runtime's `ErrParse`), not
-a problem in your program. `bin/finc0` does not print it. The compiler
-will return `ErrReported` instead, and the line will go away, once the
-bootstrap seed is a release that has `ErrReported` (v0.3.0): until then
-compiler/ may not use it.
 
 ## 14. Where to go next
 

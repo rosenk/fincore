@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // codegen.fc — lowering and the deterministic Go code generator, part 1
 // (port of finc0's bootstrap/internal/ir and codegen/golang gen.go,
 // types.go, values.go). Parts 2 and 3 are codegen_expr.fc (expressions,
@@ -268,37 +269,37 @@ func cgBytesHasPrefix(b []byte, s string) bool {
 }
 
 func cgIsGoKeyword(b []byte) bool {
-	return cgBytesIs(b, "break") || cgBytesIs(b, "case") || cgBytesIs(b, "chan") || cgBytesIs(b, "const") ||
-		cgBytesIs(b, "continue") || cgBytesIs(b, "default") || cgBytesIs(b, "defer") || cgBytesIs(b, "else") ||
-		cgBytesIs(b, "fallthrough") || cgBytesIs(b, "for") || cgBytesIs(b, "func") || cgBytesIs(b, "go") ||
-		cgBytesIs(b, "goto") || cgBytesIs(b, "if") || cgBytesIs(b, "import") || cgBytesIs(b, "interface") ||
-		cgBytesIs(b, "map") || cgBytesIs(b, "package") || cgBytesIs(b, "range") || cgBytesIs(b, "return") ||
-		cgBytesIs(b, "select") || cgBytesIs(b, "struct") || cgBytesIs(b, "switch") || cgBytesIs(b, "type") ||
-		cgBytesIs(b, "var")
+	return b is "break" | "case" | "chan" | "const" |
+		"continue" | "default" | "defer" | "else" |
+		"fallthrough" | "for" | "func" | "go" |
+		"goto" | "if" | "import" | "interface" |
+		"map" | "package" | "range" | "return" |
+		"select" | "struct" | "switch" | "type" |
+		"var"
 }
 
 func cgIsGoPredeclared(b []byte) bool {
-	return cgBytesIs(b, "any") || cgBytesIs(b, "bool") || cgBytesIs(b, "byte") || cgBytesIs(b, "comparable") ||
-		cgBytesIs(b, "complex64") || cgBytesIs(b, "complex128") || cgBytesIs(b, "error") || cgBytesIs(b, "float32") ||
-		cgBytesIs(b, "float64") || cgBytesIs(b, "int") || cgBytesIs(b, "int8") || cgBytesIs(b, "int16") ||
-		cgBytesIs(b, "int32") || cgBytesIs(b, "int64") || cgBytesIs(b, "rune") || cgBytesIs(b, "string") ||
-		cgBytesIs(b, "uint") || cgBytesIs(b, "uint8") || cgBytesIs(b, "uint16") || cgBytesIs(b, "uint32") ||
-		cgBytesIs(b, "uint64") || cgBytesIs(b, "uintptr") || cgBytesIs(b, "true") || cgBytesIs(b, "false") ||
-		cgBytesIs(b, "iota") || cgBytesIs(b, "nil") || cgBytesIs(b, "append") || cgBytesIs(b, "cap") ||
-		cgBytesIs(b, "clear") || cgBytesIs(b, "close") || cgBytesIs(b, "complex") || cgBytesIs(b, "copy") ||
-		cgBytesIs(b, "delete") || cgBytesIs(b, "imag") || cgBytesIs(b, "len") || cgBytesIs(b, "make") ||
-		cgBytesIs(b, "max") || cgBytesIs(b, "min") || cgBytesIs(b, "new") || cgBytesIs(b, "panic") ||
-		cgBytesIs(b, "print") || cgBytesIs(b, "println") || cgBytesIs(b, "real") || cgBytesIs(b, "recover") ||
-		cgBytesIs(b, "init") || cgBytesIs(b, "main") || cgBytesIs(b, "fincrt") || cgBytesIs(b, "os")
+	return b is "any" | "bool" | "byte" | "comparable" |
+		"complex64" | "complex128" | "error" | "float32" |
+		"float64" | "int" | "int8" | "int16" |
+		"int32" | "int64" | "rune" | "string" |
+		"uint" | "uint8" | "uint16" | "uint32" |
+		"uint64" | "uintptr" | "true" | "false" |
+		"iota" | "nil" | "append" | "cap" |
+		"clear" | "close" | "complex" | "copy" |
+		"delete" | "imag" | "len" | "make" |
+		"max" | "min" | "new" | "panic" |
+		"print" | "println" | "real" | "recover" |
+		"init" | "main" | "fincrt" | "os"
 }
 
 func cgIsVetMethod(b []byte) bool {
-	return cgBytesIs(b, "Format") || cgBytesIs(b, "GobDecode") || cgBytesIs(b, "GobEncode") ||
-		cgBytesIs(b, "MarshalJSON") || cgBytesIs(b, "MarshalXML") || cgBytesIs(b, "Peek") ||
-		cgBytesIs(b, "ReadByte") || cgBytesIs(b, "ReadFrom") || cgBytesIs(b, "ReadRune") || cgBytesIs(b, "Scan") ||
-		cgBytesIs(b, "Seek") || cgBytesIs(b, "UnmarshalJSON") || cgBytesIs(b, "UnmarshalXML") ||
-		cgBytesIs(b, "UnreadByte") || cgBytesIs(b, "UnreadRune") || cgBytesIs(b, "WriteByte") ||
-		cgBytesIs(b, "WriteTo") || cgBytesIs(b, "Is") || cgBytesIs(b, "As")
+	return b is "Format" | "GobDecode" | "GobEncode" |
+		"MarshalJSON" | "MarshalXML" | "Peek" |
+		"ReadByte" | "ReadFrom" | "ReadRune" | "Scan" |
+		"Seek" | "UnmarshalJSON" | "UnmarshalXML" |
+		"UnreadByte" | "UnreadRune" | "WriteByte" |
+		"WriteTo" | "Is" | "As"
 }
 
 // wGoIdent writes ir.GoIdent(name).
