@@ -140,3 +140,5 @@ compiles a real program the same way the seed did. finc2 then has to pass
 | `make diff-prev-fuzz` | the same plus mutants (`FUZZ_SEED=n`) |
 | `make bootstrap` | seed chain and fixed point, `finc2 test testdata`, integration with finc2 |
 | `make integration` | corpus runner and TCP echo E2E tests |
+| `make fmt-fc-check` | `finc fmt` on every .fc file: idempotent and AST-preserving (docs/fmt.md) |
+| `make context-test` | golden `check --context` output of `testdata/context` (docs/fmt.md) |

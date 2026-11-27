@@ -160,6 +160,8 @@ make help       # all targets
 
 bin/finc0 parse --dump-ast examples/tcp_echo.fc
 bin/finc0 check examples/tcp_echo.fc
+bin/finc1 fmt -l compiler std examples   # formatter (docs/fmt.md)
+bin/finc1 check --context testdata/fail/fail_conn_leak.fc   # diagnostics with source context
 ```
 
 ## Design notes

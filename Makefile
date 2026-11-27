@@ -147,3 +147,20 @@ finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3
 	$(BIN)/finc1 build --emit-go=$(STAGE)/stage2.go -o $(BIN)/finc2 ./compiler
 	$(BIN)/finc2 build --emit-go=$(STAGE)/stage3.go -o $(BIN)/finc3 ./compiler
 	cmp $(STAGE)/stage2.go $(STAGE)/stage3.go && echo "finc2: stage2.go == stage3.go"
+
+# --- tooling of the current compiler (bin/finc1): fmt and --context (docs/fmt.md)
+.PHONY: fmt-fc fmt-fc-check context-test
+fmt-fc: finc1 ## list the .fc files of compiler/ std/ examples/ whose formatting differs from `finc fmt`
+	@$(BIN)/finc1 fmt -l compiler std examples
+
+fmt-fc-check: finc1 ## finc fmt on every .fc file of the repo: idempotent and AST-preserving (scripts/fmtcheck)
+	$(GO) run ./scripts/fmtcheck
+
+context-test: finc1 ## golden `check --context` output of testdata/context (UPDATE=1 rewrites the .out files)
+	@set -e; for f in testdata/context/*.fc; do o=$${f%.fc}.out; \
+	  got=$$($(BIN)/finc1 check --context $$f 2>&1 | grep -v '^error: fincore:' || true); \
+	  if [ -n "$(UPDATE)" ]; then printf '%s\n' "$$got" >$$o; fi; \
+	  diff -u $$o <(printf '%s\n' "$$got") || { echo "context-test: $$f differs from $$o"; exit 1; }; \
+	  cmp -s <(FINC_DIAG=context $(BIN)/finc1 check $$f 2>&1) <($(BIN)/finc1 check --context $$f 2>&1) || { echo "context-test: FINC_DIAG=context differs from --context on $$f"; exit 1; }; \
+	  cmp -s <($(BIN)/finc1 check $$f 2>&1 | grep -v '^error: fincore:') <(grep -E '^[^ ]+\.fc:[0-9]+:[0-9]+: error\[' $$o) || { echo "context-test: default output of $$f is not the plain diagnostics"; exit 1; }; \
+	done; echo "context-test: ok ($$(ls testdata/context/*.fc | wc -l) files)"

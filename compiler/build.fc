@@ -122,7 +122,7 @@ driver func buildUsage(io Stdio, name string, withOut bool) error {
 			return err
 		}
 	}
-	if err := emsg(io, "  -race\n    \tbuild with the race detector (needs cgo)\n"); err != nil {
+	if err := emsg(io, "  -context\n    \tshow source context and hints with diagnostics (also FINC_DIAG=context)\n  -race\n    \tbuild with the race detector (needs cgo)\n"); err != nil {
 		return err
 	}
 	if withOut {
@@ -185,7 +185,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 			val = bytesToStr(ab[eq+1:])
 		}
 		i++
-		isBool := cgBytesIs(fname, "race") || (withOut && cgBytesIs(fname, "trimpath"))
+		isBool := cgBytesIs(fname, "race") || cgBytesIs(fname, "context") || (withOut && cgBytesIs(fname, "trimpath"))
 		isStr := withOut && (cgBytesIs(fname, "o") || cgBytesIs(fname, "emit-go"))
 		isFuel := cgBytesIs(fname, "comptime-fuel")
 		if !isBool && !isStr && !isFuel {
@@ -214,6 +214,8 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 			}
 			if cgBytesIs(fname, "race") {
 				bRace = v
+			} else if cgBytesIs(fname, "context") {
+				diagContext = v
 			} else {
 				bTrim = v
 			}
@@ -1297,6 +1299,10 @@ driver func runFailTest(exec Exec, self string, src string) {
 	k := usize(0)
 	argv[k] = "check"
 	k++
+	if diagContext {
+		argv[k] = "--context"
+		k++
+	}
 	for i := usize(0); i < nhFlags; i++ {
 		argv[k] = hFlags[i]
 		k++
@@ -1359,6 +1365,10 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 	k := usize(0)
 	argv[k] = "build"
 	k++
+	if diagContext {
+		argv[k] = "--context"
+		k++
+	}
 	for i := usize(0); i < nhFlags; i++ {
 		argv[k] = hFlags[i]
 		k++
@@ -1418,7 +1428,7 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 }
 
 driver func testUsage(io Stdio) error {
-	if err := emsg(io, "usage: finc1 test <dir>\n  -v\tprint every test result\n"); err != nil {
+	if err := emsg(io, "usage: finc1 test [-v] [--context] <dir>\n  -context\n    \tshow source context in the diagnostics of failing tests\n  -v\tprint every test result\n"); err != nil {
 		return err
 	}
 	return ErrParse
@@ -1434,6 +1444,8 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		a := env.Arg(i)
 		if nops == 0 && (strEq(a, "-v") || strEq(a, "--v") || strEq(a, "-v=true") || strEq(a, "--v=true")) {
 			verbose = true
+		} else if nops == 0 && (strEq(a, "-context") || strEq(a, "--context")) {
+			diagContext = true
 		} else if nops == 0 && len(a) > 1 && strBytes(a)[0] == '-' {
 			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
 				return err

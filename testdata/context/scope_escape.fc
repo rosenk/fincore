@@ -1,0 +1,30 @@
+// SINCE: v0.3
+// context: E3002 (scope escape) inside a task literal, with a hint.
+package main
+
+const (
+	Slots   = 4
+	BufSize = 16
+)
+
+driver func main(io Stdio) error {
+	ctx, cancel := NewContext()
+	defer cancel()
+
+	var pool [Slots][BufSize]byte
+	var outer [BufSize]byte
+	saved := &outer
+
+	scope conns := NewScope(Slots) {
+		slot, err := conns.AcquireSlot(ctx, &pool)
+		if err != nil {
+			return err
+		}
+		conns.Go(slot, driver func(buf *[BufSize]byte) {
+			saved = buf
+		})
+	}
+
+	saved[0] = 1
+	return nil
+}

@@ -14,6 +14,7 @@ testing strategy as a whole.
 testdata/
 ├── fail/          negative tests (spec 13.1), one expected diagnostic each
 ├── pass/          positive tests (spec 13.2 + pass_extra_*), stdout compared with .out
+├── context/       golden `check --context` output (.out), run by `make context-test` only (docs/fmt.md)
 └── integration/   Go E2E tests for tcp_echo (spec 13.3) + corpus driver
 ```
 

@@ -9,8 +9,8 @@ files (spec 9.5.6); there are no local imports.
 | File | Contents |
 | :--- | :--- |
 | `arena.fc` | Capacities, `SourceArena`, `Token`/`TokenArena` (`vec.Vec`), `Node`/`NodeArena` with its child lists `NodeLists` (`vec.ListArena`), `OutBuf` (`bytes.Builder`) |
-| `diag.fc` | Diagnostic codes and the `file:line:col: error[E####]: msg` header; UTF-8 decoding and Go-compatible quoting (`strconv.Quote`, `%q`, `%c`) |
-| `lexer.fc` | Token kinds, keyword lookup, total lexer with semicolon insertion, literal/escape validation, E1001/E1002 messages |
+| `diag.fc` | Diagnostic codes and the `file:line:col: error[E####]: msg` header; UTF-8 decoding and Go-compatible quoting (`strconv.Quote`, `%q`, `%c`); the opt-in source context of `--context` / `FINC_DIAG=context` (source line, caret span, help hints; docs/fmt.md) |
+| `lexer.fc` | Token kinds, keyword lookup, total lexer with semicolon insertion, literal/escape validation, E1001/E1002 messages; the comment side table `comments` (filled only when `Lexer.keepComments` is set, by `fmt`) |
 | `ast.fc` | Node kinds, the per-kind slot `layout`, post-order NodeID assignment, the `--dump-ast` dumper and the source printer |
 | `parser.fc` | Recursive-descent parser for the full grammar of spec section 3 (fincore_language_specification_v0_2.md) |
 | `sema.fc` | Semantic data model: interned names, symbols, scopes and the (scope, name) symbol table, packages, u32 lists and list cells, per-node resolver tables, the sorted diagnostic list, AST accessors |
@@ -33,6 +33,7 @@ files (spec 9.5.6); there are no local imports.
 | `format.fc` | The v0.2 builtin `formatTo` (finc0's types/format.go plus the formatTo parts of codegen and comptime): lazy format parser, argument checking, Go lowering over `fincrt.Fmt`, comptime writer (port of runtime/fincrt/fmt.go) |
 | `codegen_enum.fc` | Code generator part 4 (v0.2 sum types and patterns, enum.go): compact enum layouts (LIFO layout pools), match switches, if-chain lowering of general patterns (guards, tuples, binding or-patterns), `is`, match expressions, `return match` |
 | `build.fc` | `build`, `run`, `test` (finc0's build.go / test.go): temporary module, gofmt and `go build` via Exec, test conventions of testdata/README.md |
+| `fmt.fc` | `fmt [-w] [-l] [-d] [--check]`: the source formatter (token-stream layout with AST-derived token classes, gofmt's binary-operator spacing and elastic-tabstop alignment, comments from the lexer's side table, in-process AST-equivalence check of every result; docs/fmt.md) |
 
 ## Architecture
 

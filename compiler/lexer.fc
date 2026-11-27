@@ -15,6 +15,8 @@
 // the source length (each iteration consumes at least one byte or exits).
 package main
 
+import "std/vec"
+
 // Token kinds.
 const (
 	TkIllegal = 0
@@ -504,8 +506,9 @@ type Lexer struct {
 	n          usize
 	off        usize
 	line       u32
-	lineStart  usize
-	insertSemi bool
+	lineStart    usize
+	insertSemi   bool
+	keepComments bool // record comments in the side table (finc fmt)
 }
 
 // newLexer creates a lexer over one file; a UTF-8 BOM is skipped.
@@ -626,7 +629,9 @@ func (l *Lexer) nextToken() Token {
 			continue
 		}
 		if c == '/' && l.peekByte(1) == '/' {
+			cs := tokAt(TkIllegal, l.off, l.line, l.col())
 			l.skipLineComment()
+			l.recordComment(cs, false)
 			continue
 		}
 		if c == '/' && l.peekByte(1) == '*' {
@@ -637,6 +642,7 @@ func (l *Lexer) nextToken() Token {
 			if !closed {
 				return l.illegal(start, LexErrUntermComment)
 			}
+			l.recordComment(start, true)
 			if sawNewline && l.insertSemi {
 				l.insertSemi = false
 				start.kind = TkSemicolon
@@ -648,6 +654,44 @@ func (l *Lexer) nextToken() Token {
 		return l.scan()
 	}
 	return tokAt(TkEOF, l.off, l.line, l.col())
+}
+
+// Comment side table. The parser never sees comments (nextToken skips
+// them); `finc fmt` needs them, so a lexer with keepComments set appends
+// every comment (span and position, in source order) to the package-level
+// table `comments`. Overflow sets commentsFull.
+
+const MaxComments = 65_536
+
+type Comment struct {
+	off   u32 // file-relative offset of the "//" or "/*"
+	end   u32 // just past the comment (a line comment excludes the newline)
+	line  u32
+	col   u32
+	eline u32 // line of the last byte
+	block bool
+}
+
+type CommentTable = vec.Vec[MaxComments, Comment]
+
+var comments CommentTable
+var commentsFull bool
+
+// recordComment appends the comment from start to the current offset.
+func (l *Lexer) recordComment(start Token, block bool) {
+	if !l.keepComments {
+		return
+	}
+	var c Comment
+	c.off = start.off
+	c.end = u32(l.off)
+	c.line = start.line
+	c.col = start.col
+	c.eline = l.line
+	c.block = block
+	if !comments.Push(c) {
+		commentsFull = true
+	}
 }
 
 func (l *Lexer) skipLineComment() {

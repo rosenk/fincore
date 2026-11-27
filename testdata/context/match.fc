@@ -1,0 +1,37 @@
+// SINCE: v0.3
+// context: E2012 for a non-exhaustive match and an unreachable arm, and
+// E2002 at a binary operator (the span is the operator); tabs in the
+// source line are shown as four spaces.
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+func area(s Shape) u32 {
+	match s {
+		Circle(r) -> return 3 * r * r
+	}
+	return 0
+}
+
+func kind(s Shape) u32 {
+	return match s {
+		Circle(_) -> 1
+		_ -> 2
+		Empty -> 3
+	}
+}
+
+func mix(a u32, b u64) bool {
+	return a+1 == b
+}
+
+driver func main(io Stdio) error {
+	_ = area(Shape.Empty)
+	_ = kind(Shape.Empty)
+	_ = mix(1, 2)
+	return nil
+}

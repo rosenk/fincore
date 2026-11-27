@@ -506,6 +506,8 @@ type DiagList struct {
 	line  [MaxDiags]u32
 	col   [MaxDiags]u32
 	code  [MaxDiags]u32
+	eline [MaxDiags]u32 // end of the reported node (0: unknown), for --context
+	ecol  [MaxDiags]u32
 	order [MaxDiags]u32
 	count usize
 }
@@ -533,12 +535,19 @@ func addDiag(file usize, line u32, col u32, code u32, msg []byte) {
 	diags.line[i] = line
 	diags.col[i] = col
 	diags.code[i] = code
+	diags.eline[i] = 0
+	diags.ecol[i] = 0
 	diags.text.Extend(n)
 }
 
 // errAt records the diagnostic mbuf[:k] at the start of node n.
 func errAt(code u32, n u32, k usize) {
+	i := diags.count
 	addDiag(nfile(n), nodes.items[usize(n)].sLine, nodes.items[usize(n)].sCol, code, mbuf[:k])
+	if diags.count > i {
+		diags.eline[i] = nodes.items[usize(n)].eLine
+		diags.ecol[i] = nodes.items[usize(n)].eCol
+	}
 }
 
 // addParseDiag records a finished parser diagnostic line (with or without

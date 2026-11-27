@@ -225,7 +225,12 @@ func writeExpr(o *OutBuf, e u32, dp usize) decreases(dp) {
 // errAtOp reports at the operator of a BinaryExpr (OpPos).
 func errAtOp(code u32, e u32, k usize) {
 	p := nival(e)
+	i := diags.count
 	addDiag(nfile(e), u32(p>>32), u32(p&0xFFFFFFFF), code, mbuf[:k])
+	if diags.count > i { // --context: underline the operator
+		diags.eline[i] = u32(p >> 32)
+		diags.ecol[i] = u32(p&0xFFFFFFFF) + u32(len(binOpString(nodes.items[usize(e)].op)))
+	}
 }
 
 // errAtEnd reports at the last byte of a node (missing return).

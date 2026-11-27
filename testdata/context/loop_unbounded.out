@@ -1,0 +1,8 @@
+testdata/context/loop_unbounded.fc:8:2: error[E4002]: cannot prove termination of for loop: not a counting loop (no post statement), slice-shrink loop, or loop with decreases clause
+    8 |     for x > 0 { // the loop never shrinks x
+      |     ^^^^^^^^^^^
+      = help: write a counting loop `for i := usize(0); i < n; i++` whose bound n the body does not assign, or give the loop a `decreases(m)` measure
+testdata/context/loop_unbounded.fc:14:1: error[E4002]: recursive function down has no decreases clause
+   14 | func down(n u32) u32 {
+      | ^^^^^^^^^^^^^^^^^^^^^^
+      = help: add `decreases(n)` with an unsigned parameter n and pass a smaller value (such as n-1) on every recursive call

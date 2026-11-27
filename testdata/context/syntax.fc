@@ -1,0 +1,7 @@
+// SINCE: v0.3
+// context: a syntax error (E1001) has no node range: one caret.
+package main
+
+func f(x u32) u32 {
+	return x 2
+}
