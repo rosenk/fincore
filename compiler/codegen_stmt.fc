@@ -64,6 +64,7 @@ func cgStmt(s u32, dp usize) decreases(dp) {
 	if s == 0 {
 		return
 	}
+	cgHoistIs(s, dp-1)
 	k := nkind(s)
 	if k == NkBlockStmt {
 		cgW("{\n")
@@ -422,16 +423,6 @@ func cgIfStmt(s u32, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
-	// v0.2: variables bound by `is` in the condition are declared in a
-	// block around the if statement.
-	m := cgWmark()
-	cgW("{\n")
-	m1 := cgWmark()
-	cgIsDecls(nb(s), dp-1)
-	decls := cgWmark() > m1
-	if !decls {
-		cgWtruncate(m)
-	}
 	cgHeader++
 	cgW("if ")
 	if na(s) != 0 {
@@ -451,9 +442,6 @@ func cgIfStmt(s u32, dp usize) decreases(dp) {
 		cgW(" else {\n")
 		cgStmts(e, dp-1)
 		cgWc('}')
-	}
-	if decls {
-		cgW("\n}")
 	}
 }
 

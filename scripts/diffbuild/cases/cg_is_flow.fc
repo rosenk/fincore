@@ -1,0 +1,149 @@
+// cg_is_flow: code generation edge cases of v0.2 flow-scoped `is`
+// bindings: hoisted `var _fc_tN_x T` declarations before the statement
+// (return, assignment, var, call arguments, defer, else-if chains, for
+// init/condition/post, match statements with guards, scope values),
+// let-else without a wrapping block, `x is Some(x)` (the operand reads
+// the outer x), the same name bound in several statements and branches,
+// generic functions, or-patterns with bindings, function literals with
+// their own hoisting, unused bindings (not declared) and `return match`
+// with `is` in its arms.
+package main
+
+type Opt[T any] enum {
+	Some(T)
+	None
+}
+
+type Tok enum {
+	Ident(string, u32)
+	Num(u64)
+	Op(u8)
+	Big(u64, u8)
+	Eof
+}
+
+var counter u32 = 0
+
+func bump(b bool) u32 {
+	if b {
+		counter++
+	}
+	return counter
+}
+
+func shadowOuter(x Opt[u32]) u32 {
+	{
+		if !(x is Some(x)) {
+			return 0
+		}
+		return x + 1
+	}
+}
+
+func sameName(a Tok, b Tok) u64 {
+	var r u64 = 0
+	if a is Num(n) && n > 1 {
+		r = n
+	} else if b is Num(n) && n > 2 {
+		r = n * 10
+	} else if !(a is Ident(_, n)) || n == 0 {
+		r = 7
+	} else {
+		r = u64(n)
+	}
+	ok := (a is Num(n) && n == 5) || (b is Num(n) && n == 6)
+	if ok {
+		r += 1000
+	}
+	return r
+}
+
+func unwrap[T any](o Opt[T], d T) T {
+	if !(o is Some(v)) {
+		return d
+	}
+	return v
+}
+
+func orBind(t Tok) u64 {
+	if !(t is Num(n) | Big(n, _)) {
+		return 0
+	}
+	var v u64 = n
+	return v + bumpBy(t is Num(k) | Big(k, _) && k > 0)
+}
+
+func bumpBy(b bool) u64 {
+	if b {
+		return 1
+	}
+	return 2
+}
+
+func lit(o Opt[u32]) u32 {
+	f := func(p Opt[u32]) u32 {
+		if !(p is Some(y)) {
+			return 0
+		}
+		return y
+	}
+	return f(o) + bump(o is Some(z) && z > 3)
+}
+
+func loops(ts []Tok) u64 {
+	var s u64 = 0
+	for i := usize(0); i < len(ts); i++ {
+		if !(ts[i] is Num(n)) {
+			continue
+		}
+		var w u64 = n
+		match ts[i] {
+			Num(m) if counter > 0 && ts[0] is Num(f) && f < m -> s += m - f
+			_ -> s += w
+		}
+	}
+	return s
+}
+
+driver func whileLoop(o Opt[u32]) u32 {
+	var r u32 = 0
+	cur := o
+	driver for j := u32(0); cur is Some(x) && x > 0; j += bump(cur is Some(y) && y > 1) {
+		r += x
+		cur = Opt[u32].Some(x - 1)
+	}
+	return r
+}
+
+driver func deferred(o Opt[u32]) {
+	defer bump(o is Some(x) && x > 0)
+	var v = o is Some(w) && w > 1
+	_ = v
+}
+
+func retMatch(t Tok, o Opt[u32]) bool {
+	return match t {
+		Num(n) -> o is Some(k) && u64(k) == n
+		Ident(_, n) -> !(o is Some(k)) || k == n
+		_ -> false
+	}
+}
+
+func unused(t Tok) bool {
+	return t is Ident(s, n)
+}
+
+driver func main(io Stdio) error {
+	_ = shadowOuter(Opt[u32].Some(3))
+	_ = sameName(Tok.Num(2), Tok.Eof)
+	_ = unwrap[u32](Opt[u32].None, 4)
+	_ = orBind(Tok.Op(1))
+	_ = lit(Opt[u32].Some(2))
+	var ts [2]Tok
+	_ = loops(ts[:])
+	_ = whileLoop(Opt[u32].Some(3))
+	deferred(Opt[u32].None)
+	_ = retMatch(Tok.Eof, Opt[u32].None)
+	_ = unused(Tok.Eof)
+	return nil
+}

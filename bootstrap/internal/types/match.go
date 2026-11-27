@@ -251,7 +251,7 @@ func patternAlts(p ast.Pattern) []ast.Pattern {
 }
 
 // isExpr checks `X is Pattern` (v0.2). Bindings are declared by the
-// resolver only in if conditions; elsewhere they are E2002.
+// resolver for every `is` (flow-scoped, decisions 110-117).
 func (c *Checker) isExpr(e *ast.IsExpr) operand {
 	x := c.exprValue(e.X)
 	if !x.invalid() && IsUntyped(x.typ) {

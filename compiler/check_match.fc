@@ -308,7 +308,7 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 }
 
 // isExpr checks `X is Pattern` (v0.2). Bindings are declared by the
-// resolver only in if conditions; elsewhere they are E2002.
+// resolver for every `is` (flow-scoped, decisions 110-117).
 func isExpr(e u32, dp usize) Operand decreases(dp) {
 	if dp == 0 {
 		tooDeep()

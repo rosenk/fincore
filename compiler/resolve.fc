@@ -724,6 +724,11 @@ func bindExpr(e u32, depth usize) decreases(depth) {
 	k := nkind(e)
 	if k == NkIdent {
 		_ = bLookup(e)
+	} else if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) || k == NkIsExpr {
+		// v0.2: `is` bindings flow into the right operand of && / ||.
+		mark := bFlowTop
+		_, _ = bFlow(e, depth-1)
+		bFlowTop = mark
 	} else if k == NkBinaryExpr {
 		bindExpr(na(e), depth-1)
 		bindExpr(nb(e), depth-1)
@@ -774,9 +779,6 @@ func bindExpr(e u32, depth usize) decreases(depth) {
 		for i := usize(0); i < n; i++ {
 			bindExpr(l1at(e, i), depth-1)
 		}
-	} else if k == NkIsExpr {
-		bindExpr(na(e), depth-1)
-		bPatternNames(nb(e), false, depth-1)
 	}
 }
 
@@ -787,7 +789,12 @@ func bStmts(bl u32, depth usize) decreases(depth) {
 	}
 	n := l1len(bl)
 	for i := usize(0); i < n; i++ {
-		bStmt(l1at(bl, i), depth-1)
+		s := l1at(bl, i)
+		if nkind(s) == NkIfStmt {
+			bIfStmt(s, true, depth-1)
+		} else {
+			bStmt(s, depth-1)
+		}
 	}
 }
 
@@ -867,34 +874,22 @@ func bStmt(s u32, depth usize) decreases(depth) {
 			bindExpr(l1at(s, i), depth-1)
 		}
 	} else if k == NkIfStmt {
-		outer := bScope
-		bScope = newScope(outer, ScopeBlock, s)
-		bStmt(na(s), depth-1)
-		if condWithBindings(nb(s), depth-1) {
-			// v0.2: `is` bindings are visible in later conjuncts and the
-			// then block, not in the else branch.
-			ifScope := bScope
-			bScope = newScope(ifScope, ScopeBlock, nb(s))
-			bCond(nb(s), depth-1)
-			bBlock(nc(s), depth-1)
-			bScope = ifScope
-		} else {
-			bindExpr(nb(s), depth-1)
-			bBlock(nc(s), depth-1)
-		}
-		bStmt(nd(s), depth-1)
-		bScope = outer
+		bIfStmt(s, false, depth-1)
 	} else if k == NkForStmt {
 		outer := bScope
 		bScope = newScope(outer, ScopeBlock, s)
 		bStmt(na(s), depth-1)
-		bindExpr(nb(s), depth-1)
+		mark := bFlowTop
+		nt, _ := bFlow(nb(s), depth-1)
 		bStmt(nc(s), depth-1)
 		if nd(s) != 0 {
 			bindExpr(na(nd(s)), depth-1)
 		}
+		// v0.2: the condition's true-outcome bindings are visible in the body.
+		bVisible(mark, mark+nt)
 		bBlock(ne(s), depth-1)
 		bScope = outer
+		bFlowTop = mark
 	} else if k == NkMatchStmt {
 		bindExpr(na(s), depth-1)
 		n := l1len(s)
@@ -930,7 +925,10 @@ func bMatchArm(arm u32, depth usize) decreases(depth) {
 	outer := bScope
 	bScope = newScope(outer, ScopeBlock, arm)
 	bPatternNames(na(arm), true, depth-1)
-	bindExpr(nd(arm), depth-1)
+	// v0.2: the guard's true-outcome bindings are visible in the body.
+	mark := bFlowTop
+	nt, _ := bFlow(nd(arm), depth-1)
+	bVisible(mark, mark+nt)
 	if nb(arm) != 0 {
 		bindExpr(nb(arm), depth-1)
 	}
@@ -938,6 +936,7 @@ func bMatchArm(arm u32, depth usize) decreases(depth) {
 		bStmts(nc(arm), depth-1)
 	}
 	bScope = outer
+	bFlowTop = mark
 }
 
 // MaxPatternBindings bounds the distinct names one pattern binds (more are
@@ -995,40 +994,179 @@ func bPatWalk(p u32, declare bool, depth usize) decreases(depth) {
 	}
 }
 
-// condWithBindings reports whether an if condition has an `is` expression
-// in a binding position (the condition itself or a conjunct of its
-// top-level && chain).
-func condWithBindings(e u32, depth usize) bool decreases(depth) {
-	if depth == 0 || e == 0 {
-		return false
+// ---------------------------------------------------------------------------
+// v0.2 flow-scoped `is` bindings (finc0's binder.flow, ifStmt, visible,
+// union).
+
+// MaxFlowSyms bounds the symbols of the outcome sets under construction.
+const MaxFlowSyms = 4096
+
+// bFlowSyms is a LIFO stack of outcome sets: bFlow leaves the true set
+// followed by the false set on top of it.
+var bFlowSyms [MaxFlowSyms]u32
+var bFlowTop usize
+var bFlowTmp [MaxFlowSyms]u32
+
+func bFlowPush(sym u32) {
+	if bFlowTop >= MaxFlowSyms {
+		setFull("flow bindings")
+		return
 	}
-	k := nkind(e)
-	if k == NkIsExpr {
-		return true
-	}
-	if k == NkBinaryExpr && nop(e) == OpLAnd {
-		return condWithBindings(na(e), depth-1) || condWithBindings(nb(e), depth-1)
-	}
-	return false
+	bFlowSyms[bFlowTop] = sym
+	bFlowTop++
 }
 
-// bCond binds an if condition; `is` expressions in binding positions
-// declare their bindings in the current scope, visible to later conjuncts
-// and the then block (v0.2).
-func bCond(e u32, depth usize) decreases(depth) {
-	if depth == 0 || e == 0 {
+// bIfStmt binds an if statement: the bindings of the condition's true
+// outcome are visible in the then block, those of its false outcome in
+// the else branch. If the if statement is directly in a statement list
+// (inList) and has no else branch, the false-outcome bindings are
+// declared in the enclosing block after it, like a `:=` at the if
+// statement (let-else; the type checker requires the then block to
+// terminate where they are used).
+func bIfStmt(s u32, inList bool, depth usize) decreases(depth) {
+	if depth == 0 {
 		return
+	}
+	outer := bScope
+	bScope = newScope(outer, ScopeBlock, s)
+	bStmt(na(s), depth-1)
+	mark := bFlowTop
+	nt, nf := bFlow(nb(s), depth-1)
+	ifScope := bScope
+	bVisible(mark, mark+nt)
+	bBlock(nc(s), depth-1)
+	bScope = ifScope
+	bVisible(mark+nt, mark+nt+nf)
+	bStmt(nd(s), depth-1)
+	bScope = outer
+	if inList && nd(s) == 0 {
+		for i := mark + nt; i < mark+nt+nf; i++ {
+			sym := bFlowSyms[i]
+			if scopeInsert(bScope, sym) != 0 {
+				errAt(E2001, syms.items[usize(sym)].ident, formatTo(mbuf[:], "%v redeclared in this block", NameRef(symName(sym))))
+			}
+		}
+	}
+	bFlowTop = mark
+}
+
+// bFlow binds a boolean expression and pushes its outcome sets: the
+// variables bound by `is` tests that are definitely matched when e is
+// true (the first nt symbols) and when e is false (the next nf), in
+// source order.
+//
+//	e is P      t = bindings of P, f = {}
+//	!A          t = f(A), f = t(A)
+//	A && B      t = t(A) + t(B), f = {}; t(A) is visible in B
+//	A || B      t = {}, f = f(A) + f(B); f(A) is visible in B
+//	(A)         those of A
+//	otherwise   {}, {}
+//
+// The symbols of an `is` pattern are declared in a scope of their own and
+// become visible only where flow makes them visible. A name in both
+// operand sets of a union is E2001.
+func bFlow(e u32, depth usize) (usize, usize) decreases(depth) {
+	if depth == 0 || e == 0 {
+		return 0, 0
 	}
 	k := nkind(e)
+	if k == NkParenExpr {
+		return bFlow(na(e), depth-1)
+	}
+	if k == NkUnaryExpr && nop(e) == OpNot {
+		base := bFlowTop
+		t, f := bFlow(na(e), depth-1)
+		n := t + f
+		for i := usize(0); i < n; i++ {
+			bFlowTmp[i] = bFlowSyms[base+i]
+		}
+		for i := usize(0); i < f; i++ {
+			bFlowSyms[base+i] = bFlowTmp[t+i]
+		}
+		for i := usize(0); i < t; i++ {
+			bFlowSyms[base+f+i] = bFlowTmp[i]
+		}
+		return f, t
+	}
 	if k == NkIsExpr {
 		bindExpr(na(e), depth-1)
+		outer := bScope
+		bScope = newScope(outer, ScopeBlock, e)
 		bPatternNames(nb(e), true, depth-1)
-		return
+		bScope = outer
+		n := bPatN
+		for i := usize(0); i < n; i++ {
+			bFlowPush(bPatSeen[i])
+		}
+		return n, 0
 	}
-	if k == NkBinaryExpr && nop(e) == OpLAnd {
-		bCond(na(e), depth-1)
-		bCond(nb(e), depth-1)
-		return
+	if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) {
+		and := nop(e) == OpLAnd
+		base := bFlowTop
+		ta, fa := bFlow(na(e), depth-1)
+		outer := bScope
+		if and {
+			bVisible(base, base+ta)
+		} else {
+			bVisible(base+ta, base+ta+fa)
+		}
+		tb, fb := bFlow(nb(e), depth-1)
+		bScope = outer
+		// the union keeps the left set x and appends the right set y
+		xs := base
+		xn := ta
+		ys := base + ta + fa
+		yn := tb
+		if !and {
+			xs = base + ta
+			xn = fa
+			ys = base + ta + fa + tb
+			yn = fb
+		}
+		for i := usize(0); i < xn; i++ {
+			bFlowTmp[i] = bFlowSyms[xs+i]
+		}
+		for i := usize(0); i < yn; i++ {
+			bFlowTmp[xn+i] = bFlowSyms[ys+i]
+		}
+		bFlowTop = base
+		for i := usize(0); i < xn; i++ {
+			bFlowPush(bFlowTmp[i])
+		}
+		n := xn
+		for i := usize(0); i < yn; i++ {
+			sym := bFlowTmp[xn+i]
+			dup := false
+			for j := usize(0); j < xn; j++ {
+				if symName(bFlowTmp[j]) == symName(sym) {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				errAt(E2001, syms.items[usize(sym)].ident, formatTo(mbuf[:], "%v redeclared in this condition", NameRef(symName(sym))))
+				continue
+			}
+			bFlowPush(sym)
+			n++
+		}
+		if and {
+			return n, 0
+		}
+		return 0, n
 	}
 	bindExpr(e, depth-1)
+	return 0, 0
+}
+
+// bVisible opens a scope holding bFlowSyms[from:to] (none if empty); the
+// caller restores bScope.
+func bVisible(from usize, to usize) {
+	if to <= from {
+		return
+	}
+	bScope = newScope(bScope, ScopeBlock, 0)
+	for i := from; i < to; i++ {
+		_ = scopeInsert(bScope, bFlowSyms[i])
+	}
 }

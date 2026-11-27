@@ -1124,8 +1124,8 @@ func cgGuardCond(a u32, s usize, sn usize, x u32, dp usize) decreases(dp) {
 	cgHeader = saveHeader
 }
 
-// cgIsExpr writes `X is P` (v0.2). Its bindings (only in if conditions)
-// are declared before the if statement (cgIsDecls) and assigned here.
+// cgIsExpr writes `X is P` (v0.2). Its bindings that are read are
+// declared before the statement (cgHoistIs) and assigned here.
 func cgIsExpr(e u32, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
@@ -1215,27 +1215,110 @@ func cgSingleTest(p u32) bool {
 	return true
 }
 
-// cgIsDecls writes the declarations `var x T` of the variables bound by
-// the `is` expressions of an if condition (v0.2) that are read.
-func cgIsDecls(cond u32, dp usize) decreases(dp) {
-	if dp == 0 || cond == 0 {
+// cgSymTmp renames the variables of `is` bindings (v0.2): temporary
+// number + 1 (0 = not renamed); cgWSymName writes `_fc_tN_<name>`.
+var cgSymTmp [MaxSyms]u64
+
+// cgHoistIs writes, before statement s, the declarations of the variables
+// bound by the `is` expressions of s that are read anywhere (v0.2 flow
+// bindings): `var _fc_tN_x T`, in source order (finc0's hoistIs). Each
+// gets a fresh temporary name, so the declarations can neither clash with
+// nor shadow other variables; the is test assigns them (cgIsExpr). The
+// expressions of s are those outside its nested blocks and function
+// literals, including the conditions of an else-if chain and a for
+// statement's init, condition and post.
+func cgHoistIs(s u32, dp usize) decreases(dp) {
+	if dp == 0 || s == 0 {
 		return
 	}
-	k := nkind(cond)
+	k := nkind(s)
+	if k == NkDeclStmt {
+		if nkind(na(s)) == NkVarDecl {
+			cgHoistExpr(nc(na(s)), dp-1)
+		}
+	} else if k == NkShortVarDecl {
+		n := l2len(s)
+		for i := usize(0); i < n; i++ {
+			cgHoistExpr(l2at(s, i), dp-1)
+		}
+	} else if k == NkAssignStmt {
+		n := l1len(s)
+		for i := usize(0); i < n; i++ {
+			cgHoistExpr(l1at(s, i), dp-1)
+		}
+		m := l2len(s)
+		for i := usize(0); i < m; i++ {
+			cgHoistExpr(l2at(s, i), dp-1)
+		}
+	} else if k is NkIncDecStmt | NkExprStmt | NkDeferStmt {
+		cgHoistExpr(na(s), dp-1)
+	} else if k == NkReturnStmt {
+		n := l1len(s)
+		for i := usize(0); i < n; i++ {
+			cgHoistExpr(l1at(s, i), dp-1)
+		}
+	} else if k == NkIfStmt {
+		cgHoistIs(na(s), dp-1)
+		cgHoistExpr(nb(s), dp-1)
+		if nd(s) != 0 && nkind(nd(s)) == NkIfStmt {
+			cgHoistIs(nd(s), dp-1)
+		}
+	} else if k == NkForStmt {
+		cgHoistIs(na(s), dp-1)
+		cgHoistExpr(nb(s), dp-1)
+		cgHoistIs(nc(s), dp-1)
+	} else if k == NkMatchStmt {
+		cgHoistExpr(na(s), dp-1)
+		n := l1len(s)
+		for i := usize(0); i < n; i++ {
+			arm := l1at(s, i)
+			cgHoistExpr(nd(arm), dp-1)
+			cgHoistExpr(nb(arm), dp-1)
+		}
+	} else if k == NkScopeStmt {
+		cgHoistExpr(nb(s), dp-1)
+	}
+}
+
+// cgHoistExpr declares the read bindings of the `is` expressions in e,
+// in pre-order, not descending into function literals.
+func cgHoistExpr(e u32, dp usize) decreases(dp) {
+	if dp == 0 || e == 0 {
+		return
+	}
+	k := nkind(e)
+	if k == NkFuncLit {
+		return
+	}
 	if k == NkIsExpr {
 		bmark := cgBindTop
-		cgPatBindings(nb(cond), ntype[usize(na(cond))], 0, 1, 0, dp-1)
+		cgPatBindings(nb(e), ntype[usize(na(e))], 0, 1, 0, dp-1)
 		btop := cgBindTop
 		for i := bmark; i < btop; i++ {
+			sym := cgBindSym[i]
+			cgSymTmp[usize(sym)] = cgNewTemp() + 1
 			cgW("var ")
-			cgWSymName(cgBindSym[i])
+			cgWSymName(sym)
 			cgWc(' ')
-			cgGoType(cond, cgBindT[i], dp-1)
+			cgGoType(e, cgBindT[i], dp-1)
 			cgWc('\n')
 		}
 		cgBindTop = bmark
-	} else if k == NkBinaryExpr && nop(cond) == OpLAnd {
-		cgIsDecls(na(cond), dp-1)
-		cgIsDecls(nb(cond), dp-1)
+	}
+	node := nodes.items[usize(e)]
+	for i := usize(0); i < MaxSlots; i++ {
+		slot, _ := layout(node.kind, i)
+		if slot == SlotNone {
+			break
+		}
+		if slot >= SlotL1 {
+			st, cnt := slotList(node, slot)
+			m := usize(cnt)
+			for j := usize(0); j < m; j++ {
+				cgHoistExpr(listAt(st, j), dp-1)
+			}
+		} else {
+			cgHoistExpr(slotChild(node, slot), dp-1)
+		}
 	}
 }

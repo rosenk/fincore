@@ -446,6 +446,7 @@ func (f *fnCtx) patTest(p ast.Pattern, s subject) (cond string, compound bool) {
 
 // patBinding is a variable bound by a pattern: Go name and type.
 type patBinding struct {
+	sym  *resolve.Symbol
 	name string
 	typ  types.Type
 }
@@ -463,7 +464,7 @@ func (f *fnCtx) patBindings(p ast.Pattern, t types.Type, region ast.Node, out *[
 		f.patBindings(p.Alts[0], t, region, out)
 	case *ast.Ident:
 		if sym := f.g.p.Prog.Defs[p.ID()]; sym != nil && f.bindUsed(sym, region) {
-			*out = append(*out, patBinding{name: f.g.p.Name(sym), typ: t})
+			*out = append(*out, patBinding{sym: sym, name: f.g.p.Name(sym), typ: t})
 		}
 	case *ast.CtorPattern:
 		v := f.g.info.VariantOf(p)
@@ -666,8 +667,8 @@ func (f *fnCtx) guardCond(a *ast.MatchArm, s subject) string {
 	return out
 }
 
-// isExpr renders `X is P` (v0.2). Its bindings (only in if conditions)
-// are declared before the if statement (isDecls) and assigned here.
+// isExpr renders `X is P` (v0.2). Its bindings that are read are
+// declared before the statement (hoistIs) and assigned here.
 func (f *fnCtx) isExpr(e *ast.IsExpr) string {
 	t := f.typeOf(e.X)
 	var bs []patBinding
@@ -742,21 +743,72 @@ func (f *fnCtx) bindUsed(sym *resolve.Symbol, region ast.Node) bool {
 	return f.g.p.UsedIn(region, sym)
 }
 
-// isDecls declares the variables bound by the `is` expressions of an if
-// condition (v0.2) that are read: `var x T`.
-func (f *fnCtx) isDecls(cond ast.Expr) []string {
-	var out []string
-	switch e := cond.(type) {
-	case *ast.IsExpr:
-		var bs []patBinding
-		f.patBindings(e.Pattern, f.typeOf(e.X), nil, &bs)
-		for _, b := range bs {
-			out = append(out, "var "+b.name+" "+f.goType(e, b.typ))
-		}
-	case *ast.BinaryExpr:
-		if e.Op == ast.OpLAnd {
-			out = append(f.isDecls(e.X), f.isDecls(e.Y)...)
+// hoistIs declares, before statement s, the variables bound by the `is`
+// expressions of s that are read anywhere (v0.2 flow bindings): `var
+// _fc_tN_x T`, in source order. Each gets a fresh temporary name, so the
+// declarations can neither clash with nor shadow other variables; the
+// is test assigns them (isExpr). The expressions of s are those outside
+// its nested blocks and function literals, including the conditions of
+// an else-if chain and a for statement's init, condition and post.
+func (f *fnCtx) hoistIs(s ast.Stmt) {
+	var exprs []ast.Expr
+	var parts func(s ast.Stmt)
+	parts = func(s ast.Stmt) {
+		switch s := s.(type) {
+		case *ast.DeclStmt:
+			if d, ok := s.Decl.(*ast.VarDecl); ok {
+				exprs = append(exprs, d.Value)
+			}
+		case *ast.ShortVarDecl:
+			exprs = append(exprs, s.Values...)
+		case *ast.AssignStmt:
+			exprs = append(append(exprs, s.LHS...), s.RHS...)
+		case *ast.IncDecStmt:
+			exprs = append(exprs, s.X)
+		case *ast.ExprStmt:
+			exprs = append(exprs, s.X)
+		case *ast.DeferStmt:
+			exprs = append(exprs, s.X)
+		case *ast.ReturnStmt:
+			exprs = append(exprs, s.Results...)
+		case *ast.IfStmt:
+			parts(s.Init)
+			exprs = append(exprs, s.Cond)
+			if e, ok := s.Else.(*ast.IfStmt); ok {
+				parts(e)
+			}
+		case *ast.ForStmt:
+			parts(s.Init)
+			exprs = append(exprs, s.Cond)
+			parts(s.Post)
+		case *ast.MatchStmt:
+			exprs = append(exprs, s.X)
+			for _, a := range s.Arms {
+				exprs = append(exprs, a.Guard, a.Expr)
+			}
+		case *ast.ScopeStmt:
+			exprs = append(exprs, s.Value)
 		}
 	}
-	return out
+	parts(s)
+	for _, e := range exprs {
+		if e == nil {
+			continue
+		}
+		ast.Inspect(e, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.FuncLit:
+				return false
+			case *ast.IsExpr:
+				var bs []patBinding
+				f.patBindings(n.Pattern, f.typeOf(n.X), nil, &bs)
+				for _, b := range bs {
+					name := f.newTemp() + "_" + b.sym.Name
+					f.g.p.SetName(b.sym, name)
+					f.line("var %s %s", name, f.goType(n, b.typ))
+				}
+			}
+			return true
+		})
+	}
 }

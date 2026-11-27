@@ -340,6 +340,12 @@ func cgWSymName(s u32) {
 		cgW("_")
 		return
 	}
+	if t := cgSymTmp[usize(s)]; t != 0 {
+		cgWtemp(t - 1)
+		cgWc('_')
+		cgWb(nm)
+		return
+	}
 	k := symKind(s)
 	if k == SymTypeParam {
 		cgWGoIdent(nm)

@@ -9,6 +9,60 @@ import (
 func (c *Checker) stmtList(list []ast.Stmt) {
 	for _, s := range list {
 		c.stmt(s)
+		if is, ok := s.(*ast.IfStmt); ok && is.Else == nil && !c.terminatingList(is.Then.Stmts, true) {
+			// v0.2 let-else: the resolver declared the false-outcome
+			// bindings after the if; they are bound there only if the
+			// then block cannot complete normally.
+			var syms []*resolve.Symbol
+			c.outcome(is.Cond, false, &syms)
+			for _, sym := range syms {
+				if c.unbound == nil {
+					c.unbound = map[*resolve.Symbol]bool{}
+				}
+				c.unbound[sym] = true
+			}
+		}
+	}
+}
+
+// outcome appends the variables bound by the `is` tests of e that are
+// definitely matched when e evaluates to want (v0.2 flow bindings; the
+// resolver's outcome sets): `!` swaps the outcomes, `A && B` has the true
+// bindings of both operands, `A || B` the false bindings of both,
+// parentheses are transparent and every other expression has none.
+func (c *Checker) outcome(e ast.Expr, want bool, out *[]*resolve.Symbol) {
+	switch e := e.(type) {
+	case *ast.ParenExpr:
+		c.outcome(e.X, want, out)
+	case *ast.UnaryExpr:
+		if e.Op == ast.OpNot {
+			c.outcome(e.X, !want, out)
+		}
+	case *ast.IsExpr:
+		if !want {
+			return
+		}
+		walkPattern(e.Pattern, func(q ast.Pattern) {
+			id, ok := q.(*ast.Ident)
+			if !ok {
+				return
+			}
+			sym := c.prog.Defs[id.ID()]
+			if sym == nil {
+				return
+			}
+			for _, o := range *out {
+				if o == sym {
+					return
+				}
+			}
+			*out = append(*out, sym)
+		})
+	case *ast.BinaryExpr:
+		if (e.Op == ast.OpLAnd && want) || (e.Op == ast.OpLOr && !want) {
+			c.outcome(e.X, want, out)
+			c.outcome(e.Y, want, out)
+		}
 	}
 }
 
@@ -369,23 +423,36 @@ func (c *Checker) returnStmt(s *ast.ReturnStmt) {
 // Terminating statements (Go spec rules, adapted)
 
 func (c *Checker) isTerminatingList(list []ast.Stmt) bool {
-	return len(list) > 0 && c.isTerminating(list[len(list)-1])
+	return c.terminatingList(list, false)
 }
 
 func (c *Checker) isTerminating(s ast.Stmt) bool {
+	return c.terminating(s, false)
+}
+
+// terminatingList and terminating implement the terminating statements;
+// with jumps, break and continue terminate too (v0.2: the then block of
+// a let-else must not complete normally).
+func (c *Checker) terminatingList(list []ast.Stmt, jumps bool) bool {
+	return len(list) > 0 && c.terminating(list[len(list)-1], jumps)
+}
+
+func (c *Checker) terminating(s ast.Stmt, jumps bool) bool {
 	switch s := s.(type) {
+	case *ast.BreakStmt, *ast.ContinueStmt:
+		return jumps
 	case *ast.ReturnStmt:
 		return true
 	case *ast.ExprStmt:
 		return c.isPanicCall(s.X)
 	case *ast.BlockStmt:
-		return c.isTerminatingList(s.Stmts)
+		return c.terminatingList(s.Stmts, jumps)
 	case *ast.IfStmt:
-		return s.Else != nil && c.isTerminatingList(s.Then.Stmts) && c.isTerminating(s.Else)
+		return s.Else != nil && c.terminatingList(s.Then.Stmts, jumps) && c.terminating(s.Else, jumps)
 	case *ast.ForStmt:
 		return s.Cond == nil && !hasBreak(s.Body.Stmts)
 	case *ast.ScopeStmt:
-		return c.isTerminatingList(s.Body.Stmts)
+		return c.terminatingList(s.Body.Stmts, jumps)
 	case *ast.MatchStmt:
 		// v0.2: a match is a terminating statement if it is exhaustive
 		// (see Info.Exhaustive) and all its arms terminate.
@@ -393,7 +460,7 @@ func (c *Checker) isTerminating(s ast.Stmt) bool {
 			if arm.Expr != nil && !c.isPanicCall(arm.Expr) {
 				return false
 			}
-			if arm.Block != nil && !c.isTerminatingList(arm.Block.Stmts) {
+			if arm.Block != nil && !c.terminatingList(arm.Block.Stmts, jumps) {
 				return false
 			}
 		}

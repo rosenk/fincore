@@ -412,6 +412,10 @@ func (b *binder) bindExpr(e ast.Expr) {
 		b.ident(e)
 	case *ast.BasicLit, *ast.BoolLit, *ast.NilLit:
 	case *ast.BinaryExpr:
+		if e.Op == ast.OpLAnd || e.Op == ast.OpLOr {
+			b.flow(e) // v0.2: `is` bindings flow into the right operand
+			return
+		}
 		b.bindExpr(e.X)
 		b.bindExpr(e.Y)
 	case *ast.UnaryExpr:
@@ -465,8 +469,7 @@ func (b *binder) bindExpr(e ast.Expr) {
 			b.bindExpr(x)
 		}
 	case *ast.IsExpr:
-		b.bindExpr(e.X)
-		b.patternNames(e.Pattern, false)
+		b.flow(e)
 	}
 }
 
@@ -493,6 +496,10 @@ func (b *binder) openScope(n ast.Node) func() {
 
 func (b *binder) stmts(list []ast.Stmt) {
 	for _, s := range list {
+		if is, ok := s.(*ast.IfStmt); ok {
+			b.ifStmt(is, true)
+			continue
+		}
 		b.stmt(s)
 	}
 }
@@ -563,29 +570,19 @@ func (b *binder) stmt(s ast.Stmt) {
 			b.bindExpr(r)
 		}
 	case *ast.IfStmt:
-		defer b.openScope(s)()
-		b.stmt(s.Init)
-		if condWithBindings(s.Cond) {
-			// v0.2: `is` bindings are visible in later conjuncts and the
-			// then block, not in the else branch.
-			closeCond := b.openScope(s.Cond)
-			b.bindCond(s.Cond)
-			b.block(s.Then)
-			closeCond()
-		} else {
-			b.bindExpr(s.Cond)
-			b.block(s.Then)
-		}
-		b.stmt(s.Else)
+		b.ifStmt(s, false)
 	case *ast.ForStmt:
 		defer b.openScope(s)()
 		b.stmt(s.Init)
-		b.bindExpr(s.Cond)
+		t, _ := b.flow(s.Cond)
 		b.stmt(s.Post)
 		if s.Decreases != nil {
 			b.bindExpr(s.Decreases.Measure)
 		}
+		// v0.2: the condition's true-outcome bindings are visible in the body.
+		closeT := b.visible(t)
 		b.block(s.Body)
+		closeT()
 	case *ast.MatchStmt:
 		b.bindExpr(s.X)
 		for _, arm := range s.Arms {
@@ -603,7 +600,9 @@ func (b *binder) stmt(s ast.Stmt) {
 func (b *binder) matchArm(arm *ast.MatchArm) {
 	defer b.openScope(arm)()
 	b.patternNames(arm.Pattern, true)
-	b.bindExpr(arm.Guard)
+	// v0.2: the guard's true-outcome bindings are visible in the body.
+	t, _ := b.flow(arm.Guard)
+	defer b.visible(t)()
 	if arm.Expr != nil {
 		b.bindExpr(arm.Expr)
 	}
@@ -653,34 +652,119 @@ func (b *binder) patternNames(p ast.Pattern, declare bool) {
 	walk(p, false)
 }
 
-// condWithBindings reports whether an if condition has an `is` expression
-// in a binding position (the condition itself or a conjunct of its
-// top-level && chain).
-func condWithBindings(e ast.Expr) bool {
-	switch e := e.(type) {
-	case *ast.IsExpr:
-		return true
-	case *ast.BinaryExpr:
-		return e.Op == ast.OpLAnd && (condWithBindings(e.X) || condWithBindings(e.Y))
+// ifStmt binds an if statement (v0.2 `is` flow bindings): the bindings of
+// the condition's true outcome are visible in the then block, those of its
+// false outcome in the else branch. If the if statement is directly in a
+// statement list (inList) and has no else branch, the false-outcome
+// bindings are declared in the enclosing block after it, like a `:=` at
+// the if statement (let-else; the type checker requires the then block
+// to terminate where they are used).
+func (b *binder) ifStmt(s *ast.IfStmt, inList bool) {
+	outer := b.scope
+	b.scope = NewScope(outer, ScopeBlock, s)
+	b.stmt(s.Init)
+	t, f := b.flow(s.Cond)
+	closeT := b.visible(t)
+	b.block(s.Then)
+	closeT()
+	closeF := b.visible(f)
+	b.stmt(s.Else)
+	closeF()
+	b.scope = outer
+	if inList && s.Else == nil {
+		for _, sym := range f {
+			if old := b.scope.Insert(sym); old != nil {
+				b.errorf(diag.E2001, sym.Ident.Range, "%s redeclared in this block", sym.Name)
+			}
+		}
 	}
-	return false
 }
 
-// bindCond binds an if condition; `is` expressions in binding positions
-// declare their bindings in the current scope, visible to later conjuncts
-// and the then block (v0.2).
-func (b *binder) bindCond(e ast.Expr) {
+// flow binds a boolean expression and returns its outcome sets (v0.2):
+// the variables bound by `is` tests that are definitely matched when e is
+// true (t) and when e is false (f), in source order.
+//
+//	e is P      t = bindings of P, f = {}
+//	!A          t = f(A), f = t(A)
+//	A && B      t = t(A) + t(B), f = {}; t(A) is visible in B
+//	A || B      t = {}, f = f(A) + f(B); f(A) is visible in B
+//	(A)         those of A
+//	otherwise   {}, {}
+//
+// The symbols of an `is` pattern are created in a scope of their own and
+// become visible only where flow makes them visible. A name in both
+// operand sets of a union is E2001.
+func (b *binder) flow(e ast.Expr) (t, f []*Symbol) {
 	switch e := e.(type) {
+	case *ast.ParenExpr:
+		return b.flow(e.X)
+	case *ast.UnaryExpr:
+		if e.Op == ast.OpNot {
+			t, f = b.flow(e.X)
+			return f, t
+		}
 	case *ast.IsExpr:
 		b.bindExpr(e.X)
+		outer := b.scope
+		b.scope = NewScope(outer, ScopeBlock, e)
 		b.patternNames(e.Pattern, true)
-		return
+		t = b.scope.Syms
+		b.scope = outer
+		return t, nil
 	case *ast.BinaryExpr:
-		if e.Op == ast.OpLAnd {
-			b.bindCond(e.X)
-			b.bindCond(e.Y)
-			return
+		if e.Op == ast.OpLAnd || e.Op == ast.OpLOr {
+			ta, fa := b.flow(e.X)
+			vis := ta
+			if e.Op == ast.OpLOr {
+				vis = fa
+			}
+			closeV := b.visible(vis)
+			tb, fb := b.flow(e.Y)
+			closeV()
+			if e.Op == ast.OpLAnd {
+				return b.union(ta, tb), nil
+			}
+			return nil, b.union(fa, fb)
 		}
 	}
 	b.bindExpr(e)
+	return nil, nil
+}
+
+// visible opens a scope holding syms (none if empty) and returns its
+// closer.
+func (b *binder) visible(syms []*Symbol) func() {
+	if len(syms) == 0 {
+		return func() {}
+	}
+	outer := b.scope
+	b.scope = NewScope(outer, ScopeBlock, nil)
+	for _, sym := range syms {
+		b.scope.Insert(sym)
+	}
+	return func() { b.scope = outer }
+}
+
+// union returns x followed by the symbols of y; a name of y already in x
+// is E2001 (one outcome set binds it twice) and is dropped.
+func (b *binder) union(x, y []*Symbol) []*Symbol {
+	if len(y) == 0 {
+		return x
+	}
+	out := append([]*Symbol(nil), x...)
+	for _, sym := range y {
+		dup := false
+		for _, o := range x {
+			if o.Name == sym.Name {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			b.errorf(diag.E2001, sym.Ident.Range, "%s redeclared in this condition", sym.Name)
+			continue
+		}
+		out = append(out, sym)
+	}
+	return out
 }

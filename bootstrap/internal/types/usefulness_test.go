@@ -450,7 +450,7 @@ func f(v Val) u32 {
 	}
 }
 `, []string{"E2002@3: variable x is bound more than once in a pattern"}},
-		{"is binding outside if", `package main
+		{"is binding in a return chain", `package main
 type Shape enum {
 	Circle(u32)
 	Rect(u32, u32)
@@ -468,8 +468,8 @@ type Val enum {
 func f(v Val) bool {
 	return v is Int(a, _) && a > 0
 }
-`, []string{"E2001@2: undefined: a"}},
-		{"is binding unused outside if", `package main
+`, nil}, // v0.2 flow bindings (decision 110)
+		{"is binding never used", `package main
 type Shape enum {
 	Circle(u32)
 	Rect(u32, u32)
@@ -487,7 +487,7 @@ type Val enum {
 func f(v Val) bool {
 	return v is Int(a, _)
 }
-`, []string{"E2002@2: cannot bind a: an 'is' pattern can bind variables only in the condition of an if statement"}},
+`, nil},
 		{"is binding in if", `package main
 type Shape enum {
 	Circle(u32)

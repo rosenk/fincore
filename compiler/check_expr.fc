@@ -69,6 +69,10 @@ func expr0(e u32, dp usize) Operand decreases(dp) {
 			if sym == 0 {
 				return invalidOp(e)
 			}
+			if chkUnbound[usize(sym)] {
+				errAt(E2002, e, formatTo(mbuf[:], "cannot use %v: the then block of the if statement that binds it can complete normally", NameRef(idName(e))))
+				return invalidOp(e)
+			}
 			return symOperand(sym, e, dp-1)
 		}
 		NkBasicLit -> {

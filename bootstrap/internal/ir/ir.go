@@ -372,6 +372,15 @@ func (p *Program) Name(s *resolve.Symbol) string {
 	return n
 }
 
+// SetName sets the Go identifier of a local symbol (v0.2: the variables
+// of `is` bindings are renamed to unique temporaries where they are
+// declared, before any use is rendered).
+func (p *Program) SetName(s *resolve.Symbol, name string) {
+	if s != nil && s.ID != 0 && int(s.ID) < len(p.names) {
+		p.names[s.ID] = name
+	}
+}
+
 var goReserved = map[string]bool{}
 
 func init() {

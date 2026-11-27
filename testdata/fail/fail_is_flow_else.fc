@@ -1,0 +1,21 @@
+// fail_is_flow_else (v0.2): the bindings of a positive `is` test are in
+// scope in the then block only, not in the else branch.
+package main
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+func f(o Option[u32]) u32 {
+	if o is Some(x) {
+		return x
+	} else {
+		return x + 1 // ERROR E2001
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(Option[u32].None)
+	return nil
+}

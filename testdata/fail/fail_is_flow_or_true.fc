@@ -1,0 +1,20 @@
+// fail_is_flow_or_true (v0.2): `A || B` has no true-outcome bindings, so
+// a binding of A is not in scope where the whole disjunction is true.
+package main
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+func f(a Option[u32], b Option[u32]) u32 {
+	if a is Some(x) || b is None {
+		return x // ERROR E2001
+	}
+	return 0
+}
+
+driver func main(io Stdio) error {
+	_ = f(Option[u32].None, Option[u32].None)
+	return nil
+}

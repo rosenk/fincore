@@ -66,6 +66,10 @@ type Checker struct {
 	fn       *FuncInfo
 	loops    int // enclosing for loops in the current function
 	constCtx int // >0 while checking an expression that must be constant
+
+	// unbound holds the let-else bindings (v0.2) of if statements whose
+	// then block can complete normally; using one is E2002.
+	unbound map[*resolve.Symbol]bool
 }
 
 // Check type-checks prog and returns the typed model and diagnostics

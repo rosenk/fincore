@@ -355,6 +355,10 @@ func (c *Checker) ident(e *ast.Ident) operand {
 	if sym == nil {
 		return invalidOp(e) // reported by the resolver
 	}
+	if c.unbound[sym] {
+		c.errorf(diag.E2002, e.Range, "cannot use %s: the then block of the if statement that binds it can complete normally", e.Name)
+		return invalidOp(e)
+	}
 	return c.symOperand(sym, e)
 }
 

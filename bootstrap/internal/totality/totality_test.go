@@ -803,6 +803,9 @@ func TestCorpus(t *testing.T) {
 	for _, in := range ins {
 		t.Run(in, func(t *testing.T) {
 			prog, diags, err := resolve.Load(in, resolve.Options{})
+			if err == nil && len(diags) > 0 && strings.HasPrefix(in, "testdata/fail/") {
+				return // a resolver fail test
+			}
 			if err != nil || len(diags) > 0 {
 				t.Fatalf("load: %v %v", err, diags)
 			}
