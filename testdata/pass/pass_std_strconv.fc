@@ -1,0 +1,184 @@
+// pass_std_strconv: std/strconv — FormatUint/FormatInt in several bases
+// (extremes, too-small dst, bad base), ParseUint/ParseInt (prefixes,
+// underscores, overflow, signs, bad digits) and Quote (FinCore escapes).
+package main
+
+import (
+	"std/bytes"
+	"std/strconv"
+)
+
+var out bytes.Builder[4096]
+
+func fmtU(v u64, base u32) {
+	var buf [strconv.MaxUintLen]byte
+	n := strconv.FormatUint(buf[:], v, base)
+	o := &out
+	o.WriteString("FormatUint(")
+	o.WriteUint(v)
+	o.WriteString(", ")
+	o.WriteUint(u64(base))
+	o.WriteString(") = ")
+	o.WriteBytes(buf[:n])
+	o.WriteByte('\n')
+}
+
+func fmtI(v i64, base u32) {
+	var buf [strconv.MaxIntLen]byte
+	n := strconv.FormatInt(buf[:], v, base)
+	o := &out
+	o.WriteString("FormatInt(")
+	o.WriteInt(v)
+	o.WriteString(", ")
+	o.WriteUint(u64(base))
+	o.WriteString(") = ")
+	o.WriteBytes(buf[:n])
+	o.WriteByte('\n')
+}
+
+func parseU(s string, base u32) {
+	v, ok := strconv.ParseUint(strBytes(s), base)
+	o := &out
+	o.WriteString("ParseUint(\"")
+	o.WriteString(s)
+	o.WriteString("\", ")
+	o.WriteUint(u64(base))
+	o.WriteString(") = ")
+	if ok {
+		o.WriteUint(v)
+	} else {
+		o.WriteString("invalid")
+	}
+	o.WriteByte('\n')
+}
+
+func parseI(s string, base u32) {
+	v, ok := strconv.ParseInt(strBytes(s), base)
+	o := &out
+	o.WriteString("ParseInt(\"")
+	o.WriteString(s)
+	o.WriteString("\", ")
+	o.WriteUint(u64(base))
+	o.WriteString(") = ")
+	if ok {
+		o.WriteInt(v)
+	} else {
+		o.WriteString("invalid")
+	}
+	o.WriteByte('\n')
+}
+
+func quote(s []byte) {
+	var buf [128]byte
+	n := strconv.Quote(buf[:], s)
+	o := &out
+	o.WriteString("Quote = ")
+	o.WriteBytes(buf[:n])
+	o.WriteString(" (len ")
+	o.WriteUint(u64(strconv.QuotedLen(s)))
+	o.WriteString(")\n")
+}
+
+func run() {
+	fmtU(0, 10)
+	fmtU(1234567890, 10)
+	fmtU(255, 16)
+	fmtU(255, 2)
+	fmtU(35, 36)
+	fmtU(18_446_744_073_709_551_615, 10)
+	fmtU(18_446_744_073_709_551_615, 2)
+	fmtU(18_446_744_073_709_551_615, 16)
+	fmtU(7, 1)
+	fmtU(7, 37)
+	fmtI(0, 10)
+	fmtI(-1, 10)
+	fmtI(-255, 16)
+	fmtI(9_223_372_036_854_775_807, 10)
+	fmtI(-9_223_372_036_854_775_807-1, 10)
+	fmtI(-9_223_372_036_854_775_807-1, 2)
+
+	var small [3]byte
+	o := &out
+	o.WriteString("small dst: ")
+	o.WriteUint(u64(strconv.FormatUint(small[:], 999, 10)))
+	o.WriteByte(' ')
+	o.WriteUint(u64(strconv.FormatUint(small[:], 1000, 10)))
+	o.WriteByte(' ')
+	o.WriteUint(u64(strconv.FormatInt(small[:], -99, 10)))
+	o.WriteByte(' ')
+	o.WriteUint(u64(strconv.FormatInt(small[:], -100, 10)))
+	o.WriteByte('\n')
+	var ab [8]byte
+	at := strconv.AppendUint(ab[:], 0, 12)
+	at = strconv.AppendUint(ab[:], at, 345)
+	at = strconv.AppendUint(ab[:], at, 6789) // does not fit: unchanged
+	o.WriteString("AppendUint: ")
+	o.WriteBytes(ab[:at])
+	o.WriteByte('\n')
+
+	parseU("0", 10)
+	parseU("12345", 10)
+	parseU("18446744073709551615", 10)
+	parseU("18446744073709551616", 10)
+	parseU("99999999999999999999", 10)
+	parseU("ff", 16)
+	parseU("FF", 16)
+	parseU("fg", 16)
+	parseU("1010", 2)
+	parseU("z", 36)
+	parseU("", 10)
+	parseU("12", 1)
+	parseU("12", 37)
+	parseU("-1", 10)
+	parseU("0x1F", 0)
+	parseU("0X_1f", 0)
+	parseU("0b1010", 0)
+	parseU("0o17", 0)
+	parseU("017", 0)
+	parseU("1_000_000", 0)
+	parseU("1_000_000", 10)
+	parseU("1__0", 0)
+	parseU("_1", 0)
+	parseU("1_", 0)
+	parseU("0x", 0)
+	parseU("0x_", 0)
+	parseU("0xFFFFFFFFFFFFFFFF", 0)
+	parseU("0x10000000000000000", 0)
+	parseI("0", 10)
+	parseI("-42", 10)
+	parseI("+42", 10)
+	parseI("9223372036854775807", 10)
+	parseI("9223372036854775808", 10)
+	parseI("-9223372036854775808", 10)
+	parseI("-9223372036854775809", 10)
+	parseI("-0x10", 0)
+	parseI("-", 10)
+	parseI("", 10)
+
+	quote(strBytes(""))
+	quote(strBytes("plain text"))
+	quote(strBytes("tab\there\nnew \"q\" back\\slash\r"))
+	var raw [6]byte
+	raw[0] = 0
+	raw[1] = 0x1f
+	raw[2] = 'A'
+	raw[3] = 0x7f
+	raw[4] = 0x80
+	raw[5] = 0xff
+	quote(raw[:])
+	o.WriteString("Quote small dst: ")
+	o.WriteUint(u64(strconv.Quote(small[:], strBytes("ab"))))
+	o.WriteByte(' ')
+	var four [4]byte
+	o.WriteUint(u64(strconv.Quote(four[:], strBytes("ab"))))
+	o.WriteByte('\n')
+}
+
+driver func main(io Stdio) error {
+	run()
+	op := &out
+	if op.Truncated() {
+		return ErrArenaFull
+	}
+	return io.WriteStdout(op.Bytes())
+}

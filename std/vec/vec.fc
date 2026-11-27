@@ -1,0 +1,259 @@
+// Package vec provides bounded, allocation-free sequence containers:
+//
+//   - Vec[N, T]: a fixed-capacity vector (at most N elements of type T);
+//   - ListArena[NI, NS, T]: a flat store of variable-length runs ("lists")
+//     built on a LIFO scratch stack and committed in one piece.
+//
+// Every function is total and never panics. Operations that do not fit
+// report it in their result (Push returns false) instead of growing.
+// Containers are Value structs: declare them as package-level `var`s or
+// locals and call the methods through a pointer (`vp := &v; vp.Push(x)`,
+// decision 10).
+package vec
+
+// Vec is a vector of at most N elements of type T stored inline.
+// The zero value is an empty vector.
+type Vec[N usize, T any] struct {
+	data [N]T
+	n    usize
+}
+
+// Push appends x. It returns false (and leaves v unchanged) when v is full.
+// O(1).
+func (v *Vec[N, T]) Push(x T) bool {
+	if v.n >= N {
+		return false
+	}
+	v.data[v.n] = x
+	v.n++
+	return true
+}
+
+// Pop removes and returns the last element; ok is false when v is empty
+// (the zero T is returned). O(1).
+func (v *Vec[N, T]) Pop() (T, bool) {
+	var z T
+	if v.n == 0 {
+		return z, false
+	}
+	v.n--
+	x := v.data[v.n]
+	v.data[v.n] = z
+	return x, true
+}
+
+// Len returns the number of elements. O(1).
+func (v *Vec[N, T]) Len() usize {
+	return v.n
+}
+
+// Cap returns the capacity N. O(1).
+func (v *Vec[N, T]) Cap() usize {
+	return N
+}
+
+// Full reports whether Len() == Cap(). O(1).
+func (v *Vec[N, T]) Full() bool {
+	return v.n >= N
+}
+
+// At returns element i; ok is false (zero T) when i >= Len(). O(1).
+func (v *Vec[N, T]) At(i usize) (T, bool) {
+	var z T
+	if i >= v.n {
+		return z, false
+	}
+	return v.data[i], true
+}
+
+// Set replaces element i; it returns false when i >= Len(). O(1).
+func (v *Vec[N, T]) Set(i usize, x T) bool {
+	if i >= v.n {
+		return false
+	}
+	v.data[i] = x
+	return true
+}
+
+// Last returns the last element; ok is false (zero T) when v is empty.
+// O(1).
+func (v *Vec[N, T]) Last() (T, bool) {
+	var z T
+	if v.n == 0 {
+		return z, false
+	}
+	return v.data[v.n-1], true
+}
+
+// Slice returns the elements as a slice that aliases v's storage. It stays
+// valid until v is modified. O(1).
+func (v *Vec[N, T]) Slice() []T {
+	return v.data[:v.n]
+}
+
+// Truncate shrinks v to n elements (no-op when n >= Len()). Removed slots
+// are reset to the zero T. O(Len() - n).
+func (v *Vec[N, T]) Truncate(n usize) {
+	if n >= v.n {
+		return
+	}
+	var z T
+	top := v.n
+	for i := n; i < top; i++ {
+		v.data[i] = z
+	}
+	v.n = n
+}
+
+// Reset empties v. O(Len()).
+func (v *Vec[N, T]) Reset() {
+	v.Truncate(0)
+}
+
+// ---------------------------------------------------------------------------
+// ListArena
+
+// ListArena stores variable-length runs of T back to back in a store of
+// NI items and builds them on a LIFO scratch stack of NS items:
+//
+//	mark := la.Mark()
+//	la.Push(a)
+//	la.Push(b)
+//	start, n := la.Commit(mark) // run [start, start+n) of the store
+//	xs := la.Run(start, n)
+//
+// Runs under construction may nest (a run can be started and committed
+// while an outer one is being pushed) as long as marks are committed in
+// LIFO order. An empty run is (0, 0); store slot 0 is reserved, so a
+// non-empty run never starts at 0 and a start of 0 always means "empty".
+//
+// Overflow is sticky: a Push on a full stack or a Commit that does not fit
+// sets Full() and drops the data (Commit then returns (0, 0)), so callers
+// can check once at the end, the way the compiler/ arenas do.
+type ListArena[NI usize, NS usize, T any] struct {
+	items [NI]T
+	nitem usize
+	stack [NS]T
+	top   usize
+	full  bool
+}
+
+// Push pushes x onto the scratch stack. O(1).
+func (la *ListArena[NI, NS, T]) Push(x T) {
+	if la.top >= NS {
+		la.full = true
+		return
+	}
+	la.stack[la.top] = x
+	la.top++
+}
+
+// Mark returns the current scratch stack height (the start of a new run).
+// O(1).
+func (la *ListArena[NI, NS, T]) Mark() usize {
+	return la.top
+}
+
+// Pending returns the part of the scratch stack above mark (the run being
+// built) as a slice aliasing the stack. O(1).
+func (la *ListArena[NI, NS, T]) Pending(mark usize) []T {
+	if mark >= la.top {
+		return la.stack[0:0]
+	}
+	return la.stack[mark:la.top]
+}
+
+// Discard pops the scratch stack back to mark without storing anything.
+// O(1).
+func (la *ListArena[NI, NS, T]) Discard(mark usize) {
+	if mark < la.top {
+		la.top = mark
+	}
+}
+
+// Commit moves stack[mark:] into the store, pops it and returns the run
+// (start, len). O(len).
+func (la *ListArena[NI, NS, T]) Commit(mark usize) (u32, u32) {
+	top := la.top
+	if mark >= top {
+		la.Discard(mark)
+		return 0, 0
+	}
+	s, n := la.Store(la.stack[mark:top])
+	la.top = mark
+	return s, n
+}
+
+// Store copies xs into the store as a new run and returns (start, len):
+// (0, 0) for an empty xs or when it does not fit (sets Full).
+// O(len(xs)).
+func (la *ListArena[NI, NS, T]) Store(xs []T) (u32, u32) {
+	n := len(xs)
+	if n == 0 {
+		return 0, 0
+	}
+	if la.nitem == 0 {
+		la.nitem = 1
+	}
+	if n > NI || la.nitem > NI-n {
+		la.full = true
+		return 0, 0
+	}
+	st := la.nitem
+	k := copy(la.items[st:st+n], xs)
+	la.nitem = st + k
+	return u32(st), u32(n)
+}
+
+// Run returns the committed run (start, n) as a slice aliasing the store
+// (empty when out of range). O(1).
+func (la *ListArena[NI, NS, T]) Run(start u32, n u32) []T {
+	s := usize(start)
+	e := s + usize(n)
+	if e > la.nitem || s > e {
+		return la.items[0:0]
+	}
+	return la.items[s:e]
+}
+
+// At returns store slot i (zero T when out of range). O(1).
+func (la *ListArena[NI, NS, T]) At(i usize) T {
+	var z T
+	if i >= la.nitem {
+		return z
+	}
+	return la.items[i]
+}
+
+// Set replaces store slot i; it returns false when out of range. O(1).
+func (la *ListArena[NI, NS, T]) Set(i usize, x T) bool {
+	if i >= la.nitem {
+		return false
+	}
+	la.items[i] = x
+	return true
+}
+
+// Used returns the number of store slots in use (including the reserved
+// slot 0 once anything was stored). O(1).
+func (la *ListArena[NI, NS, T]) Used() usize {
+	return la.nitem
+}
+
+// Depth returns the scratch stack height. O(1).
+func (la *ListArena[NI, NS, T]) Depth() usize {
+	return la.top
+}
+
+// Full reports whether any Push or Commit overflowed (sticky). O(1).
+func (la *ListArena[NI, NS, T]) Full() bool {
+	return la.full
+}
+
+// Reset empties the store and the stack and clears Full. Stored items are
+// not zeroed. O(1).
+func (la *ListArena[NI, NS, T]) Reset() {
+	la.nitem = 0
+	la.top = 0
+	la.full = false
+}

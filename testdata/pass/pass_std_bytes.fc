@@ -1,0 +1,130 @@
+// pass_std_bytes: std/bytes — searching, comparing, trimming, counting,
+// and Builder (all-or-nothing writes, sticky truncation, integers).
+package main
+
+import "std/bytes"
+
+var out bytes.Builder[2048]
+
+func b(s string) []byte {
+	return strBytes(s)
+}
+
+func line(label string, v int) {
+	o := &out
+	o.WriteString(label)
+	o.WriteString(": ")
+	o.WriteInt(i64(v))
+	o.WriteByte('\n')
+}
+
+func flag(label string, v bool) {
+	o := &out
+	o.WriteString(label)
+	if v {
+		o.WriteString(": true\n")
+	} else {
+		o.WriteString(": false\n")
+	}
+}
+
+func quoted(label string, v []byte) {
+	o := &out
+	o.WriteString(label)
+	o.WriteString(": [")
+	o.WriteBytes(v)
+	o.WriteString("]\n")
+}
+
+func run() {
+	flag("HasPrefix", bytes.HasPrefix(b("std/vec"), b("std/")))
+	flag("HasPrefix longer", bytes.HasPrefix(b("st"), b("std")))
+	flag("HasPrefix empty", bytes.HasPrefix(b(""), b("")))
+	flag("HasSuffix", bytes.HasSuffix(b("main.fc"), b(".fc")))
+	flag("HasSuffix no", bytes.HasSuffix(b("main.go"), b(".fc")))
+	line("Index", bytes.Index(b("chicken"), b("ken")))
+	line("Index absent", bytes.Index(b("chicken"), b("dmr")))
+	line("Index empty sep", bytes.Index(b("abc"), b("")))
+	line("Index sep longer", bytes.Index(b("ab"), b("abc")))
+	line("Index at end", bytes.Index(b("aab"), b("ab")))
+	line("IndexByte", bytes.IndexByte(b("golang"), 'l'))
+	line("IndexByte absent", bytes.IndexByte(b("golang"), 'x'))
+	line("LastIndexByte", bytes.LastIndexByte(b("go gopher"), 'o'))
+	line("LastIndexByte absent", bytes.LastIndexByte(b(""), 'o'))
+	flag("Equal", bytes.Equal(b("abc"), b("abc")))
+	flag("Equal no", bytes.Equal(b("abc"), b("abd")))
+	line("Compare a<b", bytes.Compare(b("a"), b("b")))
+	line("Compare prefix", bytes.Compare(b("ab"), b("abc")))
+	line("Compare equal", bytes.Compare(b("abc"), b("abc")))
+	line("Compare greater", bytes.Compare(b("b"), b("abc")))
+	line("Compare empty", bytes.Compare(b(""), b("")))
+	quoted("TrimSpace", bytes.TrimSpace(b(" \t hello world\r\n ")))
+	quoted("TrimSpace all", bytes.TrimSpace(b(" \n\t ")))
+	quoted("TrimSpace none", bytes.TrimSpace(b("x")))
+	quoted("TrimPrefix", bytes.TrimPrefix(b("std/maps"), b("std/")))
+	quoted("TrimSuffix", bytes.TrimSuffix(b("a.fc"), b(".fc")))
+	quoted("TrimSuffix no", bytes.TrimSuffix(b("a.fc"), b(".go")))
+	line("Count", int(bytes.Count(b("cheese"), b("e"))))
+	line("Count overlap", int(bytes.Count(b("aaaa"), b("aa"))))
+	line("Count empty sep", int(bytes.Count(b("five"), b(""))))
+	line("Count none", int(bytes.Count(b("abc"), b("x"))))
+	flag("Contains", bytes.Contains(b("seafood"), b("foo")))
+
+	// Builder
+	var sb bytes.Builder[8]
+	p := &sb
+	p.WriteString("abc")
+	p.WriteUint(42)
+	p.WriteByte('!')
+	quoted("builder", p.Bytes())
+	flag("builder truncated", p.Truncated())
+	p.WriteString("xyz") // does not fit (6 + 3 > 8): dropped
+	quoted("builder after drop", p.Bytes())
+	flag("builder truncated", p.Truncated())
+	p.WriteString("xy") // fits exactly
+	quoted("builder full", p.Bytes())
+	line("builder len/cap", int(p.Len()*10+p.Cap()))
+	p.WriteByte('z')
+	quoted("builder still", p.Bytes())
+	p.Truncate(2)
+	quoted("builder truncate(2)", p.Bytes())
+	flag("builder truncated kept", p.Truncated())
+	p.Reset()
+	flag("builder reset truncated", p.Truncated())
+	p.WriteInt(-9_223_372_036_854_775_807 - 1)
+	flag("min int truncated", p.Truncated())
+	p.Reset()
+	p.WriteInt(-1234567)
+	quoted("WriteInt", p.Bytes())
+	p.Reset()
+	p.WriteInt(0)
+	p.WriteUint(0)
+	quoted("zeros", p.Bytes())
+	var wide bytes.Builder[64]
+	w := &wide
+	w.WriteInt(-9_223_372_036_854_775_807 - 1)
+	w.WriteByte(' ')
+	w.WriteUint(18_446_744_073_709_551_615)
+	quoted("extremes", w.Bytes())
+	w.Reset()
+	w.WriteRepeat('\t', 2)
+	w.WriteHex(0xBEEF, 4, true)
+	w.WriteRepeat(' ', 1)
+	w.WriteHex(0x1f, 4, false)
+	w.WriteRepeat('.', 0)
+	w.WriteHex(0xFFFF_FFFF_FFFF_FFFF, 16, false)
+	quoted("repeat/hex", w.Bytes())
+	w.WriteRepeat('x', 100)
+	w.WriteHex(1, 17, false)
+	flag("repeat/hex truncated", w.Truncated())
+	line("len after dropped writes", int(w.Len()))
+}
+
+driver func main(io Stdio) error {
+	run()
+	op := &out
+	if op.Truncated() {
+		return ErrArenaFull
+	}
+	return io.WriteStdout(op.Bytes())
+}

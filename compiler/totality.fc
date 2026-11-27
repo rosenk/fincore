@@ -704,6 +704,11 @@ func atomsOf(e u32, fnode u32, dp usize) bool decreases(dp) {
 		}
 		return false
 	}
+	if k == NkIdent && symKind(symbolOf(e)) == SymTypeParam {
+		// a const type parameter (`N` of `Vec[N usize, T any]`) is a
+		// constant of every instance
+		return true
+	}
 	if k == NkIdent || k == NkSelectorExpr {
 		return pathAtom(e, fnode)
 	}

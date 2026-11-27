@@ -28,6 +28,10 @@ var errBuf OutBuf
 var tmpBuf OutBuf
 var fileNames [MaxFiles]string
 
+// fincRoot is $FINCROOT (read once by main): the directory std/... imports
+// resolve against; "" means the module root.
+var fincRoot string
+
 func strEq(a string, b string) bool {
 	return bytesEqual(strBytes(a), strBytes(b))
 }
@@ -204,6 +208,9 @@ driver func capacityFail(io Stdio, path string, what string) error {
 
 driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	eb := &errBuf
+	if r, ok := env.GetEnv("FINCROOT"); ok {
+		fincRoot = r
+	}
 	argc := env.ArgsCount()
 	if argc < 2 {
 		if err := usage(io, true); err != nil {
@@ -841,6 +848,15 @@ func validImportPath(ip []byte) bool {
 	return k == n && bytesEqual(cb[:k], ip)
 }
 
+// isStdImport reports whether ip is "std" or starts with "std/".
+func isStdImport(ip []byte) bool {
+	n := len(ip)
+	if n < 3 || ip[0] != 's' || ip[1] != 't' || ip[2] != 'd' {
+		return false
+	}
+	return n == 3 || ip[3] == '/'
+}
+
 // loadImport resolves one import spec (resolve/load.go: importSpec);
 // problems are E2001/E2006 diagnostics.
 driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
@@ -854,9 +870,21 @@ driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
 		errAt(E2001, pathLit)
 		return 0, nil
 	}
+	// std/... resolves against $FINCROOT when it is set (finc0:
+	// resolve.StdDir); dir is then the cleaned $FINCROOT/<ip> and names
+	// the package's files in diagnostics.
+	dir := ip
+	if len(strBytes(fincRoot)) > 0 && isStdImport(strBytes(ip)) {
+		var db [MaxPathBytes]byte
+		dk := cleanJoin(strBytes(fincRoot), strBytes(ip), db[:])
+		if dk == 0 {
+			return 0, capacityFail(io, ip, "path too long")
+		}
+		dir = bytesToStr(db[:dk])
+	}
 	n := pkgs.count
 	for p := usize(1); p < n; p++ {
-		if strEq(pkgs.items[p].key, ip) {
+		if strEq(pkgs.items[p].key, dir) {
 			if pkgs.items[p].state == 1 {
 				mreset()
 				ms("import cycle not allowed: ")
@@ -868,28 +896,28 @@ driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
 			return u32(p), nil
 		}
 	}
-	if !fs.IsDir(ip) {
+	if !fs.IsDir(dir) {
 		mreset()
 		ms("cannot find package ")
 		mquote(strBytes(ip))
 		ms(" (no directory ")
-		ms(ip)
+		ms(dir)
 		ms(")")
 		errAt(E2001, pathLit)
 		return 0, nil
 	}
-	cnt, lerr := fs.ListSourceFiles(ip, fileNames[:])
+	cnt, lerr := fs.ListSourceFiles(dir, fileNames[:])
 	if lerr != nil || cnt == 0 {
 		mreset()
 		ms("cannot find package ")
 		mquote(strBytes(ip))
 		ms(" (no .fc files in ")
-		ms(ip)
+		ms(dir)
 		ms(")")
 		errAt(E2001, pathLit)
 		return 0, nil
 	}
-	f0, f1, _, err := parseSources(fs, io, ip, true)
+	f0, f1, _, err := parseSources(fs, io, dir, true)
 	if err != nil {
 		return 0, err
 	}
@@ -902,5 +930,5 @@ driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
 	if !anyOK {
 		return 0, nil
 	}
-	return visitPackage(fs, io, f0, f1, ip, ip)
+	return visitPackage(fs, io, f0, f1, ip, dir)
 }

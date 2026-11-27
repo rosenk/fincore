@@ -1,0 +1,13 @@
+input: 38 26 13 83 19 95 78 87 80 86 49 67 84 28 25 11
+SortU32: 11 13 19 25 26 28 38 49 67 78 80 83 84 86 87 95
+Sort desc: 95 87 86 84 83 80 78 67 49 38 28 26 25 19 13 11
+Stable (literal less): 11 13 19 25 26 28 38 49 67 78 80 83 84 86 87 95
+IsSorted asc/desc: yes no
+SearchU32 50/0/1000: 8 0 16
+items: 0a 3b 2c 1d 0e 3f 2g 1h 0i 3j
+Stable byKey: 0a 0e 0i 1d 1h 2c 2g 3b 3f 3j
+Sort byKey keys sorted: yes
+single: 9
+SortU64: 0 3 1099511627776 1099511627776 18446744073709551615
+SortBytes: app apple apricot banana fig pear
+300 sorted: yes

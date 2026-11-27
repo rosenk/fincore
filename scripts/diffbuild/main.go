@@ -5,7 +5,8 @@
 //
 // Cases (run from the module root): examples/*.fc, testdata/pass (files and
 // package directories), testdata/integration/*.fc, compiler/,
-// scripts/diffbuild/cases/*.fc (hand-written code generation edge cases)
+// scripts/diffbuild/cases/*.fc (hand-written code generation edge cases;
+// cg_std.fc imports every std/ package)
 // and every FinCore snippet embedded in finc0's codegen, types, comptime
 // and resolve unit tests (string literals starting with "package ", each
 // written to t.fc in its own temporary directory; snippets without a

@@ -1,0 +1,161 @@
+// pass_std_sort: std/sort — generic heapsort and insertion sort with a
+// function-valued comparison (named functions and a function literal),
+// stability, struct elements, the u32/u64/byte-string specialisations,
+// IsSorted and SearchU32.
+package main
+
+import (
+	"std/bytes"
+	"std/sort"
+)
+
+var out bytes.Builder[4096]
+
+type Item struct {
+	key u32
+	tag u8
+}
+
+func byKey(a Item, b Item) bool {
+	return a.key < b.key
+}
+
+func desc(a u32, b u32) bool {
+	return a > b
+}
+
+func showU32(label string, xs []u32) {
+	o := &out
+	o.WriteString(label)
+	o.WriteByte(':')
+	for i := usize(0); i < len(xs); i++ {
+		o.WriteByte(' ')
+		o.WriteUint(u64(xs[i]))
+	}
+	o.WriteByte('\n')
+}
+
+func showItems(label string, xs []Item) {
+	o := &out
+	o.WriteString(label)
+	o.WriteByte(':')
+	for i := usize(0); i < len(xs); i++ {
+		o.WriteByte(' ')
+		o.WriteUint(u64(xs[i].key))
+		o.WriteByte(xs[i].tag)
+	}
+	o.WriteByte('\n')
+}
+
+func fill(xs []u32, seed u32) {
+	x := seed
+	for i := usize(0); i < len(xs); i++ {
+		x = x*1103515245 + 12345
+		xs[i] = (x >> 16) % 100
+	}
+}
+
+func items(xs []Item) {
+	tags := strBytes("abcdefghij")
+	for i := usize(0); i < len(xs); i++ {
+		xs[i] = Item{key: u32(i*7) % 4, tag: tags[i%10]}
+	}
+}
+
+func run() {
+	var a [16]u32
+	fill(a[:], 1)
+	showU32("input", a[:])
+	sort.SortU32(a[:])
+	showU32("SortU32", a[:])
+	sort.Sort[u32](a[:], desc)
+	showU32("Sort desc", a[:])
+	lt := func(x u32, y u32) bool {
+		return x < y
+	}
+	sort.Stable[u32](a[:], lt)
+	showU32("Stable (literal less)", a[:])
+	o := &out
+	o.WriteString("IsSorted asc/desc: ")
+	if sort.IsSorted[u32](a[:], lt) {
+		o.WriteString("yes")
+	}
+	if !sort.IsSorted[u32](a[:], desc) {
+		o.WriteString(" no")
+	}
+	o.WriteByte('\n')
+	o.WriteString("SearchU32 50/0/1000: ")
+	o.WriteUint(u64(sort.SearchU32(a[:], 50)))
+	o.WriteByte(' ')
+	o.WriteUint(u64(sort.SearchU32(a[:], 0)))
+	o.WriteByte(' ')
+	o.WriteUint(u64(sort.SearchU32(a[:], 1000)))
+	o.WriteByte('\n')
+
+	// stability: equal keys keep their tags in input order
+	var it [10]Item
+	items(it[:])
+	showItems("items", it[:])
+	sort.Stable[Item](it[:], byKey)
+	showItems("Stable byKey", it[:])
+	items(it[:])
+	sort.Sort[Item](it[:], byKey)
+	o.WriteString("Sort byKey keys sorted: ")
+	if sort.IsSorted[Item](it[:], byKey) {
+		o.WriteString("yes\n")
+	}
+
+	// edge cases
+	var one [1]u32
+	one[0] = 9
+	sort.SortU32(one[:])
+	sort.SortU32(one[:0])
+	showU32("single", one[:])
+
+	var w [5]u64
+	w[0] = 18_446_744_073_709_551_615
+	w[1] = 0
+	w[2] = 1 << 40
+	w[3] = 3
+	w[4] = 1 << 40
+	sort.SortU64(w[:])
+	o.WriteString("SortU64:")
+	for i := usize(0); i < len(w); i++ {
+		o.WriteByte(' ')
+		o.WriteUint(w[i])
+	}
+	o.WriteByte('\n')
+
+	src := strBytes("pear apple fig apricot app banana")
+	var words [6][]byte
+	words[0] = src[0:4]
+	words[1] = src[5:10]
+	words[2] = src[11:14]
+	words[3] = src[15:22]
+	words[4] = src[23:26]
+	words[5] = src[27:33]
+	sort.SortBytes(words[:])
+	o.WriteString("SortBytes:")
+	for i := usize(0); i < len(words); i++ {
+		o.WriteByte(' ')
+		o.WriteBytes(words[i])
+	}
+	o.WriteByte('\n')
+
+	var big [300]u32
+	fill(big[:], 7)
+	sort.SortU32(big[:])
+	o.WriteString("300 sorted: ")
+	if sort.IsSorted[u32](big[:], lt) {
+		o.WriteString("yes\n")
+	}
+}
+
+driver func main(io Stdio) error {
+	run()
+	op := &out
+	if op.Truncated() {
+		return ErrArenaFull
+	}
+	return io.WriteStdout(op.Bytes())
+}

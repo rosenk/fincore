@@ -1,0 +1,151 @@
+// pass_std_path: std/path — Clean (Go path.Clean semantics, incl. "", "/",
+// "a/../..", "//a//b/./c/..", in-place cleaning, a too-small dst), Join,
+// Base, Dir, Ext, Split, IsAbs. The expected output matches Go's path
+// package.
+package main
+
+import (
+	"std/bytes"
+	"std/path"
+)
+
+var out bytes.Builder[4096]
+
+func show(label string, arg string, res []byte) {
+	o := &out
+	o.WriteString(label)
+	o.WriteString("(\"")
+	o.WriteString(arg)
+	o.WriteString("\") = \"")
+	o.WriteBytes(res)
+	o.WriteString("\"\n")
+}
+
+func clean(s string) {
+	var buf [64]byte
+	n := path.Clean(buf[:], strBytes(s))
+	show("Clean", s, buf[:n])
+}
+
+func join(a string, b string) {
+	var buf [64]byte
+	n := path.Join(buf[:], strBytes(a), strBytes(b))
+	o := &out
+	o.WriteString("Join(\"")
+	o.WriteString(a)
+	o.WriteString("\", \"")
+	o.WriteString(b)
+	o.WriteString("\") = \"")
+	o.WriteBytes(buf[:n])
+	o.WriteString("\"\n")
+}
+
+func base(s string) {
+	show("Base", s, path.Base(strBytes(s)))
+}
+
+func dir(s string) {
+	var buf [64]byte
+	n := path.Dir(buf[:], strBytes(s))
+	show("Dir", s, buf[:n])
+}
+
+func ext(s string) {
+	show("Ext", s, path.Ext(strBytes(s)))
+}
+
+func split(s string) {
+	d, f := path.Split(strBytes(s))
+	o := &out
+	o.WriteString("Split(\"")
+	o.WriteString(s)
+	o.WriteString("\") = \"")
+	o.WriteBytes(d)
+	o.WriteString("\", \"")
+	o.WriteBytes(f)
+	o.WriteString("\"\n")
+}
+
+func run() {
+	clean("")
+	clean("/")
+	clean(".")
+	clean("..")
+	clean("a/../..")
+	clean("//a//b/./c/..")
+	clean("a/b/c")
+	clean("a/b/c/")
+	clean("/../a")
+	clean("../../a/b/../c")
+	clean("a/./b/./")
+	clean("abc/def/../../..")
+	clean("/abc/def/../../..")
+	clean("./a")
+	clean("a//")
+	clean("...")
+	clean("a/.../b")
+	clean("..a/b..")
+
+	// in place
+	var ip [32]byte
+	k := copy(ip[:], strBytes("x//y/../z/."))
+	n := path.Clean(ip[:k], ip[:k])
+	show("Clean in place", "x//y/../z/.", ip[:n])
+
+	// dst too small: needs max(len(src), 1) bytes
+	var small [3]byte
+	o := &out
+	o.WriteString("Clean small dst: ")
+	o.WriteUint(u64(path.Clean(small[:], strBytes("abcd"))))
+	o.WriteByte(' ')
+	o.WriteUint(u64(path.Clean(small[:], strBytes("a/b"))))
+	o.WriteByte(' ')
+	o.WriteUint(u64(path.Clean(small[:0], strBytes(""))))
+	o.WriteByte('\n')
+
+	join("a", "b")
+	join("a/", "/b")
+	join("", "")
+	join("", "x/../y")
+	join("a/b", "")
+	join("a", "../../c")
+	join("/", "a")
+	join("std", "vec")
+	o.WriteString("Join small dst: ")
+	o.WriteUint(u64(path.Join(small[:], strBytes("a"), strBytes("bc"))))
+	o.WriteByte('\n')
+
+	base("")
+	base("/")
+	base("///")
+	base("a/b/c.fc")
+	base("a/b/")
+	base("name")
+	dir("")
+	dir("a")
+	dir("/a")
+	dir("a/b/c")
+	dir("a/b/")
+	dir("//x//y")
+	ext("a/b.fc")
+	ext("a.b/c")
+	ext("x.tar.gz")
+	ext(".hidden")
+	ext("noext")
+	split("a/b/c")
+	split("abc")
+	split("/")
+	o.WriteString("IsAbs: ")
+	if path.IsAbs(strBytes("/a")) && !path.IsAbs(strBytes("a/")) && !path.IsAbs(strBytes("")) {
+		o.WriteString("ok\n")
+	}
+}
+
+driver func main(io Stdio) error {
+	run()
+	op := &out
+	if op.Truncated() {
+		return ErrArenaFull
+	}
+	return io.WriteStdout(op.Bytes())
+}

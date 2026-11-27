@@ -1,0 +1,319 @@
+// Package bytes provides total, allocation-free helpers on byte slices and
+// Builder, a bounded byte buffer.
+//
+// Functions that return a slice return a subslice of their argument (never
+// a copy). Every loop is bounded by the length of its input.
+package bytes
+
+// Equal reports whether a and b hold the same bytes. O(min(len)).
+func Equal(a []byte, b []byte) bool {
+	return bytesEqual(a, b)
+}
+
+// Compare returns -1, 0 or +1 as a sorts before, equal to or after b
+// (lexicographic byte order, a proper prefix sorts first). O(min(len)).
+func Compare(a []byte, b []byte) int {
+	na := len(a)
+	nb := len(b)
+	n := na
+	if nb < n {
+		n = nb
+	}
+	for i := usize(0); i < n; i++ {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	if na < nb {
+		return -1
+	}
+	if na > nb {
+		return 1
+	}
+	return 0
+}
+
+// HasPrefix reports whether s begins with prefix. O(len(prefix)).
+func HasPrefix(s []byte, prefix []byte) bool {
+	n := len(prefix)
+	return len(s) >= n && bytesEqual(s[:n], prefix)
+}
+
+// HasSuffix reports whether s ends with suffix. O(len(suffix)).
+func HasSuffix(s []byte, suffix []byte) bool {
+	n := len(suffix)
+	m := len(s)
+	return m >= n && bytesEqual(s[m-n:], suffix)
+}
+
+// IndexByte returns the index of the first c in s, or -1. O(len(s)).
+func IndexByte(s []byte, c byte) int {
+	n := len(s)
+	for i := usize(0); i < n; i++ {
+		if s[i] == c {
+			return int(i)
+		}
+	}
+	return -1
+}
+
+// LastIndexByte returns the index of the last c in s, or -1. O(len(s)).
+func LastIndexByte(s []byte, c byte) int {
+	for i := len(s); i > 0; i-- {
+		if s[i-1] == c {
+			return int(i - 1)
+		}
+	}
+	return -1
+}
+
+// Index returns the index of the first occurrence of sep in s, or -1. An
+// empty sep matches at 0. O(len(s) * len(sep)).
+func Index(s []byte, sep []byte) int {
+	n := len(s)
+	m := len(sep)
+	if m == 0 {
+		return 0
+	}
+	if m > n {
+		return -1
+	}
+	lim := n - m + 1
+	for i := usize(0); i < lim; i++ {
+		if s[i] == sep[0] && bytesEqual(s[i:i+m], sep) {
+			return int(i)
+		}
+	}
+	return -1
+}
+
+// Contains reports whether sep occurs in s. O(len(s) * len(sep)).
+func Contains(s []byte, sep []byte) bool {
+	return Index(s, sep) >= 0
+}
+
+// Count returns the number of non-overlapping occurrences of sep in s. An
+// empty sep counts len(s)+1 (between every byte, like Go's bytes.Count
+// on ASCII). O(len(s) * len(sep)).
+func Count(s []byte, sep []byte) usize {
+	n := len(s)
+	m := len(sep)
+	if m == 0 {
+		return n + 1
+	}
+	if m > n {
+		return 0
+	}
+	c := usize(0)
+	i := usize(0)
+	for g := usize(0); g < n; g++ {
+		if i+m > n {
+			break
+		}
+		if bytesEqual(s[i:i+m], sep) {
+			c++
+			i += m
+		} else {
+			i++
+		}
+	}
+	return c
+}
+
+// IsSpace reports whether c is ASCII white space (' ', \t, \n, \v, \f, \r).
+func IsSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0b || c == 0x0c
+}
+
+// TrimSpace returns s without leading and trailing ASCII white space (a
+// subslice of s). O(len(s)).
+func TrimSpace(s []byte) []byte {
+	n := len(s)
+	lo := usize(0)
+	for g := usize(0); g < n; g++ {
+		if lo >= n || !IsSpace(s[lo]) {
+			break
+		}
+		lo++
+	}
+	hi := n
+	for g := usize(0); g < n; g++ {
+		if hi <= lo || !IsSpace(s[hi-1]) {
+			break
+		}
+		hi--
+	}
+	return s[lo:hi]
+}
+
+// TrimPrefix returns s without the leading prefix (s itself if it does not
+// start with prefix). O(len(prefix)).
+func TrimPrefix(s []byte, prefix []byte) []byte {
+	if HasPrefix(s, prefix) {
+		return s[len(prefix):]
+	}
+	return s
+}
+
+// TrimSuffix returns s without the trailing suffix (s itself if it does
+// not end with suffix). O(len(suffix)).
+func TrimSuffix(s []byte, suffix []byte) []byte {
+	if HasSuffix(s, suffix) {
+		return s[:len(s)-len(suffix)]
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// Builder
+
+// Builder is a byte buffer with a fixed capacity of N bytes. The zero value
+// is empty and ready to use.
+//
+// Writes are all-or-nothing: a write that does not fit completely is
+// dropped and sets the sticky Truncated flag (the contents written before
+// stay intact), so a caller can build a whole message and check once.
+type Builder[N usize] struct {
+	data  [N]byte
+	n     usize
+	trunc bool
+}
+
+// WriteByte appends c. O(1).
+func (b *Builder[N]) WriteByte(c byte) {
+	if b.n >= N {
+		b.trunc = true
+		return
+	}
+	b.data[b.n] = c
+	b.n++
+}
+
+// WriteBytes appends p. O(len(p)).
+func (b *Builder[N]) WriteBytes(p []byte) {
+	k := len(p)
+	if k > N-b.n {
+		b.trunc = true
+		return
+	}
+	b.n += copy(b.data[b.n:b.n+k], p)
+}
+
+// WriteString appends s. O(len(s)).
+func (b *Builder[N]) WriteString(s string) {
+	b.WriteBytes(strBytes(s))
+}
+
+// WriteUint appends v in decimal. O(20).
+func (b *Builder[N]) WriteUint(v u64) {
+	var tmp [20]byte
+	i := usize(20)
+	x := v
+	for g := usize(0); g < 20; g++ {
+		i--
+		tmp[i] = '0' + byte(x%10)
+		x = x / 10
+		if x == 0 {
+			break
+		}
+	}
+	b.WriteBytes(tmp[i:])
+}
+
+// WriteInt appends v in decimal with a leading '-' when negative. O(20).
+func (b *Builder[N]) WriteInt(v i64) {
+	if v >= 0 {
+		b.WriteUint(u64(v))
+		return
+	}
+	var tmp [20]byte
+	// -v as u64 without overflowing on the minimum i64.
+	u := u64(-(v + 1)) + 1
+	i := usize(20)
+	x := u
+	for g := usize(0); g < 20; g++ {
+		i--
+		tmp[i] = '0' + byte(x%10)
+		x = x / 10
+		if x == 0 {
+			break
+		}
+	}
+	i--
+	tmp[i] = '-'
+	b.WriteBytes(tmp[i:])
+}
+
+// WriteRepeat appends n copies of c (indentation: tabs, spaces). O(n).
+func (b *Builder[N]) WriteRepeat(c byte, n usize) {
+	if n > N-b.n {
+		b.trunc = true
+		return
+	}
+	for i := usize(0); i < n; i++ {
+		b.data[b.n+i] = c
+	}
+	b.n += n
+}
+
+// WriteHex appends the low 4*width bits of v as exactly width hex digits
+// (lower or upper case), most significant first; width is at most 16.
+// O(width).
+func (b *Builder[N]) WriteHex(v u64, width usize, upper bool) {
+	if width > 16 {
+		b.trunc = true
+		return
+	}
+	var tmp [16]byte
+	for i := usize(0); i < width; i++ {
+		shift := u64((width - 1 - i) * 4)
+		d := byte((v >> shift) & 15)
+		if d < 10 {
+			tmp[i] = '0' + d
+		} else if upper {
+			tmp[i] = 'A' + d - 10
+		} else {
+			tmp[i] = 'a' + d - 10
+		}
+	}
+	b.WriteBytes(tmp[:width])
+}
+
+// Bytes returns the contents, aliasing the buffer (valid until the next
+// write or Reset). O(1).
+func (b *Builder[N]) Bytes() []byte {
+	return b.data[:b.n]
+}
+
+// Len returns the number of bytes written. O(1).
+func (b *Builder[N]) Len() usize {
+	return b.n
+}
+
+// Cap returns the capacity N. O(1).
+func (b *Builder[N]) Cap() usize {
+	return N
+}
+
+// Truncate shrinks the contents to the first n bytes (no-op when
+// n >= Len()). It does not clear Truncated. O(1).
+func (b *Builder[N]) Truncate(n usize) {
+	if n < b.n {
+		b.n = n
+	}
+}
+
+// Reset empties the buffer and clears Truncated. O(1).
+func (b *Builder[N]) Reset() {
+	b.n = 0
+	b.trunc = false
+}
+
+// Truncated reports whether any write was dropped since the last Reset.
+// O(1).
+func (b *Builder[N]) Truncated() bool {
+	return b.trunc
+}
