@@ -3,6 +3,12 @@
 Each `## vX.Y.Z` section is the release notes of that tag (the release
 workflow publishes it; docs/release.md).
 
+## Unreleased (v0.4)
+
+- Bootstrap: the seed is `v0.3.0` (bootstrap/SEED); finc0 builds it
+  directly. compiler/ may now use v0.3 features. The diff-prev allowlist
+  is empty again.
+
 ## v0.3.0
 
 Language v0.3, implemented only in the self-hosted compiler (`compiler/`,

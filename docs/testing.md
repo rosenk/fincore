@@ -89,7 +89,7 @@ are reported, and the list empties when the seed moves past the change. The
 summary looks like this:
 
 ```
-diff-prev (current v0.2 vs previous release v0.2.0, v0.2): 848 cases, 848 identical, 0 expected (new features), 0 regressions, 0 diag-changed, 0 allowlisted (33s)
+diff-prev (current v0.3 vs previous release v0.3.0, v0.3): 915 cases, 915 identical, 0 expected (new features), 0 regressions, 0 diag-changed, 0 allowlisted (33s)
 ```
 
 `-v` prints every case and the details of EXPECTED and allowlisted ones.

@@ -11,9 +11,3 @@
 # Go string literals: old is a substring of the previous message, new of the
 # current one). `driver "old" => "new" # reason` rewords the compiler's own
 # non-diagnostic lines: old replaced by new must give the current line.
-
-E1001 "expected expression, found '='" => "compound assignment operator " # v0.3, decision 157: `c >>= 1` (also |= &= ^= %= <<=) names the operator and the assignment to write; same position (the '=')
-E1001 "expected expression, found '^'" => "unary ^ (bitwise complement) is not supported" # v0.3, decision 157: Go's unary ^ is explained; same position (the '^')
-E1001 "expected type, found ','" => "a var declaration declares one name; write separate var declarations" # v0.3, decision 157: `var a, b T`; same position (the ',')
-E3002 ", which outlives it" => ": each parameter is its own region" # v0.3, decision 157: a store between parameters at the same depth (decision 44) states the rule instead of "(depth N) ... (depth N), which outlives it"
-driver "finc1: " => "finc: " # v0.3: the driver names itself finc, not finc1, in its own messages (`finc: codegen: ...`, `finc: stat x.fc: ...`)

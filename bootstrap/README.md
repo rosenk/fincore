@@ -71,8 +71,9 @@ makes compiler/ need v0.3 as well, without a marker in compiler/.
 
 `bootstrap/SEED` names the seed: an annotated git tag, the release of
 `compiler/` that the chain builds before the current one. It is
-`v0.2.0`, the last commit at which `finc0` and `compiler/` implement the
-same language. The seed is extracted with `git archive <seed> go.mod
+`v0.3.0` (before: `v0.2.0`, the last commit at which `finc0` and
+`compiler/` implement the same language). finc0 builds v0.3.0 directly,
+since compiler/ at v0.3.0 uses only v0.2. The seed is extracted with `git archive <seed> go.mod
 compiler std runtime` into `.stage/seed/<seed>` (the working tree is not
 touched) and built there, against the seed's own `runtime/`; the later
 stages build the current tree against the current `runtime/`.

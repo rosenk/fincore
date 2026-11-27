@@ -76,7 +76,7 @@ To build from source instead, see Bootstrap and Build and test below.
 
 ```text
 bootstrap/ (Go) ──go build──► finc0                         (frozen at language v0.2)
-finc0     build compiler/ @ seed tag (bootstrap/SEED) ──► finc-seed   (v0.2.0)
+finc0     build compiler/ @ seed tag (bootstrap/SEED) ──► finc-seed   (v0.3.0)
 finc-seed build ./compiler (current) ──► finc1
 finc1     build ./compiler ──► finc2
 finc2     build ./compiler ──► finc3
@@ -111,6 +111,7 @@ fixed point: sha256(stage2.go) == sha256(stage3.go)
 | M8 | Fixed-point bootstrap gate: `sha256(stage2.go) == sha256(stage3.go)`, finc2 passes all tests | ✅ |
 | v0.2 | Language v0.2 (sum types, patterns, `is`, ergonomics; [`docs/v0_2.md`](docs/v0_2.md)) in both compilers; release tag `v0.2.0` | ✅ |
 | Seed | finc0 frozen at v0.2; bootstrap goes finc0 → finc-seed (`v0.2.0`) → current `compiler/` | ✅ |
+| v0.3 | `min`/`max`, `match` on `[]byte`, multi-value `match`, `ErrReported` ([`docs/v0_3.md`](docs/v0_3.md)), only in `compiler/`; `finc fmt`, `--context`, release archives; tag `v0.3.0`, now the seed | ✅ |
 
 Reproduce the bootstrap (about 15 seconds):
 
@@ -119,12 +120,12 @@ make bootstrap   # go run ./scripts/bootstrap_verify.go
 ```
 
 ```text
-==> 2. finc0 build compiler/@v0.2.0 → finc-seed
+==> 2. finc0 build compiler/@v0.3.0 → finc-seed
 ...
 ==> 6. fixed point: sha256(stage2.go) == sha256(stage3.go)
-   stage2.go dff7efd8e43b7ce8d8975e5577ab871c16bc81ad15d11286ad0137456ccecf02
-   stage3.go dff7efd8e43b7ce8d8975e5577ab871c16bc81ad15d11286ad0137456ccecf02
-BOOTSTRAP OK: finc0 → finc-seed (v0.2.0) → finc1 → finc2 → finc3; fixed point reached (stage2.go == stage3.go)
+   stage2.go 7c526a7ec71e564eaad8f0a8d25f3ff9506c01e3535073d5595cd0ffe39d208a
+   stage3.go 7c526a7ec71e564eaad8f0a8d25f3ff9506c01e3535073d5595cd0ffe39d208a
+BOOTSTRAP OK: finc0 → finc-seed (v0.3.0) → finc1 → finc2 → finc3; fixed point reached (stage2.go == stage3.go)
 ```
 
 ## Layout
