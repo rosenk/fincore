@@ -14,6 +14,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags: the bootstrap needs the seed tag (bootstrap/SEED)
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -26,6 +28,10 @@ jobs:
         run: make finc0
       - name: parse corpus
         run: make parse-corpus
+      - name: seed compiler (finc0 builds compiler/ at bootstrap/SEED)
+        run: make seed
+      # finc0 vs finc1: regression checks of the frozen v0.2 subset
+      # (inputs marked // SINCE: v0.3+ are skipped).
       - name: finc0 vs finc1 differential
         run: make diff-parse
       - name: finc0 vs finc1 check differential
@@ -38,7 +44,7 @@ jobs:
         run: make diff-check-all
       - name: finc0 vs finc1 codegen differential
         run: make diff-build
-      - name: bootstrap fixed point (finc0 → finc1 → finc2 → finc3)
+      - name: bootstrap fixed point (finc0 → finc-seed → finc1 → finc2 → finc3)
         run: make bootstrap
       - name: integration
         run: make integration

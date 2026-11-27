@@ -20,6 +20,11 @@
 // failed") is always a mismatch: the type checker is unsound there. With
 // -govet, `go vet` additionally runs on the emitted Go of every case both
 // compilers build (`make diff-build-vet`).
+//
+// finc0 is frozen at language v0.2, so this is a regression check of the
+// v0.2 subset: corpus files and packages (compiler/ included) whose leading
+// comment block says `// SINCE: vX.Y` with vX.Y newer than v0.2
+// (scripts/langver) are skipped.
 package main
 
 import (
@@ -36,7 +41,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"fincore/scripts/langver"
 )
+
+// skipped counts corpus inputs left out because they need a language
+// version newer than finc0's (`// SINCE:` directive).
+var skipped int
 
 type tcase struct {
 	name  string
@@ -114,7 +125,11 @@ func main() {
 			fmt.Printf("DIFF  %s\n%s", c.name, r.msg)
 		}
 	}
-	fmt.Printf("diff-build: %d cases, %d identical, %d fail in both, %d mismatch\n", len(cases), match, both, mismatch)
+	fmt.Printf("diff-build: %d cases, %d identical, %d fail in both, %d mismatch", len(cases), match, both, mismatch)
+	if skipped > 0 {
+		fmt.Printf(", %d inputs skipped (// SINCE: newer than finc0's %s)", skipped, langver.Finc0)
+	}
+	fmt.Println()
 	if mismatch > 0 {
 		os.Exit(1)
 	}
@@ -264,6 +279,14 @@ func headerFlags(path string) []string {
 func corpusCases() []tcase {
 	var out []tcase
 	add := func(path string, flags []string) {
+		ok, err := langver.Finc0Can(path)
+		if err != nil {
+			fatal(err)
+		}
+		if !ok {
+			skipped++
+			return
+		}
 		out = append(out, tcase{name: path, dir: ".", path: path, flags: flags})
 	}
 	for _, pat := range []string{"examples/*.fc", "testdata/pass/*.fc", "testdata/integration/*.fc", "scripts/diffbuild/cases/*.fc"} {

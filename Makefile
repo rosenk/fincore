@@ -40,56 +40,68 @@ fmt-check: ## fail if any Go file is not gofmt-ed
 
 lint: fmt-check vet ## fmt-check + vet
 
-parse-corpus: finc0 ## finc0 parse on examples, testdata, std/ and compiler/
-	@set -e; for f in examples/*.fc testdata/pass/*.fc testdata/fail/*.fc std/*/; do $(FINC0) parse $$f >/dev/null; done
-	$(FINC0) parse compiler/ >/dev/null
+parse-corpus: finc0 ## finc0 parse on examples, testdata, std/ and compiler/ (v0.2 inputs: no newer // SINCE:)
+	@set -e; fs=$$($(GO) run ./scripts/sincefilter examples/*.fc testdata/pass/*.fc testdata/fail/*.fc std/*/ compiler/); \
+	for f in $$fs; do $(FINC0) parse $$f >/dev/null; done
 	@echo "parse-corpus: ok"
 
-check-corpus: finc0 ## finc0 check on examples, pass tests, std/ and compiler/
-	@set -e; for f in examples/*.fc testdata/pass/*.fc std/*/; do $(FINC0) check --comptime-fuel=$(FUEL) $$f; done
-	$(FINC0) check compiler/
+check-corpus: finc0 ## finc0 check on examples, pass tests, std/ and compiler/ (v0.2 inputs: no newer // SINCE:)
+	@set -e; fs=$$($(GO) run ./scripts/sincefilter examples/*.fc testdata/pass/*.fc std/*/ compiler/); \
+	for f in $$fs; do $(FINC0) check --comptime-fuel=$(FUEL) $$f; done
 	@echo "check-corpus: ok"
 
 integration: ## end-to-end TCP echo + corpus tests (skips until finc0 can build)
 	$(GO) test -count=1 -v ./testdata/integration/
 
-finc1: finc0 ## build the self-hosted compiler with finc0 (Stage 1)
-	@mkdir -p $(STAGE)
-	$(FINC0) build --emit-go=$(STAGE)/stage1.go -o $(BIN)/finc1 ./compiler
+# --- bootstrap chain: finc0 (frozen at v0.2) -> finc-seed (compiler/ at the
+# tag in bootstrap/SEED) -> finc1 (current compiler/). See bootstrap/README.md.
+.PHONY: seed
+seed: ## build .stage/finc-seed: finc0 builds compiler/ at the bootstrap/SEED tag (needs git tags)
+	$(GO) run ./scripts/bootstrap_verify.go -seed-only
 
-bootstrap: finc0 ## full fixed-point bootstrap gate (stage2.go == stage3.go)
+finc1: finc0 seed ## build bin/finc1: finc-seed builds the current compiler/ (Stage 1)
+	$(STAGE)/finc-seed build --emit-go=$(STAGE)/stage1.go -o $(BIN)/finc1 ./compiler
+
+bootstrap: finc0 ## fixed-point gate: finc0 -> finc-seed -> finc1 -> finc2 -> finc3, stage2.go == stage3.go
 	$(GO) run ./scripts/bootstrap_verify.go
+# --- end bootstrap chain
 
 ci: lint test build integration ## what CI runs
 
 clean: ## remove build outputs
 	rm -rf $(BIN) $(STAGE)
 
-diff-parse: finc1 ## finc0 vs finc1: byte-identical `parse --dump-ast` on the corpus
-	@set -e; for t in examples/tcp_echo.fc compiler/ std/*/ testdata/pass/*.fc testdata/fail/*.fc; do \
+# --- finc0 vs finc1 differential: regression checks of the FROZEN v0.2 subset.
+# finc0 implements only v0.2. Inputs that need a newer version say
+# `// SINCE: vX.Y` in their leading comment block and are skipped
+# (scripts/langver; diff-parse via scripts/sincefilter).
+diff-parse: finc1 ## [v0.2 regression] finc0 vs finc1: byte-identical `parse --dump-ast` on the corpus
+	@set -e; ts=$$($(GO) run ./scripts/sincefilter examples/tcp_echo.fc compiler/ std/*/ testdata/pass/*.fc testdata/fail/*.fc); \
+	for t in $$ts; do \
 	  cmp -s <($(FINC0) parse --dump-ast $$t 2>&1) <($(BIN)/finc1 parse --dump-ast $$t 2>&1) || { echo "DIFF: $$t"; exit 1; }; \
 	done; echo "diff-parse: ok"
 
-diff-check: finc1 ## finc0 vs finc1 check --passes=types: identical diagnostics (corpus + unit-test snippets)
+diff-check: finc1 ## [v0.2 regression] finc0 vs finc1 check --passes=types: identical diagnostics (corpus + snippets)
 	$(GO) run ./scripts/diffcheck
 
-diff-check-scope: finc1 ## finc0 check --passes=scope vs finc1 check --passes=scope (corpus + unit-test snippets incl. scope tests)
+diff-check-scope: finc1 ## [v0.2 regression] finc0 vs finc1 check --passes=scope (corpus + snippets incl. scope tests)
 	$(GO) run ./scripts/diffcheck -passes scope
 
-diff-check-totality: finc1 ## finc0 vs finc1 check --passes=totality: identical diagnostics (corpus, snippets, compiler mutants)
+diff-check-totality: finc1 ## [v0.2 regression] finc0 vs finc1 check --passes=totality (corpus, snippets, compiler mutants)
 	$(GO) run ./scripts/diffcheck -passes=totality
 
-diff-check-all: finc1 ## finc0 vs finc1 check (all passes)
+diff-check-all: finc1 ## [v0.2 regression] finc0 vs finc1 check (all passes)
 	$(GO) run ./scripts/diffcheck -passes=all
 
-diff-check-fuzz: finc1 ## diff-check plus 20 random mutants per corpus file (SEED=n)
+diff-check-fuzz: finc1 ## [v0.2 regression] diff-check plus 20 random mutants per corpus file (SEED=n)
 	$(GO) run ./scripts/diffcheck -mutate 20 -seed $(SEED)
 
-diff-build: finc1 ## finc0 vs finc1: byte-identical `build --emit-go` (corpus, edge cases, unit-test snippets, compiler/)
+diff-build: finc1 ## [v0.2 regression] finc0 vs finc1: byte-identical `build --emit-go` (corpus, edge cases, snippets, compiler/)
 	$(GO) run ./scripts/diffbuild
 
-diff-build-vet: finc1 ## diff-build plus `go vet` on the emitted Go of every built case
+diff-build-vet: finc1 ## [v0.2 regression] diff-build plus `go vet` on the emitted Go of every built case
 	$(GO) run ./scripts/diffbuild -govet
+# --- end finc0 vs finc1 differential
 
 finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3.go
 	@mkdir -p $(STAGE)

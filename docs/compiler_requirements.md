@@ -2,6 +2,16 @@
 
 Reported by the M6 author; see compiler/README.md for details.
 
+**Which features compiler/ may use (the seed rule).** finc0 is frozen at
+language v0.2 and builds only `compiler/` at the seed tag named in
+`bootstrap/SEED` (`v0.2.0`); that seed compiler builds the current
+`compiler/` (bootstrap/README.md). So the current `compiler/` may use
+exactly the features the **seed** implements, no longer "only features both
+finc0 and finc1 support". To use a new feature in `compiler/`, implement
+it first, cut a release tag that contains it, then bump `bootstrap/SEED` to
+that tag. The list below is what finc0 must support to build the v0.2.0
+seed; it is closed (finc0 gets no new features).
+
 1. Multi-file `package main` (6+ files).
 2. Untyped int consts in grouped `const (...)` (no iota), `_` separators, const arithmetic; mixed with u8/u32/usize.
 3. Large Value globals (structs of big fixed arrays, NodeArena ≈ 12 MB) accessed by field/index paths and via `&global`, never copied.

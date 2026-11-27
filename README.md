@@ -41,15 +41,29 @@ func writeAll(ctx Context, conn Conn, data []byte) error {
 
 The full TCP echo server with graceful shutdown is in [`examples/tcp_echo.fc`](examples/tcp_echo.fc).
 
-## Bootstrap plan
+## Bootstrap
 
 ```text
-bootstrap/ (Go) ──go build──► finc0
-finc0 build ./compiler ──► finc1   (compiler written in FinCore)
-finc1 build ./compiler ──► finc2
-finc2 build ./compiler ──► finc3
+bootstrap/ (Go) ──go build──► finc0                         (frozen at language v0.2)
+finc0     build compiler/ @ seed tag (bootstrap/SEED) ──► finc-seed   (v0.2.0)
+finc-seed build ./compiler (current) ──► finc1
+finc1     build ./compiler ──► finc2
+finc2     build ./compiler ──► finc3
 fixed point: sha256(stage2.go) == sha256(stage3.go)
 ```
+
+- **finc0 is frozen at v0.2.** New language features are implemented only
+  in `compiler/`. finc0 gets only the bug fixes it needs to keep building
+  the seed (see [`bootstrap/README.md`](bootstrap/README.md)).
+- **compiler/ may use a feature once the seed tag has it.** To use one, a
+  release tag that implements it must exist first; then `bootstrap/SEED` is
+  bumped to that tag. Go and Rust bootstrap from their previous releases
+  the same way.
+- The seed is built from `git archive <seed>`, so the bootstrap needs a git
+  checkout with tags (`git fetch --tags`). `make seed` builds
+  `.stage/finc-seed`.
+- `make diff-*` (finc0 vs finc1) are regression checks of the frozen v0.2
+  subset; inputs marked `// SINCE: v0.3` (or later) are skipped.
 
 ## Status
 
@@ -64,25 +78,30 @@ fixed point: sha256(stage2.go) == sha256(stage3.go)
 | M6 | Self-hosted front end in FinCore (`compiler/`: arenas, lexer, parser, AST dump); `finc1 parse` byte-identical to finc0 | ✅ |
 | M7 | Self-hosted checker (resolve, types, comptime, scope, totality) + Go codegen in FinCore; `finc1 check/build` byte-identical to finc0 | ✅ |
 | M8 | Fixed-point bootstrap gate: `sha256(stage2.go) == sha256(stage3.go)`, finc2 passes all tests | ✅ |
+| v0.2 | Language v0.2 (sum types, patterns, `is`, ergonomics; [`docs/v0_2.md`](docs/v0_2.md)) in both compilers; release tag `v0.2.0` | ✅ |
+| Seed | finc0 frozen at v0.2; bootstrap goes finc0 → finc-seed (`v0.2.0`) → current `compiler/` | ✅ |
 
-Reproduce the bootstrap (about 10 seconds):
+Reproduce the bootstrap (about 15 seconds):
 
 ```sh
 make bootstrap   # go run ./scripts/bootstrap_verify.go
 ```
 
 ```text
-==> 5. fixed point: sha256(stage2.go) == sha256(stage3.go)
-   stage2.go d04e4c6be6f5e5ec041f8c09a002f0f3e4480ddc1524c2d975efc768d386b09c
-   stage3.go d04e4c6be6f5e5ec041f8c09a002f0f3e4480ddc1524c2d975efc768d386b09c
-BOOTSTRAP OK: fixed point reached (stage2.go == stage3.go)
+==> 2. finc0 build compiler/@v0.2.0 → finc-seed
+...
+==> 6. fixed point: sha256(stage2.go) == sha256(stage3.go)
+   stage2.go dff7efd8e43b7ce8d8975e5577ab871c16bc81ad15d11286ad0137456ccecf02
+   stage3.go dff7efd8e43b7ce8d8975e5577ab871c16bc81ad15d11286ad0137456ccecf02
+BOOTSTRAP OK: finc0 → finc-seed (v0.2.0) → finc1 → finc2 → finc3; fixed point reached (stage2.go == stage3.go)
 ```
 
 ## Layout
 
 ```text
-bootstrap/        Stage 0 compiler in Go (finc0): diag, lexer, ast, parser, resolve,
-                  comptime, types, check, scope, totality, ir, codegen/golang
+bootstrap/        Stage 0 compiler in Go (finc0, frozen at v0.2): diag, lexer, ast, parser,
+                  resolve, comptime, types, check, scope, totality, ir, codegen/golang;
+                  SEED names the seed tag
 compiler/         Self-hosting compiler written in FinCore (data-oriented, fixed arenas)
 runtime/fincrt/   Go runtime used by generated code
 std/              Finitist standard library in FinCore: vec, maps, bytes, strconv, path,
@@ -101,7 +120,8 @@ make            # vet + test + build bin/finc0
 make race       # unit tests with the race detector
 make check-corpus
 make integration
-make bootstrap  # finc0 → finc1 → finc2 → finc3, fixed-point gate
+make seed       # .stage/finc-seed: finc0 builds compiler/ at the bootstrap/SEED tag
+make bootstrap  # finc0 → finc-seed → finc1 → finc2 → finc3, fixed-point gate
 make help       # all targets
 
 bin/finc0 parse --dump-ast examples/tcp_echo.fc

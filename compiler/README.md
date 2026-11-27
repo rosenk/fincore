@@ -390,6 +390,21 @@ function; overflow is reported as capacity exceeded.
 
 ## Language subset used (conservative on purpose)
 
+**The seed rule.** compiler/ is built by the seed compiler, not by finc0:
+finc0 (frozen at v0.2) builds compiler/ at the tag in `bootstrap/SEED`
+(`v0.2.0`), and that `finc-seed` builds the current compiler/ (`make seed`,
+`make bootstrap`; bootstrap/README.md). New language features are
+implemented only here. compiler/ may use a feature once the seed tag has
+it: implement the feature, cut a release tag that contains it, then bump
+`bootstrap/SEED`. Until then the feature may appear in tests and examples
+but not in compiler/ itself (or the std/ packages it imports). The list
+below is the subset in use today, all of it v0.2.
+
+Once compiler/ uses a v0.3 feature, mark the file that uses it with
+`// SINCE: v0.3` in its leading comment block so that the finc0-vs-finc1
+differential (`make diff-*`, a regression check of the v0.2 subset)
+skips compiler/ and its mutants.
+
 - Only `func` (total) and `driver func`; no `comptime`, generics,
   closures, `defer` or `scope`. Sum types (enums with payloads, `match`
   statements and expressions) model compile-time values (`Val`), type

@@ -31,6 +31,12 @@
 // finc1's generated main prints "error: <err>" after a failing driver and
 // always exits 1 on error, so its final "error: fincore: ..." line is
 // removed before comparing and exit statuses are compared as 0 / non-zero.
+//
+// finc0 is frozen at language v0.2, so this is a regression check of the
+// v0.2 subset: corpus files and packages whose leading comment block says
+// `// SINCE: vX.Y` with vX.Y newer than v0.2 (scripts/langver) are
+// skipped together with their mutants; when compiler/ (or a std/ package)
+// declares a newer version, its cases and mutants are skipped too.
 package main
 
 import (
@@ -47,6 +53,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"fincore/scripts/langver"
 )
 
 type tcase struct {
@@ -131,7 +139,11 @@ func main() {
 		fmt.Print(indent("finc0: ", e0+o0))
 		fmt.Print(indent("finc1: ", e1+o1))
 	}
-	fmt.Printf("diff-check (--passes=%s): %d cases, %d match, %d mismatch\n", *passes, len(cases), match, mismatch)
+	fmt.Printf("diff-check (--passes=%s): %d cases, %d match, %d mismatch", *passes, len(cases), match, mismatch)
+	if skipped > 0 {
+		fmt.Printf(", %d inputs skipped (// SINCE: newer than finc0's %s)", skipped, langver.Finc0)
+	}
+	fmt.Println()
 	if mismatch > 0 {
 		os.Exit(1)
 	}
@@ -213,9 +225,29 @@ func headerFlags(path string) []string {
 	return nil
 }
 
+// skipped counts inputs left out because they need a language version
+// newer than finc0's (`// SINCE:` directive).
+var skipped int
+
+// finc0Can reports whether finc0 implements the language version path
+// needs (scripts/langver); a malformed directive is fatal.
+func finc0Can(path string) bool {
+	ok, err := langver.Finc0Can(path)
+	if err != nil {
+		fatal(err)
+	}
+	if !ok {
+		skipped++
+	}
+	return ok
+}
+
 func corpusCases() []tcase {
 	var out []tcase
 	add := func(path string, flags []string) {
+		if !finc0Can(path) {
+			return
+		}
 		out = append(out, tcase{name: path + flagSuffix(flags), dir: ".", path: path, flags: flags})
 	}
 	for _, pat := range []string{"examples/*.fc", "testdata/pass/*.fc", "testdata/fail/*.fc",
@@ -489,7 +521,13 @@ func mutantCases(tmp string, n int, seed int64, tot bool) []tcase {
 		"testdata/pass/*/*.fc", "testdata/pass/*/*/*.fc", "scripts/diffcheck/cases/*.fc", "std/*/*.fc", "compiler/*.fc"} {
 		files, _ := filepath.Glob(pat)
 		sort.Strings(files)
-		srcs = append(srcs, files...)
+		for _, f := range files {
+			// A file of a package directory counts with its package.
+			isPkg := strings.Contains(pat, "*/") || strings.HasPrefix(pat, "compiler/")
+			if finc0Can(f) && (!isPkg || finc0Can(filepath.Dir(f))) {
+				srcs = append(srcs, f)
+			}
+		}
 	}
 	snipDirs, _ := filepath.Glob(filepath.Join(tmp, "s*", "t.fc"))
 	sort.Strings(snipDirs)
@@ -726,6 +764,9 @@ func mutantStdCases(tmp string) []tcase {
 	var out []tcase
 	for i, m := range stdMutations {
 		pkg := filepath.Dir(m.file)
+		if !finc0Can(pkg) {
+			continue
+		}
 		files, _ := filepath.Glob(filepath.Join(pkg, "*.fc"))
 		root := filepath.Join(tmp, fmt.Sprintf("m%02d", i))
 		dir := filepath.Join(root, pkg)
@@ -755,6 +796,9 @@ func mutantStdCases(tmp string) []tcase {
 // mutantCompilerCases writes copies of compiler/ with one mutation each.
 func mutantCompilerCases(tmp string) []tcase {
 	var out []tcase
+	if !finc0Can("compiler") {
+		return nil
+	}
 	files, _ := filepath.Glob("compiler/*.fc")
 	for i, m := range compilerMutations {
 		root := filepath.Join(tmp, fmt.Sprintf("c%02d", i))
