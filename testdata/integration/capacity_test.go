@@ -5,6 +5,7 @@ package integration
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,9 +19,20 @@ import (
 // them failing and raising one past them is noticed here.
 func TestCapacityExceeded(t *testing.T) {
 	root := moduleRoot(t)
-	bin := filepath.Join(root, "bin", "finc1")
-	if !fileExists(bin) {
-		t.Skip("bin/finc1 not built (make finc1)")
+	// The compiler under test: $FINC0 (the bootstrap passes finc2 there)
+	// when it is the self-hosted compiler, else bin/finc1. finc0 has its
+	// own (Go) capacities and is not tested here.
+	bin := os.Getenv("FINC0")
+	if bin != "" {
+		out, err := exec.Command(bin, "version").Output()
+		if err != nil || !strings.HasPrefix(string(out), "finc language") {
+			t.Skipf("$FINC0 (%s) is not the self-hosted compiler", bin)
+		}
+	} else {
+		bin = filepath.Join(root, "bin", "finc1")
+		if !fileExists(bin) {
+			t.Skip("bin/finc1 not built (make finc1)")
+		}
 	}
 	const mainFn = "\ndriver func main(io Stdio) error {\n\treturn nil\n}\n"
 	repeat := func(n int, f func(i int) string) string {
@@ -80,7 +92,7 @@ func TestCapacityExceeded(t *testing.T) {
 			stdout, stderr, code := runIn(t, root, bin, "check", target)
 			want := fmt.Sprintf("finc: %s: compiler capacity exceeded (%s)\n", target, c.arena)
 			if code != 1 || stdout != "" || !strings.HasPrefix(stderr, want) {
-				t.Errorf("finc1 check: exit %d, stdout %q, stderr:\n%.500s\nwant exit 1 and stderr starting with %q", code, stdout, stderr, want)
+				t.Errorf("%s check: exit %d, stdout %q, stderr:\n%.500s\nwant exit 1 and stderr starting with %q", filepath.Base(bin), code, stdout, stderr, want)
 			}
 		})
 	}
