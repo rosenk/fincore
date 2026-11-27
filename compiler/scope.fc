@@ -288,40 +288,47 @@ func scHasSlice(t u32, dp usize) bool decreases(dp) {
 	}
 	scSliceMemo[usize(t)] = 1 // cycles
 	r := false
-	k := tk(t)
-	if k == TCNamed {
-		u := typs.items[usize(t)].a
-		if u != 0 {
-			r = scHasSlice(u, dp-1)
-		}
-	} else if k == TCSlice {
-		r = true
-	} else if k == TCArray {
-		r = scHasSlice(elemOf(t), dp-1)
-	} else if k == TCStruct {
-		n := nfields(t)
-		for i := usize(0); i < n; i++ {
-			if !r {
-				r = scHasSlice(fieldType(t, i), dp-1)
+	match trec(t) {
+		Named(_) -> {
+			u := namedUnder(t)
+			if u != 0 {
+				r = scHasSlice(u, dp-1)
 			}
 		}
-	} else if k == TCEnum {
-		n := nvariants(t)
-		for i := usize(0); i < n; i++ {
-			m2 := variantPayN(t, i)
-			for j := usize(0); j < m2; j++ {
+		Slice(_) -> {
+			r = true
+		}
+		Array(e, _, _) -> {
+			r = scHasSlice(e, dp-1)
+		}
+		Struct(_, _) -> {
+			n := nfields(t)
+			for i := usize(0); i < n; i++ {
 				if !r {
-					r = scHasSlice(variantPay(t, i, j), dp-1)
+					r = scHasSlice(fieldType(t, i), dp-1)
 				}
 			}
 		}
-	} else if k == TCTuple {
-		n := tl1n(t)
-		for i := usize(0); i < n; i++ {
-			if !r {
-				r = scHasSlice(tl1(t, i), dp-1)
+		Enum(_, _) -> {
+			n := nvariants(t)
+			for i := usize(0); i < n; i++ {
+				m2 := variantPayN(t, i)
+				for j := usize(0); j < m2; j++ {
+					if !r {
+						r = scHasSlice(variantPay(t, i, j), dp-1)
+					}
+				}
 			}
 		}
+		Tuple(_, _) -> {
+			n := tupleN(t)
+			for i := usize(0); i < n; i++ {
+				if !r {
+					r = scHasSlice(tupleAt(t, i), dp-1)
+				}
+			}
+		}
+		NoType | Basic(_) | Sig(_, _, _, _, _, _, _, _) | Pointer(_) | Code(_) | TypeParam(_, _, _, _) | ConstArg(_) | Opaque(_, _) -> {}
 	}
 	if r {
 		scSliceMemo[usize(t)] = 2
@@ -335,7 +342,7 @@ func scIsArray(t u32) bool {
 	if t == 0 {
 		return false
 	}
-	return tk(underlying(t)) == TCArray
+	return isArrayT(underlying(t))
 }
 
 // ---------------------------------------------------------------------------
@@ -623,8 +630,8 @@ func wDiscard(rhs u32, idx int, at u32) {
 		return
 	}
 	t := ntype[usize(rhs)]
-	if t != 0 && tk(t) == TCTuple && idx >= 0 && usize(idx) < tl1n(t) {
-		t = tl1(t, usize(idx))
+	if t != 0 && isTupleT(t) && idx >= 0 && usize(idx) < tupleN(t) {
+		t = tupleAt(t, usize(idx))
 	}
 	if t != 0 && isLinear(t) {
 		mreset()

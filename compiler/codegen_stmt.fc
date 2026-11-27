@@ -282,7 +282,7 @@ func cgRhs(s u32, ret bool, nl usize, dp usize) decreases(dp) {
 	if n == 1 && nl > 1 {
 		r0 := cgRhsItem(s, ret, 0)
 		cs := cgConstValueSlot(r0)
-		if cs != 0 && vals.items[usize(cs)].kind == VTuple {
+		if cs != 0 && isTupleVal(slotGet(cs)) {
 			cgTupleValues(r0, slotGet(cs), dp-1)
 			return
 		}
@@ -362,7 +362,7 @@ func cgReturnStmt(s u32, dp usize) decreases(dp) {
 	if nres == 1 && nw > 1 {
 		r0 := l1at(s, 0)
 		cs := cgConstValueSlot(r0)
-		if cs != 0 && vals.items[usize(cs)].kind == VTuple {
+		if cs != 0 && isTupleVal(slotGet(cs)) {
 			p := cgWmark()
 			cgTupleValues(r0, slotGet(cs), dp-1)
 			cgStashCut(p)

@@ -111,7 +111,7 @@ func record(x *Operand) {
 		ntype[usize(e)] = 0
 	}
 	nmode[usize(e)] = x.mode
-	if x.mode == KConst && x.val.kind != VNone {
+	if x.mode == KConst && x.val != Val.None {
 		nval[usize(e)] = valStore(x.val)
 	}
 }
@@ -368,7 +368,7 @@ func mcallName(c Ctx) {
 		mexpr(c.a)
 	} else if c.kind == CtxArgMethod {
 		m := meths.items[usize(c.a)]
-		mname(u32(typs.items[usize(m.recv)].n))
+		mname(typeName(m.recv))
 		mbyte('.')
 		mname(m.name)
 	} else if c.kind == CtxArgBuiltin {
@@ -418,9 +418,9 @@ func assignment(x *Operand, t u32, c Ctx) bool {
 	if isUntyped(x.typ) {
 		return convertUntyped(x, t)
 	}
-	if tk(x.typ) == TCCode {
+	if isCodeT(x.typ) {
 		ct := underlying(t)
-		if tk(ct) == TCCode {
+		if isCodeT(ct) {
 			if codeLevel(x.typ) < 0 {
 				x.typ = t
 				updateType(x.expr, t, SemaDepth)
@@ -462,15 +462,15 @@ func assignable(v u32, t u32) bool {
 	if v == t {
 		return true
 	}
-	vn := tk(v) == TCNamed
-	tn := tk(t) == TCNamed
+	vn := isNamedT(v)
+	tn := isNamedT(t)
 	if !vn || !tn {
 		vu := underlying(v)
 		tu := underlying(t)
-		if tk(vu) != TCTypeParam && vu == tu && tk(vu) != TCOpaque {
+		if !isTypeParamT(vu) && vu == tu && !isOpaqueT(vu) {
 			return true
 		}
-		if tk(vu) == TCSig && tk(tu) == TCSig && sigEffect(vu) <= sigEffect(tu) && sigVariadic(vu) == sigVariadic(tu) &&
+		if isSigT(vu) && isSigT(tu) && sigEffect(vu) <= sigEffect(tu) && sigVariadic(vu) == sigVariadic(tu) &&
 			u32sEqual(sigParamsSlice(vu), sigParamsSlice(tu)) && u32sEqual(sigResultsSlice(vu), sigResultsSlice(tu)) {
 			return true
 		}
@@ -497,13 +497,13 @@ func convertUntypedDp(x *Operand, t u32, dp usize) bool decreases(dp) {
 	ok := false
 	if k == BkUntypedNil {
 		u := underlying(t)
-		if tk(u) == TCSlice || basicKind(t) == BkError {
+		if isSliceT(u) || basicKind(t) == BkError {
 			ok = true
 		} else {
 			mreset()
 			ms("cannot use nil as ")
 			mtype(t)
-			if tk(u) == TCPointer || isScoped(t) {
+			if isPointerT(u) || isScoped(t) {
 				ms(" value: nil is only valid for error and slices")
 				errAt(E2004, x.expr)
 			} else {
@@ -514,7 +514,7 @@ func convertUntypedDp(x *Operand, t u32, dp usize) bool decreases(dp) {
 		}
 	} else if k == BkUntypedInt || k == BkUntypedChar {
 		if isInteger(t) && !isUntyped(t) {
-			if x.val.kind != VNone && !representable(x.val, t) {
+			if x.val != Val.None && !representable(x.val, t) {
 				mreset()
 				ms("constant ")
 				mval(x.val)
@@ -615,12 +615,12 @@ func singleValue(x *Operand) {
 		return
 	}
 	if m == KValue || m == KVar || m == KConst {
-		if x.typ != 0 && tk(x.typ) == TCTuple {
+		if x.typ != 0 && isTupleT(x.typ) {
 			mreset()
 			ms("multiple-value ")
 			mexpr(x.expr)
 			ms(" (")
-			mu(u64(tl1n(x.typ)))
+			mu(u64(tupleN(x.typ)))
 			ms(" values) in single-value context")
 			errAt(E2003, x.expr)
 			x.mode = KNone
@@ -643,7 +643,7 @@ func singleValue(x *Operand) {
 		ms(" must be called")
 		errAt(E2002, x.expr)
 	} else if m == KFunc {
-		isSig := x.typ != 0 && tk(x.typ) == TCSig
+		isSig := x.typ != 0 && isSigT(x.typ)
 		if x.method != 0 {
 			ms("method value ")
 			mexpr(x.expr)
@@ -766,7 +766,7 @@ func objDecl(s u32, dp usize) decreases(dp) {
 		mreset()
 		if k == SymType {
 			t := syms.items[usize(s)].typ
-			if t != 0 && tk(t) == TCNamed {
+			if t != 0 && isNamedT(t) {
 				return
 			}
 			ms("invalid recursive type alias ")
@@ -968,34 +968,32 @@ func typeDeclIn(s u32, d u32, dp usize) decreases(dp) {
 	}
 	if nb(d) != 0 {
 		ts, tn := typeParams(nb(d), dp-1)
-		typs.items[usize(n)].l2s = ts
-		typs.items[usize(n)].l2n = tn
+		setNamedTParams(n, ts, tn)
 	}
 	under := typExpr(nc(d), dp-1)
-	uk := tk(under)
-	if uk == TCNamed {
-		ua := typs.items[usize(under)].a
+	if isNamedT(under) {
+		ua := namedUnder(under)
 		if ua == 0 {
 			mreset()
 			ms("invalid recursive type ")
 			mname(symName(s))
 			errAt(E2002, na(d))
-			typs.items[usize(n)].a = TyInvalid
+			setNamedUnder(n, TyInvalid)
 		} else {
-			typs.items[usize(n)].a = ua
-			if namedBuiltin(under) != 0 && typs.items[usize(under)].flag&1 != 0 {
-				typs.items[usize(n)].cls = typs.items[usize(under)].cls
-				typs.items[usize(n)].flag = typs.items[usize(n)].flag | 1
+			setNamedUnder(n, ua)
+			uc, cached := namedClass(under)
+			if namedBuiltin(under) != 0 && cached {
+				setNamedClass(n, uc)
 			}
 		}
-	} else if uk == TCTypeParam {
+	} else if isTypeParamT(under) {
 		mreset()
 		ms("cannot use a type parameter as the underlying type of ")
 		mname(symName(s))
 		errAt(E2002, nc(d))
-		typs.items[usize(n)].a = TyInvalid
+		setNamedUnder(n, TyInvalid)
 	} else {
-		typs.items[usize(n)].a = under
+		setNamedUnder(n, under)
 	}
 	completePending(n)
 }
@@ -1136,7 +1134,7 @@ func typeParams(l u32, dp usize) (u32, u32) decreases(dp) {
 		for j := usize(0); j < nn; j++ {
 			id := l1at(p, j)
 			sym := defs[usize(id)]
-			tp := newTypeParam(idName(id), sym, u32(typs.top-mark), constT)
+			tp := newTypeParam(idName(id), sym, u32(tmark()-mark), constT)
 			tpush(tp)
 			setSymType(sym, tp)
 		}
@@ -1268,7 +1266,7 @@ func receiver(fid u32, d u32, dp usize) decreases(dp) {
 		return
 	}
 	named := symType(tsym, dp-1)
-	if named == 0 || tk(named) != TCNamed || namedSym(named) != tsym {
+	if named == 0 || !isNamedT(named) || namedSym(named) != tsym {
 		mreset()
 		ms("invalid receiver type ")
 		mname(idName(tn))
@@ -1281,11 +1279,11 @@ func receiver(fid u32, d u32, dp usize) decreases(dp) {
 	ntype[usize(tn)] = named
 	recvT := named
 	nr := l1len(r)
-	ntp := tl2n(named)
+	ntp := namedNTParams(named)
 	if nr != ntp {
 		mreset()
 		ms("receiver ")
-		mname(u32(typs.items[usize(named)].n))
+		mname(typeName(named))
 		ms(" needs ")
 		mu(u64(ntp))
 		ms(" type parameters, got ")
@@ -1296,7 +1294,7 @@ func receiver(fid u32, d u32, dp usize) decreases(dp) {
 		for i := usize(0); i < nr; i++ {
 			id := l1at(r, i)
 			sym := defs[usize(id)]
-			tp := newTypeParam(idName(id), sym, u32(i), typs.items[usize(tl2(named, i))].a)
+			tp := newTypeParam(idName(id), sym, u32(i), tpConstType(namedTParam(named, i)))
 			setSymType(sym, tp)
 			tpush(tp)
 		}
@@ -1305,7 +1303,7 @@ func receiver(fid u32, d u32, dp usize) decreases(dp) {
 		meths.items[usize(mid)].rtpN = tc
 		funcs.items[usize(fid)].tpS = ts
 		funcs.items[usize(fid)].tpN = tc
-		recvT = instantiate(named, typs.lists[usize(ts):usize(ts)+usize(tc)], 0, SemaDepth)
+		recvT = instantiate(named, tlistSlice(ts, tc), 0, SemaDepth)
 	}
 	if nflag(r) {
 		recvT = mkPointer(recvT)
@@ -1323,15 +1321,16 @@ func methodsOf(n0 u32, dp usize) (u32, u32) decreases(dp) {
 	if namedOrigin(n) != 0 {
 		n = namedOrigin(n)
 	}
-	if typs.items[usize(n)].flag&2 != 0 || namedBuiltin(n) != 0 {
-		return typs.items[usize(n)].l3s, typs.items[usize(n)].l3n
+	ms0, mn0, cached := namedMethodCache(n)
+	if cached || namedBuiltin(n) != 0 {
+		return ms0, mn0
 	}
 	mark := ustack.count
 	ns := namedSym(n)
 	if ns != 0 && syms.items[usize(ns)].pkg != 0 {
 		p := syms.items[usize(ns)].pkg
 		cnt := usize(pkgs.items[usize(p)].methN)
-		tname := u32(typs.items[usize(n)].n)
+		tname := typeName(n)
 		for i := usize(0); i < cnt; i++ {
 			msym := uat(pkgs.items[usize(p)].methS, i)
 			if syms.items[usize(msym)].recvType != tname {
@@ -1345,9 +1344,7 @@ func methodsOf(n0 u32, dp usize) (u32, u32) decreases(dp) {
 		}
 	}
 	s, c := ucommit(mark)
-	typs.items[usize(n)].l3s = s
-	typs.items[usize(n)].l3n = c
-	typs.items[usize(n)].flag = typs.items[usize(n)].flag | 2
+	setNamedMethods(n, s, c)
 	return s, c
 }
 
@@ -1493,9 +1490,10 @@ func typExpr0(t u32, dp usize) u32 decreases(dp) {
 				id := l1at(f, j)
 				nm := idName(id)
 				if nm != nameBlank {
-					cnt := (typs.top - mark) / 2
+					fs := tslice(mark)
+					cnt := len(fs) / 2
 					for q := usize(0); q < cnt; q++ {
-						if typs.stack[mark+2*q] == nm {
+						if fs[2*q] == nm {
 							mreset()
 							ms("duplicate field ")
 							mname(nm)
@@ -1517,9 +1515,10 @@ func typExpr0(t u32, dp usize) u32 decreases(dp) {
 		for i := usize(0); i < nv; i++ {
 			v := l1at(t, i)
 			nm := idName(na(v))
-			cnt := (typs.top - mark) / 3
+			vs := tslice(mark)
+			cnt := len(vs) / 3
 			for q := usize(0); q < cnt; q++ {
-				if typs.stack[mark+3*q] == nm {
+				if vs[3*q] == nm {
 					mreset()
 					ms("duplicate variant ")
 					mname(nm)
@@ -1605,7 +1604,7 @@ func elType(e u32, dp usize) u32 decreases(dp) {
 	if isInvalidOp(&x) {
 		return TyInvalid
 	}
-	if tk(x.typ) != TCCode {
+	if !isCodeT(x.typ) {
 		mreset()
 		ms("El expects a Code value, got ")
 		mexpr(e)
@@ -1615,7 +1614,7 @@ func elType(e u32, dp usize) u32 decreases(dp) {
 		errAt(E2002, e)
 		return TyInvalid
 	}
-	if x.mode != KConst || x.val.kind != VCode {
+	if x.mode != KConst || !isCodeVal(x.val) {
 		mreset()
 		ms("El argument ")
 		mexpr(e)
@@ -1636,8 +1635,8 @@ func arrayLen(e u32, dp usize) (u64, u32, bool) decreases(dp) {
 		sym := uses[usize(e)]
 		if sym != 0 && symKind(sym) == SymTypeParam {
 			tp := syms.items[usize(sym)].typ
-			if tp != 0 && tk(tp) == TCTypeParam && tpIsConst(tp) {
-				ntype[usize(e)] = typs.items[usize(tp)].a
+			if tp != 0 && isTypeParamT(tp) && tpIsConst(tp) {
+				ntype[usize(e)] = tpConstType(tp)
 				nmode[usize(e)] = KValue
 				return 0, tp, true
 			}
@@ -1734,11 +1733,11 @@ func namedTypeExpr(t u32, dp usize) u32 decreases(dp) {
 	}
 	ntype[usize(name)] = r
 	nmode[usize(name)] = KType
-	if tk(r) == TCNamed && tl2n(r) > 0 {
+	if isNamedT(r) && namedNTParams(r) > 0 {
 		if l1len(t) == 0 {
 			mreset()
 			ms("generic type ")
-			mname(u32(typs.items[usize(r)].n))
+			mname(typeName(r))
 			ms(" used without type arguments")
 			errAt(E2002, t)
 			return TyInvalid
@@ -1784,7 +1783,7 @@ func typeSym(sym u32, id u32, dp usize) u32 decreases(dp) {
 	}
 	if k == SymTypeParam {
 		tp := syms.items[usize(sym)].typ
-		if tp == 0 || tk(tp) != TCTypeParam {
+		if tp == 0 || !isTypeParamT(tp) {
 			return TyInvalid
 		}
 		if tpIsConst(tp) {
@@ -1812,11 +1811,11 @@ func instantiateArgs(n u32, args u32, node u32, sp u32, dp usize) u32 decreases(
 		return TyInvalid
 	}
 	na1 := l1len(args)
-	ntp := tl2n(n)
+	ntp := namedNTParams(n)
 	if na1 != ntp {
 		mreset()
 		ms("wrong number of type arguments for ")
-		mname(u32(typs.items[usize(n)].n))
+		mname(typeName(n))
 		ms(": have ")
 		mu(u64(na1))
 		ms(", want ")
@@ -1826,15 +1825,15 @@ func instantiateArgs(n u32, args u32, node u32, sp u32, dp usize) u32 decreases(
 	}
 	mark := tmark()
 	for i := usize(0); i < na1; i++ {
-		ta := typeArg(l1at(args, i), tl2(n, i), dp-1)
+		ta := typeArg(l1at(args, i), namedTParam(n, i), dp-1)
 		if isInvalid(ta) {
-			typs.top = mark
+			tdiscard(mark)
 			return TyInvalid
 		}
 		tpush(ta)
 	}
 	s, c := tcommitStack(mark)
-	return instantiate(n, typs.lists[usize(s):usize(s)+usize(c)], node, SemaDepth)
+	return instantiate(n, tlistSlice(s, c), node, SemaDepth)
 }
 
 // typeArg checks one type argument against its parameter.
@@ -1849,8 +1848,8 @@ func typeArg(e u32, tp u32, dp usize) u32 decreases(dp) {
 			sym := uses[usize(u)]
 			if sym != 0 && symKind(sym) == SymTypeParam {
 				p := syms.items[usize(sym)].typ
-				if p != 0 && tk(p) == TCTypeParam && tpIsConst(p) {
-					ntype[usize(u)] = typs.items[usize(p)].a
+				if p != 0 && isTypeParamT(p) && tpIsConst(p) {
+					ntype[usize(u)] = tpConstType(p)
 					nmode[usize(u)] = KValue
 					return p
 				}
@@ -1867,12 +1866,12 @@ func typeArg(e u32, tp u32, dp usize) u32 decreases(dp) {
 			ms("type argument ")
 			mexpr(e)
 			ms(" for const parameter ")
-			mname(u32(typs.items[usize(tp)].n))
+			mname(typeName(tp))
 			ms(" must be an integer constant")
 			errAt(E2002, e)
 			return TyInvalid
 		}
-		if !assignment(&x, typs.items[usize(tp)].a, mkCtx(CtxTypeArg)) {
+		if !assignment(&x, tpConstType(tp), mkCtx(CtxTypeArg)) {
 			return TyInvalid
 		}
 		v, ok := valUint64(x.val)
@@ -1917,32 +1916,38 @@ func recVisit(t u32, dp usize) bool decreases(dp) {
 	if dp == 0 || t == 0 {
 		return false
 	}
-	k := tk(t)
-	if k == TCNamed {
-		return recVisitNamed(t, dp-1)
-	}
-	if k == TCArray {
-		return recVisit(elemOf(t), dp-1)
-	}
-	if k == TCStruct {
-		n := nfields(t)
-		for i := usize(0); i < n; i++ {
-			if recVisit(fieldType(t, i), dp-1) {
-				return true
-			}
+	match trec(t) {
+		Named(_) -> {
+			return recVisitNamed(t, dp-1)
 		}
-	} else if k == TCEnum {
-		n := nvariants(t)
-		for i := usize(0); i < n; i++ {
-			m := variantPayN(t, i)
-			for j := usize(0); j < m; j++ {
-				if recVisit(variantPay(t, i, j), dp-1) {
+		Array(e, _, _) -> {
+			return recVisit(e, dp-1)
+		}
+		Struct(_, _) -> {
+			n := nfields(t)
+			for i := usize(0); i < n; i++ {
+				if recVisit(fieldType(t, i), dp-1) {
 					return true
 				}
 			}
+			return false
+		}
+		Enum(_, _) -> {
+			n := nvariants(t)
+			for i := usize(0); i < n; i++ {
+				m := variantPayN(t, i)
+				for j := usize(0); j < m; j++ {
+					if recVisit(variantPay(t, i, j), dp-1) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		NoType | Basic(_) | Sig(_, _, _, _, _, _, _, _) | Slice(_) | Pointer(_) | Code(_) | TypeParam(_, _, _, _) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {
+			return false
 		}
 	}
-	return false
 }
 
 func recVisitNamed(t u32, dp usize) bool decreases(dp) {
@@ -1961,7 +1966,7 @@ func recVisitNamed(t u32, dp usize) bool decreases(dp) {
 		return false
 	}
 	recState[usize(n)] = 1
-	bad := recVisit(typs.items[usize(n)].a, dp-1)
+	bad := recVisit(namedUnder(n), dp-1)
 	recState[usize(n)] = 2
 	return bad
 }
@@ -1976,7 +1981,7 @@ func checkRecursiveTypes() {
 			if s != 0 && syms.items[usize(s)].ident != 0 {
 				mreset()
 				ms("invalid recursive type ")
-				mname(u32(typs.items[usize(t)].n))
+				mname(typeName(t))
 				ms(" (contains itself by value)")
 				errAt(E2002, syms.items[usize(s)].ident)
 			}

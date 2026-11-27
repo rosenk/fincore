@@ -109,12 +109,16 @@ const (
 )
 
 // Escape decoding results.
+// Esc is the result of scanning one escape sequence.
+type Esc enum {
+	Ok(u8)      // the decoded byte
+	EOF         // end of input after the backslash
+	Newline     // a newline after the backslash
+	Invalid(u8) // an unknown escape: the offending byte
+	BadHex      // \x without two hex digits
+}
+
 const (
-	EscOK      = 0
-	EscEOF     = 1
-	EscNewline = 2
-	EscInvalid = 3
-	EscBadHex  = 4
 )
 
 // Integer literal check results (checkIntLit).
@@ -1016,52 +1020,51 @@ func (l *Lexer) scanOperator(start Token) Token {
 	return t
 }
 
-// escape scans one escape sequence starting at the backslash. It returns
-// the status (Esc*), the decoded byte and the offending byte.
-func (l *Lexer) escape(quote byte) (u8, byte, byte) {
+// escape scans one escape sequence starting at the backslash.
+func (l *Lexer) escape(quote byte) Esc {
 	l.advance() // backslash
 	if l.off >= l.n {
-		return EscEOF, 0, 0
+		return Esc.EOF
 	}
 	c := l.src[l.off]
 	if c == 'n' {
 		l.advance()
-		return EscOK, '\n', 0
+		return Esc.Ok('\n')
 	}
 	if c == 'r' {
 		l.advance()
-		return EscOK, '\r', 0
+		return Esc.Ok('\r')
 	}
 	if c == 't' {
 		l.advance()
-		return EscOK, '\t', 0
+		return Esc.Ok('\t')
 	}
 	if c == '\\' {
 		l.advance()
-		return EscOK, '\\', 0
+		return Esc.Ok('\\')
 	}
 	if c == '"' || c == '\'' {
 		if c != quote {
-			return EscInvalid, 0, c
+			return Esc.Invalid(c)
 		}
 		l.advance()
-		return EscOK, c, 0
+		return Esc.Ok(c)
 	}
 	if c == 'x' {
 		l.advance()
 		h1 := l.peekByte(0)
 		h2 := l.peekByte(1)
 		if !isHex(h1) || !isHex(h2) {
-			return EscBadHex, 0, 0
+			return Esc.BadHex
 		}
 		l.advance()
 		l.advance()
-		return EscOK, (hexVal(h1) << 4) | hexVal(h2), 0
+		return Esc.Ok((hexVal(h1) << 4) | hexVal(h2))
 	}
 	if c == '\n' {
-		return EscNewline, 0, 0
+		return Esc.Newline
 	}
-	return EscInvalid, 0, c
+	return Esc.Invalid(c)
 }
 
 func (l *Lexer) scanString(start Token) Token {
@@ -1085,19 +1088,26 @@ func (l *Lexer) scanString(start Token) Token {
 		if c == '\\' {
 			pl := l.line
 			pc := l.col()
-			st, _, bb := l.escape('"')
-			if st == EscEOF || st == EscNewline {
-				return l.illegal(start, LexErrUntermString)
+			bad := u8(LexErrNone)
+			match l.escape('"') {
+				EOF | Newline -> {
+					return l.illegal(start, LexErrUntermString)
+				}
+				Ok(_) -> {}
+				BadHex -> {
+					bad = LexErrBadHexEscape
+				}
+				Invalid(bb) -> {
+					bad = LexErrBadEscape
+					if badKind == LexErrNone {
+						badByte = bb
+					}
+				}
 			}
-			if st != EscOK && badKind == LexErrNone {
+			if bad != LexErrNone && badKind == LexErrNone {
 				badLine = pl
 				badCol = pc
-				badByte = bb
-				if st == EscBadHex {
-					badKind = LexErrBadHexEscape
-				} else {
-					badKind = LexErrBadEscape
-				}
+				badKind = bad
 			}
 			continue
 		}
@@ -1128,19 +1138,22 @@ func (l *Lexer) scanChar(start Token) Token {
 	} else if c == '\\' {
 		pl := l.line
 		pc := l.col()
-		st, b, bb := l.escape('\'')
-		if st == EscEOF || st == EscNewline {
-			return l.illegal(start, LexErrUntermChar)
+		match l.escape('\'') {
+			EOF | Newline -> {
+				return l.illegal(start, LexErrUntermChar)
+			}
+			BadHex -> {
+				l.skipCharRest()
+				return l.illegalAt(start, LexErrBadHexEscape, pl, pc, 0)
+			}
+			Invalid(bb) -> {
+				l.skipCharRest()
+				return l.illegalAt(start, LexErrBadEscape, pl, pc, bb)
+			}
+			Ok(b) -> {
+				v = b
+			}
 		}
-		if st == EscBadHex {
-			l.skipCharRest()
-			return l.illegalAt(start, LexErrBadHexEscape, pl, pc, bb)
-		}
-		if st == EscInvalid {
-			l.skipCharRest()
-			return l.illegalAt(start, LexErrBadEscape, pl, pc, bb)
-		}
-		v = b
 	} else if c >= 0x80 {
 		l.skipCharRest()
 		return l.illegal(start, LexErrCharMultiByte)

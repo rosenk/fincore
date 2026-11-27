@@ -1,8 +1,8 @@
 // values.fc — compile-time values (port of finc0's types/value.go).
 //
 // A Val is a small by-value record. Integers are exact 128-bit two's
-// complement numbers (finc0 uses math/big; values outside ±2^127 set the
-// `ovf` flag, see README "Known gaps"). Aggregates (arrays, structs, enum
+// complement numbers (finc0 uses math/big; values outside ±2^127 are
+// IntOvf, see README "Known gaps"). Aggregates (arrays, structs, enum
 // payloads, tuples, code trees) live in the value-slot arena: a Val refers
 // to its first element slot. The arena has two regions: the persistent
 // region (values recorded in the typed model) and the comptime heap, which
@@ -22,51 +22,45 @@ const (
 	AllOnes          = 0xFFFFFFFFFFFFFFFF
 )
 
-// Value kinds.
+// Code kinds of CodeBasic values (types.CodeKind up to CodeI64).
 const (
-	VNone      = 0
-	VInt       = 1  // lo/hi: two's complement; flag&1: overflowed 128 bits
-	VBool      = 2  // lo: 0/1
-	VString    = 3  // ref: strPool offset, aux: length
-	VError     = 4  // lo: sentinel builtin (0 = nil error)
-	VNil       = 5  // untyped nil
-	VArray     = 6  // ref: first element slot, aux: length
-	VSlice     = 7  // flag&2: has array; ref: array's first slot, lo: array length, aux: lo, aux2: hi
-	VStruct    = 8  // ref, aux: field count
-	VEnum      = 9  // lo: variant index; ref, aux: payload
-	VTuple     = 10 // ref, aux: element count
-	VCode      = 11 // lo: code kind, hi: Len/Univ, ref: elem slot (array, slice) or fields (struct), aux: field count
-	VFieldCode = 12 // lo/hi: name (strPool offset/len), ref: slot of the Code value
-	VPtr       = 13 // ref: target slot (0 = nil pointer)
+	CKEmpty = 0
+	CKUnit  = 1
+	CKBool  = 2
+	CKU8    = 3
+	CKU16   = 4
+	CKU32   = 5
+	CKU64   = 6
+	CKI8    = 7
+	CKI16   = 8
+	CKI32   = 9
+	CKI64   = 10
 )
 
-// Code kinds (types.CodeKind).
-const (
-	CKEmpty  = 0
-	CKUnit   = 1
-	CKBool   = 2
-	CKU8     = 3
-	CKU16    = 4
-	CKU32    = 5
-	CKU64    = 6
-	CKI8     = 7
-	CKI16    = 8
-	CKI32    = 9
-	CKI64    = 10
-	CKArray  = 11
-	CKSlice  = 12
-	CKStruct = 13
-	CKUniv   = 14
-)
-
-type Val struct {
-	lo   u64
-	hi   u64
-	ref  u32
-	aux  u32
-	aux2 u32
-	kind u8
-	flag u8
+// Val is a compile-time value. Aggregates refer to value slots: a run of
+// consecutive slots starting at the first one. The variant order fixes the
+// compact layout (bool, u8, 3 x u32, 2 x u64: 32 bytes), see docs/v0_2.md.
+type Val enum {
+	None                      // no value (the zero Val)
+	Bool(bool)                //
+	Err(u8)                   // sentinel error: builtin (0 = nil error)
+	Nil                       // untyped nil
+	Str(u32, u32)             // strPool offset, length
+	Int(u64, u64)             // hi, lo: exact 128-bit two's complement
+	IntOvf                    // an integer outside ±2^127
+	Array(u32, u32)           // first element slot, length
+	Slice(u32, u32, u32, u64) // backing array's first slot, lo, hi, array length
+	NilSlice                  // a slice without backing array (nil)
+	Struct(u32, u32)          // first field slot, field count
+	Enum(u32, u32, u32)       // variant index, first payload slot, payload count
+	Tuple(u32, u32)           // first element slot, count
+	Ptr(u32)                  // target slot (0 = nil pointer)
+	CodeBasic(u8)             // CKEmpty..CKI64
+	CodeArray(u64, u32)       // length, slot of the element code
+	CodeSlice(u32)            // slot of the element code
+	CodeStruct(u32, u32)      // first FieldCode slot, field count
+	CodeUniv(u64)             // universe level
+	FieldCode(u32, u32, u32)  // name (strPool offset, length), slot of the code
 }
 
 type ValArena struct {
@@ -162,78 +156,41 @@ func strAlloc(b []byte) u32 {
 	return u32(st)
 }
 
+func strSpan(off u32, n u32) []byte {
+	return strPool[usize(off) : usize(off)+usize(n)]
+}
+
+// strOf returns the bytes of a string value (empty for other values).
 func strOf(v Val) []byte {
-	return strPool[usize(v.ref) : usize(v.ref)+usize(v.aux)]
+	return match v { Str(off, n) -> strSpan(off, n), _ -> strPool[0:0] }
 }
 
 // ---------------------------------------------------------------------------
 // Constructors
 
 func vIntU(u u64) Val {
-	var v Val
-	v.kind = VInt
-	v.lo = u
-	return v
+	return Val.Int(0, u)
 }
 
 func vInt(hi u64, lo u64) Val {
-	var v Val
-	v.kind = VInt
-	v.lo = lo
-	v.hi = hi
-	return v
-}
-
-func vIntOvf() Val {
-	var v Val
-	v.kind = VInt
-	v.flag = 1
-	return v
+	return Val.Int(hi, lo)
 }
 
 func vBool(b bool) Val {
-	var v Val
-	v.kind = VBool
-	if b {
-		v.lo = 1
-	}
-	return v
+	return Val.Bool(b)
 }
 
 func vErr(b u8) Val {
-	var v Val
-	v.kind = VError
-	v.lo = u64(b)
-	return v
-}
-
-func vNilV() Val {
-	var v Val
-	v.kind = VNil
-	return v
+	return Val.Err(b)
 }
 
 func vStr(b []byte) Val {
-	var v Val
-	v.kind = VString
-	v.ref = strAlloc(b)
-	v.aux = u32(len(b))
-	return v
+	return Val.Str(strAlloc(b), u32(len(b)))
 }
 
-func vAgg(kind u8, ref u32, n usize) Val {
-	var v Val
-	v.kind = kind
-	v.ref = ref
-	v.aux = u32(n)
-	return v
-}
-
-func vCode(k u8) Val {
-	var v Val
-	v.kind = VCode
-	v.lo = u64(k)
-	return v
+// sliceOver is a slice of all n slots of the array at st.
+func sliceOver(st u32, n usize) Val {
+	return Val.Slice(st, 0, u32(n), u64(n))
 }
 
 // ---------------------------------------------------------------------------
@@ -453,11 +410,69 @@ func cmp128(ah u64, al u64, bh u64, bl u64) int {
 	return 0
 }
 
+// intParts returns the digits of an exact integer value (ok == false and
+// 0, 0 for IntOvf and non-integers).
+func intParts(v Val) (u64, u64, bool) {
+	match v {
+		Int(hi, lo) -> {
+			return hi, lo, true
+		}
+		_ -> {
+			return 0, 0, false
+		}
+	}
+}
+
+func isIntVal(v Val) bool {
+	return match v { Int(_, _) | IntOvf -> true, _ -> false }
+}
+
+func isBoolVal(v Val) bool {
+	return match v { Bool(_) -> true, _ -> false }
+}
+
+// intLo returns the low 64 bits of an exact integer value (0 for other
+// values).
+func intLo(v Val) u64 {
+	_, lo, _ := intParts(v)
+	return lo
+}
+
+// sliceElems returns the first element slot and the length of a slice
+// value ((0, 0) for nil slices and other values).
+func sliceElems(v Val) (u32, u32) {
+	match v {
+		Slice(ref, lo, hi, _) -> {
+			return ref + lo, hi - lo
+		}
+		_ -> {
+			return 0, 0
+		}
+	}
+}
+
+func isSliceVal(v Val) bool {
+	return match v { Slice(_, _, _, _) | NilSlice -> true, _ -> false }
+}
+
+func isPtrVal(v Val) bool {
+	return match v { Ptr(_) -> true, _ -> false }
+}
+
+func isStructVal(v Val) bool {
+	return match v { Struct(_, _) -> true, _ -> false }
+}
+
+func isStrVal(v Val) bool {
+	return match v { Str(_, _) -> true, _ -> false }
+}
+
 func intSign(v Val) int {
-	if isNeg128(v.hi) {
+	hi, lo, _ := intParts(v)
+	if isNeg128(hi) {
 		return -1
 	}
-	if v.hi == 0 && v.lo == 0 {
+	if hi == 0 && lo == 0 {
 		return 0
 	}
 	return 1
@@ -465,12 +480,11 @@ func intSign(v Val) int {
 
 // putInt128 writes the decimal form of an integer value.
 func putInt128(o *OutBuf, v Val) {
-	if v.flag&1 != 0 {
+	if v == Val.IntOvf {
 		o.putStr("<overflow>")
 		return
 	}
-	h := v.hi
-	l := v.lo
+	h, l, _ := intParts(v)
 	if isNeg128(h) {
 		o.putByte('-')
 		h, l = neg128(h, l)
@@ -510,60 +524,61 @@ func divSmall128(h u64, l u64, d u64) (u64, u64, u64) {
 
 // inRange reports whether integer v fits a bits-wide integer type.
 func inRange(v Val, bits u32, signed bool) bool {
-	if v.flag&1 != 0 {
+	hi, lo, ok := intParts(v)
+	if !ok {
 		return false
 	}
 	if signed {
 		lim := u64(1) << u64(bits-1)
-		if isNeg128(v.hi) {
+		if isNeg128(hi) {
 			// v >= -lim
-			if v.hi != AllOnes {
+			if hi != AllOnes {
 				return false
 			}
 			if bits == 64 {
-				return v.lo >= SignBit
+				return lo >= SignBit
 			}
-			return v.lo >= AllOnes-lim+1
+			return lo >= AllOnes-lim+1
 		}
-		return v.hi == 0 && v.lo < lim
+		return hi == 0 && lo < lim
 	}
-	if v.hi != 0 {
+	if hi != 0 {
 		return false
 	}
 	if bits == 64 {
 		return true
 	}
-	return v.lo < (u64(1) << u64(bits))
+	return lo < (u64(1) << u64(bits))
 }
 
 // representable reports whether constant v fits type t.
 func representable(v Val, t u32) bool {
-	if v.kind == VInt {
-		bits, signed, ok := intInfo(t)
-		if ok {
-			return inRange(v, bits, signed)
-		}
-		return isUntyped(t) && isInteger(t)
+	return match v {
+		Int(_, _) | IntOvf -> intRepresentable(v, t)
+		Bool(_) -> isBoolean(t)
+		Str(_, _) -> isString(t)
+		_ -> true
 	}
-	if v.kind == VBool {
-		return isBoolean(t)
+}
+
+func intRepresentable(v Val, t u32) bool {
+	bits, signed, ok := intInfo(t)
+	if ok {
+		return inRange(v, bits, signed)
 	}
-	if v.kind == VString {
-		return isString(t)
-	}
-	return true
+	return isUntyped(t) && isInteger(t)
 }
 
 // wrapVal truncates an integer to the range of t (two's complement).
 func wrapVal(v Val, t u32) Val {
-	if v.kind != VInt {
+	if !isIntVal(v) {
 		return v
 	}
 	bits, signed, ok := intInfo(t)
 	if !ok || inRange(v, bits, signed) {
 		return v
 	}
-	lo := v.lo
+	_, lo, _ := intParts(v)
 	if bits < 64 {
 		lo = lo & ((u64(1) << u64(bits)) - 1)
 	}
@@ -574,15 +589,16 @@ func wrapVal(v Val, t u32) Val {
 		}
 		hi = AllOnes
 	}
-	return vInt(hi, lo)
+	return Val.Int(hi, lo)
 }
 
 // valUint64 returns v as a u64 if it is a non-negative integer that fits.
 func valUint64(v Val) (u64, bool) {
-	if v.kind != VInt || v.flag&1 != 0 || v.hi != 0 {
+	hi, lo, ok := intParts(v)
+	if !ok || hi != 0 {
 		return 0, false
 	}
-	return v.lo, true
+	return lo, true
 }
 
 // ---------------------------------------------------------------------------
@@ -592,63 +608,87 @@ func putVal(o *OutBuf, v Val, depth usize) decreases(depth) {
 	if depth == 0 {
 		return
 	}
-	k := v.kind
-	if k == VInt {
-		putInt128(o, v)
-	} else if k == VBool {
-		if v.lo != 0 {
-			o.putStr("true")
-		} else {
-			o.putStr("false")
+	match v {
+		None -> {}
+		Int(_, _) | IntOvf -> putInt128(o, v)
+		Bool(b) -> {
+			if b {
+				o.putStr("true")
+			} else {
+				o.putStr("false")
+			}
 		}
-	} else if k == VString {
-		putQuoted(o, strOf(v))
-	} else if k == VError {
-		if v.lo == 0 {
-			o.putStr("nil")
-		} else {
-			o.putStr(builtinName(u8(v.lo)))
+		Str(off, n) -> putQuoted(o, strSpan(off, n))
+		Err(b) -> {
+			if b == 0 {
+				o.putStr("nil")
+			} else {
+				o.putStr(builtinName(b))
+			}
 		}
-	} else if k == VNil {
-		o.putStr("nil")
-	} else if k == VArray {
-		putElems(o, v.ref, usize(v.aux), depth-1)
-	} else if k == VSlice {
-		if v.flag&2 == 0 {
-			o.putStr("[]")
-		} else {
-			putElems(o, v.ref+v.aux, usize(v.aux2-v.aux), depth-1)
+		Nil -> o.putStr("nil")
+		Array(ref, n) -> putElems(o, ref, usize(n), depth-1)
+		Slice(ref, lo, hi, _) -> putElems(o, ref+lo, usize(hi-lo), depth-1)
+		NilSlice -> o.putStr("[]")
+		Struct(ref, n) -> {
+			o.putByte('{')
+			putValList(o, ref, usize(n), depth-1)
+			o.putByte('}')
 		}
-	} else if k == VStruct {
-		o.putByte('{')
-		putValList(o, v.ref, usize(v.aux), depth-1)
-		o.putByte('}')
-	} else if k == VEnum {
-		o.putStr("variant#")
-		o.putUint(v.lo)
-		if v.aux > 0 {
+		Enum(vi, ref, n) -> {
+			o.putStr("variant#")
+			o.putUint(u64(vi))
+			if n > 0 {
+				o.putByte('(')
+				putValList(o, ref, usize(n), depth-1)
+				o.putByte(')')
+			}
+		}
+		Tuple(ref, n) -> {
 			o.putByte('(')
-			putValList(o, v.ref, usize(v.aux), depth-1)
+			putValList(o, ref, usize(n), depth-1)
 			o.putByte(')')
 		}
-	} else if k == VTuple {
-		o.putByte('(')
-		putValList(o, v.ref, usize(v.aux), depth-1)
-		o.putByte(')')
-	} else if k == VCode {
-		putCode(o, v, depth-1)
-	} else if k == VFieldCode {
-		o.putStr("CodeField(")
-		putQuoted(o, strPool[usize(v.lo):usize(v.lo)+usize(v.hi)])
-		o.putStr(", ")
-		putVal(o, slotGet(v.ref), depth-1)
-		o.putByte(')')
-	} else if k == VPtr {
-		o.putByte('&')
-		if v.ref != 0 {
-			putVal(o, slotGet(v.ref), depth-1)
-		} else {
-			o.putStr("<nil>")
+		CodeBasic(k) -> {
+			o.putStr(codeKindName(k))
+			o.putStr("()")
+		}
+		CodeArray(n, el) -> {
+			o.putStr("CodeArray(")
+			o.putUint(n)
+			o.putStr(", ")
+			putVal(o, slotGet(el), depth-1)
+			o.putByte(')')
+		}
+		CodeSlice(el) -> {
+			o.putStr("CodeSlice(")
+			putVal(o, slotGet(el), depth-1)
+			o.putByte(')')
+		}
+		CodeStruct(ref, n) -> {
+			o.putStr("CodeStruct(")
+			putValList(o, ref, usize(n), depth-1)
+			o.putByte(')')
+		}
+		CodeUniv(l) -> {
+			o.putStr("CodeUniv(")
+			o.putUint(l)
+			o.putByte(')')
+		}
+		FieldCode(off, n, c) -> {
+			o.putStr("CodeField(")
+			putQuoted(o, strSpan(off, n))
+			o.putStr(", ")
+			putVal(o, slotGet(c), depth-1)
+			o.putByte(')')
+		}
+		Ptr(r) -> {
+			o.putByte('&')
+			if r != 0 {
+				putVal(o, slotGet(r), depth-1)
+			} else {
+				o.putStr("<nil>")
+			}
 		}
 	}
 }
@@ -683,78 +723,20 @@ func putElems(o *OutBuf, ref u32, n usize, depth usize) decreases(depth) {
 	o.putByte(']')
 }
 
-func codeKindName(k u64) string {
-	if k == CKEmpty {
-		return "CodeEmpty"
-	}
-	if k == CKUnit {
-		return "CodeUnit"
-	}
-	if k == CKBool {
-		return "CodeBool"
-	}
-	if k == CKU8 {
-		return "CodeU8"
-	}
-	if k == CKU16 {
-		return "CodeU16"
-	}
-	if k == CKU32 {
-		return "CodeU32"
-	}
-	if k == CKU64 {
-		return "CodeU64"
-	}
-	if k == CKI8 {
-		return "CodeI8"
-	}
-	if k == CKI16 {
-		return "CodeI16"
-	}
-	if k == CKI32 {
-		return "CodeI32"
-	}
-	if k == CKI64 {
-		return "CodeI64"
-	}
-	if k == CKArray {
-		return "CodeArray"
-	}
-	if k == CKSlice {
-		return "CodeSlice"
-	}
-	if k == CKStruct {
-		return "CodeStruct"
-	}
-	return "CodeUniv"
-}
-
-func putCode(o *OutBuf, v Val, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	k := v.lo
-	if k == CKArray {
-		o.putStr("CodeArray(")
-		o.putUint(v.hi)
-		o.putStr(", ")
-		putVal(o, slotGet(v.ref), depth-1)
-		o.putByte(')')
-	} else if k == CKSlice {
-		o.putStr("CodeSlice(")
-		putVal(o, slotGet(v.ref), depth-1)
-		o.putByte(')')
-	} else if k == CKStruct {
-		o.putStr("CodeStruct(")
-		putValList(o, v.ref, usize(v.aux), depth-1)
-		o.putByte(')')
-	} else if k == CKUniv {
-		o.putStr("CodeUniv(")
-		o.putUint(v.hi)
-		o.putByte(')')
-	} else {
-		o.putStr(codeKindName(k))
-		o.putStr("()")
+func codeKindName(k u8) string {
+	return match k {
+		CKEmpty -> "CodeEmpty"
+		CKUnit -> "CodeUnit"
+		CKBool -> "CodeBool"
+		CKU8 -> "CodeU8"
+		CKU16 -> "CodeU16"
+		CKU32 -> "CodeU32"
+		CKU64 -> "CodeU64"
+		CKI8 -> "CodeI8"
+		CKI16 -> "CodeI16"
+		CKI32 -> "CodeI32"
+		CKI64 -> "CodeI64"
+		_ -> "CodeUniv"
 	}
 }
 
@@ -778,24 +760,33 @@ func copyVal(v Val, depth usize) Val decreases(depth) {
 	if depth == 0 {
 		return v
 	}
-	k := v.kind
-	if k != VArray && k != VStruct && k != VEnum {
-		return v
+	return match v {
+		Array(ref, n) -> Val.Array(copyRun(ref, n, true, depth-1), n)
+		Struct(ref, n) -> Val.Struct(copyRun(ref, n, true, depth-1), n)
+		Enum(vi, ref, n) -> Val.Enum(vi, copyRun(ref, n, true, depth-1), n)
+		_ -> v
 	}
-	n := usize(v.aux)
-	if n == 0 {
-		return v
+}
+
+// copyRun copies the n slots at ref (deep copies with copyVal into the heap,
+// or persistent copies with persistVal) and returns the copy's first slot
+// (ref itself if n == 0 or the region is full).
+func copyRun(ref u32, n u32, heap bool, depth usize) u32 decreases(depth) {
+	if depth == 0 || n == 0 {
+		return ref
 	}
-	st := valAlloc(n, true)
+	st := valAlloc(usize(n), heap)
 	if st == 0 {
-		return v
+		return ref
 	}
-	for i := usize(0); i < n; i++ {
-		vals.items[usize(st)+i] = copyVal(slotGet(v.ref+u32(i)), depth-1)
+	for i := u32(0); i < n; i++ {
+		if heap {
+			vals.items[usize(st+i)] = copyVal(slotGet(ref+i), depth-1)
+		} else {
+			vals.items[usize(st+i)] = persistVal(slotGet(ref+i), depth-1)
+		}
 	}
-	r := v
-	r.ref = st
-	return r
+	return st
 }
 
 func copyV(v Val) Val {
@@ -808,50 +799,33 @@ func persistVal(v Val, depth usize) Val decreases(depth) {
 	if depth == 0 {
 		return v
 	}
-	k := v.kind
-	if k == VArray || k == VStruct || k == VEnum || k == VTuple || (k == VCode && v.lo == CKStruct) {
-		n := usize(v.aux)
-		if n == 0 {
-			return v
-		}
-		st := valAlloc(n, false)
-		if st == 0 {
-			return v
-		}
-		for i := usize(0); i < n; i++ {
-			vals.items[usize(st)+i] = persistVal(slotGet(v.ref+u32(i)), depth-1)
-		}
-		r := v
-		r.ref = st
-		return r
+	return match v {
+		None | Bool(_) | Err(_) | Nil | Str(_, _) | Int(_, _) | IntOvf | NilSlice | CodeBasic(_) | CodeUniv(_) -> v
+		Array(ref, n) -> Val.Array(copyRun(ref, n, false, depth-1), n)
+		Struct(ref, n) -> Val.Struct(copyRun(ref, n, false, depth-1), n)
+		Enum(vi, ref, n) -> Val.Enum(vi, copyRun(ref, n, false, depth-1), n)
+		Tuple(ref, n) -> Val.Tuple(copyRun(ref, n, false, depth-1), n)
+		CodeStruct(ref, n) -> Val.CodeStruct(copyRun(ref, n, false, depth-1), n)
+		Slice(ref, lo, hi, alen) -> Val.Slice(copyRun(ref, u32(alen), false, depth-1), lo, hi, alen)
+		CodeArray(n, el) -> Val.CodeArray(n, persistSlot(el, depth-1))
+		CodeSlice(el) -> Val.CodeSlice(persistSlot(el, depth-1))
+		FieldCode(off, n, c) -> Val.FieldCode(off, n, persistSlot(c, depth-1))
+		Ptr(r) -> Val.Ptr(persistSlot(r, depth-1))
 	}
-	if k == VSlice {
-		if v.flag&2 == 0 || v.lo == 0 {
-			return v
-		}
-		n := usize(v.lo)
-		st := valAlloc(n, false)
-		if st == 0 {
-			return v
-		}
-		for i := usize(0); i < n; i++ {
-			vals.items[usize(st)+i] = persistVal(slotGet(v.ref+u32(i)), depth-1)
-		}
-		r := v
-		r.ref = st
-		return r
+}
+
+// persistSlot copies the value in slot s (0 = none) into a fresh
+// persistent slot.
+func persistSlot(s u32, depth usize) u32 decreases(depth) {
+	if depth == 0 || s == 0 {
+		return s
 	}
-	if (k == VCode && v.ref != 0) || k == VFieldCode || (k == VPtr && v.ref != 0) {
-		st := valAlloc(1, false)
-		if st == 0 {
-			return v
-		}
-		vals.items[usize(st)] = persistVal(slotGet(v.ref), depth-1)
-		r := v
-		r.ref = st
-		return r
+	st := valAlloc(1, false)
+	if st == 0 {
+		return s
 	}
-	return v
+	vals.items[usize(st)] = persistVal(slotGet(s), depth-1)
+	return st
 }
 
 // ---------------------------------------------------------------------------
@@ -872,87 +846,88 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 		return z, false
 	}
 	u := underlying(t)
-	k := tk(u)
-	if k == TCBasic {
-		if isInteger(u) {
-			return vIntU(0), true
+	match trec(u) {
+		Basic(_) -> {
+			if isInteger(u) {
+				return vIntU(0), true
+			}
+			if isBoolean(u) {
+				return vBool(false), true
+			}
+			if isString(u) {
+				return vStr(emptyBytes()), true
+			}
+			if basicKind(u) == BkError {
+				return vErr(0), true
+			}
 		}
-		if isBoolean(u) {
-			return vBool(false), true
+		Code(_) -> {
+			return Val.CodeBasic(CKEmpty), true
 		}
-		if isString(u) {
-			return vStr(emptyBytes()), true
-		}
-		if basicKind(u) == BkError {
-			return vErr(0), true
-		}
-	} else if k == TCCode {
-		return vCode(CKEmpty), true
-	} else if k == TCArray {
-		r := typs.items[usize(u)]
-		if r.b != 0 {
-			etReset()
-			et("array with generic length")
-			return z, false
-		}
-		if r.n > u64(zeroBudget) {
-			etReset()
-			et("array too large for compile-time evaluation")
-			return z, false
-		}
-		zeroBudget -= usize(r.n)
-		n := usize(r.n)
-		st := valAlloc(n, heap)
-		for i := usize(0); i < n; i++ {
-			e, ok := zeroRec(r.a, heap, depth-1)
-			if !ok {
+		Array(elem, lenParam, alen) -> {
+			if lenParam != 0 {
+				etReset()
+				et("array with generic length")
 				return z, false
 			}
-			slotSet(st+u32(i), e)
-		}
-		return vAgg(VArray, st, n), true
-	} else if k == TCSlice {
-		var s Val
-		s.kind = VSlice
-		return s, true
-	} else if k == TCStruct {
-		n := nfields(u)
-		st := valAlloc(n, heap)
-		for i := usize(0); i < n; i++ {
-			e, ok := zeroRec(fieldType(u, i), heap, depth-1)
-			if !ok {
+			if alen > u64(zeroBudget) {
+				etReset()
+				et("array too large for compile-time evaluation")
 				return z, false
 			}
-			slotSet(st+u32(i), e)
-		}
-		return vAgg(VStruct, st, n), true
-	} else if k == TCEnum {
-		if nvariants(u) == 0 {
-			return vAgg(VEnum, 0, 0), true
-		}
-		n := variantPayN(u, 0)
-		st := valAlloc(n, heap)
-		for i := usize(0); i < n; i++ {
-			e, ok := zeroRec(variantPay(u, 0, i), heap, depth-1)
-			if !ok {
-				return z, false
+			zeroBudget -= usize(alen)
+			n := usize(alen)
+			st := valAlloc(n, heap)
+			for i := usize(0); i < n; i++ {
+				e, ok := zeroRec(elem, heap, depth-1)
+				if !ok {
+					return z, false
+				}
+				slotSet(st+u32(i), e)
 			}
-			slotSet(st+u32(i), e)
+			return Val.Array(st, u32(n)), true
 		}
-		return vAgg(VEnum, st, n), true
+		Slice(_) -> {
+			return Val.NilSlice, true
+		}
+		Struct(_, _) -> {
+			n := nfields(u)
+			st := valAlloc(n, heap)
+			for i := usize(0); i < n; i++ {
+				e, ok := zeroRec(fieldType(u, i), heap, depth-1)
+				if !ok {
+					return z, false
+				}
+				slotSet(st+u32(i), e)
+			}
+			return Val.Struct(st, u32(n)), true
+		}
+		Enum(_, _) -> {
+			if nvariants(u) == 0 {
+				return Val.Enum(0, 0, 0), true
+			}
+			n := variantPayN(u, 0)
+			st := valAlloc(n, heap)
+			for i := usize(0); i < n; i++ {
+				e, ok := zeroRec(variantPay(u, 0, i), heap, depth-1)
+				if !ok {
+					return z, false
+				}
+				slotSet(st+u32(i), e)
+			}
+			return Val.Enum(0, st, u32(n)), true
+		}
+		NoType | Sig(_, _, _, _, _, _, _, _) | Named(_) | Pointer(_) | TypeParam(_, _, _, _) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {}
 	}
 	if builtinOf(t) == BTFieldCode {
 		c := valAlloc(1, heap)
-		slotSet(c, vCode(CKEmpty))
-		var f Val
-		f.kind = VFieldCode
-		f.ref = c
-		return f, true
+		slotSet(c, Val.CodeBasic(CKEmpty))
+		return Val.FieldCode(0, 0, c), true
 	}
 	etReset()
 	o := &errTxt
 	putType(o, t, SemaDepth)
-	if t != 0 && tk(t) == TCNamed && namedBuiltin(t) != 0 {
+	if t != 0 && isNamedT(t) && namedBuiltin(t) != 0 {
 		et(" has no compile-time value")
 	} else {
 		et(" has no zero value")
@@ -984,71 +959,87 @@ func isCompareOp(op u8) bool {
 	return op >= OpEq && op <= OpGe
 }
 
+// boolOf returns the truth value of a Bool (ok == false for other values).
+func boolOf(v Val) (bool, bool) {
+	match v {
+		Bool(b) -> {
+			return b, true
+		}
+		_ -> {
+			return false, false
+		}
+	}
+}
+
 func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 	var z Val
 	if isCompareOp(op) {
 		return compareVals(op, x, y)
 	}
 	if op == OpLAnd || op == OpLOr {
-		if x.kind != VBool || y.kind != VBool {
+		a, aok := boolOf(x)
+		b, bok := boolOf(y)
+		if !aok || !bok {
 			etReset()
 			et("non-boolean operands")
 			return z, false
 		}
 		if op == OpLAnd {
-			return vBool(x.lo != 0 && y.lo != 0), true
+			return vBool(a && b), true
 		}
-		return vBool(x.lo != 0 || y.lo != 0), true
+		return vBool(a || b), true
 	}
-	if x.kind != VInt || y.kind != VInt {
+	if !isIntVal(x) || !isIntVal(y) {
 		opNotDefined(op, x, y, true)
 		return z, false
 	}
-	if x.flag&1 != 0 || y.flag&1 != 0 {
-		return vIntOvf(), true
+	xh, xl, xok := intParts(x)
+	yh, yl, yok := intParts(y)
+	if !xok || !yok {
+		return Val.IntOvf, true
 	}
 	if op == OpAdd {
-		h, l, ovf := add128(x.hi, x.lo, y.hi, y.lo)
+		h, l, ovf := add128(xh, xl, yh, yl)
 		return intResult(h, l, ovf), true
 	}
 	if op == OpSub {
-		h, l, ovf := sub128(x.hi, x.lo, y.hi, y.lo)
+		h, l, ovf := sub128(xh, xl, yh, yl)
 		return intResult(h, l, ovf), true
 	}
 	if op == OpMul {
-		h, l, ovf := mul128(x.hi, x.lo, y.hi, y.lo)
+		h, l, ovf := mul128(xh, xl, yh, yl)
 		return intResult(h, l, ovf), true
 	}
 	if op == OpDiv || op == OpRem {
-		if y.hi == 0 && y.lo == 0 {
+		if yh == 0 && yl == 0 {
 			etReset()
 			et("division by zero")
 			return z, false
 		}
-		qh, ql, rh, rl, ovf := quoRem128(x.hi, x.lo, y.hi, y.lo)
+		qh, ql, rh, rl, ovf := quoRem128(xh, xl, yh, yl)
 		if op == OpDiv {
 			return intResult(qh, ql, ovf), true
 		}
 		return intResult(rh, rl, ovf), true
 	}
 	if op == OpAnd {
-		return vInt(x.hi&y.hi, x.lo&y.lo), true
+		return vInt(xh&yh, xl&yl), true
 	}
 	if op == OpOr {
-		return vInt(x.hi|y.hi, x.lo|y.lo), true
+		return vInt(xh|yh, xl|yl), true
 	}
 	if op == OpXor {
-		return vInt(x.hi^y.hi, x.lo^y.lo), true
+		return vInt(xh^yh, xl^yl), true
 	}
 	if op == OpShl || op == OpShr {
-		if isNeg128(y.hi) {
+		if isNeg128(yh) {
 			etReset()
 			et("negative shift count")
 			return z, false
 		}
-		if y.hi != 0 || y.lo > MaxShift {
+		if yh != 0 || yl > MaxShift {
 			if op == OpShr {
-				if isNeg128(x.hi) {
+				if isNeg128(xh) {
 					return vInt(AllOnes, AllOnes), true
 				}
 				return vIntU(0), true
@@ -1058,20 +1049,20 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 			return z, false
 		}
 		if op == OpShl {
-			if x.hi == 0 && x.lo == 0 {
+			if xh == 0 && xl == 0 {
 				return vIntU(0), true
 			}
-			if y.lo >= 128 {
-				return vIntOvf(), true
+			if yl >= 128 {
+				return Val.IntOvf, true
 			}
-			h, l := shl128(x.hi, x.lo, y.lo)
-			bh, bl := sar128(h, l, y.lo)
-			if bh != x.hi || bl != x.lo {
-				return vIntOvf(), true
+			h, l := shl128(xh, xl, yl)
+			bh, bl := sar128(h, l, yl)
+			if bh != xh || bl != xl {
+				return Val.IntOvf, true
 			}
 			return vInt(h, l), true
 		}
-		h, l := sar128(x.hi, x.lo, y.lo)
+		h, l := sar128(xh, xl, yl)
 		return vInt(h, l), true
 	}
 	etReset()
@@ -1082,7 +1073,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 
 func intResult(h u64, l u64, ovf bool) Val {
 	if ovf {
-		return vIntOvf()
+		return Val.IntOvf
 	}
 	return vInt(h, l)
 }
@@ -1097,15 +1088,17 @@ func compareVals(op u8, x Val, y Val) (Val, bool) {
 		return vBool(eq == (op == OpEq)), true
 	}
 	c := 0
-	if x.kind == VInt {
-		if y.kind != VInt {
+	if isIntVal(x) {
+		if !isIntVal(y) {
 			etReset()
 			et("mismatched operands")
 			return z, false
 		}
-		c = cmp128(x.hi, x.lo, y.hi, y.lo)
-	} else if x.kind == VString {
-		if y.kind != VString {
+		xh, xl, _ := intParts(x)
+		yh, yl, _ := intParts(y)
+		c = cmp128(xh, xl, yh, yl)
+	} else if isStrVal(x) {
+		if !isStrVal(y) {
 			etReset()
 			et("mismatched operands")
 			return z, false
@@ -1135,67 +1128,96 @@ func cannotCompare(x Val, y Val) {
 	etval(y)
 }
 
+// isNilSlice reports whether v is a slice that compares equal to nil.
+func isNilSlice(v Val) bool {
+	return match v {
+		NilSlice -> true
+		Slice(_, lo, hi, _) -> lo == hi
+		_ -> false
+	}
+}
+
 // equalVals compares two values for == (types.Equal).
 func equalVals(x Val, y Val, depth usize) (bool, bool) decreases(depth) {
 	if depth == 0 {
 		return false, true
 	}
-	k := x.kind
-	if k == VInt {
-		return y.kind == VInt && x.hi == y.hi && x.lo == y.lo && x.flag == y.flag, true
-	}
-	if k == VBool {
-		return y.kind == VBool && x.lo == y.lo, true
-	}
-	if k == VString {
-		return y.kind == VString && bytesEqual(strOf(x), strOf(y)), true
-	}
-	if k == VError {
-		if y.kind == VError {
-			return x.lo == y.lo, true
+	match x {
+		Int(_, _) | IntOvf | Bool(_) -> {
+			return x == y, true
 		}
-		if y.kind == VNil {
-			return x.lo == 0, true
+		Str(_, _) -> {
+			return isStrVal(y) && bytesEqual(strOf(x), strOf(y)), true
 		}
-		return false, true
-	}
-	if k == VNil {
-		if y.kind == VError {
-			return y.lo == 0, true
+		Err(a) -> {
+			return match y {
+				Err(b) -> a == b
+				Nil -> a == 0
+				_ -> false
+			}, true
 		}
-		if y.kind == VSlice {
-			return y.flag&2 == 0 || y.aux2 == y.aux, true
+		Nil -> {
+			match y {
+				Err(b) -> {
+					return b == 0, true
+				}
+				Slice(_, _, _, _) | NilSlice -> {
+					return isNilSlice(y), true
+				}
+				Nil -> {
+					return true, true
+				}
+				_ -> {}
+			}
 		}
-		if y.kind == VNil {
-			return true, true
+		Slice(_, _, _, _) | NilSlice -> {
+			if y == Val.Nil {
+				return isNilSlice(x), true
+			}
 		}
-		cannotCompare(x, y)
-		return false, false
-	}
-	if k == VSlice {
-		if y.kind == VNil {
-			return x.flag&2 == 0 || x.aux2 == x.aux, true
+		CodeBasic(_) | CodeArray(_, _) | CodeSlice(_) | CodeStruct(_, _) | CodeUniv(_) -> {
+			return codeEqual(x, y, depth-1), true
 		}
-		cannotCompare(x, y)
-		return false, false
-	}
-	if k == VCode {
-		if y.kind != VCode {
-			return false, true
+		Array(xr, xn) -> {
+			match y {
+				Array(yr, yn) -> {
+					if xn != yn {
+						return false, true
+					}
+					return equalList(xr, yr, usize(xn), depth-1)
+				}
+				_ -> {
+					return false, true
+				}
+			}
 		}
-		return codeEqual(x, y, depth-1), true
-	}
-	if k == VArray || k == VStruct {
-		if y.kind != k || x.aux != y.aux {
-			return false, true
+		Struct(xr, xn) -> {
+			match y {
+				Struct(yr, yn) -> {
+					if xn != yn {
+						return false, true
+					}
+					return equalList(xr, yr, usize(xn), depth-1)
+				}
+				_ -> {
+					return false, true
+				}
+			}
 		}
-		return equalList(x.ref, y.ref, usize(x.aux), depth-1)
-	}
-	if k == VEnum {
-		if y.kind != VEnum || x.lo != y.lo || x.aux != y.aux {
-			return false, true
+		Enum(xv, xr, xn) -> {
+			match y {
+				Enum(yv, yr, yn) -> {
+					if xv != yv || xn != yn {
+						return false, true
+					}
+					return equalList(xr, yr, usize(xn), depth-1)
+				}
+				_ -> {
+					return false, true
+				}
+			}
 		}
-		return equalList(x.ref, y.ref, usize(x.aux), depth-1)
+		None | Tuple(_, _) | Ptr(_) | FieldCode(_, _, _) -> {}
 	}
 	cannotCompare(x, y)
 	return false, false
@@ -1220,39 +1242,35 @@ func codeEqual(x Val, y Val, depth usize) bool decreases(depth) {
 	if depth == 0 {
 		return false
 	}
-	if x.kind != y.kind {
+	return match x {
+		CodeArray(xn, xe) -> match y {
+			CodeArray(yn, ye) -> xn == yn && codeEqual(slotGet(xe), slotGet(ye), depth-1)
+			_ -> false
+		}
+		CodeSlice(xe) -> match y {
+			CodeSlice(ye) -> codeEqual(slotGet(xe), slotGet(ye), depth-1)
+			_ -> false
+		}
+		CodeStruct(xr, xn) -> match y {
+			CodeStruct(yr, yn) -> xn == yn && codeListEqual(xr, yr, xn, depth-1)
+			_ -> false
+		}
+		FieldCode(xo, xl, xc) -> match y {
+			FieldCode(yo, yl, yc) -> bytesEqual(strSpan(xo, xl), strSpan(yo, yl)) && codeEqual(slotGet(xc), slotGet(yc), depth-1)
+			_ -> false
+		}
+		_ -> x == y
+	}
+}
+
+func codeListEqual(a u32, b u32, n u32, depth usize) bool decreases(depth) {
+	if depth == 0 {
 		return false
 	}
-	if x.kind == VFieldCode {
-		if !bytesEqual(strPool[usize(x.lo):usize(x.lo)+usize(x.hi)], strPool[usize(y.lo):usize(y.lo)+usize(y.hi)]) {
+	for i := u32(0); i < n; i++ {
+		if !codeEqual(slotGet(a+i), slotGet(b+i), depth-1) {
 			return false
 		}
-		return codeEqual(slotGet(x.ref), slotGet(y.ref), depth-1)
-	}
-	if x.lo != y.lo {
-		return false
-	}
-	k := x.lo
-	if k == CKArray {
-		return x.hi == y.hi && codeEqual(slotGet(x.ref), slotGet(y.ref), depth-1)
-	}
-	if k == CKSlice {
-		return codeEqual(slotGet(x.ref), slotGet(y.ref), depth-1)
-	}
-	if k == CKUniv {
-		return x.hi == y.hi
-	}
-	if k == CKStruct {
-		if x.aux != y.aux {
-			return false
-		}
-		n := usize(x.aux)
-		for i := usize(0); i < n; i++ {
-			if !codeEqual(slotGet(x.ref+u32(i)), slotGet(y.ref+u32(i)), depth-1) {
-				return false
-			}
-		}
-		return true
 	}
 	return true
 }
@@ -1260,18 +1278,27 @@ func codeEqual(x Val, y Val, depth usize) bool decreases(depth) {
 // unaryOpVal evaluates !x or -x.
 func unaryOpVal(op u8, x Val) (Val, bool) {
 	var z Val
-	if op == OpNot && x.kind == VBool {
-		return vBool(x.lo == 0), true
-	}
-	if op == OpNeg && x.kind == VInt {
-		if x.flag&1 != 0 {
-			return x, true
+	match x {
+		Bool(b) -> {
+			if op == OpNot {
+				return vBool(!b), true
+			}
 		}
-		if x.hi == SignBit && x.lo == 0 {
-			return vIntOvf(), true
+		Int(hi, lo) -> {
+			if op == OpNeg {
+				if hi == SignBit && lo == 0 {
+					return Val.IntOvf, true
+				}
+				h, l := neg128(hi, lo)
+				return vInt(h, l), true
+			}
 		}
-		h, l := neg128(x.hi, x.lo)
-		return vInt(h, l), true
+		IntOvf -> {
+			if op == OpNeg {
+				return x, true
+			}
+		}
+		_ -> {}
 	}
 	etReset()
 	et("operator ")
@@ -1281,34 +1308,102 @@ func unaryOpVal(op u8, x Val) (Val, bool) {
 	return z, false
 }
 
+// isVariant reports whether v is an enum value of variant vi.
+func isVariant(v Val, vi u32) bool {
+	return match v { Enum(x, _, _) -> x == vi, _ -> false }
+}
+
+// tupleOf returns the first element slot and the length of a tuple
+// ((0, 0) for other values).
+func tupleOf(v Val) (u32, u32) {
+	match v {
+		Tuple(ref, n) -> {
+			return ref, n
+		}
+		_ -> {
+			return 0, 0
+		}
+	}
+}
+
+func isTupleVal(v Val) bool {
+	return match v { Tuple(_, _) -> true, _ -> false }
+}
+
+func isCodeVal(v Val) bool {
+	return match v {
+		CodeBasic(_) | CodeArray(_, _) | CodeSlice(_) | CodeStruct(_, _) | CodeUniv(_) -> true
+		_ -> false
+	}
+}
+
+// fieldSlot returns the slot of field i of a struct value (0 if v is not a
+// struct).
+func fieldSlot(v Val, i u32) u32 {
+	return match v { Struct(ref, _) -> ref + i, _ -> 0 }
+}
+
 // ---------------------------------------------------------------------------
 // Code values
+
+// fieldCodeOf is the FieldCode value with the name of string value name and
+// the code in slot c.
+func fieldCodeOf(name Val, c u32) Val {
+	return match name { Str(off, n) -> Val.FieldCode(off, n, c), _ -> Val.FieldCode(0, 0, c) }
+}
+
+// fieldCodeSlot returns the slot of the code of a FieldCode value.
+func fieldCodeSlot(f Val) u32 {
+	return match f { FieldCode(_, _, c) -> c, _ -> 0 }
+}
 
 // codeLevelOf returns the universe level of a code (CodeVal.Level).
 func codeLevelOf(v Val, depth usize) int decreases(depth) {
 	if depth == 0 {
 		return -1
 	}
-	k := v.lo
-	if k == CKUniv {
-		return int(v.hi) + 1
-	}
-	if k == CKArray || k == CKSlice {
-		return codeLevelOf(slotGet(v.ref), depth-1)
-	}
-	if k == CKStruct {
-		l := -1
-		n := usize(v.aux)
-		for i := usize(0); i < n; i++ {
-			f := slotGet(v.ref + u32(i))
-			x := codeLevelOf(slotGet(f.ref), depth-1)
-			if x > l {
-				l = x
-			}
+	match v {
+		CodeUniv(l) -> {
+			return int(l) + 1
 		}
-		return l
+		CodeArray(_, el) -> {
+			return codeLevelOf(slotGet(el), depth-1)
+		}
+		CodeSlice(el) -> {
+			return codeLevelOf(slotGet(el), depth-1)
+		}
+		CodeStruct(ref, n) -> {
+			l := -1
+			for i := u32(0); i < n; i++ {
+				x := codeLevelOf(slotGet(fieldCodeSlot(slotGet(ref+i))), depth-1)
+				if x > l {
+					l = x
+				}
+			}
+			return l
+		}
+		_ -> {
+			return -1
+		}
 	}
-	return -1
+}
+
+// basicCodeType is the type a CodeBasic value denotes.
+func basicCodeType(k u8) u32 {
+	return match k {
+		CKEmpty -> mkEnum(tmark())
+		CKUnit -> mkStruct(tmark())
+		CKBool -> TyBool
+		CKU8 -> TyU8
+		CKU16 -> TyU16
+		CKU32 -> TyU32
+		CKU64 -> TyU64
+		CKI8 -> TyI8
+		CKI16 -> TyI16
+		CKI32 -> TyI32
+		CKI64 -> TyI64
+		_ -> TyInvalid
+	}
 }
 
 // foldCode converts a code value into the type it denotes (types.FoldCode).
@@ -1316,60 +1411,36 @@ func foldCode(v Val, depth usize) u32 decreases(depth) {
 	if depth == 0 {
 		return TyInvalid
 	}
-	k := v.lo
-	if k == CKEmpty {
-		return mkEnum(tmark())
-	}
-	if k == CKUnit {
-		return mkStruct(tmark())
-	}
-	if k == CKBool {
-		return TyBool
-	}
-	if k == CKU8 {
-		return TyU8
-	}
-	if k == CKU16 {
-		return TyU16
-	}
-	if k == CKU32 {
-		return TyU32
-	}
-	if k == CKU64 {
-		return TyU64
-	}
-	if k == CKI8 {
-		return TyI8
-	}
-	if k == CKI16 {
-		return TyI16
-	}
-	if k == CKI32 {
-		return TyI32
-	}
-	if k == CKI64 {
-		return TyI64
-	}
-	if k == CKArray {
-		return mkArray(v.hi, 0, foldCode(slotGet(v.ref), depth-1))
-	}
-	if k == CKSlice {
-		return mkSlice(foldCode(slotGet(v.ref), depth-1))
-	}
-	if k == CKStruct {
-		m := tmark()
-		n := usize(v.aux)
-		for i := usize(0); i < n; i++ {
-			f := slotGet(v.ref + u32(i))
-			nm := intern(strPool[usize(f.lo) : usize(f.lo)+usize(f.hi)])
-			ft := foldCode(slotGet(f.ref), depth-1)
-			tpush(nm)
-			tpush(ft)
+	match v {
+		CodeBasic(k) -> {
+			return basicCodeType(k)
 		}
-		return mkStruct(m)
+		CodeArray(n, el) -> {
+			return mkArray(n, 0, foldCode(slotGet(el), depth-1))
+		}
+		CodeSlice(el) -> {
+			return mkSlice(foldCode(slotGet(el), depth-1))
+		}
+		CodeStruct(ref, n) -> {
+			m := tmark()
+			for i := u32(0); i < n; i++ {
+				match slotGet(ref + i) {
+					FieldCode(off, ln, c) -> {
+						nm := intern(strSpan(off, ln))
+						ft := foldCode(slotGet(c), depth-1)
+						tpush(nm)
+						tpush(ft)
+					}
+					_ -> {}
+				}
+			}
+			return mkStruct(m)
+		}
+		CodeUniv(l) -> {
+			return mkCode(int(l))
+		}
+		_ -> {
+			return TyInvalid
+		}
 	}
-	if k == CKUniv {
-		return mkCode(int(v.hi))
-	}
-	return TyInvalid
 }

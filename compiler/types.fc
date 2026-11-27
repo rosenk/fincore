@@ -1,19 +1,31 @@
 // types.fc — the typed model (port of finc0's bootstrap/internal/types:
 // type.go, universe.go, info.go and the instantiation half of typexpr.go).
 //
-// Types live in a TypeArena indexed by TypeID (u32, 0 = no type). All
-// structural types (arrays, slices, pointers, structs, enums, signatures,
-// codes, const args, tuples) and generic instances (Named with an origin)
-// are hash-consed, so type identity (types.Identical) is TypeID equality.
-// Declared named types, type parameters and opaque resource types are
-// unique records. Child lists (fields, variants, params, type args, ...)
-// are ranges in TypeArena.lists.
+// Types live in a TypeArena indexed by TypeID (u32, 0 = no type); a type is
+// a TypeRec, one variant per type form. All structural types (arrays,
+// slices, pointers, structs, enums, signatures, codes, const args, tuples)
+// and generic instances are hash-consed, so type identity
+// (types.Identical) is TypeID equality. Declared named types, type
+// parameters and opaque resource types are unique records. Child lists
+// (fields, variants, params, type args, ...) are runs of a vec.ListArena;
+// they are interned as well, so equal lists are equal (start, len) pairs
+// and hash-consing compares TypeRecs with ==. The mutable state of named
+// types (underlying type, type parameters, method and class caches) lives
+// in NamedRec records.
 package main
+
+import (
+	"std/maps"
+	"std/vec"
+)
 
 const (
 	MaxTypes     = 131_072
-	TypeBuckets  = 262_144 // power of two
+	TypeBuckets  = 262_144
 	MaxTypeLists = 1 << 20
+	MaxListRecs  = 131_072
+	ListBuckets  = 262_144
+	MaxNamedRecs = 65_536
 	MaxMethods   = 16_384
 	MaxInsts     = 8192
 	MaxPending   = 8192
@@ -67,23 +79,6 @@ const (
 	TyUntypedNil    = 19
 )
 
-// Type constructors (TypeRec.kind).
-const (
-	TCBasic     = 1
-	TCNamed     = 2
-	TCArray     = 3
-	TCSlice     = 4
-	TCPointer   = 5
-	TCStruct    = 6
-	TCEnum      = 7
-	TCSig       = 8
-	TCCode      = 9
-	TCTypeParam = 10
-	TCConstArg  = 11
-	TCTuple     = 12
-	TCOpaque    = 13
-)
-
 // Effects (types.Effect): Comptime < Total < Driver.
 const (
 	EffComptime = 0
@@ -98,135 +93,182 @@ const (
 	ClassLinear = 2
 )
 
-// TypeRec fields by kind:
-//
-//	Basic      sub = BasicKind
-//	Named      n = NameID, c = declaring symbol, d = package, sub = builtin,
-//	           a = underlying (0 = not yet resolved), b = origin (instances),
-//	           l1 = type args (instances), l2 = type params (generic decls),
-//	           l3 = method IDs (ulists, valid when flag&2), flag&1 = class
-//	           cached in cls
-//	Array      n = len, b = len type parameter (0 = constant length), a = elem
-//	Slice      a = elem          Pointer  a = elem
-//	Struct     l1 = (name, type) pairs
-//	Enum       l1 = (name, payload start, payload len) triples (payloads in lists)
-//	Sig        sub = effect, flag&1 = variadic, l1 = params, l2 = results,
-//	           l3 = type params (generic functions)
-//	Code       n = level + 1 (0 = level-polymorphic `Code ?`)
-//	TypeParam  n = NameID, b = symbol, c = index, a = const type (0 = type param)
-//	ConstArg   n = value         Tuple  l1 = types
-//	Opaque     n = NameID, a = builtin
-type TypeRec struct {
-	kind u8
-	sub  u8
-	flag u8
-	cls  u8
-	a    u32
-	b    u32
-	c    u32
-	d    u32
-	n    u64
-	l1s  u32
-	l1n  u32
-	l2s  u32
-	l2n  u32
-	l3s  u32
-	l3n  u32
+// TypeRec is a type form. Lists are (start, len) runs of TypeArena.lists.
+// The variant order fixes the compact layout (u8, bool, 6 x u32, u64:
+// 40 bytes).
+type TypeRec enum {
+	NoType                                      // TypeID 0
+	Basic(u8)                                   // BasicKind
+	Sig(u8, bool, u32, u32, u32, u32, u32, u32) // effect, variadic, params, results, type params (generic functions)
+	Named(u32)                                  // NamedRec ID: declared named types and generic instances
+	Array(u32, u32, u64)                        // elem, length type parameter (0 = constant length), length
+	Slice(u32)                                  // elem
+	Pointer(u32)                                // elem
+	Struct(u32, u32)                            // (name, type) pairs
+	Enum(u32, u32)                              // (name, payload start, payload len) triples
+	Code(u32)                                   // level + 1 (0 = level-polymorphic `Code ?`)
+	TypeParam(u32, u32, u32, u32)               // name, symbol, index, const type (0 = type parameter)
+	ConstArg(u64)                               // value
+	Tuple(u32, u32)                             // types
+	Opaque(u32, u8)                             // name, builtin
+}
+
+// NamedRec holds a named type. Instances (origin != 0) are hash-consed by
+// (origin, type args).
+type NamedRec struct {
+	name    u32 // NameID
+	sym     u32 // declaring symbol
+	pkg     u32
+	under   u32 // underlying type (0 = not yet resolved)
+	origin  u32 // generic type (instances)
+	argS    u32 // type args (instances)
+	argN    u32
+	tpS     u32 // type params (generic declarations)
+	tpN     u32
+	methS   u32 // method IDs (ulists), valid when methOK
+	methN   u32
+	builtin u8
+	cls     u8 // value class, valid when clsOK
+	clsOK   bool
+	methOK  bool
 }
 
 type TypeArena struct {
 	items   [MaxTypes]TypeRec
 	count   usize
-	buckets [TypeBuckets]u32
-	lists   [MaxTypeLists]u32
-	nlists  usize
-	stack   [MaxTypeLists]u32
-	top     usize
+	table   maps.Table[TypeBuckets]
+	lists   vec.ListArena[MaxTypeLists, MaxTypeLists, u32]
+	listTab maps.Table[ListBuckets]
+	listS   [MaxListRecs]u32 // interned list i: run (listS[i], listN[i])
+	listN   [MaxListRecs]u32
+	nlrec   usize
+	named   [MaxNamedRecs]NamedRec
+	nnamed  usize
 }
 
 var typs TypeArena
 
-func tk(t u32) u8 {
-	return typs.items[usize(t)].kind
+func trec(t u32) TypeRec {
+	return typs.items[usize(t)]
 }
 
 func tlist(s u32, i usize) u32 {
-	return typs.lists[usize(s)+i]
+	la := &typs.lists
+	return la.At(usize(s) + i)
 }
 
-func tl1(t u32, i usize) u32 {
-	return typs.lists[usize(typs.items[usize(t)].l1s)+i]
-}
-
-func tl1n(t u32) usize {
-	return usize(typs.items[usize(t)].l1n)
-}
-
-func tl2(t u32, i usize) u32 {
-	return typs.lists[usize(typs.items[usize(t)].l2s)+i]
-}
-
-func tl2n(t u32) usize {
-	return usize(typs.items[usize(t)].l2n)
-}
-
-func tl3(t u32, i usize) u32 {
-	return typs.lists[usize(typs.items[usize(t)].l3s)+i]
-}
-
-func tl3n(t u32) usize {
-	return usize(typs.items[usize(t)].l3n)
+// tlistSlice returns the run (s, n) as a slice.
+func tlistSlice(s u32, n u32) []u32 {
+	la := &typs.lists
+	return la.Run(s, n)
 }
 
 func tpush(x u32) {
-	if typs.top >= MaxTypeLists {
-		setFull("type list stack")
-		return
+	la := &typs.lists
+	la.Push(x)
+	if la.Full() {
+		setFull("type lists")
 	}
-	typs.stack[typs.top] = x
-	typs.top++
 }
 
 func tmark() usize {
-	return typs.top
+	la := &typs.lists
+	return la.Depth()
 }
 
-// tslice returns stack[a:b].
-func tslice(a usize, b usize) []u32 {
-	return typs.stack[a:b]
+// tslice returns the pending list stack[a:top].
+func tslice(a usize) []u32 {
+	la := &typs.lists
+	return la.Pending(a)
 }
 
-// tcommit copies xs into the list arena and returns its range.
-func tcommit(xs []u32) (u32, u32) {
+// tdiscard pops the list stack back to mark.
+func tdiscard(mark usize) {
+	la := &typs.lists
+	la.Discard(mark)
+}
+
+func tlistsUsed() usize {
+	la := &typs.lists
+	return la.Used()
+}
+
+func hashList(xs []u32) u64 {
 	n := len(xs)
-	if n == 0 {
-		return 0, 0
-	}
-	if typs.nlists == 0 {
-		typs.nlists = 1
-	}
-	if typs.nlists+n > MaxTypeLists {
-		setFull("type lists")
-		return 0, 0
-	}
-	st := typs.nlists
+	h := maps.HashU64(u64(n))
 	for i := usize(0); i < n; i++ {
-		typs.lists[st+i] = xs[i]
+		h = maps.Mix(h, u64(xs[i]))
 	}
-	typs.nlists = st + n
-	return u32(st), u32(n)
+	return h
 }
 
-// tcommitStack commits stack[mark:top] and pops it.
+// tcommitStack interns stack[mark:top], pops it and returns its run: equal
+// lists get the same run.
 func tcommitStack(mark usize) (u32, u32) {
-	top := typs.top
-	if mark >= top {
-		typs.top = mark
+	la := &typs.lists
+	xs := la.Pending(mark)
+	if len(xs) == 0 {
+		la.Discard(mark)
 		return 0, 0
 	}
-	s, n := tcommit(typs.stack[mark:top])
-	typs.top = mark
-	return s, n
+	tp := &typs.listTab
+	s := tp.Start(hashList(xs))
+	lim := tp.Cap()
+	for g := usize(0); g < lim; g++ {
+		id := tp.At(s)
+		if id == 0 {
+			if typs.nlrec == 0 {
+				typs.nlrec = 1
+			}
+			if typs.nlrec >= MaxListRecs {
+				setFull("type lists")
+				la.Discard(mark)
+				return 0, 0
+			}
+			st, n := la.Commit(mark)
+			if n == 0 {
+				setFull("type lists")
+				return 0, 0
+			}
+			r := typs.nlrec
+			typs.nlrec++
+			typs.listS[r] = st
+			typs.listN[r] = n
+			tp.Set(s, u32(r))
+			return st, n
+		}
+		if u32sEqual(la.Run(typs.listS[usize(id)], typs.listN[usize(id)]), xs) {
+			la.Discard(mark)
+			return typs.listS[usize(id)], typs.listN[usize(id)]
+		}
+		s = tp.Next(s)
+	}
+	setFull("type lists")
+	la.Discard(mark)
+	return 0, 0
+}
+
+// tcommit interns xs (a slice that may alias the list arena or the stack).
+func tcommit(xs []u32) (u32, u32) {
+	m := tmark()
+	n := len(xs)
+	for i := usize(0); i < n; i++ {
+		tpush(xs[i])
+	}
+	return tcommitStack(m)
+}
+
+func u32sEqual(a []u32, b []u32) bool {
+	n := len(a)
+	if n != len(b) {
+		return false
+	}
+	for i := usize(0); i < n; i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func newTypeRec(r TypeRec) u32 {
@@ -243,142 +285,105 @@ func newTypeRec(r TypeRec) u32 {
 	return u32(id)
 }
 
-func mix(h u64, v u64) u64 {
-	x := (h ^ v) * 0x100000001B3
-	return x ^ (x >> 29)
+func newNamedRec(r NamedRec) u32 {
+	if typs.nnamed == 0 {
+		typs.nnamed = 1
+	}
+	if typs.nnamed >= MaxNamedRecs {
+		setFull("named types")
+		return 0
+	}
+	id := typs.nnamed
+	typs.nnamed++
+	typs.named[id] = r
+	return u32(id)
 }
 
-func mixList(h u64, xs []u32) u64 {
-	x := mix(h, u64(len(xs)))
-	n := len(xs)
-	for i := usize(0); i < n; i++ {
-		x = mix(x, u64(xs[i]))
-	}
-	return x
+func mix3(h u64, a u64, b u64, c u64) u64 {
+	return maps.Mix(maps.Mix(maps.Mix(h, a), b), c)
 }
 
-// mixEnum hashes (name, payload...) triples by payload contents.
-func mixEnum(h u64, xs []u32) u64 {
-	x := mix(h, u64(len(xs)))
-	n := len(xs) / 3
-	for i := usize(0); i < n; i++ {
-		x = mix(x, u64(xs[3*i]))
-		x = mixList(x, typs.lists[usize(xs[3*i+1]):usize(xs[3*i+1])+usize(xs[3*i+2])])
+// typeHash hashes the identity of a hash-consed type: its fields (lists
+// are interned) or, for an instance, its origin and type args.
+func typeHash(r TypeRec) u64 {
+	return match r {
+		NoType -> 1
+		Basic(k) -> maps.Mix(2, u64(k))
+		Sig(eff, va, ps, pn, rs, rn, ts, tn) -> mix3(mix3(mix3(3, u64(eff), boolU64(va), u64(ps)), u64(pn), u64(rs), u64(rn)), u64(ts), u64(tn), 0)
+		Named(id) -> mix3(4, u64(typs.named[usize(id)].origin), u64(typs.named[usize(id)].argS), u64(typs.named[usize(id)].argN))
+		Array(e, p, n) -> mix3(5, u64(e), u64(p), n)
+		Slice(e) -> maps.Mix(6, u64(e))
+		Pointer(e) -> maps.Mix(7, u64(e))
+		Struct(s, n) -> mix3(8, u64(s), u64(n), 0)
+		Enum(s, n) -> mix3(9, u64(s), u64(n), 0)
+		Code(l) -> maps.Mix(10, u64(l))
+		TypeParam(nm, sym, i, ct) -> mix3(mix3(11, u64(nm), u64(sym), u64(i)), u64(ct), 0, 0)
+		ConstArg(v) -> maps.Mix(12, v)
+		Tuple(s, n) -> mix3(13, u64(s), u64(n), 0)
+		Opaque(nm, b) -> mix3(14, u64(nm), u64(b), 0)
 	}
-	return x
 }
 
-func u32sEqual(a []u32, b []u32) bool {
-	n := len(a)
-	if n != len(b) {
-		return false
+func boolU64(b bool) u64 {
+	if b {
+		return 1
 	}
-	for i := usize(0); i < n; i++ {
-		if a[i] != b[i] {
-			return false
+	return 0
+}
+
+// sameType reports whether x and r are the same hash-consed type.
+func sameType(x TypeRec, r TypeRec) bool {
+	match r {
+		Named(rn) -> {
+			return match x {
+				Named(xn) -> typs.named[usize(xn)].origin == typs.named[usize(rn)].origin && typs.named[usize(xn)].argS == typs.named[usize(rn)].argS && typs.named[usize(xn)].argN == typs.named[usize(rn)].argN
+				_ -> false
+			}
+		}
+		_ -> {
+			return x == r
 		}
 	}
-	return true
 }
 
-func enumListsEqual(a []u32, b []u32) bool {
-	n := len(a)
-	if n != len(b) {
-		return false
-	}
-	m := n / 3
-	for i := usize(0); i < m; i++ {
-		if a[3*i] != b[3*i] {
-			return false
-		}
-		pa := typs.lists[usize(a[3*i+1]) : usize(a[3*i+1])+usize(a[3*i+2])]
-		pb := typs.lists[usize(b[3*i+1]) : usize(b[3*i+1])+usize(b[3*i+2])]
-		if !u32sEqual(pa, pb) {
-			return false
-		}
-	}
-	return true
-}
-
-func typeHash(r TypeRec, c1 []u32, c2 []u32, c3 []u32) usize {
-	h := mix(1469598103934665603, u64(r.kind))
-	h = mix(h, u64(r.b))
-	if r.kind == TCNamed {
-		h = mixList(h, c1)
-		return usize(h)
-	}
-	h = mix(h, u64(r.sub))
-	h = mix(h, u64(r.flag))
-	h = mix(h, u64(r.a))
-	h = mix(h, r.n)
-	if r.kind == TCEnum {
-		h = mixEnum(h, c1)
-	} else {
-		h = mixList(h, c1)
-	}
-	h = mixList(h, c2)
-	h = mixList(h, c3)
-	return usize(h)
-}
-
-func typeRecEq(id u32, r TypeRec, c1 []u32, c2 []u32, c3 []u32) bool {
-	x := typs.items[usize(id)]
-	if x.kind != r.kind || x.b != r.b {
-		return false
-	}
-	l1 := typs.lists[usize(x.l1s) : usize(x.l1s)+usize(x.l1n)]
-	if r.kind == TCNamed {
-		return u32sEqual(l1, c1)
-	}
-	if x.sub != r.sub || x.flag != r.flag || x.a != r.a || x.n != r.n {
-		return false
-	}
-	if r.kind == TCEnum {
-		if !enumListsEqual(l1, c1) {
-			return false
-		}
-	} else if !u32sEqual(l1, c1) {
-		return false
-	}
-	l2 := typs.lists[usize(x.l2s) : usize(x.l2s)+usize(x.l2n)]
-	l3 := typs.lists[usize(x.l3s) : usize(x.l3s)+usize(x.l3n)]
-	return u32sEqual(l2, c2) && u32sEqual(l3, c3)
-}
-
-// internType returns the canonical TypeID of r with child lists c1..c3
-// (copied into the list arena if the type is new) and whether it is new.
-func internType(r TypeRec, c1 []u32, c2 []u32, c3 []u32) (u32, bool) {
-	i := typeHash(r, c1, c2, c3) & (TypeBuckets - 1)
-	for step := usize(0); step < TypeBuckets; step++ {
-		id := typs.buckets[i]
+// internType returns the canonical TypeID of r (whose lists are interned)
+// and whether it is new. An instance's NamedRec must be the last one
+// allocated; it is released if the instance already exists.
+func internType(r TypeRec) (u32, bool) {
+	tp := &typs.table
+	s := tp.Start(typeHash(r))
+	lim := tp.Cap()
+	for g := usize(0); g < lim; g++ {
+		id := tp.At(s)
 		if id == 0 {
-			nr := r
-			s1, n1 := tcommit(c1)
-			s2, n2 := tcommit(c2)
-			s3, n3 := tcommit(c3)
-			nr.l1s = s1
-			nr.l1n = n1
-			nr.l2s = s2
-			nr.l2n = n2
-			nr.l3s = s3
-			nr.l3n = n3
-			nid := newTypeRec(nr)
+			nid := newTypeRec(r)
 			if nid != TyInvalid {
-				typs.buckets[i] = nid
+				tp.Set(s, nid)
 			}
 			return nid, true
 		}
-		if typeRecEq(id, r, c1, c2, c3) {
+		if sameType(typs.items[usize(id)], r) {
+			match r {
+				Named(_) -> {
+					typs.nnamed--
+				}
+				_ -> {}
+			}
 			return id, false
 		}
-		i = (i + 1) & (TypeBuckets - 1)
+		s = tp.Next(s)
 	}
 	setFull("type table")
 	return TyInvalid, false
 }
 
+func intern1(r TypeRec) u32 {
+	t, _ := internType(r)
+	return t
+}
+
 func emptyU32() []u32 {
-	return typs.stack[0:0]
+	return tslice(tmark())
 }
 
 // ---------------------------------------------------------------------------
@@ -387,156 +392,203 @@ func emptyU32() []u32 {
 func initBasicTypes() {
 	typs.count = 1
 	for k := u8(0); k < NumBasic; k++ {
-		var r TypeRec
-		r.kind = TCBasic
-		r.sub = k
-		_ = newTypeRec(r)
+		_ = newTypeRec(TypeRec.Basic(k))
 	}
 }
 
 func mkArray(n u64, lenParam u32, elem u32) u32 {
-	var r TypeRec
-	r.kind = TCArray
-	r.n = n
-	r.b = lenParam
-	r.a = elem
-	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
-	return t
+	return intern1(TypeRec.Array(elem, lenParam, n))
 }
 
 func mkSlice(elem u32) u32 {
-	var r TypeRec
-	r.kind = TCSlice
-	r.a = elem
-	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
-	return t
+	return intern1(TypeRec.Slice(elem))
 }
 
 func mkPointer(elem u32) u32 {
-	var r TypeRec
-	r.kind = TCPointer
-	r.a = elem
-	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
-	return t
+	return intern1(TypeRec.Pointer(elem))
 }
 
 // mkCode returns `Code level` (level < 0: level-polymorphic).
 func mkCode(level int) u32 {
-	var r TypeRec
-	r.kind = TCCode
 	if level >= 0 {
-		r.n = u64(level + 1)
+		return intern1(TypeRec.Code(u32(level + 1)))
 	}
-	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
-	return t
+	return intern1(TypeRec.Code(0))
 }
 
 func codeLevel(t u32) int {
-	return int(typs.items[usize(t)].n) - 1
+	return match trec(t) { Code(l) -> int(l) - 1, _ -> -1 }
 }
 
 func mkConstArg(v u64) u32 {
-	var r TypeRec
-	r.kind = TCConstArg
-	r.n = v
-	t, _ := internType(r, emptyU32(), emptyU32(), emptyU32())
-	return t
+	return intern1(TypeRec.ConstArg(v))
 }
 
 // mkStruct interns a struct from (name, type) pairs on the stack [mark:top].
 func mkStruct(mark usize) u32 {
-	var r TypeRec
-	r.kind = TCStruct
-	t, _ := internType(r, tslice(mark, typs.top), emptyU32(), emptyU32())
-	typs.top = mark
-	return t
+	s, n := tcommitStack(mark)
+	return intern1(TypeRec.Struct(s, n))
 }
 
 // mkEnum interns an enum from (name, payS, payN) triples on the stack.
 func mkEnum(mark usize) u32 {
-	var r TypeRec
-	r.kind = TCEnum
-	t, _ := internType(r, tslice(mark, typs.top), emptyU32(), emptyU32())
-	typs.top = mark
-	return t
+	s, n := tcommitStack(mark)
+	return intern1(TypeRec.Enum(s, n))
 }
 
 // mkSig interns a signature: params stack[m1:m2], results [m2:m3],
 // type params [m3:top].
 func mkSig(eff u8, variadic bool, m1 usize, m2 usize, m3 usize) u32 {
-	var r TypeRec
-	r.kind = TCSig
-	r.sub = eff
-	if variadic {
-		r.flag = 1
-	}
-	t, _ := internType(r, tslice(m1, m2), tslice(m2, m3), tslice(m3, typs.top))
-	typs.top = m1
-	return t
+	ts, tn := tcommitStack(m3)
+	rs, rn := tcommitStack(m2)
+	ps, pn := tcommitStack(m1)
+	return intern1(TypeRec.Sig(eff, variadic, ps, pn, rs, rn, ts, tn))
 }
 
-// mkSigLists interns a signature from committed lists.
+// mkSigLists interns a signature from lists.
 func mkSigLists(eff u8, variadic bool, ps []u32, rs []u32, tps []u32) u32 {
-	var r TypeRec
-	r.kind = TCSig
-	r.sub = eff
-	if variadic {
-		r.flag = 1
-	}
-	t, _ := internType(r, ps, rs, tps)
-	return t
+	s1, n1 := tcommit(ps)
+	s2, n2 := tcommit(rs)
+	s3, n3 := tcommit(tps)
+	return intern1(TypeRec.Sig(eff, variadic, s1, n1, s2, n2, s3, n3))
 }
 
 func mkTuple(xs []u32) u32 {
-	var r TypeRec
-	r.kind = TCTuple
-	t, _ := internType(r, xs, emptyU32(), emptyU32())
-	return t
+	s, n := tcommit(xs)
+	return intern1(TypeRec.Tuple(s, n))
+}
+
+// mkTupleStack interns a tuple of the types on the stack [mark:top].
+func mkTupleStack(mark usize) u32 {
+	s, n := tcommitStack(mark)
+	return intern1(TypeRec.Tuple(s, n))
 }
 
 func newNamed(name u32, sym u32, pkg u32, builtin u8) u32 {
-	var r TypeRec
-	r.kind = TCNamed
-	r.n = u64(name)
-	r.c = sym
-	r.d = pkg
-	r.sub = builtin
-	return newTypeRec(r)
+	var r NamedRec
+	r.name = name
+	r.sym = sym
+	r.pkg = pkg
+	r.builtin = builtin
+	id := newNamedRec(r)
+	if id == 0 {
+		return TyInvalid
+	}
+	return newTypeRec(TypeRec.Named(id))
 }
 
 func newTypeParam(name u32, sym u32, index u32, constT u32) u32 {
-	var r TypeRec
-	r.kind = TCTypeParam
-	r.n = u64(name)
-	r.b = sym
-	r.c = index
-	r.a = constT
-	return newTypeRec(r)
+	return newTypeRec(TypeRec.TypeParam(name, sym, index, constT))
 }
 
 func newOpaque(name u32, builtin u8) u32 {
-	var r TypeRec
-	r.kind = TCOpaque
-	r.n = u64(name)
-	r.a = u32(builtin)
-	return newTypeRec(r)
+	return newTypeRec(TypeRec.Opaque(name, builtin))
+}
+
+// ---------------------------------------------------------------------------
+// Type forms
+
+func isBasicT(t u32) bool {
+	return match trec(t) { Basic(_) -> true, _ -> false }
+}
+
+func isNamedT(t u32) bool {
+	return match trec(t) { Named(_) -> true, _ -> false }
+}
+
+func isArrayT(t u32) bool {
+	return match trec(t) { Array(_, _, _) -> true, _ -> false }
+}
+
+func isSliceT(t u32) bool {
+	return match trec(t) { Slice(_) -> true, _ -> false }
+}
+
+func isPointerT(t u32) bool {
+	return match trec(t) { Pointer(_) -> true, _ -> false }
+}
+
+func isStructT(t u32) bool {
+	return match trec(t) { Struct(_, _) -> true, _ -> false }
+}
+
+func isEnumT(t u32) bool {
+	return match trec(t) { Enum(_, _) -> true, _ -> false }
+}
+
+func isSigT(t u32) bool {
+	return match trec(t) { Sig(_, _, _, _, _, _, _, _) -> true, _ -> false }
+}
+
+func isCodeT(t u32) bool {
+	return match trec(t) { Code(_) -> true, _ -> false }
+}
+
+func isTypeParamT(t u32) bool {
+	return match trec(t) { TypeParam(_, _, _, _) -> true, _ -> false }
+}
+
+func isConstArgT(t u32) bool {
+	return match trec(t) { ConstArg(_) -> true, _ -> false }
+}
+
+func isTupleT(t u32) bool {
+	return match trec(t) { Tuple(_, _) -> true, _ -> false }
+}
+
+func isOpaqueT(t u32) bool {
+	return match trec(t) { Opaque(_, _) -> true, _ -> false }
 }
 
 // ---------------------------------------------------------------------------
 // Accessors and predicates
 
+// namedID returns the NamedRec of a named type (0 for other types).
+func namedID(t u32) u32 {
+	return match trec(t) { Named(id) -> id, _ -> 0 }
+}
+
 func underlying(t u32) u32 {
-	if t == 0 {
-		return 0
-	}
-	if tk(t) == TCNamed {
-		u := typs.items[usize(t)].a
-		if u == 0 {
-			return TyInvalid
+	match trec(t) {
+		Named(id) -> {
+			u := typs.named[usize(id)].under
+			if u == 0 {
+				return TyInvalid
+			}
+			return u
 		}
-		return u
+		_ -> {
+			return t
+		}
 	}
-	return t
+}
+
+// namedUnder returns the underlying type of a named type as recorded (0 =
+// not yet resolved or not a named type).
+func namedUnder(t u32) u32 {
+	return nrec(t).under
+}
+
+func setNamedUnder(t u32, u u32) {
+	id := namedID(t)
+	if id != 0 {
+		typs.named[usize(id)].under = u
+	}
+}
+
+// setNamedClass caches the value class of a named type.
+func setNamedClass(t u32, c u8) {
+	id := namedID(t)
+	if id != 0 {
+		typs.named[usize(id)].cls = c
+		typs.named[usize(id)].clsOK = true
+	}
+}
+
+// namedClass returns the cached class of a named type (ok == false if none).
+func namedClass(t u32) (u8, bool) {
+	r := nrec(t)
+	return r.cls, r.clsOK
 }
 
 func isInvalid(t u32) bool {
@@ -544,14 +596,7 @@ func isInvalid(t u32) bool {
 }
 
 func basicKind(t u32) u8 {
-	if t == 0 {
-		return BkInvalid
-	}
-	u := underlying(t)
-	if tk(u) == TCBasic {
-		return typs.items[usize(u)].sub
-	}
-	return BkInvalid
+	return match trec(underlying(t)) { Basic(k) -> k, _ -> BkInvalid }
 }
 
 func isInteger(t u32) bool {
@@ -610,7 +655,7 @@ func intInfo(t u32) (u32, bool, bool) {
 }
 
 func isPolyCode(t u32) bool {
-	return t != 0 && tk(t) == TCCode && typs.items[usize(t)].n == 0
+	return trec(t) == TypeRec.Code(0)
 }
 
 // defaultOf returns the default type of an untyped type (types.Default).
@@ -636,35 +681,79 @@ func defaultOf(t u32) u32 {
 
 // derefType returns the element of a pointer type (and true), else t.
 func derefType(t u32) (u32, bool) {
-	if t != 0 && tk(t) == TCPointer {
-		return typs.items[usize(t)].a, true
+	match trec(t) {
+		Pointer(e) -> {
+			return e, true
+		}
+		_ -> {
+			return t, false
+		}
 	}
-	return t, false
 }
 
-func isTypeParamT(t u32) bool {
-	return t != 0 && tk(t) == TCTypeParam
+// elemOf returns the element type of an array, slice or pointer type.
+func elemOf(t u32) u32 {
+	return match trec(t) {
+		Array(e, _, _) -> e
+		Slice(e) -> e
+		Pointer(e) -> e
+		_ -> 0
+	}
+}
+
+// arrayLenOf returns the constant length and the length type parameter of
+// an array type.
+func arrayLenOf(t u32) (u64, u32) {
+	match trec(t) {
+		Array(_, p, n) -> {
+			return n, p
+		}
+		_ -> {
+			return 0, 0
+		}
+	}
+}
+
+func constArgVal(t u32) u64 {
+	return match trec(t) { ConstArg(v) -> v, _ -> 0 }
+}
+
+// typeName returns the name of a named type, type parameter or opaque type.
+func typeName(t u32) u32 {
+	return match trec(t) {
+		Named(id) -> typs.named[usize(id)].name
+		TypeParam(nm, _, _, _) -> nm
+		Opaque(nm, _) -> nm
+		_ -> 0
+	}
+}
+
+// Type parameters.
+func tpSym(t u32) u32 {
+	return match trec(t) { TypeParam(_, sym, _, _) -> sym, _ -> 0 }
+}
+
+// tpConstType returns the type of a const type parameter (0 for a type
+// parameter).
+func tpConstType(t u32) u32 {
+	return match trec(t) { TypeParam(_, _, _, ct) -> ct, _ -> 0 }
 }
 
 func tpIsConst(t u32) bool {
-	return typs.items[usize(t)].a != 0
+	return tpConstType(t) != 0
 }
 
-func elemOf(t u32) u32 {
-	return typs.items[usize(t)].a
-}
-
-// Struct fields: pairs (name, type) in l1.
+// Struct fields: pairs (name, type).
 func nfields(st u32) usize {
-	return tl1n(st) / 2
+	return match trec(st) { Struct(_, n) -> usize(n) / 2, _ -> 0 }
 }
 
 func fieldName(st u32, i usize) u32 {
-	return tl1(st, 2*i)
+	return match trec(st) { Struct(s, _) -> tlist(s, 2*i), _ -> 0 }
 }
 
 func fieldType(st u32, i usize) u32 {
-	return tl1(st, 2*i+1)
+	return match trec(st) { Struct(s, _) -> tlist(s, 2*i+1), _ -> 0 }
 }
 
 func fieldByName(st u32, name u32) (usize, bool) {
@@ -677,21 +766,21 @@ func fieldByName(st u32, name u32) (usize, bool) {
 	return 0, false
 }
 
-// Enum variants: triples (name, payload start, payload len) in l1.
+// Enum variants: triples (name, payload start, payload len).
 func nvariants(en u32) usize {
-	return tl1n(en) / 3
+	return match trec(en) { Enum(_, n) -> usize(n) / 3, _ -> 0 }
 }
 
 func variantName(en u32, i usize) u32 {
-	return tl1(en, 3*i)
+	return match trec(en) { Enum(s, _) -> tlist(s, 3*i), _ -> 0 }
 }
 
 func variantPayS(en u32, i usize) u32 {
-	return tl1(en, 3*i+1)
+	return match trec(en) { Enum(s, _) -> tlist(s, 3*i+1), _ -> 0 }
 }
 
 func variantPayN(en u32, i usize) usize {
-	return usize(tl1(en, 3*i+2))
+	return match trec(en) { Enum(s, _) -> usize(tlist(s, 3*i+2)), _ -> 0 }
 }
 
 func variantPay(en u32, i usize, j usize) u32 {
@@ -708,33 +797,66 @@ func variantByName(en u32, name u32) (usize, bool) {
 	return 0, false
 }
 
+// Tuples.
+func tupleN(t u32) usize {
+	return match trec(t) { Tuple(_, n) -> usize(n), _ -> 0 }
+}
+
+func tupleAt(t u32, i usize) u32 {
+	return match trec(t) { Tuple(s, _) -> tlist(s, i), _ -> 0 }
+}
+
 // Signatures.
 func sigEffect(s u32) u8 {
-	return typs.items[usize(s)].sub
+	return match trec(s) { Sig(eff, _, _, _, _, _, _, _) -> eff, _ -> EffComptime }
 }
 
 func sigVariadic(s u32) bool {
-	return typs.items[usize(s)].flag&1 != 0
+	return match trec(s) { Sig(_, va, _, _, _, _, _, _) -> va, _ -> false }
 }
 
 func sigNParams(s u32) usize {
-	return tl1n(s)
+	return match trec(s) { Sig(_, _, _, pn, _, _, _, _) -> usize(pn), _ -> 0 }
 }
 
 func sigParam(s u32, i usize) u32 {
-	return tl1(s, i)
+	return match trec(s) { Sig(_, _, ps, _, _, _, _, _) -> tlist(ps, i), _ -> 0 }
+}
+
+func sigParamsSlice(s u32) []u32 {
+	return match trec(s) { Sig(_, _, ps, pn, _, _, _, _) -> tlistSlice(ps, pn), _ -> emptyU32() }
 }
 
 func sigNResults(s u32) usize {
-	return tl2n(s)
+	return match trec(s) { Sig(_, _, _, _, _, rn, _, _) -> usize(rn), _ -> 0 }
 }
 
 func sigResult(s u32, i usize) u32 {
-	return tl2(s, i)
+	return match trec(s) { Sig(_, _, _, _, rs, _, _, _) -> tlist(rs, i), _ -> 0 }
+}
+
+func sigResultsSlice(s u32) []u32 {
+	return match trec(s) { Sig(_, _, _, _, rs, rn, _, _) -> tlistSlice(rs, rn), _ -> emptyU32() }
+}
+
+// sigTParamList returns the type parameter list of a generic signature.
+func sigTParamList(s u32) (u32, u32) {
+	match trec(s) {
+		Sig(_, _, _, _, _, _, ts, tn) -> {
+			return ts, tn
+		}
+		_ -> {
+			return 0, 0
+		}
+	}
 }
 
 func sigNTParams(s u32) usize {
-	return tl3n(s)
+	return match trec(s) { Sig(_, _, _, _, _, _, _, tn) -> usize(tn), _ -> 0 }
+}
+
+func sigTParam(s u32, i usize) u32 {
+	return match trec(s) { Sig(_, _, _, _, _, _, ts, _) -> tlist(ts, i), _ -> 0 }
 }
 
 // sigResultType: 0 for no results, the result, or a Tuple.
@@ -746,51 +868,91 @@ func sigResultType(s u32) u32 {
 	if n == 1 {
 		return sigResult(s, 0)
 	}
-	r := typs.items[usize(s)]
-	return mkTuple(typs.lists[usize(r.l2s) : usize(r.l2s)+usize(r.l2n)])
+	return mkTuple(sigResultsSlice(s))
 }
 
-func sigParamsSlice(s u32) []u32 {
-	r := typs.items[usize(s)]
-	return typs.lists[usize(r.l1s) : usize(r.l1s)+usize(r.l1n)]
+// Named types. nrec returns the NamedRec of t (the zero record for other
+// types).
+func nrec(t u32) NamedRec {
+	return typs.named[usize(namedID(t))]
 }
 
-func sigResultsSlice(s u32) []u32 {
-	r := typs.items[usize(s)]
-	return typs.lists[usize(r.l2s) : usize(r.l2s)+usize(r.l2n)]
-}
-
-func l1Slice(t u32) []u32 {
-	r := typs.items[usize(t)]
-	return typs.lists[usize(r.l1s) : usize(r.l1s)+usize(r.l1n)]
-}
-
-func l2Slice(t u32) []u32 {
-	r := typs.items[usize(t)]
-	return typs.lists[usize(r.l2s) : usize(r.l2s)+usize(r.l2n)]
-}
-
-// Named types.
 func namedBuiltin(t u32) u8 {
-	return typs.items[usize(t)].sub
+	return nrec(t).builtin
 }
 
 func namedOrigin(t u32) u32 {
-	return typs.items[usize(t)].b
+	return nrec(t).origin
 }
 
 func namedSym(t u32) u32 {
-	return typs.items[usize(t)].c
+	return nrec(t).sym
+}
+
+// Type args of an instance.
+func namedArgList(t u32) (u32, u32) {
+	r := nrec(t)
+	return r.argS, r.argN
+}
+
+func namedNArgs(t u32) usize {
+	return usize(nrec(t).argN)
+}
+
+func namedArg(t u32, i usize) u32 {
+	return tlist(nrec(t).argS, i)
+}
+
+func namedArgs(t u32) []u32 {
+	r := nrec(t)
+	return tlistSlice(r.argS, r.argN)
+}
+
+// Type params of a generic declaration.
+func namedTParamList(t u32) (u32, u32) {
+	r := nrec(t)
+	return r.tpS, r.tpN
+}
+
+func namedNTParams(t u32) usize {
+	return usize(nrec(t).tpN)
+}
+
+func namedTParam(t u32, i usize) u32 {
+	return tlist(nrec(t).tpS, i)
+}
+
+func setNamedTParams(t u32, s u32, n u32) {
+	id := namedID(t)
+	if id != 0 {
+		typs.named[usize(id)].tpS = s
+		typs.named[usize(id)].tpN = n
+	}
+}
+
+// Method cache (ulists of method IDs).
+func namedMethodCache(t u32) (u32, u32, bool) {
+	r := nrec(t)
+	return r.methS, r.methN, r.methOK
+}
+
+func setNamedMethods(t u32, s u32, n u32) {
+	id := namedID(t)
+	if id != 0 {
+		typs.named[usize(id)].methS = s
+		typs.named[usize(id)].methN = n
+		typs.named[usize(id)].methOK = true
+	}
 }
 
 func isGenericNamed(t u32) bool {
-	return tk(t) == TCNamed && tl2n(t) > 0
+	return isNamedT(t) && namedNTParams(t) > 0
 }
 
 // builtinOf returns the predeclared identity of a named type (origin for
 // instances), 0 if none.
 func builtinOf(t u32) u8 {
-	if t == 0 || tk(t) != TCNamed {
+	if t == 0 || !isNamedT(t) {
 		return 0
 	}
 	n := t
@@ -810,62 +972,78 @@ func isCapability(t u32) bool {
 	return b == BTNet || b == BTSignals || b == BTClock || b == BTFS || b == BTEnv || b == BTStdio || b == BTExec
 }
 
+// maxClassOf returns the largest class of the n types in the run at s.
+func maxClassOf(s u32, n u32, depth usize) u8 decreases(depth) {
+	c := u8(ClassValue)
+	if depth == 0 {
+		return c
+	}
+	for i := u32(0); i < n; i++ {
+		x := classOf(tlist(s, usize(i)), depth-1)
+		if x > c {
+			c = x
+		}
+	}
+	return c
+}
+
 // classOf computes the value class of t (types.ClassOf).
 func classOf(t u32, depth usize) u8 decreases(depth) {
 	if depth == 0 || t == 0 {
 		return ClassValue
 	}
-	k := tk(t)
-	if k == TCNamed {
-		if typs.items[usize(t)].flag&1 != 0 {
-			return typs.items[usize(t)].cls
-		}
-		u := typs.items[usize(t)].a
-		if u == 0 {
-			return ClassValue
-		}
-		typs.items[usize(t)].flag = typs.items[usize(t)].flag | 1
-		typs.items[usize(t)].cls = ClassValue
-		c := classOf(u, depth-1)
-		typs.items[usize(t)].cls = c
-		return c
-	}
-	if k == TCPointer || k == TCSig {
-		return ClassScoped
-	}
-	if k == TCArray || k == TCSlice {
-		return classOf(elemOf(t), depth-1)
-	}
-	c := u8(ClassValue)
-	if k == TCStruct {
-		n := nfields(t)
-		for i := usize(0); i < n; i++ {
-			x := classOf(fieldType(t, i), depth-1)
-			if x > c {
-				c = x
+	match trec(t) {
+		Named(id) -> {
+			if typs.named[usize(id)].clsOK {
+				return typs.named[usize(id)].cls
 			}
+			u := typs.named[usize(id)].under
+			if u == 0 {
+				return ClassValue
+			}
+			setNamedClass(t, ClassValue)
+			c := classOf(u, depth-1)
+			typs.named[usize(id)].cls = c
+			return c
 		}
-	} else if k == TCEnum {
-		n := nvariants(t)
-		for i := usize(0); i < n; i++ {
-			m := variantPayN(t, i)
-			for j := usize(0); j < m; j++ {
-				x := classOf(variantPay(t, i, j), depth-1)
+		Pointer(_) | Sig(_, _, _, _, _, _, _, _) -> {
+			return ClassScoped
+		}
+		Array(e, _, _) -> {
+			return classOf(e, depth-1)
+		}
+		Slice(e) -> {
+			return classOf(e, depth-1)
+		}
+		Struct(_, _) -> {
+			c := u8(ClassValue)
+			nf := nfields(t)
+			for i := usize(0); i < nf; i++ {
+				x := classOf(fieldType(t, i), depth-1)
 				if x > c {
 					c = x
 				}
 			}
+			return c
 		}
-	} else if k == TCTuple {
-		n := tl1n(t)
-		for i := usize(0); i < n; i++ {
-			x := classOf(tl1(t, i), depth-1)
-			if x > c {
-				c = x
+		Enum(_, _) -> {
+			c := u8(ClassValue)
+			nv := nvariants(t)
+			for i := usize(0); i < nv; i++ {
+				x := maxClassOf(variantPayS(t, i), u32(variantPayN(t, i)), depth-1)
+				if x > c {
+					c = x
+				}
 			}
+			return c
+		}
+		Tuple(s, n) -> {
+			return maxClassOf(s, n, depth-1)
+		}
+		NoType | Basic(_) | Code(_) | TypeParam(_, _, _, _) | ConstArg(_) | Opaque(_, _) -> {
+			return ClassValue
 		}
 	}
-	return c
 }
 
 func classOfT(t u32) u8 {
@@ -885,37 +1063,53 @@ func comparable(t u32, depth usize) bool decreases(depth) {
 		return false
 	}
 	u := underlying(t)
-	k := tk(u)
-	if k == TCBasic {
-		b := typs.items[usize(u)].sub
-		return b != BkUntypedNil && b != BkInvalid
-	}
-	if k == TCPointer || k == TCCode {
-		return true
-	}
-	if k == TCArray {
-		return comparable(elemOf(u), depth-1)
-	}
-	if k == TCStruct {
-		n := nfields(u)
-		for i := usize(0); i < n; i++ {
-			if !comparable(fieldType(u, i), depth-1) {
-				return false
-			}
+	match trec(u) {
+		Basic(b) -> {
+			return b != BkUntypedNil && b != BkInvalid
 		}
-		return true
-	}
-	if k == TCEnum {
-		n := nvariants(u)
-		for i := usize(0); i < n; i++ {
-			m := variantPayN(u, i)
-			for j := usize(0); j < m; j++ {
-				if !comparable(variantPay(u, i, j), depth-1) {
+		Pointer(_) | Code(_) -> {
+			return true
+		}
+		Array(e, _, _) -> {
+			return comparable(e, depth-1)
+		}
+		Struct(_, _) -> {
+			n := nfields(u)
+			for i := usize(0); i < n; i++ {
+				if !comparable(fieldType(u, i), depth-1) {
 					return false
 				}
 			}
+			return true
 		}
-		return true
+		Enum(_, _) -> {
+			n := nvariants(u)
+			for i := usize(0); i < n; i++ {
+				m := variantPayN(u, i)
+				for j := usize(0); j < m; j++ {
+					if !comparable(variantPay(u, i, j), depth-1) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		NoType | Sig(_, _, _, _, _, _, _, _) | Named(_) | Slice(_) | TypeParam(_, _, _, _) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {
+			return false
+		}
+	}
+}
+
+// listHasTypeParam reports whether one of the n types in the run at s
+// mentions a type parameter.
+func listHasTypeParam(s u32, n u32, depth usize) bool decreases(depth) {
+	if depth == 0 {
+		return false
+	}
+	for i := u32(0); i < n; i++ {
+		if hasTypeParam(tlist(s, usize(i)), depth-1) {
+			return true
+		}
 	}
 	return false
 }
@@ -924,61 +1118,50 @@ func hasTypeParam(t u32, depth usize) bool decreases(depth) {
 	if depth == 0 || t == 0 {
 		return false
 	}
-	k := tk(t)
-	if k == TCTypeParam {
-		return true
-	}
-	if k == TCNamed || k == TCTuple {
-		n := tl1n(t)
-		for i := usize(0); i < n; i++ {
-			if hasTypeParam(tl1(t, i), depth-1) {
-				return true
-			}
+	match trec(t) {
+		TypeParam(_, _, _, _) -> {
+			return true
 		}
-		return false
-	}
-	if k == TCArray {
-		return typs.items[usize(t)].b != 0 || hasTypeParam(elemOf(t), depth-1)
-	}
-	if k == TCSlice || k == TCPointer {
-		return hasTypeParam(elemOf(t), depth-1)
-	}
-	if k == TCStruct {
-		n := nfields(t)
-		for i := usize(0); i < n; i++ {
-			if hasTypeParam(fieldType(t, i), depth-1) {
-				return true
-			}
+		Named(id) -> {
+			return listHasTypeParam(typs.named[usize(id)].argS, typs.named[usize(id)].argN, depth-1)
 		}
-		return false
-	}
-	if k == TCEnum {
-		n := nvariants(t)
-		for i := usize(0); i < n; i++ {
-			m := variantPayN(t, i)
-			for j := usize(0); j < m; j++ {
-				if hasTypeParam(variantPay(t, i, j), depth-1) {
+		Tuple(s, n) -> {
+			return listHasTypeParam(s, n, depth-1)
+		}
+		Array(e, p, _) -> {
+			return p != 0 || hasTypeParam(e, depth-1)
+		}
+		Slice(e) -> {
+			return hasTypeParam(e, depth-1)
+		}
+		Pointer(e) -> {
+			return hasTypeParam(e, depth-1)
+		}
+		Struct(_, _) -> {
+			n := nfields(t)
+			for i := usize(0); i < n; i++ {
+				if hasTypeParam(fieldType(t, i), depth-1) {
 					return true
 				}
 			}
+			return false
 		}
-		return false
-	}
-	if k == TCSig {
-		n := tl1n(t)
-		for i := usize(0); i < n; i++ {
-			if hasTypeParam(tl1(t, i), depth-1) {
-				return true
+		Enum(_, _) -> {
+			n := nvariants(t)
+			for i := usize(0); i < n; i++ {
+				if listHasTypeParam(variantPayS(t, i), u32(variantPayN(t, i)), depth-1) {
+					return true
+				}
 			}
+			return false
 		}
-		m := tl2n(t)
-		for i := usize(0); i < m; i++ {
-			if hasTypeParam(tl2(t, i), depth-1) {
-				return true
-			}
+		Sig(_, _, ps, pn, rs, rn, _, _) -> {
+			return listHasTypeParam(ps, pn, depth-1) || listHasTypeParam(rs, rn, depth-1)
+		}
+		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(_, _) -> {
+			return false
 		}
 	}
-	return false
 }
 
 func anyTypeParam(xs []u32) bool {
@@ -1043,107 +1226,113 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 		o.putStr("<nil>")
 		return
 	}
-	r := typs.items[usize(t)]
-	k := r.kind
-	if k == TCBasic {
-		o.putStr(basicName(r.sub))
-	} else if k == TCNamed {
-		if r.d != 0 && len(strBytes(pkgs.items[usize(r.d)].path)) > 0 {
-			o.putBytes(nameBytes(pkgs.items[usize(r.d)].name))
-			o.putByte('.')
+	match trec(t) {
+		NoType -> {}
+		Basic(k) -> o.putStr(basicName(k))
+		Named(id) -> {
+			r := typs.named[usize(id)]
+			if r.pkg != 0 && len(strBytes(pkgs.items[usize(r.pkg)].path)) > 0 {
+				o.putBytes(nameBytes(pkgs.items[usize(r.pkg)].name))
+				o.putByte('.')
+			}
+			o.putBytes(nameBytes(r.name))
+			if r.argN > 0 {
+				o.putByte('[')
+				putTypeList(o, tlistSlice(r.argS, r.argN), depth-1)
+				o.putByte(']')
+			}
 		}
-		o.putBytes(nameBytes(u32(r.n)))
-		if r.l1n > 0 {
+		Array(e, p, n) -> {
 			o.putByte('[')
-			putTypeList(o, l1Slice(t), depth-1)
+			if p != 0 {
+				o.putBytes(nameBytes(typeName(p)))
+			} else {
+				o.putUint(n)
+			}
 			o.putByte(']')
+			putType(o, e, depth-1)
 		}
-	} else if k == TCArray {
-		o.putByte('[')
-		if r.b != 0 {
-			o.putBytes(nameBytes(u32(typs.items[usize(r.b)].n)))
-		} else {
-			o.putUint(r.n)
+		Slice(e) -> {
+			o.putStr("[]")
+			putType(o, e, depth-1)
 		}
-		o.putByte(']')
-		putType(o, r.a, depth-1)
-	} else if k == TCSlice {
-		o.putStr("[]")
-		putType(o, r.a, depth-1)
-	} else if k == TCPointer {
-		o.putByte('*')
-		putType(o, r.a, depth-1)
-	} else if k == TCStruct {
-		o.putStr("struct{")
-		n := nfields(t)
-		for i := usize(0); i < n; i++ {
-			if i > 0 {
-				o.putStr("; ")
+		Pointer(e) -> {
+			o.putByte('*')
+			putType(o, e, depth-1)
+		}
+		Struct(_, _) -> {
+			o.putStr("struct{")
+			n := nfields(t)
+			for i := usize(0); i < n; i++ {
+				if i > 0 {
+					o.putStr("; ")
+				}
+				o.putBytes(nameBytes(fieldName(t, i)))
+				o.putByte(' ')
+				putType(o, fieldType(t, i), depth-1)
 			}
-			o.putBytes(nameBytes(fieldName(t, i)))
-			o.putByte(' ')
-			putType(o, fieldType(t, i), depth-1)
+			o.putByte('}')
 		}
-		o.putByte('}')
-	} else if k == TCEnum {
-		o.putStr("enum{")
-		n := nvariants(t)
-		for i := usize(0); i < n; i++ {
-			if i > 0 {
-				o.putStr("; ")
+		Enum(_, _) -> {
+			o.putStr("enum{")
+			n := nvariants(t)
+			for i := usize(0); i < n; i++ {
+				if i > 0 {
+					o.putStr("; ")
+				}
+				o.putBytes(nameBytes(variantName(t, i)))
+				m := variantPayN(t, i)
+				if m > 0 {
+					o.putByte('(')
+					putTypeList(o, tlistSlice(variantPayS(t, i), u32(m)), depth-1)
+					o.putByte(')')
+				}
 			}
-			o.putBytes(nameBytes(variantName(t, i)))
-			m := variantPayN(t, i)
-			if m > 0 {
-				o.putByte('(')
-				s := usize(variantPayS(t, i))
-				putTypeList(o, typs.lists[s:s+m], depth-1)
+			o.putByte('}')
+		}
+		Sig(eff, va, ps, pn, rs, rn, _, _) -> {
+			if eff == EffDriver {
+				o.putStr("driver ")
+			} else if eff == EffComptime {
+				o.putStr("comptime ")
+			}
+			o.putStr("func(")
+			n := usize(pn)
+			for i := usize(0); i < n; i++ {
+				if i > 0 {
+					o.putStr(", ")
+				}
+				if va && i == n-1 {
+					o.putStr("...")
+				}
+				putType(o, tlist(ps, i), depth-1)
+			}
+			o.putByte(')')
+			if rn == 1 {
+				o.putByte(' ')
+				putType(o, tlist(rs, 0), depth-1)
+			} else if rn > 1 {
+				o.putStr(" (")
+				putTypeList(o, tlistSlice(rs, rn), depth-1)
 				o.putByte(')')
 			}
 		}
-		o.putByte('}')
-	} else if k == TCSig {
-		if r.sub == EffDriver {
-			o.putStr("driver ")
-		} else if r.sub == EffComptime {
-			o.putStr("comptime ")
-		}
-		o.putStr("func(")
-		n := usize(r.l1n)
-		for i := usize(0); i < n; i++ {
-			if i > 0 {
-				o.putStr(", ")
+		Code(l) -> {
+			if l == 0 {
+				o.putStr("Code ?")
+			} else {
+				o.putStr("Code ")
+				o.putUint(u64(l - 1))
 			}
-			if r.flag&1 != 0 && i == n-1 {
-				o.putStr("...")
-			}
-			putType(o, tl1(t, i), depth-1)
 		}
-		o.putByte(')')
-		m := usize(r.l2n)
-		if m == 1 {
-			o.putByte(' ')
-			putType(o, tl2(t, 0), depth-1)
-		} else if m > 1 {
-			o.putStr(" (")
-			putTypeList(o, l2Slice(t), depth-1)
+		TypeParam(nm, _, _, _) -> o.putBytes(nameBytes(nm))
+		Opaque(nm, _) -> o.putBytes(nameBytes(nm))
+		ConstArg(v) -> o.putUint(v)
+		Tuple(s, n) -> {
+			o.putByte('(')
+			putTypeList(o, tlistSlice(s, n), depth-1)
 			o.putByte(')')
 		}
-	} else if k == TCCode {
-		if r.n == 0 {
-			o.putStr("Code ?")
-		} else {
-			o.putStr("Code ")
-			o.putUint(r.n - 1)
-		}
-	} else if k == TCTypeParam || k == TCOpaque {
-		o.putBytes(nameBytes(u32(r.n)))
-	} else if k == TCConstArg {
-		o.putUint(r.n)
-	} else if k == TCTuple {
-		o.putByte('(')
-		putTypeList(o, l1Slice(t), depth-1)
-		o.putByte(')')
 	}
 }
 
@@ -1238,9 +1427,8 @@ var slotT u32
 
 func mkUnivNamed(b u8, under u32, class u8) u32 {
 	t := newNamed(internStr(builtinName(b)), builtinSym[usize(b)], 0, b)
-	typs.items[usize(t)].a = under
-	typs.items[usize(t)].cls = class
-	typs.items[usize(t)].flag = 1
+	setNamedUnder(t, under)
+	setNamedClass(t, class)
 	univNamed[usize(b)] = t
 	return t
 }
@@ -1250,9 +1438,9 @@ func mkUnivNamed(b u8, under u32, class u8) u32 {
 func addUnivMethod(recv u8, name string, id u8, variadic bool, eff u8, m1 usize, m2 usize) {
 	sig := u32(0)
 	if id != BMScopeAcquireSlot && id != BMScopeReleaseSlot && id != BMScopeGo {
-		sig = mkSig(eff, variadic, m1, m2, typs.top)
+		sig = mkSig(eff, variadic, m1, m2, tmark())
 	} else {
-		typs.top = m1
+		tdiscard(m1)
 	}
 	var m Method
 	m.name = internStr(name)
@@ -1264,10 +1452,7 @@ func addUnivMethod(recv u8, name string, id u8, variadic bool, eff u8, m1 usize,
 
 func setUnivMethods(recv u8, mark usize) {
 	s, n := ucommit(mark)
-	t := univNamed[usize(recv)]
-	typs.items[usize(t)].l3s = s
-	typs.items[usize(t)].l3n = n
-	typs.items[usize(t)].flag = typs.items[usize(t)].flag | 2
+	setNamedMethods(univNamed[usize(recv)], s, n)
 }
 
 func initUnivTypes() {
@@ -1291,8 +1476,7 @@ func initUnivTypes() {
 	sp := tmark()
 	tpush(slotT)
 	s2, n2 := tcommitStack(sp)
-	typs.items[usize(slot)].l2s = s2
-	typs.items[usize(slot)].l2n = n2
+	setNamedTParams(slot, s2, n2)
 	_ = mkUnivNamed(BTFieldCode, newOpaque(internStr("FieldCode"), BTFieldCode), ClassValue)
 
 	ctx := univNamed[BTContext]
@@ -1667,11 +1851,8 @@ var npend usize
 func findInstRec(sym u32, args []u32) u32 {
 	n := insts.count
 	for i := usize(1); i < n; i++ {
-		if insts.items[i].sym == sym {
-			s := usize(insts.items[i].argS)
-			if u32sEqual(typs.lists[s:s+usize(insts.items[i].argN)], args) {
-				return u32(i)
-			}
+		if insts.items[i].sym == sym && u32sEqual(tlistSlice(insts.items[i].argS, insts.items[i].argN), args) {
+			return u32(i)
 		}
 	}
 	return 0
@@ -1698,24 +1879,28 @@ func instantiate(origin u32, args []u32, node u32, depth usize) u32 decreases(de
 		setFull("recursion depth")
 		return TyInvalid
 	}
-	o := typs.items[usize(origin)]
-	var r TypeRec
-	r.kind = TCNamed
-	r.b = origin
-	r.n = o.n
-	r.c = o.c
-	r.d = o.d
-	r.sub = o.sub
-	if o.flag&1 != 0 && o.sub != 0 {
-		r.flag = 1
+	o := typs.named[usize(namedID(origin))]
+	var r NamedRec
+	r.origin = origin
+	r.name = o.name
+	r.sym = o.sym
+	r.pkg = o.pkg
+	r.builtin = o.builtin
+	if o.clsOK && o.builtin != 0 {
+		r.clsOK = true
 		r.cls = o.cls
 	}
-	inst, isNew := internType(r, args, emptyU32(), emptyU32())
+	r.argS, r.argN = tcommit(args)
+	nid := newNamedRec(r)
+	if nid == 0 {
+		return TyInvalid
+	}
+	inst, isNew := internType(TypeRec.Named(nid))
 	if inst == TyInvalid {
 		return TyInvalid
 	}
 	if isNew {
-		if typs.items[usize(origin)].a == 0 {
+		if o.under == 0 {
 			if npend >= MaxPending {
 				setFull("pending instances")
 			} else {
@@ -1727,14 +1912,13 @@ func instantiate(origin u32, args []u32, node u32, depth usize) u32 decreases(de
 			completeInstance(inst, depth-1)
 		}
 	}
-	ia := l1Slice(inst)
-	rec := findInstRec(o.c, ia)
+	ia := namedArgs(inst)
+	rec := findInstRec(o.sym, ia)
 	if rec == 0 {
 		var ir Inst
-		ir.sym = o.c
+		ir.sym = o.sym
 		ir.named = inst
-		ir.argS = typs.items[usize(inst)].l1s
-		ir.argN = typs.items[usize(inst)].l1n
+		ir.argS, ir.argN = namedArgList(inst)
 		ir.generic = anyTypeParam(ia)
 		rec = newInstRec(ir)
 	}
@@ -1749,15 +1933,14 @@ func completeInstance(inst u32, depth usize) decreases(depth) {
 		return
 	}
 	o := namedOrigin(inst)
-	u := typs.items[usize(o)].a
-	if u != 0 && tk(u) == TCOpaque {
-		typs.items[usize(inst)].a = u
+	u := namedUnder(o)
+	if u != 0 && isOpaqueT(u) {
+		setNamedUnder(inst, u)
 		return
 	}
-	ou := typs.items[usize(o)]
-	ti := typs.items[usize(inst)]
-	r := subst(u, ou.l2s, ou.l2n, ti.l1s, ti.l1n, depth-1)
-	typs.items[usize(inst)].a = r
+	tpS, tpN := namedTParamList(o)
+	argS, argN := namedArgList(inst)
+	setNamedUnder(inst, subst(u, tpS, tpN, argS, argN, depth-1))
 }
 
 // completePending completes the instances of origin created before its
@@ -1795,106 +1978,103 @@ func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreas
 	if t == 0 || tpN == 0 || argN == 0 {
 		return t
 	}
-	r := typs.items[usize(t)]
-	k := r.kind
-	if k == TCTypeParam {
-		b := substLookup(t, tpS, tpN, argS, argN)
-		if b != 0 {
-			return b
-		}
-		return t
-	}
-	if k == TCNamed {
-		if r.b == 0 {
+	match trec(t) {
+		TypeParam(_, _, _, _) -> {
+			b := substLookup(t, tpS, tpN, argS, argN)
+			if b != 0 {
+				return b
+			}
 			return t
 		}
-		m := tmark()
-		n := usize(r.l1n)
-		changed := false
-		for i := usize(0); i < n; i++ {
-			a := tl1(t, i)
-			x := subst(a, tpS, tpN, argS, argN, depth-1)
-			if x != a {
-				changed = true
+		Named(id) -> {
+			r := typs.named[usize(id)]
+			if r.origin == 0 {
+				return t
 			}
-			tpush(x)
+			m := tmark()
+			changed := false
+			for i := usize(0); i < usize(r.argN); i++ {
+				a := tlist(r.argS, i)
+				x := subst(a, tpS, tpN, argS, argN, depth-1)
+				if x != a {
+					changed = true
+				}
+				tpush(x)
+			}
+			if !changed {
+				tdiscard(m)
+				return t
+			}
+			s, cnt := tcommitStack(m)
+			return instantiate(r.origin, tlistSlice(s, cnt), 0, depth-1)
 		}
-		if !changed {
-			typs.top = m
+		Array(e, p, n) -> {
+			elem := subst(e, tpS, tpN, argS, argN, depth-1)
+			if p != 0 {
+				b := substLookup(p, tpS, tpN, argS, argN)
+				if b != 0 && isConstArgT(b) {
+					return mkArray(constArgVal(b), 0, elem)
+				}
+				if b != 0 && isTypeParamT(b) {
+					return mkArray(0, b, elem)
+				}
+			}
+			return mkArray(n, p, elem)
+		}
+		Slice(e) -> {
+			return mkSlice(subst(e, tpS, tpN, argS, argN, depth-1))
+		}
+		Pointer(e) -> {
+			return mkPointer(subst(e, tpS, tpN, argS, argN, depth-1))
+		}
+		Struct(_, _) -> {
+			m := tmark()
+			n := nfields(t)
+			for i := usize(0); i < n; i++ {
+				nm := fieldName(t, i)
+				ft := subst(fieldType(t, i), tpS, tpN, argS, argN, depth-1)
+				tpush(nm)
+				tpush(ft)
+			}
+			return mkStruct(m)
+		}
+		Enum(_, _) -> {
+			m := tmark()
+			n := nvariants(t)
+			for i := usize(0); i < n; i++ {
+				pm := tmark()
+				pn := variantPayN(t, i)
+				for j := usize(0); j < pn; j++ {
+					tpush(subst(variantPay(t, i, j), tpS, tpN, argS, argN, depth-1))
+				}
+				ps, pc := tcommitStack(pm)
+				tpush(variantName(t, i))
+				tpush(ps)
+				tpush(pc)
+			}
+			return mkEnum(m)
+		}
+		Sig(eff, va, ps, pn, rs, rn, _, _) -> {
+			m1 := tmark()
+			for i := usize(0); i < usize(pn); i++ {
+				tpush(subst(tlist(ps, i), tpS, tpN, argS, argN, depth-1))
+			}
+			m2 := tmark()
+			for i := usize(0); i < usize(rn); i++ {
+				tpush(subst(tlist(rs, i), tpS, tpN, argS, argN, depth-1))
+			}
+			m3 := tmark()
+			return mkSig(eff, va, m1, m2, m3)
+		}
+		Tuple(s, n) -> {
+			m := tmark()
+			for i := usize(0); i < usize(n); i++ {
+				tpush(subst(tlist(s, i), tpS, tpN, argS, argN, depth-1))
+			}
+			return mkTupleStack(m)
+		}
+		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(_, _) -> {
 			return t
 		}
-		s, cnt := tcommitStack(m)
-		return instantiate(r.b, typs.lists[usize(s):usize(s)+usize(cnt)], 0, depth-1)
 	}
-	if k == TCArray {
-		elem := subst(r.a, tpS, tpN, argS, argN, depth-1)
-		if r.b != 0 {
-			b := substLookup(r.b, tpS, tpN, argS, argN)
-			if b != 0 && tk(b) == TCConstArg {
-				return mkArray(typs.items[usize(b)].n, 0, elem)
-			}
-			if b != 0 && tk(b) == TCTypeParam {
-				return mkArray(0, b, elem)
-			}
-		}
-		return mkArray(r.n, r.b, elem)
-	}
-	if k == TCSlice {
-		return mkSlice(subst(r.a, tpS, tpN, argS, argN, depth-1))
-	}
-	if k == TCPointer {
-		return mkPointer(subst(r.a, tpS, tpN, argS, argN, depth-1))
-	}
-	if k == TCStruct {
-		m := tmark()
-		n := nfields(t)
-		for i := usize(0); i < n; i++ {
-			nm := fieldName(t, i)
-			ft := subst(fieldType(t, i), tpS, tpN, argS, argN, depth-1)
-			tpush(nm)
-			tpush(ft)
-		}
-		return mkStruct(m)
-	}
-	if k == TCEnum {
-		m := tmark()
-		n := nvariants(t)
-		for i := usize(0); i < n; i++ {
-			pm := tmark()
-			pn := variantPayN(t, i)
-			for j := usize(0); j < pn; j++ {
-				tpush(subst(variantPay(t, i, j), tpS, tpN, argS, argN, depth-1))
-			}
-			ps, pc := tcommitStack(pm)
-			tpush(variantName(t, i))
-			tpush(ps)
-			tpush(pc)
-		}
-		return mkEnum(m)
-	}
-	if k == TCSig {
-		m1 := tmark()
-		n := tl1n(t)
-		for i := usize(0); i < n; i++ {
-			tpush(subst(tl1(t, i), tpS, tpN, argS, argN, depth-1))
-		}
-		m2 := tmark()
-		nr := tl2n(t)
-		for i := usize(0); i < nr; i++ {
-			tpush(subst(tl2(t, i), tpS, tpN, argS, argN, depth-1))
-		}
-		m3 := tmark()
-		return mkSig(r.sub, r.flag&1 != 0, m1, m2, m3)
-	}
-	if k == TCTuple {
-		m := tmark()
-		n := tl1n(t)
-		for i := usize(0); i < n; i++ {
-			tpush(subst(tl1(t, i), tpS, tpN, argS, argN, depth-1))
-		}
-		x := mkTuple(tslice(m, typs.top))
-		typs.top = m
-		return x
-	}
-	return t
 }

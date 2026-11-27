@@ -224,7 +224,7 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 		if isInvalidOp(&x) {
 			return false
 		}
-		if x.typ == 0 || tk(x.typ) != TCTuple || x.mode != KValue {
+		if x.typ == 0 || !isTupleT(x.typ) || x.mode != KValue {
 			singleValue(&x)
 			if isInvalidOp(&x) {
 				return false
@@ -238,7 +238,7 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 			errAt(E2003, r0)
 			return false
 		}
-		nt := tl1n(x.typ)
+		nt := tupleN(x.typ)
 		if nt != nl {
 			mreset()
 			ms("assignment mismatch: ")
@@ -253,11 +253,11 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 		}
 		tv := u32(0)
 		vs := nval[usize(r0)]
-		if vs != 0 && slotGet(vs).kind == VTuple {
-			tv = slotGet(vs).ref
+		if vs != 0 {
+			tv, _ = tupleOf(slotGet(vs))
 		}
 		for i := usize(0); i < nt; i++ {
-			op := opMode(KValue, tl1(x.typ, i))
+			op := opMode(KValue, tupleAt(x.typ, i))
 			op.expr = r0
 			if tv != 0 {
 				op.mode = KConst
@@ -343,7 +343,7 @@ func assignValue(x *Operand, t u32) {
 	e := x.expr
 	if nkind(e) == NkCallExpr {
 		rt := ntype[usize(e)]
-		if rt != 0 && tk(rt) == TCTuple {
+		if rt != 0 && isTupleT(rt) {
 			if !assignable(x.typ, t) && !isInvalid(t) {
 				mreset()
 				ms("cannot assign value of type ")
@@ -485,7 +485,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		if isInvalidOp(&x) {
 			return
 		}
-		if x.typ == 0 || tk(x.typ) != TCTuple {
+		if x.typ == 0 || !isTupleT(x.typ) {
 			singleValue(&x)
 			if !isInvalidOp(&x) {
 				mreset()
@@ -495,7 +495,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 			}
 			return
 		}
-		nt := tl1n(x.typ)
+		nt := tupleN(x.typ)
 		if nt != want {
 			mreset()
 			ms("wrong number of return values: have ")
@@ -506,7 +506,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 			return
 		}
 		for i := usize(0); i < nt; i++ {
-			t := tl1(x.typ, i)
+			t := tupleAt(x.typ, i)
 			w := sigResult(sig, i)
 			if !assignable(t, w) && !isInvalid(w) {
 				mreset()
@@ -559,7 +559,7 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 		return false
 	}
 	en := underlying(t)
-	isEnum := tk(en) == TCEnum
+	isEnum := isEnumT(en)
 	k := nkind(p)
 	if k == NkLiteralPattern {
 		x := exprValue(na(p), dp-1)
@@ -640,7 +640,7 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 			return false
 		}
 		qe := underlying(qt)
-		if tk(qe) != TCEnum {
+		if !isEnumT(qe) {
 			mreset()
 			mtype(qt)
 			ms(" is not an enum type")
@@ -651,7 +651,7 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 		// v0.2: a generic enum qualifies patterns on its instances
 		// (Option.Some(x) on an Option[u32]); the variant comes from the
 		// instance.
-		if tk(t) == TCNamed && namedOrigin(t) != 0 && namedOrigin(t) == qt && isEnum {
+		if isNamedT(t) && namedOrigin(t) != 0 && namedOrigin(t) == qt && isEnum {
 			qe = en
 		} else if qt != t {
 			mreset()
@@ -782,7 +782,7 @@ func isTerminating(s u32, dp usize) bool decreases(dp) {
 		}
 		if !exhaustive && n > 0 {
 			t := ntype[usize(na(s))]
-			if t != 0 && tk(underlying(t)) == TCEnum {
+			if t != 0 && isEnumT(underlying(t)) {
 				exhaustive = true
 			}
 		}

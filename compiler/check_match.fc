@@ -193,7 +193,7 @@ func selectArm(v Val, m u32) usize {
 			}
 			if k == NkCtorPattern {
 				if nvarEnum[usize(alt)] != 0 {
-					if v.kind == VEnum && v.lo == u64(nvarIdx[usize(alt)]) {
+					if isVariant(v, nvarIdx[usize(alt)]) {
 						return i
 					}
 				} else if nval[usize(nb(alt))] != 0 && valsEqual(v, slotGet(nval[usize(nb(alt))])) {
@@ -251,7 +251,7 @@ func mAllCovered(nv usize) bool {
 // matchPatterns (all patterns are valid).
 func matchCoverage(m u32, t u32, isExpr bool) {
 	en := underlying(t)
-	isEnum := tk(en) == TCEnum
+	isEnum := isEnumT(en)
 	nv := usize(0)
 	if isEnum {
 		nv = nvariants(en)

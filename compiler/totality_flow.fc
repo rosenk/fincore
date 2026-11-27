@@ -39,12 +39,15 @@ const (
 	SideLo  = 1
 	SideHi  = 2
 
-	TwT2  = 1
-	TwT3  = 2
-	TwRec = 3
-
 	U64Max = 18446744073709551615
 )
+
+// WalkMode selects the callbacks of the flow walker.
+type WalkMode enum {
+	T2  // T2: the loop's slice is strictly shortened
+	T3  // T3: the measure decreases
+	Rec // recursion: collect the calls of a body
+}
 
 type TSt struct {
 	dead   bool
@@ -96,7 +99,7 @@ var asgB [TotMaxAsg]Bnds
 var asgHave [TotMaxAsg]bool
 
 // walker configuration
-var wMode u8
+var wMode WalkMode
 var wTrack bool
 var twDepth usize
 var wWhy u32
@@ -546,7 +549,7 @@ func eb(e0 u32, st u32, dp usize) Bnds decreases(dp) {
 	a := lenArg(e)
 	if a != 0 {
 		s := varOf(a)
-		if s != 0 && wMode == TwT3 && t3LenOK[usize(s)] {
+		if s != 0 && wMode == WalkMode.T3 && t3LenOK[usize(s)] {
 			return exactBnds(TermLen, u64(s))
 		}
 		return emptyBnds()
@@ -959,7 +962,7 @@ func matchExhaustive(m u32) bool {
 			return true
 		}
 	}
-	return tkOf(underlying(ntype[usize(na(m))])) == TCEnum
+	return isEnumT(underlying(ntype[usize(na(m))]))
 }
 
 // wNestedLoop analyses a loop inside the analysed body: facts about the
@@ -976,7 +979,7 @@ func wNestedLoop(f u32, st0 u32, dp usize) u32 decreases(dp) {
 	}
 	killWrites(ne(f), st)
 	killWrites(nc(f), st)
-	if wMode == TwT3 {
+	if wMode == WalkMode.T3 {
 		decWrites(ne(f), st, dp-1)
 		decWrites(nc(f), st, dp-1)
 	}
@@ -1091,7 +1094,7 @@ func twExpr(e u32, st u32, dp usize) decreases(dp) {
 			wExprChild(slotChild(nodes.items[usize(e)], slot), st, dp-1)
 		}
 	}
-	if k == NkCallExpr && wMode == TwRec {
+	if k == NkCallExpr && wMode == WalkMode.Rec {
 		recOnCall(e, st)
 	}
 }
@@ -1134,7 +1137,7 @@ func twAssign(mark usize, nl usize, nr usize, op u8, st u32, dp usize) u32 decre
 		return st
 	}
 	pre := st
-	if wMode == TwT2 || wMode == TwT3 {
+	if wMode != WalkMode.Rec {
 		pre = cloneState(st)
 	}
 	bmark := nbstk
@@ -1168,7 +1171,7 @@ func twAssign(mark usize, nl usize, nr usize, op u8, st u32, dp usize) u32 decre
 			bSet(st, varOf(l), asgB[mark+i])
 		}
 	}
-	if wMode == TwT2 || wMode == TwT3 {
+	if wMode != WalkMode.Rec {
 		for i := usize(0); i < nl; i++ {
 			r := u32(0)
 			if op == AsgAssign && nr == nl {
@@ -1189,19 +1192,23 @@ func onAssign(lhs u32, rhs u32, pre u32, post u32, dp usize) decreases(dp) {
 		tooDeep()
 		return
 	}
-	if wMode == TwT2 {
-		if rhs == 0 || varOf(lhs) != wRem {
-			return
+	match wMode {
+		T2 -> {
+			if rhs == 0 || varOf(lhs) != wRem {
+				return
+			}
+			k := shrinkStep(wRem, rhs)
+			if k != 0 && positive(k, pre) {
+				tst[usize(post)].shrunk = true
+			}
 		}
-		k := shrinkStep(wRem, rhs)
-		if k != 0 && positive(k, pre) {
-			tst[usize(post)].shrunk = true
+		T3 -> {
+			s := storageRoot(lhs)
+			if s != 0 && t3Trk[usize(s)] {
+				tst[usize(post)].dec = proves(post, dp-1)
+			}
 		}
-	} else if wMode == TwT3 {
-		s := storageRoot(lhs)
-		if s != 0 && t3Trk[usize(s)] {
-			tst[usize(post)].dec = proves(post, dp-1)
-		}
+		Rec -> {}
 	}
 }
 
@@ -1210,15 +1217,19 @@ func onExit(st u32, dp usize) decreases(dp) {
 		tooDeep()
 		return
 	}
-	if wMode == TwT2 {
-		if !tst[usize(st)].shrunk && wWhy == WhyNone {
-			wWhy = WhyNotShortened
+	match wMode {
+		T2 -> {
+			if !tst[usize(st)].shrunk && wWhy == WhyNone {
+				wWhy = WhyNotShortened
+			}
 		}
-	} else if wMode == TwT3 {
-		st2 := twStmt(t3Post, cloneState(st), dp-1)
-		if !tst[usize(st2)].dead && !tst[usize(st2)].dec && wWhy == WhyNone {
-			wWhy = WhyNoDecrease
+		T3 -> {
+			st2 := twStmt(t3Post, cloneState(st), dp-1)
+			if !tst[usize(st2)].dead && !tst[usize(st2)].dec && wWhy == WhyNone {
+				wWhy = WhyNoDecrease
+			}
 		}
+		Rec -> {}
 	}
 }
 
@@ -1236,7 +1247,7 @@ func positive(k u32, st u32) bool {
 // T2 and T3 walks
 
 func walkT2(fi u32, f u32, rem u32) u32 {
-	wMode = TwT2
+	wMode = WalkMode.T2
 	wTrack = false
 	twDepth = 0
 	wWhy = WhyNone
@@ -1348,7 +1359,7 @@ func loopT3Run(fi u32, f u32) u32 {
 			}
 		}
 	}
-	wMode = TwT3
+	wMode = WalkMode.T3
 	wTrack = true
 	twDepth = 0
 	wWhy = WhyNone

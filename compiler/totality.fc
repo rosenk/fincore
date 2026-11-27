@@ -327,7 +327,7 @@ func putCalleeName(call u32, ci u32) {
 	} else if cl.kind == CallBuiltinMeth {
 		if cl.method != 0 && meths.items[usize(cl.method)].recv != 0 {
 			ms("method ")
-			mname(u32(typs.items[usize(meths.items[usize(cl.method)].recv)].n))
+			mname(typeName(meths.items[usize(cl.method)].recv))
 			mbyte('.')
 			mname(meths.items[usize(cl.method)].name)
 			return
@@ -411,7 +411,7 @@ func computeRootFacts() {
 				}
 			}
 		} else if k == NkSliceExpr {
-			if tk(underlying(ntype[usize(na(x))])) == TCArray {
+			if isArrayT(underlying(ntype[usize(na(x))])) {
 				s := storageRoot(na(x))
 				if s != 0 {
 					symAddr[usize(s)] = true
@@ -476,7 +476,7 @@ func storageRoot(e u32) u32 {
 			continue
 		}
 		if k == NkIndexExpr {
-			if tk(underlying(ntype[usize(na(x))])) != TCArray || l1len(x) != 1 {
+			if !isArrayT(underlying(ntype[usize(na(x))])) || l1len(x) != 1 {
 				return 0
 			}
 			x = na(x)
@@ -491,12 +491,6 @@ func storageRoot(e u32) u32 {
 // Small helpers
 
 // tkOf is tk of a possibly absent type.
-func tkOf(t u32) u8 {
-	if t == 0 {
-		return 0
-	}
-	return tk(t)
-}
 
 func symTyp(s u32) u32 {
 	return syms.items[usize(s)].typ
@@ -770,7 +764,7 @@ func pathAtom(e u32, fnode u32) bool {
 			atomPush(2, fieldType(ct, fx))
 			owner := ntype[usize(na(x))]
 			u := underlying(owner)
-			if tkOf(u) == TCPointer {
+			if isPointerT(u) {
 				owner = elemOf(u)
 			}
 			atomPush(1, owner)
@@ -915,7 +909,7 @@ func localPath(lhs u32) u32 {
 			continue
 		}
 		if k == NkIndexExpr {
-			if tk(underlying(ntype[usize(na(x))])) != TCArray {
+			if !isArrayT(underlying(ntype[usize(na(x))])) {
 				return 0
 			}
 			nlpath = 0 // a write to an element is a (partial) write of the array
@@ -990,10 +984,10 @@ func heapWriteConflicts(w0 u32, ai usize) bool {
 		}
 		if k == NkIndexExpr {
 			u := underlying(ntype[usize(na(w))])
-			if tkOf(u) == TCSlice {
+			if isSliceT(u) {
 				return containsAnyStr(elemOf(u), ai)
 			}
-			if tkOf(u) == TCArray {
+			if isArrayT(u) {
 				if containsAnyStr(elemOf(u), ai) {
 					return true
 				}
@@ -1005,7 +999,7 @@ func heapWriteConflicts(w0 u32, ai usize) bool {
 		if k == NkUnaryExpr {
 			if nop(w) == OpDeref {
 				u := underlying(ntype[usize(na(w))])
-				if tkOf(u) == TCPointer {
+				if isPointerT(u) {
 					el := elemOf(u)
 					return containsAnyStr(el, ai) || containsAnyLeaf(el, ai)
 				}
@@ -1040,7 +1034,7 @@ func callConflicts(call u32, ai usize) bool {
 				}
 			}
 			u := underlying(ntype[usize(l1at(call, 0))])
-			if tkOf(u) == TCSlice {
+			if isSliceT(u) {
 				return containsAnyStr(elemOf(u), ai)
 			}
 			return true
@@ -1055,7 +1049,7 @@ func callConflicts(call u32, ai usize) bool {
 				dst = ntype[usize(l1at(call, 0))]
 			}
 			u := underlying(dst)
-			if tkOf(u) == TCSlice {
+			if isSliceT(u) {
 				return containsAnyStr(elemOf(u), ai)
 			}
 			return true
@@ -1098,30 +1092,38 @@ func containsType(t u32, s u32, dp usize) bool decreases(dp) {
 		return true
 	}
 	u := underlying(t)
-	k := tkOf(u)
-	if k == TCStruct {
-		n := nfields(u)
-		for i := usize(0); i < n; i++ {
-			if containsType(fieldType(u, i), s, dp-1) {
-				return true
-			}
-		}
-	} else if k == TCArray {
-		return containsType(elemOf(u), s, dp-1)
-	} else if k == TCEnum {
-		nv := nvariants(u)
-		for i := usize(0); i < nv; i++ {
-			np := variantPayN(u, i)
-			for j := usize(0); j < np; j++ {
-				if containsType(variantPay(u, i, j), s, dp-1) {
+	match trec(u) {
+		Struct(_, _) -> {
+			n := nfields(u)
+			for i := usize(0); i < n; i++ {
+				if containsType(fieldType(u, i), s, dp-1) {
 					return true
 				}
 			}
+			return false
 		}
-	} else if k == TCTypeParam {
-		return true
+		Array(e, _, _) -> {
+			return containsType(e, s, dp-1)
+		}
+		Enum(_, _) -> {
+			nv := nvariants(u)
+			for i := usize(0); i < nv; i++ {
+				np := variantPayN(u, i)
+				for j := usize(0); j < np; j++ {
+					if containsType(variantPay(u, i, j), s, dp-1) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		TypeParam(_, _, _, _) -> {
+			return true
+		}
+		NoType | Basic(_) | Sig(_, _, _, _, _, _, _, _) | Named(_) | Slice(_) | Pointer(_) | Code(_) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {
+			return false
+		}
 	}
-	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,11 +1135,13 @@ func constSigned(e u32) (bool, u64, bool) {
 		return false, 0, false
 	}
 	v := nval[usize(e)]
-	if v == 0 || vals.items[usize(v)].kind != VInt || vals.items[usize(v)].flag&1 != 0 {
+	if v == 0 {
 		return false, 0, false
 	}
-	hi := vals.items[usize(v)].hi
-	lo := vals.items[usize(v)].lo
+	hi, lo, ok := intParts(slotGet(v))
+	if !ok {
+		return false, 0, false
+	}
 	if hi == 0 {
 		return false, lo, true
 	}
@@ -1349,7 +1353,7 @@ func isShrinkCond(e u32) u32 {
 	if s == 0 {
 		return 0
 	}
-	if tkOf(underlying(symTyp(s))) != TCSlice {
+	if !isSliceT(underlying(symTyp(s))) {
 		return 0
 	}
 	return s

@@ -419,7 +419,7 @@ func checkSCC(comp u32) {
 		rcD = defs[usize(uat(f.parS, usize(rcMeas[usize(v)])))]
 		markCalls(f.callH, true)
 		totReset()
-		wMode = TwRec
+		wMode = WalkMode.Rec
 		wTrack = false
 		twDepth = 0
 		_ = twStmt(f.body, newState(), SemaDepth)

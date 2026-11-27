@@ -46,7 +46,7 @@ func cgExpr(e u32, dp usize) decreases(dp) {
 	vs := cgConstValueSlot(e)
 	if vs != 0 {
 		v := slotGet(vs)
-		if v.kind == VTuple {
+		if isTupleVal(v) {
 			cgFail(e, "multi-value constant in single-value context")
 			return
 		}
@@ -250,7 +250,7 @@ func cgTypedConst(e u32, v Val, dp usize) decreases(dp) {
 	if t == 0 || isUntyped(t) {
 		t = defaultOf(t)
 	}
-	if v.kind == VInt {
+	if isIntVal(v) {
 		rs := cgConstRefSym(cgUnparenNode(e))
 		cgGoType(e, t, dp-1)
 		cgWc('(')
@@ -429,7 +429,7 @@ func cgStructLit(e u32, dp usize) decreases(dp) {
 	}
 	t := ntype[usize(e)]
 	st := underlying(t)
-	if t == 0 || tk(st) != TCStruct {
+	if t == 0 || !isStructT(st) {
 		cgFail(e, "struct literal of non-struct type")
 		return
 	}
@@ -612,7 +612,7 @@ func cgArgs(c u32, dp usize) decreases(dp) {
 	if n == 1 {
 		a0 := l1at(c, 0)
 		cs := cgConstValueSlot(a0)
-		if cs != 0 && vals.items[usize(cs)].kind == VTuple {
+		if cs != 0 && isTupleVal(slotGet(cs)) {
 			cgTupleValues(a0, slotGet(cs), dp-1)
 			return
 		}
@@ -631,16 +631,17 @@ func cgTupleValues(e u32, v Val, dp usize) decreases(dp) {
 		return
 	}
 	tt := ntype[usize(e)]
-	if tt == 0 || tk(tt) != TCTuple || tl1n(tt) != usize(v.aux) {
+	ref, nv := tupleOf(v)
+	if tt == 0 || !isTupleT(tt) || tupleN(tt) != usize(nv) {
 		cgFail(e, "malformed multi-value constant")
 		return
 	}
-	n := usize(v.aux)
+	n := usize(nv)
 	for i := usize(0); i < n; i++ {
 		if i > 0 {
 			cgW(", ")
 		}
-		cgValue(e, slotGet(v.ref+u32(i)), tl1(tt, i), dp-1)
+		cgValue(e, slotGet(ref+u32(i)), tupleAt(tt, i), dp-1)
 	}
 }
 

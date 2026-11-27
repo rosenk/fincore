@@ -339,14 +339,7 @@ func icall(fn u32, recv Val, hasRecv bool, as usize, ae usize, site u32, dp usiz
 		for i := usize(0); i < np-1; i++ {
 			defineIn(vbase, defs[usize(uat(ps, i))], vstack[as+i])
 		}
-		var sl Val
-		sl.kind = VSlice
-		sl.flag = 2
-		sl.ref = st
-		sl.lo = u64(nrest)
-		sl.aux = 0
-		sl.aux2 = u32(nrest)
-		defineIn(vbase, defs[usize(uat(ps, np-1))], sl)
+		defineIn(vbase, defs[usize(uat(ps, np-1))], sliceOver(st, nrest))
 	} else {
 		for i := usize(0); i < np; i++ {
 			if i < nargs {
@@ -420,7 +413,8 @@ func evalList(s u32, n usize, dp usize) decreases(dp) {
 		if ifail {
 			return
 		}
-		if v.kind != VTuple || usize(v.aux) != n {
+		ref, nt := tupleOf(v)
+		if usize(nt) != n {
 			failBegin(E2002)
 			o := &ifailMsg
 			o.putStr("expected ")
@@ -429,7 +423,7 @@ func evalList(s u32, n usize, dp usize) decreases(dp) {
 			return
 		}
 		for i := usize(0); i < n; i++ {
-			vpush(slotGet(v.ref + u32(i)))
+			vpush(slotGet(ref + u32(i)))
 		}
 		return
 	}
@@ -644,7 +638,7 @@ func istmt(s u32, dp usize) u8 decreases(dp) {
 			slotSet(st+u32(i), vstack[m+i])
 		}
 		vtop = m
-		frames[fr].ret = vAgg(VTuple, st, nr)
+		frames[fr].ret = Val.Tuple(st, u32(nr))
 		frames[fr].hasRet = true
 		return CtlReturn
 	}
@@ -735,11 +729,12 @@ func icond(e u32, dp usize) bool decreases(dp) {
 	if ifail {
 		return false
 	}
-	if v.kind != VBool {
+	b, ok := boolOf(v)
+	if !ok {
 		failS(E2002, "non-boolean condition")
 		return false
 	}
-	return v.lo != 0
+	return b
 }
 
 func iequal(a Val, b Val) bool {
@@ -844,17 +839,24 @@ func ipatternMatches(x Val, p u32, dp usize) bool decreases(dp) {
 	}
 	if pk == NkCtorPattern {
 		if nvarEnum[usize(p)] != 0 {
-			if x.kind != VEnum || x.lo != u64(nvarIdx[usize(p)]) {
-				return false
-			}
-			nb2 := l1len(p)
-			for j := usize(0); j < nb2; j++ {
-				bs := defs[usize(l1at(p, j))]
-				if bs != 0 && j < usize(x.aux) {
-					define(bs, slotGet(x.ref+u32(j)))
+			match x {
+				Enum(vi, ref, np) -> {
+					if vi != nvarIdx[usize(p)] {
+						return false
+					}
+					nb2 := l1len(p)
+					for j := usize(0); j < nb2; j++ {
+						bs := defs[usize(l1at(p, j))]
+						if bs != 0 && j < usize(np) {
+							define(bs, slotGet(ref+u32(j)))
+						}
+					}
+					return true
+				}
+				_ -> {
+					return false
 				}
 			}
-			return true
 		}
 		if nval[usize(nb(p))] != 0 {
 			return iequal(x, slotGet(nval[usize(nb(p))]))
@@ -869,10 +871,8 @@ func izero(t u32) Val {
 		failS(E2002, "unknown type")
 		return z
 	}
-	if tk(underlying(t)) == TCPointer {
-		var p Val
-		p.kind = VPtr
-		return p
+	if isPointerT(underlying(t)) {
+		return Val.Ptr(0)
 	}
 	v, ok := zeroVal(t, true)
 	if !ok {
@@ -886,11 +886,16 @@ func izero(t u32) Val {
 // Expressions
 
 func iderefSlot(v Val) u32 {
-	if v.kind != VPtr || v.ref == 0 {
-		failS(E2002, "nil pointer dereference")
-		return 0
+	match v {
+		Ptr(r) -> {
+			if r != 0 {
+				return r
+			}
+		}
+		_ -> {}
 	}
-	return v.ref
+	failS(E2002, "nil pointer dereference")
+	return 0
 }
 
 func iarith(op u8, x Val, y Val, t u32) Val {
@@ -913,19 +918,20 @@ func intArg(e u32, dp usize) usize decreases(dp) {
 	if ifail {
 		return 0
 	}
-	fits := v.kind == VInt && v.flag&1 == 0 && ((v.hi == 0 && v.lo < SignBit) || (v.hi == AllOnes && v.lo >= SignBit))
+	hi, lo, ok := intParts(v)
+	fits := ok && ((hi == 0 && lo < SignBit) || (hi == AllOnes && lo >= SignBit))
 	if !fits {
 		failS(E4003, "invalid index")
 		return 0
 	}
-	if v.hi != 0 || v.lo > 1<<40 {
+	if hi != 0 || lo > 1<<40 {
 		failS(E4003, "index ")
 		o := &ifailMsg
 		putInt128(o, v)
 		o.putStr(" out of range")
 		return 0
 	}
-	return usize(v.lo)
+	return usize(lo)
 }
 
 func failIndexRange(i usize, n usize) {
@@ -939,20 +945,23 @@ func failIndexRange(i usize, n usize) {
 
 // indexRef returns the slot of element i of an array or slice value.
 func indexRef(x Val, i usize) u32 {
-	if x.kind == VArray {
-		if i >= usize(x.aux) {
-			failIndexRange(i, usize(x.aux))
-			return 0
+	match x {
+		Array(ref, n) -> {
+			if i >= usize(n) {
+				failIndexRange(i, usize(n))
+				return 0
+			}
+			return ref + u32(i)
 		}
-		return x.ref + u32(i)
-	}
-	if x.kind == VSlice {
-		n := usize(x.aux2 - x.aux)
-		if i >= n {
-			failIndexRange(i, n)
-			return 0
+		Slice(_, _, _, _) | NilSlice -> {
+			ref, n := sliceElems(x)
+			if i >= usize(n) {
+				failIndexRange(i, usize(n))
+				return 0
+			}
+			return ref + u32(i)
 		}
-		return x.ref + x.aux + u32(i)
+		_ -> {}
 	}
 	failS(E2002, "cannot index value ")
 	o := &ifailMsg
@@ -1046,10 +1055,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 				return z
 			}
 			markAddr(na(e), r)
-			var p Val
-			p.kind = VPtr
-			p.ref = r
-			return p
+			return Val.Ptr(r)
 		}
 		if op == OpDeref {
 			v := ieval(na(e), dp-1)
@@ -1089,7 +1095,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		if x.kind == VPtr {
+		if isPtrVal(x) {
 			r := iderefSlot(x)
 			if ifail {
 				return z
@@ -1100,12 +1106,13 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 			}
 			return slotGet(s)
 		}
-		if x.kind == VString {
-			if i >= usize(x.aux) {
-				failIndexRange(i, usize(x.aux))
+		if isStrVal(x) {
+			sb := strOf(x)
+			if i >= len(sb) {
+				failIndexRange(i, len(sb))
 				return z
 			}
-			return vIntU(u64(strPool[usize(x.ref)+i]))
+			return vIntU(u64(sb[i]))
 		}
 		s := indexRef(x, i)
 		if ifail {
@@ -1132,18 +1139,18 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		if x.kind == VPtr {
+		if isPtrVal(x) {
 			r := iderefSlot(x)
 			if ifail {
 				return z
 			}
 			x = slotGet(r)
 		}
-		if x.kind != VStruct {
+		if !isStructVal(x) {
 			failS(E2002, "field access on non-struct value")
 			return z
 		}
-		return slotGet(x.ref + selTab.items[usize(sel)].index)
+		return slotGet(fieldSlot(x, selTab.items[usize(sel)].index))
 	}
 	if k == NkStructLit {
 		t := ntype[usize(e)]
@@ -1151,7 +1158,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		if sv.kind != VStruct {
+		if !isStructVal(sv) {
 			failS(E2002, "invalid struct literal")
 			return z
 		}
@@ -1165,7 +1172,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 				if ifail {
 					return z
 				}
-				slotSet(sv.ref+u32(idx), copyV(v))
+				slotSet(fieldSlot(sv, u32(idx)), copyV(v))
 			}
 		}
 		return sv
@@ -1222,13 +1229,13 @@ func ilvalue(e u32, dp usize) u32 decreases(dp) {
 		if ifail {
 			return 0
 		}
-		if v.kind == VPtr {
+		if isPtrVal(v) {
 			r := iderefSlot(v)
 			if ifail {
 				return 0
 			}
 			base = slotGet(r)
-		} else if tk(underlying(ntype[usize(x)])) == TCSlice {
+		} else if isSliceT(underlying(ntype[usize(x)])) {
 			base = ieval(x, dp-1)
 		} else {
 			r := ilvalue(x, dp-1)
@@ -1276,11 +1283,11 @@ func ilvalue(e u32, dp usize) u32 decreases(dp) {
 			}
 			base = slotGet(r)
 		}
-		if base.kind != VStruct {
+		if !isStructVal(base) {
 			failS(E2002, "field access on non-struct value")
 			return 0
 		}
-		return base.ref + selTab.items[usize(sel)].index
+		return fieldSlot(base, selTab.items[usize(sel)].index)
 	}
 	if k == NkUnaryExpr && nop(e) == OpDeref {
 		v := ieval(na(e), dp-1)
@@ -1313,7 +1320,7 @@ func islice(e u32, dp usize) Val decreases(dp) {
 	}
 	xe := na(e)
 	var x Val
-	if tk(underlying(ntype[usize(xe)])) == TCArray {
+	if isArrayT(underlying(ntype[usize(xe)])) {
 		r := ilvalue(xe, dp-1)
 		if ifail {
 			return z
@@ -1325,7 +1332,7 @@ func islice(e u32, dp usize) Val decreases(dp) {
 	if ifail {
 		return z
 	}
-	if x.kind == VPtr {
+	if isPtrVal(x) {
 		r := iderefSlot(x)
 		if ifail {
 			return z
@@ -1348,60 +1355,48 @@ func islice(e u32, dp usize) Val decreases(dp) {
 		}
 		hasHi = true
 	}
-	if x.kind == VString {
-		n := usize(x.aux)
-		if !hasHi {
-			hi = n
+	match x {
+		Str(off, sn) -> {
+			n := usize(sn)
+			if !hasHi {
+				hi = n
+			}
+			if lo > hi || hi > n {
+				failSliceBounds(lo, hi, n)
+				return z
+			}
+			return Val.Str(off+u32(lo), u32(hi-lo))
 		}
-		if lo > hi || hi > n {
-			failSliceBounds(lo, hi, n)
-			return z
+		Array(ref, an) -> {
+			n := usize(an)
+			if !hasHi {
+				hi = n
+			}
+			if lo > hi || hi > n {
+				failSliceBounds(lo, hi, n)
+				return z
+			}
+			return Val.Slice(ref, u32(lo), u32(hi), u64(n))
 		}
-		r := x
-		r.ref = x.ref + u32(lo)
-		r.aux = u32(hi - lo)
-		return r
-	}
-	if x.kind == VArray {
-		n := usize(x.aux)
-		if !hasHi {
-			hi = n
+		Slice(ref, slo, shi, alen) -> {
+			capn := usize(alen) - usize(slo)
+			if !hasHi {
+				hi = usize(shi - slo)
+			}
+			if lo > hi || hi > capn {
+				failSliceBounds(lo, hi, capn)
+				return z
+			}
+			return Val.Slice(ref, slo+u32(lo), slo+u32(hi), alen)
 		}
-		if lo > hi || hi > n {
-			failSliceBounds(lo, hi, n)
-			return z
+		NilSlice -> {
+			if lo > hi || hi > 0 {
+				failSliceBounds(lo, hi, 0)
+				return z
+			}
+			return x
 		}
-		var s Val
-		s.kind = VSlice
-		s.flag = 2
-		s.ref = x.ref
-		s.lo = u64(n)
-		s.aux = u32(lo)
-		s.aux2 = u32(hi)
-		return s
-	}
-	if x.kind == VSlice {
-		n := usize(x.aux2 - x.aux)
-		capn := usize(0)
-		if x.flag&2 != 0 {
-			capn = usize(x.lo) - usize(x.aux)
-		}
-		if !hasHi {
-			hi = n
-		}
-		if lo > hi || hi > capn {
-			failSliceBounds(lo, hi, capn)
-			return z
-		}
-		if x.flag&2 == 0 {
-			var s Val
-			s.kind = VSlice
-			return s
-		}
-		r := x
-		r.aux = x.aux + u32(lo)
-		r.aux2 = x.aux + u32(hi)
-		return r
+		_ -> {}
 	}
 	failS(E2002, "cannot slice value")
 	return z
@@ -1421,16 +1416,14 @@ func iargs(e u32, dp usize) decreases(dp) {
 	if n == 1 {
 		a0 := l1at(e, 0)
 		t := ntype[usize(a0)]
-		if t != 0 && tk(t) == TCTuple {
+		if t != 0 && isTupleT(t) {
 			v := ieval(a0, dp-1)
 			if ifail {
 				return
 			}
-			if v.kind == VTuple {
-				m := usize(v.aux)
-				for i := usize(0); i < m; i++ {
-					vpush(slotGet(v.ref + u32(i)))
-				}
+			ref, m := tupleOf(v)
+			for i := u32(0); i < m; i++ {
+				vpush(slotGet(ref + i))
 			}
 			return
 		}
@@ -1498,8 +1491,8 @@ func icallExpr(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		ptr := tk(c.recvType) == TCPointer && meths.items[usize(c.method)].ptrRecv
-		if !ptr && recv.kind == VPtr {
+		ptr := isPointerT(c.recvType) && meths.items[usize(c.method)].ptrRecv
+		if !ptr && isPtrVal(recv) {
 			r := iderefSlot(recv)
 			if ifail {
 				return z
@@ -1536,9 +1529,7 @@ func icallExpr(e u32, dp usize) Val decreases(dp) {
 			slotSet(st+u32(i), copyV(vstack[m+i]))
 		}
 		vtop = m
-		ev := vAgg(VEnum, st, n)
-		ev.lo = u64(c.variant)
-		return ev
+		return Val.Enum(c.variant, st, u32(n))
 	}
 	if c.kind == CallBuiltin {
 		return ibuiltin(e, c.builtin, dp-1)
@@ -1551,18 +1542,15 @@ func icallExpr(e u32, dp usize) Val decreases(dp) {
 
 // bytesOfSlice copies the bytes of a []byte value into tmpBuf.
 func bytesOfSlice(v Val) bool {
-	if v.kind != VSlice {
+	if !isSliceVal(v) {
 		failS(E2002, "expected a byte slice")
 		return false
 	}
 	t := &tmpBuf
 	t.reset()
-	if v.flag&2 != 0 {
-		n := usize(v.aux2 - v.aux)
-		for i := usize(0); i < n; i++ {
-			b := slotGet(v.ref + v.aux + u32(i))
-			t.putByte(byte(b.lo))
-		}
+	ref, n := sliceElems(v)
+	for i := u32(0); i < n; i++ {
+		t.putByte(byte(intLo(slotGet(ref + i))))
 	}
 	return true
 }
@@ -1573,25 +1561,18 @@ func byteSliceVal(b []byte) Val {
 	for i := usize(0); i < n; i++ {
 		slotSet(st+u32(i), vIntU(u64(b[i])))
 	}
-	var s Val
-	s.kind = VSlice
-	s.flag = 2
-	s.ref = st
-	s.lo = u64(n)
-	s.aux = 0
-	s.aux2 = u32(n)
-	return s
+	return sliceOver(st, n)
 }
 
 func tuple2(a Val, b Val) Val {
 	st := valAlloc(2, true)
 	slotSet(st, a)
 	slotSet(st+1, b)
-	return vAgg(VTuple, st, 2)
+	return Val.Tuple(st, 2)
 }
 
 func icode(v Val) bool {
-	if v.kind != VCode {
+	if !isCodeVal(v) {
 		failS(E2002, "expected a Code value")
 		return false
 	}
@@ -1625,70 +1606,70 @@ func ibuiltin0(b u8, m usize) Val {
 	var z Val
 	if b == BFLen || b == BFCap {
 		x := vstack[m]
-		if x.kind == VPtr {
+		if isPtrVal(x) {
 			r := iderefSlot(x)
 			if ifail {
 				return z
 			}
 			x = slotGet(r)
 		}
-		if x.kind == VString || x.kind == VArray {
-			return vIntU(u64(x.aux))
-		}
-		if x.kind == VSlice {
-			if b == BFCap && x.flag&2 != 0 {
-				return vIntU(x.lo - u64(x.aux))
+		match x {
+			Str(_, n) -> {
+				return vIntU(u64(n))
 			}
-			return vIntU(u64(x.aux2 - x.aux))
+			Array(_, n) -> {
+				return vIntU(u64(n))
+			}
+			Slice(_, lo, hi, alen) -> {
+				if b == BFCap {
+					return vIntU(alen - u64(lo))
+				}
+				return vIntU(u64(hi - lo))
+			}
+			NilSlice -> {
+				return vIntU(0)
+			}
+			_ -> {}
 		}
 	} else if b == BFCopy {
 		d := vstack[m]
 		s := vstack[m+1]
-		if d.kind == VSlice && s.kind == VSlice {
-			n := usize(d.aux2 - d.aux)
-			ns := usize(s.aux2 - s.aux)
-			if ns < n {
-				n = ns
+		if isSliceVal(d) && isSliceVal(s) {
+			dref, dn := sliceElems(d)
+			sref, sn := sliceElems(s)
+			n := usize(dn)
+			if usize(sn) < n {
+				n = usize(sn)
 			}
 			tmp := valAlloc(n, true)
 			for i := usize(0); i < n; i++ {
-				slotSet(tmp+u32(i), copyV(slotGet(s.ref+s.aux+u32(i))))
+				slotSet(tmp+u32(i), copyV(slotGet(sref+u32(i))))
 			}
 			for i := usize(0); i < n; i++ {
-				slotSet(d.ref+d.aux+u32(i), slotGet(tmp+u32(i)))
+				slotSet(dref+u32(i), slotGet(tmp+u32(i)))
 			}
 			return vIntU(u64(n))
 		}
 	} else if b == BFBytesEqual {
 		x := vstack[m]
 		y := vstack[m+1]
-		if x.kind != VSlice || y.kind != VSlice {
+		if !isSliceVal(x) || !isSliceVal(y) {
 			failS(E2002, "expected a byte slice")
 			return z
 		}
-		nx := usize(x.aux2 - x.aux)
-		ny := usize(y.aux2 - y.aux)
-		if x.flag&2 == 0 {
-			nx = 0
-		}
-		if y.flag&2 == 0 {
-			ny = 0
-		}
+		xr, nx := sliceElems(x)
+		yr, ny := sliceElems(y)
 		if nx != ny {
 			return vBool(false)
 		}
-		for i := usize(0); i < nx; i++ {
-			if byte(slotGet(x.ref+x.aux+u32(i)).lo) != byte(slotGet(y.ref+y.aux+u32(i)).lo) {
+		for i := u32(0); i < nx; i++ {
+			if byte(intLo(slotGet(xr+i))) != byte(intLo(slotGet(yr+i))) {
 				return vBool(false)
 			}
 		}
 		return vBool(true)
 	} else if b == BFStrBytes {
-		s := vstack[m]
-		if s.kind != VString {
-			return byteSliceVal(emptyBytes())
-		}
-		return byteSliceVal(strOf(s))
+		return byteSliceVal(strOf(vstack[m]))
 	} else if b == BFBytesToStr {
 		if !bytesOfSlice(vstack[m]) {
 			return z
@@ -1696,24 +1677,17 @@ func ibuiltin0(b u8, m usize) Val {
 		return vStr(tmpBuf.data[:tmpBuf.len])
 	} else if b == BFFormatUint {
 		v := vstack[m]
-		u := u64(0)
-		if v.kind == VInt {
-			h, l := abs128(v.hi, v.lo)
-			_ = h
-			u = l
-		}
+		vh, vl, _ := intParts(v)
+		_, u := abs128(vh, vl)
 		var db [24]byte
 		nd, _ := formatUint(u, db[:])
 		d := vstack[m+1]
-		room := usize(0)
-		if d.kind == VSlice {
-			room = usize(d.aux2 - d.aux)
-		}
-		if nd > room {
+		dref, room := sliceElems(d)
+		if nd > usize(room) {
 			return tuple2(vIntU(0), vErr(BCErrArenaFull))
 		}
 		for i := usize(0); i < nd; i++ {
-			slotSet(d.ref+d.aux+u32(i), vIntU(u64(db[i])))
+			slotSet(dref+u32(i), vIntU(u64(db[i])))
 		}
 		return tuple2(vIntU(u64(nd)), vErr(0))
 	} else if b == BFParseUint {
@@ -1750,59 +1724,43 @@ func ibuiltin0(b u8, m usize) Val {
 		if !icode(vstack[m+1]) {
 			return z
 		}
-		c := vCode(CKArray)
-		c.hi = n
-		c.ref = valAlloc(1, true)
-		slotSet(c.ref, vstack[m+1])
-		return c
+		el := valAlloc(1, true)
+		slotSet(el, vstack[m+1])
+		return Val.CodeArray(n, el)
 	} else if b == BFCodeSlice {
 		if !icode(vstack[m]) {
 			return z
 		}
-		c := vCode(CKSlice)
-		c.ref = valAlloc(1, true)
-		slotSet(c.ref, vstack[m])
-		return c
+		el := valAlloc(1, true)
+		slotSet(el, vstack[m])
+		return Val.CodeSlice(el)
 	} else if b == BFCodeField {
 		s := vstack[m]
 		if !icode(vstack[m+1]) {
 			return z
 		}
-		var f Val
-		f.kind = VFieldCode
-		if s.kind == VString {
-			f.lo = u64(s.ref)
-			f.hi = u64(s.aux)
-		}
-		f.ref = valAlloc(1, true)
-		slotSet(f.ref, vstack[m+1])
-		return f
+		c := valAlloc(1, true)
+		slotSet(c, vstack[m+1])
+		return fieldCodeOf(s, c)
 	} else if b == BFCodeStruct {
-		s := vstack[m]
-		n := usize(0)
-		if s.kind == VSlice && s.flag&2 != 0 {
-			n = usize(s.aux2 - s.aux)
-		}
-		st := valAlloc(n, true)
-		for i := usize(0); i < n; i++ {
-			f := slotGet(s.ref + s.aux + u32(i))
-			if f.kind != VFieldCode {
-				failS(E2002, "CodeStruct: zero FieldCode element")
-				return z
+		sref, n := sliceElems(vstack[m])
+		st := valAlloc(usize(n), true)
+		for i := u32(0); i < n; i++ {
+			f := slotGet(sref + i)
+			match f {
+				FieldCode(_, _, _) -> slotSet(st+i, f)
+				_ -> {
+					failS(E2002, "CodeStruct: zero FieldCode element")
+					return z
+				}
 			}
-			slotSet(st+u32(i), f)
 		}
-		c := vCode(CKStruct)
-		c.ref = st
-		c.aux = u32(n)
-		return c
+		return Val.CodeStruct(st, n)
 	} else if b == BFCodeUniv {
 		n, _ := valUint64(vstack[m])
-		c := vCode(CKUniv)
-		c.hi = n
-		return c
+		return Val.CodeUniv(n)
 	} else if b >= BFCodeEmpty && b <= BFCodeI64 {
-		return vCode(b - BFCodeEmpty)
+		return Val.CodeBasic(b - BFCodeEmpty)
 	}
 	failS(E2002, "builtin ")
 	o := &ifailMsg

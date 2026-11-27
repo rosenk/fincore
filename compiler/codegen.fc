@@ -809,7 +809,7 @@ func cgMatchArms(s u32) (usize, usize, bool, u32) {
 	t := ntype[usize(na(s))]
 	if t != 0 {
 		u := underlying(t)
-		if tk(u) == TCEnum {
+		if isEnumT(u) {
 			en = u
 		}
 	}
@@ -868,78 +868,97 @@ func cgMentionsCode(t u32, dp usize) bool decreases(dp) {
 	if dp == 0 || t == 0 {
 		return false
 	}
-	k := tk(t)
-	if k == TCCode {
-		return true
-	}
-	if k == TCNamed {
-		n := cgSeenN
-		for i := usize(0); i < n; i++ {
-			if cgSeen[i] == t {
-				return false
-			}
-		}
-		b := namedBuiltin(t)
-		if b == BTFieldCode {
+	match trec(t) {
+		Code(_) -> {
 			return true
 		}
-		if b != BNone {
-			return false
+		Named(_) -> {
+			return cgNamedMentionsCode(t, dp-1)
 		}
-		nta := tl1n(t)
-		for i := usize(0); i < nta; i++ {
-			if cgMentionsCode(tl1(t, i), dp-1) {
-				return true
-			}
+		Array(e, _, _) -> {
+			return cgMentionsCode(e, dp-1)
 		}
-		if cgSeenN >= CgMaxSeen {
-			return false
+		Slice(e) -> {
+			return cgMentionsCode(e, dp-1)
 		}
-		cgSeen[cgSeenN] = t
-		cgSeenN++
-		r := cgMentionsCode(underlying(t), dp-1)
-		cgSeenN--
-		return r
-	}
-	if k == TCArray || k == TCSlice || k == TCPointer {
-		return cgMentionsCode(typs.items[usize(t)].a, dp-1)
-	}
-	if k == TCStruct {
-		nf := nfields(t)
-		for i := usize(0); i < nf; i++ {
-			if cgMentionsCode(fieldType(t, i), dp-1) {
-				return true
-			}
+		Pointer(e) -> {
+			return cgMentionsCode(e, dp-1)
 		}
-		return false
-	}
-	if k == TCEnum {
-		nv := nvariants(t)
-		for i := usize(0); i < nv; i++ {
-			np := variantPayN(t, i)
-			for j := usize(0); j < np; j++ {
-				if cgMentionsCode(variantPay(t, i, j), dp-1) {
+		Struct(_, _) -> {
+			nf := nfields(t)
+			for i := usize(0); i < nf; i++ {
+				if cgMentionsCode(fieldType(t, i), dp-1) {
 					return true
 				}
 			}
+			return false
 		}
+		Enum(_, _) -> {
+			nv := nvariants(t)
+			for i := usize(0); i < nv; i++ {
+				np := variantPayN(t, i)
+				for j := usize(0); j < np; j++ {
+					if cgMentionsCode(variantPay(t, i, j), dp-1) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		Sig(_, _, _, _, _, _, _, _) -> {
+			np := sigNParams(t)
+			for i := usize(0); i < np; i++ {
+				if cgMentionsCode(sigParam(t, i), dp-1) {
+					return true
+				}
+			}
+			nr := sigNResults(t)
+			for i := usize(0); i < nr; i++ {
+				if cgMentionsCode(sigResult(t, i), dp-1) {
+					return true
+				}
+			}
+			return false
+		}
+		NoType | Basic(_) | TypeParam(_, _, _, _) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {
+			return false
+		}
+	}
+}
+
+// namedMentionsCode is mentionsCode for a named type (cycles stop at the
+// types on cgSeen).
+func cgNamedMentionsCode(t u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
 		return false
 	}
-	if k == TCSig {
-		np := sigNParams(t)
-		for i := usize(0); i < np; i++ {
-			if cgMentionsCode(sigParam(t, i), dp-1) {
-				return true
-			}
-		}
-		nr := sigNResults(t)
-		for i := usize(0); i < nr; i++ {
-			if cgMentionsCode(sigResult(t, i), dp-1) {
-				return true
-			}
+	n := cgSeenN
+	for i := usize(0); i < n; i++ {
+		if cgSeen[i] == t {
+			return false
 		}
 	}
-	return false
+	b := namedBuiltin(t)
+	if b == BTFieldCode {
+		return true
+	}
+	if b != BNone {
+		return false
+	}
+	nta := namedNArgs(t)
+	for i := usize(0); i < nta; i++ {
+		if cgMentionsCode(namedArg(t, i), dp-1) {
+			return true
+		}
+	}
+	if cgSeenN >= CgMaxSeen {
+		return false
+	}
+	cgSeen[cgSeenN] = t
+	cgSeenN++
+	r := cgMentionsCode(underlying(t), dp-1)
+	cgSeenN--
+	return r
 }
 
 func cgTypeMentionsCode(t u32) bool {
@@ -959,7 +978,7 @@ func cgIsTypeDeclSym(s u32) bool {
 		return false
 	}
 	t := syms.items[usize(s)].typ
-	if t == 0 || tk(t) != TCNamed {
+	if t == 0 || !isNamedT(t) {
 		return false
 	}
 	return !cgTypeMentionsCode(underlying(t))
@@ -980,9 +999,9 @@ func cgIsEmittedFunc(fi u32) bool {
 // typeConstParams counts the const parameters of a named type.
 func cgTypeConstParams(named u32) usize {
 	c := usize(0)
-	n := tl2n(named)
+	n := namedNTParams(named)
 	for i := usize(0); i < n; i++ {
-		if tpIsConst(tl2(named, i)) {
+		if tpIsConst(namedTParam(named, i)) {
 			c++
 		}
 	}
@@ -1055,7 +1074,7 @@ func cgEnvBind(tpS u32, tpN usize, valS u32) {
 			return
 		}
 		cgEnvTP[cgEnvN] = tp
-		cgEnvSym[cgEnvN] = typs.items[usize(tp)].b
+		cgEnvSym[cgEnvN] = tpSym(tp)
 		cgEnvVal[cgEnvN] = cgMonoVals[usize(valS)+k]
 		cgEnvN++
 		k++
@@ -1154,10 +1173,10 @@ func cgWMonoName(i usize) {
 
 // constArg resolves a type argument for a const parameter to its value.
 func cgConstArg(n u32, t u32) u64 {
-	if t != 0 && tk(t) == TCConstArg {
-		return typs.items[usize(t)].n
+	if t != 0 && isConstArgT(t) {
+		return constArgVal(t)
 	}
-	if t != 0 && tk(t) == TCTypeParam {
+	if t != 0 && isTypeParamT(t) {
 		v, ok := cgEnvLookup(t)
 		if ok {
 			return v
@@ -1179,28 +1198,24 @@ func cgGoType(n u32, t u32, dp usize) decreases(dp) {
 		cgFail(n, "missing type")
 		return
 	}
-	k := tk(t)
-	if k == TCBasic {
-		cgBasicGo(n, t)
-	} else if k == TCNamed {
-		cgNamedType(n, t, dp-1)
-	} else if k == TCArray || k == TCSlice || k == TCPointer || k == TCStruct || k == TCEnum || k == TCSig {
-		cgTypeLit(n, t, dp-1)
-	} else if k == TCTypeParam {
-		if tpIsConst(t) {
-			cgFail(n, "const parameter used as a type")
-			return
+	match trec(t) {
+		Basic(_) -> cgBasicGo(n, t)
+		Named(_) -> cgNamedType(n, t, dp-1)
+		Array(_, _, _) | Slice(_) | Pointer(_) | Struct(_, _) | Enum(_, _) | Sig(_, _, _, _, _, _, _, _) -> cgTypeLit(n, t, dp-1)
+		TypeParam(_, _, _, _) -> {
+			if tpIsConst(t) {
+				cgFail(n, "const parameter used as a type")
+				return
+			}
+			cgTpName(t)
 		}
-		cgTpName(t)
-	} else if k == TCCode {
-		cgFail(n, "values of Code types cannot exist at run time")
-	} else {
-		cgFail(n, "unsupported type")
+		Code(_) -> cgFail(n, "values of Code types cannot exist at run time")
+		NoType | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> cgFail(n, "unsupported type")
 	}
 }
 
 func cgBasicGo(n u32, t u32) {
-	k := typs.items[usize(t)].sub
+	k := basicKind(t)
 	if k == BkBool || k == BkUntypedBool {
 		cgW("bool")
 	} else if k == BkU8 {
@@ -1236,12 +1251,12 @@ func cgBasicGo(n u32, t u32) {
 
 // tpName writes the Go name of a type parameter.
 func cgTpName(tp u32) {
-	s := typs.items[usize(tp)].b
+	s := tpSym(tp)
 	if s != 0 {
 		cgWSymName(s)
 		return
 	}
-	cgWGoIdent(nameBytes(u32(typs.items[usize(tp)].n)))
+	cgWGoIdent(nameBytes(typeName(tp)))
 }
 
 // typeLit writes the type literal of a non-named type (or the underlying
@@ -1251,48 +1266,50 @@ func cgTypeLit(n u32, t u32, dp usize) decreases(dp) {
 		cgFail(n, "type too deep")
 		return
 	}
-	k := tk(t)
-	r := typs.items[usize(t)]
-	if k == TCArray {
-		l := r.n
-		if r.b != 0 {
-			v, ok := cgEnvLookup(r.b)
-			if !ok {
-				cgFail(n, "unbound array length parameter")
+	match trec(t) {
+		Array(e, p, ln) -> {
+			l := ln
+			if p != 0 {
+				v, ok := cgEnvLookup(p)
+				if !ok {
+					cgFail(n, "unbound array length parameter")
+				}
+				l = v
 			}
-			l = v
+			cgWc('[')
+			cgWu(l)
+			cgWc(']')
+			cgGoType(n, e, dp-1)
 		}
-		cgWc('[')
-		cgWu(l)
-		cgWc(']')
-		cgGoType(n, r.a, dp-1)
-	} else if k == TCSlice {
-		cgW("[]")
-		cgGoType(n, r.a, dp-1)
-	} else if k == TCPointer {
-		cgWc('*')
-		cgGoType(n, r.a, dp-1)
-	} else if k == TCStruct {
-		nf := nfields(t)
-		if nf == 0 {
-			cgW("struct{}")
-			return
+		Slice(e) -> {
+			cgW("[]")
+			cgGoType(n, e, dp-1)
 		}
-		cgW("struct {\n")
-		for i := usize(0); i < nf; i++ {
-			cgWFieldIdent(nameBytes(fieldName(t, i)))
-			cgWc(' ')
-			cgGoType(n, fieldType(t, i), dp-1)
-			cgWc('\n')
+		Pointer(e) -> {
+			cgWc('*')
+			cgGoType(n, e, dp-1)
 		}
-		cgWc('}')
-	} else if k == TCEnum {
-		cgWEnumStruct(n, t, dp-1)
-	} else if k == TCSig {
-		cgW("func")
-		cgSigTypes(n, t, dp-1)
-	} else {
-		cgGoType(n, t, dp-1)
+		Struct(_, _) -> {
+			nf := nfields(t)
+			if nf == 0 {
+				cgW("struct{}")
+				return
+			}
+			cgW("struct {\n")
+			for i := usize(0); i < nf; i++ {
+				cgWFieldIdent(nameBytes(fieldName(t, i)))
+				cgWc(' ')
+				cgGoType(n, fieldType(t, i), dp-1)
+				cgWc('\n')
+			}
+			cgWc('}')
+		}
+		Enum(_, _) -> cgWEnumStruct(n, t, dp-1)
+		Sig(_, _, _, _, _, _, _, _) -> {
+			cgW("func")
+			cgSigTypes(n, t, dp-1)
+		}
+		NoType | Basic(_) | Named(_) | Code(_) | TypeParam(_, _, _, _) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> cgGoType(n, t, dp-1)
 	}
 }
 
@@ -1352,7 +1369,7 @@ func cgNamedType(n u32, t u32, dp usize) decreases(dp) {
 		return
 	}
 	if origin == 0 {
-		if tl2n(t) > 0 {
+		if namedNTParams(t) > 0 {
 			cgFail(n, "uninstantiated generic type")
 		}
 		cgWSymName(namedSym(t))
@@ -1366,11 +1383,11 @@ func cgNamedType(n u32, t u32, dp usize) decreases(dp) {
 	// finc0 renders the type arguments before the (instance) name.
 	p := cgWmark()
 	vmark := cgValTop
-	nt := tl2n(origin)
+	nt := namedNTParams(origin)
 	ntargs := usize(0)
 	for i := usize(0); i < nt; i++ {
-		arg := tl1(t, i)
-		if tpIsConst(tl2(origin, i)) {
+		arg := namedArg(t, i)
+		if tpIsConst(namedTParam(origin, i)) {
 			cgValPush(cgConstArg(n, arg))
 		} else {
 			if ntargs == 0 {
@@ -1409,7 +1426,7 @@ func cgBuiltinNamed(n u32, t u32, dp usize) decreases(dp) {
 	} else if b == BTSlot {
 		cgRt("Slot")
 		cgWc('[')
-		cgGoType(n, tl1(t, 0), dp-1)
+		cgGoType(n, namedArg(t, 0), dp-1)
 		cgWc(']')
 	} else if b == BTDuration || b == BTSignal || b == BTExitStatus || b == BTNet || b == BTSignals ||
 		b == BTClock || b == BTListener || b == BTConn || b == BTContext || b == BTCancelFunc ||
@@ -1449,15 +1466,15 @@ func cgTypeParamList(tpS u32, tpN usize, withAny bool) {
 // Values (codegen/golang values.go)
 
 func cgIsUntypedOrInt(t u32) bool {
-	if t == 0 || tk(t) != TCBasic {
+	if t == 0 || !isBasicT(t) {
 		return false
 	}
-	k := typs.items[usize(t)].sub
+	k := basicKind(t)
 	return k == BkInt || k == BkUntypedInt
 }
 
 func cgIsNamedT(t u32) bool {
-	return t != 0 && tk(t) == TCNamed
+	return t != 0 && isNamedT(t)
 }
 
 // isZeroVal reports whether v is the zero value of its type.
@@ -1465,47 +1482,29 @@ func cgIsZeroVal(v Val, dp usize) bool decreases(dp) {
 	if dp == 0 {
 		return false
 	}
-	k := v.kind
-	if k == VNone || k == VNil {
-		return true
+	return match v {
+		None | Nil | NilSlice -> true
+		Int(hi, lo) -> hi == 0 && lo == 0
+		Bool(b) -> !b
+		Str(_, n) -> n == 0
+		Err(b) -> b == 0
+		Struct(ref, n) -> cgIsZeroRun(ref, n, dp-1)
+		Array(ref, n) -> cgIsZeroRun(ref, n, dp-1)
+		Enum(vi, ref, n) -> vi == 0 && cgIsZeroRun(ref, n, dp-1)
+		IntOvf | Slice(_, _, _, _) | Tuple(_, _) | Ptr(_) | CodeBasic(_) | CodeArray(_, _) | CodeSlice(_) | CodeStruct(_, _) | CodeUniv(_) | FieldCode(_, _, _) -> false
 	}
-	if k == VInt {
-		return v.hi == 0 && v.lo == 0 && v.flag&1 == 0
+}
+
+func cgIsZeroRun(ref u32, n u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		return false
 	}
-	if k == VBool {
-		return v.lo == 0
-	}
-	if k == VString {
-		return v.aux == 0
-	}
-	if k == VError {
-		return v.lo == 0
-	}
-	if k == VStruct || k == VArray {
-		n := usize(v.aux)
-		for i := usize(0); i < n; i++ {
-			if !cgIsZeroVal(slotGet(v.ref+u32(i)), dp-1) {
-				return false
-			}
-		}
-		return true
-	}
-	if k == VEnum {
-		if v.lo != 0 {
+	for i := u32(0); i < n; i++ {
+		if !cgIsZeroVal(slotGet(ref+i), dp-1) {
 			return false
 		}
-		n := usize(v.aux)
-		for i := usize(0); i < n; i++ {
-			if !cgIsZeroVal(slotGet(v.ref+u32(i)), dp-1) {
-				return false
-			}
-		}
-		return true
 	}
-	if k == VSlice {
-		return v.flag&2 == 0
-	}
-	return false
+	return true
 }
 
 func cgIsZeroSlot(s u32) bool {
@@ -1531,159 +1530,156 @@ func cgValue(n u32, v Val, t u32, dp usize) decreases(dp) {
 		cgFail(n, "value too deep")
 		return
 	}
-	k := v.kind
-	if k == VInt {
-		if t == 0 || cgIsUntypedOrInt(t) {
-			if isNeg128(v.hi) && v.flag&1 == 0 {
-				cgWc('(')
+	match v {
+		Int(_, _) | IntOvf -> {
+			if t == 0 || cgIsUntypedOrInt(t) {
+				if intSign(v) < 0 {
+					cgWc('(')
+					cgWInt(v)
+					cgWc(')')
+					return
+				}
 				cgWInt(v)
-				cgWc(')')
 				return
 			}
+			cgGoType(n, t, dp-1)
+			cgWc('(')
 			cgWInt(v)
-			return
-		}
-		cgGoType(n, t, dp-1)
-		cgWc('(')
-		cgWInt(v)
-		cgWc(')')
-	} else if k == VBool {
-		if cgIsNamedT(t) {
-			cgGoType(n, t, dp-1)
-			cgWc('(')
-		}
-		if v.lo != 0 {
-			cgW("true")
-		} else {
-			cgW("false")
-		}
-		if cgIsNamedT(t) {
 			cgWc(')')
 		}
-	} else if k == VString {
-		if cgIsNamedT(t) {
+		Bool(b) -> {
+			if cgIsNamedT(t) {
+				cgGoType(n, t, dp-1)
+				cgWc('(')
+			}
+			if b {
+				cgW("true")
+			} else {
+				cgW("false")
+			}
+			if cgIsNamedT(t) {
+				cgWc(')')
+			}
+		}
+		Str(off, ln) -> {
+			if cgIsNamedT(t) {
+				cgGoType(n, t, dp-1)
+				cgWc('(')
+			}
+			cgWQuoted(strSpan(off, ln))
+			if cgIsNamedT(t) {
+				cgWc(')')
+			}
+		}
+		Err(b) -> {
+			if b == 0 {
+				cgW("nil")
+				return
+			}
+			cgRt(builtinName(b))
+		}
+		Nil | NilSlice -> cgW("nil")
+		Struct(ref, nv) -> {
+			st := underlying(t)
+			if t == 0 || !isStructT(st) {
+				cgFail(n, "struct value of non-struct type")
+				return
+			}
+			p := cgWmark()
+			cgWc('{')
+			nf := nfields(st)
+			first := true
+			for i := usize(0); i < nf; i++ {
+				if i < usize(nv) && !cgIsZeroVal(slotGet(ref+u32(i)), dp-1) {
+					if !first {
+						cgW(", ")
+					}
+					first = false
+					cgWFieldIdent(nameBytes(fieldName(st, i)))
+					cgW(": ")
+					cgValue(n, slotGet(ref+u32(i)), fieldType(st, i), dp-1)
+				}
+			}
+			cgWc('}')
+			q := cgWmark()
 			cgGoType(n, t, dp-1)
-			cgWc('(')
+			cgWrotate(p, q)
 		}
-		cgWQuoted(strOf(v))
-		if cgIsNamedT(t) {
-			cgWc(')')
-		}
-	} else if k == VError {
-		if v.lo == 0 {
-			cgW("nil")
-			return
-		}
-		cgRt(builtinName(u8(v.lo)))
-	} else if k == VNil {
-		cgW("nil")
-	} else if k == VStruct {
-		st := underlying(t)
-		if t == 0 || tk(st) != TCStruct {
-			cgFail(n, "struct value of non-struct type")
-			return
-		}
-		p := cgWmark()
-		cgWc('{')
-		nf := nfields(st)
-		first := true
-		for i := usize(0); i < nf; i++ {
-			if i < usize(v.aux) && !cgIsZeroVal(slotGet(v.ref+u32(i)), dp-1) {
-				if !first {
+		Enum(vix, ref, np) -> {
+			en := underlying(t)
+			if t == 0 || !isEnumT(en) || usize(vix) >= nvariants(en) {
+				cgFail(n, "enum value of non-enum type")
+				return
+			}
+			vi := usize(vix)
+			lay := cgLayout(n, t, dp-1)
+			p := cgWmark()
+			cgWc('{')
+			if vi != 0 {
+				cgW("_tag: ")
+				cgWu(u64(vi))
+			}
+			for i := usize(0); i < usize(np); i++ {
+				if vi != 0 || i > 0 {
 					cgW(", ")
 				}
-				first = false
-				cgWFieldIdent(nameBytes(fieldName(st, i)))
+				cgWSlot(lay, vi, i)
 				cgW(": ")
-				cgValue(n, slotGet(v.ref+u32(i)), fieldType(st, i), dp-1)
+				cgValue(n, slotGet(ref+u32(i)), variantPay(en, vi, i), dp-1)
 			}
+			cgWc('}')
+			q := cgWmark()
+			cgGoType(n, t, dp-1)
+			cgWrotate(p, q)
+			cgLayRelease(lay)
 		}
-		cgWc('}')
-		q := cgWmark()
-		cgGoType(n, t, dp-1)
-		cgWrotate(p, q)
-	} else if k == VEnum {
-		en := underlying(t)
-		if t == 0 || tk(en) != TCEnum || usize(v.lo) >= nvariants(en) {
-			cgFail(n, "enum value of non-enum type")
-			return
-		}
-		vi := usize(v.lo)
-		lay := cgLayout(n, t, dp-1)
-		p := cgWmark()
-		cgWc('{')
-		if vi != 0 {
-			cgW("_tag: ")
-			cgWu(u64(vi))
-		}
-		np := usize(v.aux)
-		for i := usize(0); i < np; i++ {
-			if vi != 0 || i > 0 {
-				cgW(", ")
+		Array(ref, ne) -> {
+			at := underlying(t)
+			if t == 0 || !isArrayT(at) {
+				cgFail(n, "array value of non-array type")
+				return
 			}
-			cgWSlot(lay, vi, i)
-			cgW(": ")
-			cgValue(n, slotGet(v.ref+u32(i)), variantPay(en, vi, i), dp-1)
+			p := cgWmark()
+			cgWc('{')
+			first := true
+			for i := usize(0); i < usize(ne); i++ {
+				el := slotGet(ref + u32(i))
+				if !cgIsZeroVal(el, dp-1) {
+					if !first {
+						cgW(", ")
+					}
+					first = false
+					cgWu(u64(i))
+					cgW(": ")
+					cgValue(n, el, elemOf(at), dp-1)
+				}
+			}
+			cgWc('}')
+			q := cgWmark()
+			cgGoType(n, t, dp-1)
+			cgWrotate(p, q)
 		}
-		cgWc('}')
-		q := cgWmark()
-		cgGoType(n, t, dp-1)
-		cgWrotate(p, q)
-		cgLayRelease(lay)
-	} else if k == VArray {
-		at := underlying(t)
-		if t == 0 || tk(at) != TCArray {
-			cgFail(n, "array value of non-array type")
-			return
-		}
-		p := cgWmark()
-		cgWc('{')
-		first := true
-		ne := usize(v.aux)
-		for i := usize(0); i < ne; i++ {
-			el := slotGet(v.ref + u32(i))
-			if !cgIsZeroVal(el, dp-1) {
-				if !first {
+		Slice(ref, lo, hi, _) -> {
+			sl := underlying(t)
+			if t == 0 || !isSliceT(sl) {
+				cgFail(n, "slice value of non-slice type")
+				return
+			}
+			p := cgWmark()
+			cgWc('{')
+			for i := lo; i < hi; i++ {
+				if i > lo {
 					cgW(", ")
 				}
-				first = false
-				cgWu(u64(i))
-				cgW(": ")
-				cgValue(n, el, typs.items[usize(at)].a, dp-1)
+				cgValue(n, slotGet(ref+i), elemOf(sl), dp-1)
 			}
+			cgWc('}')
+			q := cgWmark()
+			cgGoType(n, t, dp-1)
+			cgWrotate(p, q)
 		}
-		cgWc('}')
-		q := cgWmark()
-		cgGoType(n, t, dp-1)
-		cgWrotate(p, q)
-	} else if k == VSlice {
-		if v.flag&2 == 0 {
-			cgW("nil")
-			return
-		}
-		sl := underlying(t)
-		if t == 0 || tk(sl) != TCSlice {
-			cgFail(n, "slice value of non-slice type")
-			return
-		}
-		p := cgWmark()
-		cgWc('{')
-		lo := usize(v.aux)
-		hi := usize(v.aux2)
-		for i := lo; i < hi; i++ {
-			if i > lo {
-				cgW(", ")
-			}
-			cgValue(n, slotGet(v.ref+u32(i)), typs.items[usize(sl)].a, dp-1)
-		}
-		cgWc('}')
-		q := cgWmark()
-		cgGoType(n, t, dp-1)
-		cgWrotate(p, q)
-	} else if k == VCode || k == VFieldCode {
-		cgFail(n, "Code values cannot exist at run time")
-	} else {
-		cgFail(n, "unsupported constant")
+		CodeBasic(_) | CodeArray(_, _) | CodeSlice(_) | CodeStruct(_, _) | CodeUniv(_) | FieldCode(_, _, _) -> cgFail(n, "Code values cannot exist at run time")
+		None | Tuple(_, _) | Ptr(_) -> cgFail(n, "unsupported constant")
 	}
 }
 
@@ -1701,18 +1697,18 @@ func cgConstNameOK(s u32) bool {
 	if v == 0 {
 		return false
 	}
-	vk := vals.items[usize(v)].kind
-	if vk != VInt && vk != VBool && vk != VString {
+	vk := slotGet(v)
+	if !isIntVal(vk) && !isBoolVal(vk) && !isStrVal(vk) {
 		return false
 	}
 	t := syms.items[usize(s)].typ
 	if t == 0 {
 		return false
 	}
-	if tk(t) == TCNamed && (namedOrigin(t) != 0 || tl2n(t) > 0) {
+	if isNamedT(t) && (namedOrigin(t) != 0 || namedNTParams(t) > 0) {
 		return false
 	}
-	return tk(underlying(t)) == TCBasic
+	return isBasicT(underlying(t))
 }
 
 // wConstName writes gen.constName(sym) (constNameOK must hold).
@@ -1742,16 +1738,16 @@ func cgConstDecl(s u32) bool {
 		cgEnvN = saved
 	}
 	cgW(" = ")
-	if v.kind == VInt {
-		cgWInt(v)
-	} else if v.kind == VBool {
-		if v.lo != 0 {
-			cgW("true")
-		} else {
-			cgW("false")
+	match v {
+		Int(_, _) | IntOvf -> cgWInt(v)
+		Bool(b) -> {
+			if b {
+				cgW("true")
+			} else {
+				cgW("false")
+			}
 		}
-	} else {
-		cgWQuoted(strOf(v))
+		_ -> cgWQuoted(strOf(v))
 	}
 	return true
 }
@@ -1769,7 +1765,8 @@ func cgTypeDecl(sym u32, mi int) {
 	} else {
 		cgWSymName(sym)
 	}
-	cgTypeParamList(typs.items[usize(named)].l2s, tl2n(named), true)
+	tpS, _ := namedTParamList(named)
+	cgTypeParamList(tpS, namedNTParams(named), true)
 	cgWc(' ')
 	cgTypeLit(syms.items[usize(sym)].decl, underlying(named), SemaDepth)
 	cgW("\n\n")
@@ -2019,7 +2016,8 @@ func cgGenerateGo() bool {
 		sym := cgMonoSym[next]
 		if cgMonoKind[next] == 1 {
 			named := syms.items[usize(sym)].typ
-			cgEnvBind(typs.items[usize(named)].l2s, tl2n(named), cgMonoValS[next])
+			tpS, _ := namedTParamList(named)
+			cgEnvBind(tpS, namedNTParams(named), cgMonoValS[next])
 			cgTypeDecl(sym, int(next))
 			pid := syms.items[usize(sym)].pkg
 			cgEmitMethods(pid, sym, int(next))

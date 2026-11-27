@@ -739,7 +739,7 @@ driver func printStats(io Stdio) error {
 	statLine(o, "u32 lists", ulists.count, MaxULists)
 	statLine(o, "cells", cells.count, MaxCells)
 	statLine(o, "types", typs.count, MaxTypes)
-	statLine(o, "type list items", typs.nlists, MaxTypeLists)
+	statLine(o, "type list items", tlistsUsed(), MaxTypeLists)
 	statLine(o, "methods", meths.count, MaxMethods)
 	statLine(o, "instances", insts.count, MaxInsts)
 	statLine(o, "funcs", funcs.count, MaxFuncs)

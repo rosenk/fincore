@@ -167,10 +167,20 @@ symbol but no `defs` entry.
 
 ### Types (types.fc)
 
-`typs.items[TypeID]` (`TypeRec`), see the field table in types.fc. Basic
+`typs.items[TypeID]` is a `TypeRec`, a sum type with one variant per type
+form (`NoType` for TypeID 0, `Basic`, `Sig`, `Named`, `Array`, `Slice`,
+`Pointer`, `Struct`, `Enum`, `Code`, `TypeParam`, `ConstArg`, `Tuple`,
+`Opaque`; 40 bytes). Kind switches are `match trec(t) { ... }`; single
+tests are `isNamedT`, `isArrayT`, ... A `Named(id)` refers to a mutable
+`NamedRec` in `typs.named` (name, symbol, package, builtin, underlying
+type, origin and type args of instances, type params, method and class
+caches). Basic
 types have fixed IDs `TyBool`..`TyUntypedNil` (`TyInvalid = 1`). Structural
 types and generic instances are **hash-consed**, so `types.Identical(a, b)`
-is `a == b`. Named types (`newNamed`), type parameters and opaque resource
+is `a == b`. Type lists live in a `vec.ListArena` and are interned as well
+(`tcommitStack`), so equal lists are equal `(start, len)` pairs and the
+type table (a `maps.Table`) compares records with `==` (instances by
+origin and type args). Named types (`newNamed`), type parameters and opaque resource
 types are unique records. Helpers: `underlying`, `basicKind`, `isInteger`,
 `isUnsigned`, `isUntyped`, `isBoolean`, `isString`, `intInfo`, `defaultOf`,
 `derefType`, `elemOf`, `nfields/fieldName/fieldType/fieldByName`,
@@ -214,10 +224,15 @@ resolved by receiver type).
 
 ### Values (values.fc)
 
-`Val` is a by-value record: `VInt` (exact 128-bit two's complement in
-`hi/lo`; `flag&1` marks values outside ±2^127), `VBool`, `VString`
-(`strPool` span), `VError` (sentinel builtin, 0 = nil), `VNil`, `VArray`,
-`VSlice`, `VStruct`, `VEnum`, `VTuple`, `VCode`, `VFieldCode`, `VPtr`.
+`Val` is a sum type (32 bytes in the compact layout): `None`, `Bool(b)`,
+`Err(builtin)` (0 = nil), `Nil`, `Str(off, len)` (`strPool` span),
+`Int(hi, lo)` (exact 128-bit two's complement), `IntOvf` (outside
+±2^127), `Array(ref, n)`, `Slice(ref, lo, hi, alen)`, `NilSlice`,
+`Struct(ref, n)`, `Enum(variant, ref, n)`, `Tuple(ref, n)`, `Ptr(slot)`,
+`CodeBasic(kind)`, `CodeArray(len, elem)`, `CodeSlice(elem)`,
+`CodeStruct(ref, n)`, `CodeUniv(level)` and `FieldCode(off, len, code)`.
+The functions that handle every value (`putVal`, `persistVal`,
+`equalVals`, `cgValue`, `cgIsZeroVal`) are exhaustive matches without `_`.
 Aggregates refer to contiguous **value slots** in `vals`: the persistent
 region `[1, VtabCap)` holds every value recorded in the typed model; the
 comptime heap `[VtabCap, MaxValSlots)` is reset after each evaluation root
@@ -296,7 +311,7 @@ diff-check corpus and snippets plus the 60 cases of finc0's
 | `scopes` | `MaxScopes = 524_288` | 6.7k |
 | `ulists`, `ustack` | `MaxULists = 1_048_576` | 3.3k |
 | `cells` | `MaxCells = 524_288` | 7.7k |
-| `typs` | `MaxTypes = 131_072`, `TypeBuckets = 262_144`, `MaxTypeLists = 1_048_576` | 501 / 1.6k |
+| `typs` | `MaxTypes = 131_072`, `TypeBuckets = 262_144`, `MaxTypeLists = 1_048_576` (interned: `MaxListRecs = 131_072`, `ListBuckets = 262_144`), `MaxNamedRecs = 65_536` | 1.5k / 2.8k (with std/maps, std/vec) |
 | `meths`, `insts`, `funcs` | 16_384, 8_192, 65_536 | 164, 0, 644 |
 | `callTab`, `selTab` | 262_144 each | 7.7k, 5.1k |
 | `vals` | `VtabCap = 1 Mi` persistent + `HeapCap = 2 Mi` heap slots | 9.4k |
@@ -367,8 +382,12 @@ function; overflow is reported as capacity exceeded.
 
 ## Language subset used (conservative on purpose)
 
-- Only `func` (total) and `driver func`; no `comptime`, generics, enums,
-  `match`, closures, `defer` or `scope`. The M7 files use free functions
+- Only `func` (total) and `driver func`; no `comptime`, generics,
+  closures, `defer` or `scope`. Sum types (enums with payloads, `match`
+  statements and expressions) model compile-time values (`Val`), type
+  forms (`TypeRec`), escape sequences (`Esc`), Linear consumption kinds
+  (`Consume`) and the totality walker mode (`WalkMode`); types.fc uses
+  `std/maps.Table` and `std/vec.ListArena`. The M7 files use free functions
   over package-level arenas instead of methods on Scoped helper structs
   (total functions read and write globals directly); pointers appear only
   as `*Operand` / `*OutBuf` parameters (`&opStack.items[i]`, `&msgBuf`).

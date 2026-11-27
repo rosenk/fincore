@@ -189,7 +189,7 @@ func fmtCount(s []byte, at u32) (usize, bool) {
 // fmtFormatString returns the constant format of a checked formatTo call.
 func fmtFormatString(e u32) []byte {
 	s := nval[usize(l1at(e, 1))]
-	if s == 0 || vals.items[usize(s)].kind != VString {
+	if s == 0 || !isStrVal(slotGet(s)) {
 		return emptyBytes()
 	}
 	return strOf(slotGet(s))
@@ -222,7 +222,7 @@ func fmtIntOp(t u32, hex bool) u8 {
 // isByteSliceT: t's underlying type is []u8.
 func isByteSliceT(t u32) bool {
 	u := underlying(t)
-	return tk(u) == TCSlice && elemOf(u) == TyU8
+	return isSliceT(u) && elemOf(u) == TyU8
 }
 
 // formatMethodOK: m is a value-receiver, total `Format(dst []byte) usize`.
@@ -264,7 +264,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 	if isInvalidOp(&fx) || !assignment(&fx, TyString, ctx) {
 		ok = false
 		fok = false
-	} else if fx.mode != KConst || fx.val.kind == VNone {
+	} else if fx.mode != KConst || fx.val == Val.None {
 		mreset()
 		ms("format argument ")
 		mexpr(a1)
@@ -391,7 +391,7 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 			op = FmtByte
 		}
 	} else {
-		if tk(t) == TCNamed && builtinOf(t) == 0 {
+		if isNamedT(t) && builtinOf(t) == 0 {
 			m := lookupMethod(t, internStr("Format"), dp-1)
 			if m != 0 {
 				if !formatMethodOK(m) {
@@ -750,18 +750,16 @@ func cfNumber(neg bool, mag u64, base u64, width int, zero bool) {
 }
 
 func cfSigned(v Val, base u64, width int, zero bool) {
-	if i64(v.lo) < 0 {
-		cfNumber(true, AllOnes-v.lo+1, base, width, zero)
+	lo := intLo(v)
+	if i64(lo) < 0 {
+		cfNumber(true, AllOnes-lo+1, base, width, zero)
 	} else {
-		cfNumber(false, v.lo, base, width, zero)
+		cfNumber(false, lo, base, width, zero)
 	}
 }
 
 // cfDst is fincrt.Fmt.Dst: the slice a Format method writes into.
 func cfDst(width int) Val {
-	var sl Val
-	sl.kind = VSlice
-	sl.flag = 2
 	w := width
 	if w > MaxFormatWidth {
 		w = MaxFormatWidth
@@ -774,17 +772,10 @@ func cfDst(width int) Val {
 			}
 		}
 		cfInScr = true
-		sl.ref = cfScr
-		sl.aux = 0
-		sl.aux2 = u32(w)
-	} else {
-		cfInScr = false
-		sl.ref = cfRef
-		sl.aux = u32(cfN)
-		sl.aux2 = u32(cfLen)
+		return Val.Slice(cfScr, 0, u32(w), u64(w))
 	}
-	sl.lo = u64(sl.aux2)
-	return sl
+	cfInScr = false
+	return Val.Slice(cfRef, u32(cfN), u32(cfLen), u64(cfLen))
 }
 
 // cfAdvance is fincrt.Fmt.Advance.
@@ -804,7 +795,7 @@ func cfAdvance(n0 u64, width int) {
 		}
 		cfPadLeft(n, width)
 		for i := usize(0); i < n; i++ {
-			cfPut(byte(slotGet(cfScr + u32(i)).lo))
+			cfPut(byte(intLo(slotGet(cfScr + u32(i)))))
 		}
 		cfPadRight(n, width)
 		return
@@ -851,10 +842,8 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 		return z
 	}
 	d := vstack[m]
-	dlen := usize(0)
-	if d.kind == VSlice && d.flag&2 != 0 {
-		dlen = usize(d.aux2 - d.aux)
-	}
+	dref, dn := sliceElems(d)
+	dlen := usize(dn)
 	saveRef := cfRef
 	saveLen := cfLen
 	saveN := cfN
@@ -866,7 +855,7 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 	cfScr = 0
 	cfInScr = false
 	for i := usize(0); i < dlen; i++ {
-		slotSet(cfRef+u32(i), slotGet(d.ref+d.aux+u32(i)))
+		slotSet(cfRef+u32(i), slotGet(dref+u32(i)))
 	}
 	s := strOf(vstack[m+1])
 	ln := len(s)
@@ -915,21 +904,13 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 		} else if op == FmtHexInt {
 			cfSigned(v, 16, width, p.zero)
 		} else if op == FmtUint {
-			cfNumber(false, v.lo, 10, width, p.zero)
+			cfNumber(false, intLo(v), 10, width, p.zero)
 		} else if op == FmtHexUint {
-			cfNumber(false, v.lo, 16, width, p.zero)
+			cfNumber(false, intLo(v), 16, width, p.zero)
 		} else if op == FmtStr {
-			if v.kind == VString {
-				cfBytes(strOf(v), width)
-			} else {
-				cfBytes(emptyBytes(), width)
-			}
+			cfBytes(strOf(v), width)
 		} else if op == FmtQuoteStr {
-			if v.kind == VString {
-				cfQuote(strOf(v), width)
-			} else {
-				cfQuote(emptyBytes(), width)
-			}
+			cfQuote(strOf(v), width)
 		} else if op == FmtBytes || op == FmtQuoteBytes {
 			if !bytesOfSlice(v) {
 				break
@@ -941,10 +922,10 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 			}
 		} else if op == FmtByte {
 			cfPadLeft(1, width)
-			cfPut(byte(v.lo))
+			cfPut(byte(intLo(v)))
 			cfPadRight(1, width)
 		} else if op == FmtBool {
-			if v.lo != 0 {
+			if v == Val.Bool(true) {
 				cfBytes(strBytes("true"), width)
 			} else {
 				cfBytes(strBytes("false"), width)
@@ -967,7 +948,7 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 	res := vIntU(u64(cfN))
 	if !ifail {
 		for j := usize(0); j < dlen; j++ {
-			slotSet(d.ref+d.aux+u32(j), slotGet(cfRef+u32(j)))
+			slotSet(dref+u32(j), slotGet(cfRef+u32(j)))
 		}
 	}
 	cfRef = saveRef

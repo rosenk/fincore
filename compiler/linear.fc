@@ -42,12 +42,14 @@ const (
 	StBorrowed = 64 // borrowed from the caller / enclosing function
 	StOwned    = 6  // StLive | StPending
 	StGone     = 24 // StMoved | StConsumed
-
-	// Consumption kinds.
-	KConsume = 0 // finalize
-	KMove    = 1 // transfer ownership
-	KDefer   = 2 // finalize at function exit
 )
+
+// Consume is what a use does with a Linear resource.
+type Consume enum {
+	Finalize // Close, ReleaseSlot, cancel()
+	Move     // transfer ownership
+	Defer    // finalize at function exit
+}
 
 type LnFlow struct {
 	varS     usize // variables: lnVars[varS : varS+nvar]
@@ -411,7 +413,7 @@ func lnUse(fl u32, e u32, i u32, at u32) {
 }
 
 // lnConsume finalizes, moves or defers the finalization of variable i.
-func lnConsume(fl u32, e u32, i u32, at u32, kind u8) {
+func lnConsume(fl u32, e u32, i u32, at u32, kind Consume) {
 	if lnIsDead(e) {
 		return
 	}
@@ -431,20 +433,20 @@ func lnConsume(fl u32, e u32, i u32, at u32, kind u8) {
 		ms(" cannot be closed or moved here (it is owned by the caller)")
 		scReport(E3003, at)
 	}
-	n := u8(0)
-	if kind == KDefer {
-		n = StDeferred
-	} else if st&StDeferred != 0 {
-		// Explicit finalization of a resource whose close is deferred:
-		// it stays usable until the deferred call runs.
-		n = StDeferred
-		if lnClr(st, StDeferred)&(StOwned|StAbsent) != 0 {
-			n = n | StConsumed
+	n := u8(StDeferred)
+	if kind != Consume.Defer {
+		if st&StDeferred != 0 {
+			// Explicit finalization of a resource whose close is deferred:
+			// it stays usable until the deferred call runs.
+			if lnClr(st, StDeferred)&(StOwned|StAbsent) != 0 {
+				n = n | StConsumed
+			}
+		} else {
+			n = match kind {
+				Move -> StMoved
+				Finalize | Defer -> StConsumed
+			}
 		}
-	} else if kind == KMove {
-		n = StMoved
-	} else {
-		n = StConsumed
 	}
 	lnSet(e, i, n|(st&StBorrowed), 0)
 }
@@ -786,7 +788,7 @@ func lnStmt(fl u32, s u32, e u32, dp usize) u32 decreases(dp) {
 			r := l1at(s, i)
 			vi := lnLinArg(fl, r)
 			if vi != LnNoVar {
-				lnConsume(fl, e, vi, lnRootIdent(r), KMove)
+				lnConsume(fl, e, vi, lnRootIdent(r), Consume.Move)
 			} else {
 				lnExpr(fl, r, e, dp-1)
 			}
@@ -966,7 +968,7 @@ func lnExhaustive(s u32) bool {
 	if t == 0 {
 		return false
 	}
-	return tk(underlying(t)) == TCEnum && n > 0
+	return isEnumT(underlying(t)) && n > 0
 }
 
 // lnBorrowBindings marks the Linear payload bindings of a match-arm
@@ -1014,7 +1016,7 @@ func lnMatchExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
 		ae := nb(arm)
 		vi := lnLinArg(fl, ae)
 		if vi != LnNoVar {
-			lnConsume(fl, a, vi, lnRootIdent(ae), KMove)
+			lnConsume(fl, a, vi, lnRootIdent(ae), Consume.Move)
 		} else {
 			lnExpr(fl, ae, a, dp-1)
 		}
@@ -1035,7 +1037,7 @@ func lnAssign(fl u32, e u32, lS usize, lN usize, rS usize, rN usize, dp usize) d
 		r := lnTmp[rS+k]
 		vi := lnLinArg(fl, r)
 		if vi != LnNoVar {
-			lnConsume(fl, e, vi, lnRootIdent(r), KMove)
+			lnConsume(fl, e, vi, lnRootIdent(r), Consume.Move)
 		} else {
 			lnExpr(fl, r, e, dp-1)
 		}
@@ -1044,7 +1046,7 @@ func lnAssign(fl u32, e u32, lS usize, lN usize, rS usize, rN usize, dp usize) d
 	errSym := u32(0)
 	if rN == 1 && lN > 1 {
 		t := ntype[usize(lnTmp[rS])]
-		if t != 0 && tk(t) == TCTuple && tl1n(t) == lN && tl1(t, lN-1) == TyError {
+		if t != 0 && isTupleT(t) && tupleN(t) == lN && tupleAt(t, lN-1) == TyError {
 			last := lnTmp[lS+lN-1]
 			if nkind(last) == NkIdent {
 				errSym = scVarSym(last)
@@ -1127,7 +1129,7 @@ func lnExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
 			v := nb(l1at(x, i))
 			vi := lnLinArg(fl, v)
 			if vi != LnNoVar {
-				lnConsume(fl, e, vi, lnRootIdent(v), KMove)
+				lnConsume(fl, e, vi, lnRootIdent(v), Consume.Move)
 			} else {
 				lnExpr(fl, v, e, dp-1)
 			}
@@ -1171,7 +1173,7 @@ func lnLit(fl u32, lit u32, e u32, goTask bool, dp usize) decreases(dp) {
 			}
 			at := lnCapAt(lit, s)
 			if goTask {
-				lnConsume(fl, e, i, at, KMove)
+				lnConsume(fl, e, i, at, Consume.Move)
 			} else {
 				lnUse(fl, e, i, at)
 			}
@@ -1261,11 +1263,11 @@ func lnCall(fl u32, x u32, e u32, deferred bool, dp usize) decreases(dp) {
 		}
 		return
 	}
-	finalize := u8(KConsume)
-	move := u8(KMove)
+	finalize := Consume.Finalize
+	move := Consume.Move
 	if deferred {
-		finalize = KDefer
-		move = KDefer
+		finalize = Consume.Defer
+		move = Consume.Defer
 	}
 	c := callTab.items[usize(ci)]
 	fun := unparen(na(x))
@@ -1355,9 +1357,9 @@ func lnInlineLit(fl u32, lit u32, e u32, deferred bool, dp usize) decreases(dp) 
 	mid := lnNTmp
 	lnPushParams(fi, false)
 	lnRun(g, nb(lit), mark, mid, dp-1)
-	kind := u8(KConsume)
+	kind := Consume.Finalize
 	if deferred {
-		kind = KDefer
+		kind = Consume.Defer
 	}
 	ex := lnFlows[usize(g)].exits
 	c2 := litCapHead[usize(lit)]

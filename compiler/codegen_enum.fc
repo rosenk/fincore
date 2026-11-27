@@ -141,22 +141,22 @@ func cgLayout(n u32, t u32, dp usize) CgLay decreases(dp) {
 		z.bmark = cgLayBTop
 		return z
 	}
-	if tk(t) == TCNamed {
+	if isNamedT(t) {
 		origin := namedOrigin(t)
 		if origin != 0 {
 			saveN := cgEnvN
 			if cgTypeConstParams(origin) > 0 {
 				// Values first (in the current environment), then bind.
 				vmark := cgValTop
-				nt := tl2n(origin)
+				nt := namedNTParams(origin)
 				for i := usize(0); i < nt; i++ {
-					if tpIsConst(tl2(origin, i)) {
-						cgValPush(cgConstArg(n, tl1(t, i)))
+					if tpIsConst(namedTParam(origin, i)) {
+						cgValPush(cgConstArg(n, namedArg(t, i)))
 					}
 				}
 				k := vmark
 				for i := usize(0); i < nt; i++ {
-					tp := tl2(origin, i)
+					tp := namedTParam(origin, i)
 					if !tpIsConst(tp) {
 						continue
 					}
@@ -165,7 +165,7 @@ func cgLayout(n u32, t u32, dp usize) CgLay decreases(dp) {
 						break
 					}
 					cgEnvTP[cgEnvN] = tp
-					cgEnvSym[cgEnvN] = typs.items[usize(tp)].b
+					cgEnvSym[cgEnvN] = tpSym(tp)
 					cgEnvVal[cgEnvN] = cgValStack[k]
 					cgEnvN++
 					k++
@@ -186,7 +186,7 @@ func cgComputeLayout(n u32, en u32, dp usize) CgLay decreases(dp) {
 	l.g0 = cgLayGTop
 	l.p0 = cgLayPTop
 	l.bmark = cgLayBTop
-	if dp == 0 || tk(en) != TCEnum {
+	if dp == 0 || !isEnumT(en) {
 		cgFail(n, "enum layout of non-enum type")
 		return l
 	}

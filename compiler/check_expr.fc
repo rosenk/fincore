@@ -84,7 +84,7 @@ func expr0(e u32, dp usize) Operand decreases(dp) {
 		return opConst(TyUntypedBool, vBool(nflag(e)))
 	}
 	if k == NkNilLit {
-		return opConst(TyUntypedNil, vNilV())
+		return opConst(TyUntypedNil, Val.Nil)
 	}
 	if k == NkParenExpr {
 		x := rawExpr(na(e), dp-1)
@@ -158,11 +158,11 @@ func symOperand(sym u32, id u32, dp usize) Operand decreases(dp) {
 	}
 	if k == SymTypeParam {
 		tp := symType(sym, dp-1)
-		if tp == 0 || tk(tp) != TCTypeParam {
+		if tp == 0 || !isTypeParamT(tp) {
 			return invalidOp(id)
 		}
 		if tpIsConst(tp) {
-			return opMode(KValue, typs.items[usize(tp)].a)
+			return opMode(KValue, tpConstType(tp))
 		}
 		return opMode(KType, tp)
 	}
@@ -248,7 +248,7 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	if (op == OpDiv || op == OpRem) && y.mode == KConst {
-		if y.val.kind == VInt && y.val.hi == 0 && y.val.lo == 0 && y.val.flag&1 == 0 {
+		if y.val == vIntU(0) {
 			mreset()
 			ms("division by zero")
 			errAt(E2002, nb(e))
@@ -343,7 +343,7 @@ func shiftExpr(e u32, x *Operand, y *Operand) Operand {
 		return invalidOp(e)
 	}
 	if isUntyped(y.typ) {
-		if y.val.kind == VInt && intSign(y.val) < 0 {
+		if intSign(y.val) < 0 {
 			mreset()
 			ms("negative shift count ")
 			mval(y.val)
@@ -495,7 +495,7 @@ func unaryExpr(e u32, dp usize) Operand decreases(dp) {
 			return invalidOp(e)
 		}
 		u := underlying(x.typ)
-		if tk(u) != TCPointer {
+		if !isPointerT(u) {
 			mreset()
 			ms("cannot dereference ")
 			mexpr(na(e))
@@ -587,7 +587,7 @@ func indexArg(e u32, dp usize) (Val, bool, bool) decreases(dp) {
 		errAt(E2002, e)
 		return z, false, false
 	}
-	if x.mode == KConst && x.val.kind == VInt && intSign(x.val) < 0 {
+	if x.mode == KConst && intSign(x.val) < 0 {
 		mreset()
 		ms("index ")
 		mval(x.val)
@@ -621,7 +621,7 @@ func indexExpr(e u32, dp usize) Operand decreases(dp) {
 		return funcInstance(e, &x, dp-1)
 	}
 	if x.mode == KType {
-		if tk(x.typ) != TCNamed || tl2n(x.typ) == 0 {
+		if !isNamedT(x.typ) || namedNTParams(x.typ) == 0 {
 			mreset()
 			mtype(x.typ)
 			ms(" is not a generic type")
@@ -655,22 +655,21 @@ func indexExpr(e u32, dp usize) Operand decreases(dp) {
 	t := x.typ
 	mode := x.mode
 	u := underlying(t)
-	if tk(u) == TCPointer && tk(underlying(elemOf(u))) == TCArray {
+	if isPointerT(u) && isArrayT(underlying(elemOf(u))) {
 		t = elemOf(u)
 		mode = KVar
 	}
 	u = underlying(t)
-	k := tk(u)
-	if k == TCArray {
-		r := typs.items[usize(u)]
-		if has && r.b == 0 {
+	if isArrayT(u) {
+		alen, lenParam := arrayLenOf(u)
+		if has && lenParam == 0 {
 			n, _ := valUint64(idx)
-			if n >= r.n {
+			if n >= alen {
 				mreset()
 				ms("index ")
 				mval(idx)
 				ms(" out of bounds for array of length ")
-				mu(r.n)
+				mu(alen)
 				errAt(E4003, i0)
 				return invalidOp(e)
 			}
@@ -678,12 +677,12 @@ func indexExpr(e u32, dp usize) Operand decreases(dp) {
 		if mode != KVar {
 			mode = KValue
 		}
-		return opMode(mode, r.a)
+		return opMode(mode, elemOf(u))
 	}
-	if k == TCSlice {
+	if isSliceT(u) {
 		return opMode(KVar, elemOf(u))
 	}
-	if k == TCBasic && isString(u) {
+	if isBasicT(u) && isString(u) {
 		if x.mode == KConst && has {
 			sb := strOf(x.val)
 			n, _ := valUint64(idx)
@@ -752,13 +751,12 @@ func sliceExpr(e u32, dp usize) Operand decreases(dp) {
 	t := x.typ
 	addressable := x.mode == KVar
 	u := underlying(t)
-	if tk(u) == TCPointer && tk(underlying(elemOf(u))) == TCArray {
+	if isPointerT(u) && isArrayT(underlying(elemOf(u))) {
 		t = elemOf(u)
 		addressable = true
 	}
 	u = underlying(t)
-	k := tk(u)
-	if k == TCArray {
+	if isArrayT(u) {
 		if !addressable {
 			mreset()
 			ms("cannot slice ")
@@ -767,8 +765,8 @@ func sliceExpr(e u32, dp usize) Operand decreases(dp) {
 			errAt(E2002, e)
 			return invalidOp(e)
 		}
-		r := typs.items[usize(u)]
-		if r.b == 0 {
+		alen, lenParam := arrayLenOf(u)
+		if lenParam == 0 {
 			for q := usize(0); q < 2; q++ {
 				b := lo
 				hb := hasLo
@@ -780,23 +778,23 @@ func sliceExpr(e u32, dp usize) Operand decreases(dp) {
 					continue
 				}
 				n, ok := valUint64(b)
-				if ok && n > r.n {
+				if ok && n > alen {
 					mreset()
 					ms("slice bound ")
 					mu(n)
 					ms(" out of range for array of length ")
-					mu(r.n)
+					mu(alen)
 					errAt(E4003, e)
 					return invalidOp(e)
 				}
 			}
 		}
-		return opMode(KValue, mkSlice(r.a))
+		return opMode(KValue, mkSlice(elemOf(u)))
 	}
-	if k == TCSlice {
+	if isSliceT(u) {
 		return opMode(KValue, t)
 	}
-	if k == TCBasic && isString(u) {
+	if isBasicT(u) && isString(u) {
 		if isUntyped(x.typ) {
 			_ = convertUntyped(&x, TyString)
 			t = TyString
@@ -850,7 +848,7 @@ func selectorExpr(e u32, dp usize) Operand decreases(dp) {
 	name := idName(sel)
 	if x.mode == KType {
 		en := underlying(x.typ)
-		if tk(en) != TCEnum {
+		if !isEnumT(en) {
 			mreset()
 			mexpr(na(e))
 			mbyte('.')
@@ -882,10 +880,7 @@ func selectorExpr(e u32, dp usize) Operand decreases(dp) {
 		s.index = u32(vi)
 		nsel[usize(e)] = newSel(s)
 		if variantPayN(en, vi) == 0 {
-			var ev Val
-			ev.kind = VEnum
-			ev.lo = u64(vi)
-			return opConst(x.typ, ev)
+			return opConst(x.typ, Val.Enum(u32(vi), 0, 0))
 		}
 		r := opMode(KVariantCtor, x.typ)
 		r.vEnum = en
@@ -898,12 +893,12 @@ func selectorExpr(e u32, dp usize) Operand decreases(dp) {
 	}
 	t := x.typ
 	indirect := false
-	if tk(underlying(t)) == TCPointer {
+	if isPointerT(underlying(t)) {
 		t = elemOf(underlying(t))
 		indirect = true
 	}
 	st := underlying(t)
-	if tk(st) == TCStruct {
+	if isStructT(st) {
 		fi, found := fieldByName(st, name)
 		if found {
 			var s Selection
@@ -922,7 +917,7 @@ func selectorExpr(e u32, dp usize) Operand decreases(dp) {
 			return opMode(mode, ft)
 		}
 	}
-	if tk(t) == TCNamed {
+	if isNamedT(t) {
 		m := lookupMethod(t, name, dp-1)
 		if m != 0 {
 			var s Selection
@@ -966,7 +961,7 @@ func structLit(e u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	st := underlying(t)
-	if tk(st) != TCStruct {
+	if !isStructT(st) {
 		mreset()
 		ms("invalid composite literal type ")
 		mtype(t)
@@ -1051,7 +1046,7 @@ func structValue(e u32, st u32) (Val, bool) {
 			if vs == 0 {
 				return z, false
 			}
-			slotSet(z.ref+u32(idx), slotGet(vs))
+			slotSet(fieldSlot(z, u32(idx)), slotGet(vs))
 		}
 	}
 	return z, true
@@ -1185,7 +1180,7 @@ func call0(e u32, dp usize) Operand decreases(dp) {
 			return methodCall(e, &fun, ci, dp-1)
 		}
 		sig := fun.typ
-		if sig == 0 || tk(sig) != TCSig {
+		if sig == 0 || !isSigT(sig) {
 			useArgs(e, 0, dp-1)
 			return invalidOp(e)
 		}
@@ -1225,7 +1220,7 @@ func call0(e u32, dp usize) Operand decreases(dp) {
 	}
 	if m == KValue || m == KVar {
 		sig := underlying(fun.typ)
-		if tk(sig) != TCSig {
+		if !isSigT(sig) {
 			mreset()
 			ms("cannot call non-function ")
 			mexpr(na(e))
@@ -1272,12 +1267,12 @@ func arguments(e u32, params []u32, variadic bool, c Ctx, dp usize) bool decreas
 	}
 	if nargs == 1 && opStack.items[mark].mode == KValue {
 		t0 := opStack.items[mark].typ
-		if t0 != 0 && tk(t0) == TCTuple {
+		if t0 != 0 && isTupleT(t0) {
 			first := opStack.items[mark]
 			opStack.top = mark
-			nt := tl1n(t0)
+			nt := tupleN(t0)
 			for i := usize(0); i < nt; i++ {
-				x := opMode(KValue, tl1(t0, i))
+				x := opMode(KValue, tupleAt(t0, i))
 				x.expr = first.expr
 				opPush(x)
 			}
@@ -1287,7 +1282,7 @@ func arguments(e u32, params []u32, variadic bool, c Ctx, dp usize) bool decreas
 	top := opStack.top
 	for i := mark; i < top; i++ {
 		t := opStack.items[i].typ
-		if t != 0 && tk(t) == TCTuple && nargs == 1 {
+		if t != 0 && isTupleT(t) && nargs == 1 {
 			continue
 		}
 		singleValue(&opStack.items[i])
@@ -1337,7 +1332,7 @@ func foldComptime(e u32, fn u32, sig u32, mark usize, ci u32, dp usize) Operand 
 	vmark := vtop
 	for i := mark; i < top; i++ {
 		a := opStack.items[i]
-		if a.mode != KConst || a.val.kind == VNone {
+		if a.mode != KConst || a.val == Val.None {
 			mreset()
 			ms("argument ")
 			mexpr(a.expr)
@@ -1365,7 +1360,7 @@ func foldComptime(e u32, fn u32, sig u32, mark usize, ci u32, dp usize) Operand 
 	if r == 0 {
 		return opMode(KNoValue, 0)
 	}
-	if tk(r) == TCTuple {
+	if isTupleT(r) {
 		nval[usize(e)] = valStore(v)
 		return opMode(KValue, r)
 	}
@@ -1408,11 +1403,11 @@ func methodCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	base, _ := derefType(fun.recvType)
-	if tk(base) == TCNamed && namedOrigin(base) != 0 && mr.rtpN > 0 {
-		br := typs.items[usize(base)]
-		sig = subst(sig, mr.rtpS, mr.rtpN, br.l1s, br.l1n, SemaDepth)
-		callTab.items[usize(ci)].taS = br.l1s
-		callTab.items[usize(ci)].taN = br.l1n
+	if isNamedT(base) && namedOrigin(base) != 0 && mr.rtpN > 0 {
+		bs, bn := namedArgList(base)
+		sig = subst(sig, mr.rtpS, mr.rtpN, bs, bn, SemaDepth)
+		callTab.items[usize(ci)].taS = bs
+		callTab.items[usize(ci)].taN = bn
 	}
 	callTab.items[usize(ci)].sig = sig
 	callTab.items[usize(ci)].effect = sigEffect(sig)
@@ -1465,13 +1460,14 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 		}
 		arr := u32(0)
 		pu := underlying(pool.typ)
-		if tk(pu) == TCPointer {
+		if isPointerT(pu) {
 			au := underlying(elemOf(pu))
-			if tk(au) == TCArray {
+			if isArrayT(au) {
 				arr = au
 			}
 		}
-		if arr == 0 || typs.items[usize(arr)].b != 0 {
+		alen, lenParam := arrayLenOf(arr)
+		if arr == 0 || lenParam != 0 {
 			mreset()
 			ms("cannot use ")
 			mexpr(a1)
@@ -1487,9 +1483,9 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 		am := tmark()
 		tpush(elem)
 		as, an := tcommitStack(am)
-		slot := instantiate(univNamed[BTSlot], typs.lists[usize(as):usize(as)+usize(an)], 0, SemaDepth)
+		slot := instantiate(univNamed[BTSlot], tlistSlice(as, an), 0, SemaDepth)
 		tm := tmark()
-		tpush(mkConstArg(typs.items[usize(arr)].n))
+		tpush(mkConstArg(alen))
 		tpush(elem)
 		ts, tn := tcommitStack(tm)
 		callTab.items[usize(ci)].taS = ts
@@ -1522,7 +1518,7 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 			return invalidOp(e)
 		}
 		sn := s.typ
-		if tk(sn) != TCNamed || namedOrigin(sn) == 0 || namedBuiltin(namedOrigin(sn)) != BTSlot {
+		if !isNamedT(sn) || namedOrigin(sn) == 0 || namedBuiltin(namedOrigin(sn)) != BTSlot {
 			mreset()
 			ms("cannot use ")
 			mexpr(a0)
@@ -1534,7 +1530,7 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 			useArgs(e, 1, dp-1)
 			return invalidOp(e)
 		}
-		elem := tl1(sn, 0)
+		elem := namedArg(sn, 0)
 		tm := tmark()
 		tpush(elem)
 		ts, tn := tcommitStack(tm)
@@ -1662,28 +1658,27 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		t := x.typ
 		viaPtr := false
 		u := underlying(t)
-		if tk(u) == TCPointer && tk(underlying(elemOf(u))) == TCArray {
+		if isPointerT(u) && isArrayT(underlying(elemOf(u))) {
 			t = elemOf(u)
 			viaPtr = true
 		}
 		u = underlying(t)
-		k := tk(u)
-		if k == TCArray {
-			r := typs.items[usize(u)]
-			if r.b == 0 && !viaPtr && !containsCall(a0, SemaDepth) {
-				return opConst(TyUsize, vIntU(r.n))
+		if isArrayT(u) {
+			alen, lenParam := arrayLenOf(u)
+			if lenParam == 0 && !viaPtr && !containsCall(a0, SemaDepth) {
+				return opConst(TyUsize, vIntU(alen))
 			}
 			return opMode(KValue, TyUsize)
 		}
-		if k == TCSlice {
+		if isSliceT(u) {
 			return opMode(KValue, TyUsize)
 		}
-		if k == TCBasic && isString(u) && b == BFLen {
+		if isBasicT(u) && isString(u) && b == BFLen {
 			if isUntyped(x.typ) {
 				_ = convertUntyped(&x, TyString)
 			}
 			if x.mode == KConst {
-				return opConst(TyUsize, vIntU(u64(x.val.aux)))
+				return opConst(TyUsize, vIntU(u64(len(strOf(x.val)))))
 			}
 			return opMode(KValue, TyUsize)
 		}
@@ -1708,7 +1703,7 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		}
 		du := underlying(d.typ)
 		su := underlying(s.typ)
-		if tk(du) != TCSlice || tk(su) != TCSlice || elemOf(du) != elemOf(su) {
+		if !isSliceT(du) || !isSliceT(su) || elemOf(du) != elemOf(su) {
 			mreset()
 			ms("arguments to copy must be slices with identical element types (have ")
 			mtype(d.typ)
@@ -1811,7 +1806,7 @@ func codeArg(a u32, b u8, dp usize) (Operand, bool) decreases(dp) {
 	if isInvalidOp(&x) {
 		return x, false
 	}
-	if tk(x.typ) != TCCode {
+	if !isCodeT(x.typ) {
 		mreset()
 		ms("cannot use ")
 		mexpr(a)
@@ -1861,10 +1856,7 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 		lvl := codeLevel(el.typ)
 		if n.mode == KConst && el.mode == KConst {
 			ln, _ := valUint64(n.val)
-			v := vCode(CKArray)
-			v.hi = ln
-			v.ref = valStore(el.val)
-			return opConst(mkCode(lvl), v)
+			return opConst(mkCode(lvl), Val.CodeArray(ln, valStore(el.val)))
 		}
 		return opMode(KValue, mkCode(lvl))
 	}
@@ -1875,9 +1867,7 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 		}
 		lvl := codeLevel(el.typ)
 		if el.mode == KConst {
-			v := vCode(CKSlice)
-			v.ref = valStore(el.val)
-			return opConst(mkCode(lvl), v)
+			return opConst(mkCode(lvl), Val.CodeSlice(valStore(el.val)))
 		}
 		return opMode(KValue, mkCode(lvl))
 	}
@@ -1897,12 +1887,7 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 		}
 		fc := univNamed[BTFieldCode]
 		if n.mode == KConst && el.mode == KConst {
-			var f Val
-			f.kind = VFieldCode
-			f.lo = u64(n.val.ref)
-			f.hi = u64(n.val.aux)
-			f.ref = valStore(el.val)
-			return opConst(fc, f)
+			return opConst(fc, fieldCodeOf(n.val, valStore(el.val)))
 		}
 		return opMode(KValue, fc)
 	}
@@ -1928,11 +1913,9 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 			errAt(E2010, a0)
 			return invalidOp(e)
 		}
-		v := vCode(CKUniv)
-		v.hi = lv
-		return opConst(mkCode(int(lv)+1), v)
+		return opConst(mkCode(int(lv)+1), Val.CodeUniv(lv))
 	}
-	return opConst(mkCode(-1), vCode(b-BFCodeEmpty))
+	return opConst(mkCode(-1), Val.CodeBasic(b-BFCodeEmpty))
 }
 
 func conversion(e u32, t u32, ci u32, dp usize) Operand decreases(dp) {
@@ -1972,7 +1955,7 @@ func conversion(e u32, t u32, ci u32, dp usize) Operand decreases(dp) {
 	}
 	if isUntyped(x.typ) {
 		if isInteger(x.typ) && isInteger(t) || isBoolean(x.typ) && isBoolean(t) || isString(x.typ) && isString(t) {
-			if x.val.kind != VNone && !representable(x.val, t) {
+			if x.val != Val.None && !representable(x.val, t) {
 				mreset()
 				ms("cannot convert ")
 				mexpr(a0)
@@ -2003,7 +1986,7 @@ func conversion(e u32, t u32, ci u32, dp usize) Operand decreases(dp) {
 		errAt(E2002, e)
 		return invalidOp(e)
 	}
-	if x.mode == KConst && x.val.kind != VNone {
+	if x.mode == KConst && x.val != Val.None {
 		if isInteger(t) && !representable(x.val, t) {
 			mreset()
 			ms("cannot convert constant ")
@@ -2031,7 +2014,7 @@ func convertible(v u32, t u32) bool {
 	if isInteger(vu) && isInteger(tu) {
 		return true
 	}
-	if tk(vu) == TCPointer && tk(tu) == TCPointer {
+	if isPointerT(vu) && isPointerT(tu) {
 		return underlying(elemOf(vu)) == underlying(elemOf(tu))
 	}
 	return false
@@ -2051,7 +2034,7 @@ func variantCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 	ps := usize(variantPayS(en, vi))
 	pn := variantPayN(en, vi)
 	mark := opStack.top
-	ok := arguments(e, typs.lists[ps:ps+pn], false, Ctx{kind: CtxArgVariant, a: fun.typ, b: variantName(en, vi)}, dp-1)
+	ok := arguments(e, tlistSlice(u32(ps), u32(pn)), false, Ctx{kind: CtxArgVariant, a: fun.typ, b: variantName(en, vi)}, dp-1)
 	if !ok {
 		opStack.top = mark
 		return opMode(KValue, fun.typ)
@@ -2069,9 +2052,7 @@ func variantCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 		slotSet(st+u32(i), opStack.items[mark+i].val)
 	}
 	opStack.top = mark
-	ev := vAgg(VEnum, st, n)
-	ev.lo = u64(vi)
-	return opConst(fun.typ, ev)
+	return opConst(fun.typ, Val.Enum(u32(vi), st, u32(n)))
 }
 
 // funcInstance handles f[T1, ...] for a generic function f.
@@ -2081,7 +2062,7 @@ func funcInstance(e u32, x *Operand, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	sig := x.typ
-	if sig == 0 || tk(sig) != TCSig || sigNTParams(sig) == 0 {
+	if sig == 0 || !isSigT(sig) || sigNTParams(sig) == 0 {
 		mreset()
 		mexpr(na(e))
 		ms(" is not a generic function")
@@ -2103,18 +2084,18 @@ func funcInstance(e u32, x *Operand, dp usize) Operand decreases(dp) {
 	}
 	mark := tmark()
 	for i := usize(0); i < ni; i++ {
-		ta := typeArg(l1at(e, i), tl3(sig, i), dp-1)
+		ta := typeArg(l1at(e, i), sigTParam(sig, i), dp-1)
 		if isInvalid(ta) {
-			typs.top = mark
+			tdiscard(mark)
 			return invalidOp(e)
 		}
 		tpush(ta)
 	}
 	as, an := tcommitStack(mark)
-	args := typs.lists[usize(as) : usize(as)+usize(an)]
-	sr := typs.items[usize(sig)]
-	generic := mkSigLists(sr.sub, sr.flag&1 != 0, sigParamsSlice(sig), sigResultsSlice(sig), emptyU32())
-	inst := subst(generic, sr.l3s, sr.l3n, as, an, SemaDepth)
+	args := tlistSlice(as, an)
+	generic := mkSigLists(sigEffect(sig), sigVariadic(sig), sigParamsSlice(sig), sigResultsSlice(sig), emptyU32())
+	tpS, tpN := sigTParamList(sig)
+	inst := subst(generic, tpS, tpN, as, an, SemaDepth)
 	rec := findInstRec(x.sym, args)
 	if rec == 0 {
 		var ir Inst
