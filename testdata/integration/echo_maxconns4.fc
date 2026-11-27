@@ -1,6 +1,7 @@
 // Backpressure variant: MaxConns = 4.
 // Derived from examples/tcp_echo.fc (spec section 12); only the listen
-// address and the constants noted above differ.
+// address (from the first argument, default 127.0.0.1:0, reported on
+// stdout as `listening on <addr>`) and the constants noted above differ.
 package main
 
 const (
@@ -55,12 +56,23 @@ driver func handleConn(drainCtx Context, hardCtx Context, conn Conn, buf *[BufSi
 	}
 }
 
-driver func main(net Net, sig Signals) error {
-	ln, err := net.ListenTCP("127.0.0.1:18102")
+driver func main(net Net, sig Signals, env Env, io Stdio) error {
+	// The listen address is the first argument (the integration tests pass
+	// 127.0.0.1:0); the bound address is reported on stdout.
+	addr := "127.0.0.1:0"
+	if env.ArgsCount() > 1 {
+		addr = env.Arg(1)
+	}
+	ln, err := net.ListenTCP(addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
+	var line [128]byte
+	n := formatTo(line[:], "listening on %s\n", ln.Addr())
+	if err := io.WriteStdout(line[:n]); err != nil {
+		return err
+	}
 
 	drainCtx, stopSignals := sig.NotifyContext(SIGINT, SIGTERM)
 	defer stopSignals()

@@ -52,9 +52,9 @@ check-corpus: finc0 ## finc0 check on examples, pass tests, std/ and compiler/ (
 
 .PHONY: examples-test tutorial-check
 examples-test: finc1 ## bin/finc1 builds examples/*.fc; runs those with a .out and compares stdout
-	@set -eo pipefail; mkdir -p $(STAGE); for f in examples/*.fc; do o=$${f%.fc}.out; \
-	  $(BIN)/finc1 build -o $(STAGE)/example $$f; \
-	  if [ -f $$o ]; then $(STAGE)/example | cmp -s - $$o || { echo "examples-test: $$f output differs from $$o"; exit 1; }; fi; \
+	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; for f in examples/*.fc; do o=$${f%.fc}.out; \
+	  $(BIN)/finc1 build -o $$d/example $$f; \
+	  if [ -f $$o ]; then $$d/example | cmp -s - $$o || { echo "examples-test: $$f output differs from $$o"; exit 1; }; fi; \
 	done; echo "examples-test: ok"
 
 tutorial-check: finc1 ## complete snippets of docs/tutorial.md compile; shown compiler output matches

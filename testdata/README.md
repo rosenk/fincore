@@ -220,12 +220,19 @@ implementation to be compared with. It is tested by
 ## Integration (`integration/`)
 
 - `echo_*.fc` are copies of `examples/tcp_echo.fc` that change only the listen
-  address (each has a fixed `127.0.0.1:181xx` port) and, where named,
-  `MaxConns = 4` or `DrainHorizon = 300 * Millisecond`.
+  address and, where named, `MaxConns = 4` or `DrainHorizon = 300 * Millisecond`.
+  The address is the program's first argument (default `127.0.0.1:0`,
+  read with `Env`), and the program prints the address it is bound to as
+  `listening on <addr>` on stdout (`Stdio`).
 - `echo_test.go` implements the five E2E tests of spec 13.3. It also has
   `TestBuildExample`, which builds `examples/tcp_echo.fc`. Every test runs once
   for each build mode (`static`, `race`).
 - `harness_test.go` builds `finc0` and the binaries, and manages the server
-  processes. A test fails if a server prints `DATA RACE`.
-- The tests run in sequence because the ports are fixed. Do not use `-parallel`
-  with other runs that use the 18101–18104 ports.
+  processes. `startServer` runs a server with `127.0.0.1:0`, so the kernel
+  picks a free port, and connects to the address the server reports. No
+  test uses a fixed port, so several runs of the suite (for example `make
+  integration` next to `make bootstrap`, or two checkouts) can run at the
+  same time. A test fails if a server prints `DATA RACE`.
+- The tests of one run execute in sequence, which keeps the timing
+  assertions (shutdown within 1 s, ~300 ms drain) away from CPU contention
+  within the run.

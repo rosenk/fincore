@@ -19,17 +19,14 @@ import (
 	"time"
 )
 
-// Variant programs (derived from examples/tcp_echo.fc) and their fixed
-// listen addresses. Keep in sync with the ListenTCP literal in each file.
+// Variant programs (derived from examples/tcp_echo.fc). Each listens on
+// the address given as its first argument and reports the bound address;
+// startServer passes 127.0.0.1:0, so every server gets a free port.
 const (
 	srcBasic     = "testdata/integration/echo_basic.fc"
-	addrBasic    = "127.0.0.1:18101"
 	srcMaxConns4 = "testdata/integration/echo_maxconns4.fc"
-	addrMaxConns = "127.0.0.1:18102"
 	srcGraceful  = "testdata/integration/echo_graceful.fc"
-	addrGraceful = "127.0.0.1:18103"
 	srcDrain300  = "testdata/integration/echo_drain300ms.fc"
-	addrDrain300 = "127.0.0.1:18104"
 )
 
 func dial(t testing.TB, addr string) *net.TCPConn {
@@ -81,7 +78,7 @@ func TestBuildExample(t *testing.T) {
 func TestEchoFunctional(t *testing.T) {
 	forEachMode(t, func(t *testing.T, m buildMode) {
 		bin := buildFC(t, srcBasic, m)
-		srv := startServer(t, bin, addrBasic)
+		srv := startServer(t, bin)
 
 		const clients = 50
 		const maxSize = 256 * 1024
@@ -92,7 +89,7 @@ func TestEchoFunctional(t *testing.T) {
 			wg.Add(1)
 			go func(i, size int) {
 				defer wg.Done()
-				if err := echoStream(addrBasic, i, size); err != nil {
+				if err := echoStream(srv.addr, i, size); err != nil {
 					errs <- fmt.Errorf("client %d (%d bytes): %w", i, size, err)
 				}
 			}(i, size)
@@ -154,18 +151,18 @@ func echoStream(addr string, seed, size int) error {
 func TestEchoBackpressure(t *testing.T) {
 	forEachMode(t, func(t *testing.T, m buildMode) {
 		bin := buildFC(t, srcMaxConns4, m)
-		srv := startServer(t, bin, addrMaxConns)
+		srv := startServer(t, bin)
 
 		var conns [4]*net.TCPConn
 		for i := range conns {
-			conns[i] = dial(t, addrMaxConns)
+			conns[i] = dial(t, srv.addr)
 			defer conns[i].Close()
 			if err := roundTrip(conns[i], []byte(fmt.Sprintf("client-%d", i)), 5*time.Second); err != nil {
 				t.Fatalf("client %d: %v", i, err)
 			}
 		}
 
-		fifth := dial(t, addrMaxConns) // completes in the kernel backlog
+		fifth := dial(t, srv.addr) // completes in the kernel backlog
 		defer fifth.Close()
 		msg := []byte("fifth")
 		if _, err := fifth.Write(msg); err != nil {
@@ -212,9 +209,9 @@ func TestEchoBackpressure(t *testing.T) {
 func TestEchoGracefulShutdown(t *testing.T) {
 	forEachMode(t, func(t *testing.T, m buildMode) {
 		bin := buildFC(t, srcGraceful, m)
-		srv := startServer(t, bin, addrGraceful)
+		srv := startServer(t, bin)
 
-		c := dial(t, addrGraceful)
+		c := dial(t, srv.addr)
 		defer c.Close()
 		if err := roundTrip(c, []byte("before-sigterm"), 5*time.Second); err != nil {
 			t.Fatalf("initial round trip: %v", err)
@@ -266,9 +263,9 @@ func TestEchoGracefulShutdown(t *testing.T) {
 func TestEchoForcedShutdown(t *testing.T) {
 	forEachMode(t, func(t *testing.T, m buildMode) {
 		bin := buildFC(t, srcDrain300, m)
-		srv := startServer(t, bin, addrDrain300)
+		srv := startServer(t, bin)
 
-		c := dial(t, addrDrain300)
+		c := dial(t, srv.addr)
 		defer c.Close()
 		// Make sure the connection is owned by a handler, then go silent.
 		if err := roundTrip(c, []byte("hello"), 5*time.Second); err != nil {
@@ -320,10 +317,10 @@ func TestEchoFDStability(t *testing.T) {
 	}
 	forEachMode(t, func(t *testing.T, m buildMode) {
 		bin := buildFC(t, srcBasic, m)
-		srv := startServer(t, bin, addrBasic)
+		srv := startServer(t, bin)
 
 		short := func(i int) {
-			c := dial(t, addrBasic)
+			c := dial(t, srv.addr)
 			if err := roundTrip(c, []byte(fmt.Sprintf("ping-%03d", i)), 5*time.Second); err != nil {
 				t.Fatalf("connection %d: %v", i, err)
 			}

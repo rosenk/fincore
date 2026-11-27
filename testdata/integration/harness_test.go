@@ -162,8 +162,9 @@ func buildModes() []buildMode {
 	return []buildMode{{"static", false}, {"race", true}}
 }
 
-// forEachMode runs fn as a subtest per build mode, sequentially (variants
-// listen on fixed ports, so two servers of one variant must not overlap).
+// forEachMode runs fn as a subtest per build mode, sequentially (the
+// servers listen on ports the kernel picks, so this is not needed for port
+// isolation, but it keeps the timing tests free of CPU contention).
 func forEachMode(t *testing.T, fn func(t *testing.T, m buildMode)) {
 	for _, m := range buildModes() {
 		t.Run(m.name, func(t *testing.T) { fn(t, m) })
@@ -235,18 +236,18 @@ type server struct {
 	err    error
 }
 
-func startServer(t testing.TB, bin, addr string) *server {
-	t.Helper()
-	// Refuse to start if a stale process still owns the port: we would be
-	// testing the wrong server.
-	if ln, err := net.Listen("tcp", addr); err != nil {
-		t.Fatalf("port %s is busy before starting the server: %v", addr, err)
-	} else {
-		_ = ln.Close()
-	}
+// listenPrefix starts the line in which an echo program reports the
+// address it is bound to.
+const listenPrefix = "listening on "
 
-	s := &server{t: t, addr: addr, output: &syncBuffer{}, done: make(chan struct{})}
-	s.cmd = exec.Command(bin)
+// startServer runs bin with the listen address 127.0.0.1:0, so the kernel
+// picks a free port (concurrent runs of the suite never collide), and waits
+// for the program to report its bound address (`listening on <addr>` on
+// stdout) and to accept a connection there. The address is s.addr.
+func startServer(t testing.TB, bin string) *server {
+	t.Helper()
+	s := &server{t: t, output: &syncBuffer{}, done: make(chan struct{})}
+	s.cmd = exec.Command(bin, "127.0.0.1:0")
 	s.cmd.Stdout = s.output
 	s.cmd.Stderr = s.output
 	if err := s.cmd.Start(); err != nil {
@@ -272,10 +273,15 @@ func startServer(t testing.TB, bin, addr string) *server {
 
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
-		if err == nil {
-			_ = c.Close()
-			return s
+		if s.addr == "" {
+			s.addr = reportedAddr(s.output.String())
+		}
+		if s.addr != "" {
+			c, err := net.DialTimeout("tcp", s.addr, 200*time.Millisecond)
+			if err == nil {
+				_ = c.Close()
+				return s
+			}
 		}
 		select {
 		case <-s.done:
@@ -283,9 +289,24 @@ func startServer(t testing.TB, bin, addr string) *server {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("server did not listen on %s within 15s; output:\n%s", addr, s.output.String())
+			t.Fatalf("server did not listen within 15s (reported address %q); output:\n%s", s.addr, s.output.String())
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// reportedAddr returns the address of the first complete
+// `listening on <addr>` line of out, or "".
+func reportedAddr(out string) string {
+	for {
+		line, rest, ok := strings.Cut(out, "\n")
+		if !ok {
+			return ""
+		}
+		if a, found := strings.CutPrefix(line, listenPrefix); found {
+			return strings.TrimSpace(a)
+		}
+		out = rest
 	}
 }
 
