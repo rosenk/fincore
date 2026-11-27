@@ -1,0 +1,130 @@
+// SINCE: v0.3
+// pass_variant_multi (v0.3, decision 149): a variant constructor whose
+// only argument supplies all payload values, like a call f(g()): a
+// multi-result call `Shape.Rect(pair())`, a multi-value match
+// `Shape.Rect(match ...)`, a folded comptime call `Shape.Rect(cpair())`,
+// on a generic enum, in an if header, nested in a match arm, at comptime.
+// Both v0.2 compilers accepted `Shape.Rect(pair())` in the checker but
+// emitted Go that did not compile. Also: a folded comptime call as a
+// multi-value match arm.
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+type Two[T any] enum {
+	None
+	Both(T, T)
+}
+
+type Mixed enum {
+	Flag(bool)
+	Tri(u64, bool, u8)
+}
+
+func pair(n u32) (u32, u32) {
+	return n, n + 1
+}
+
+func tri(n u64) (u64, bool, u8) {
+	return n * 2, n > 1, u8(n)
+}
+
+comptime func cpair() (u32, u32) {
+	return 5, 6
+}
+
+func area(s Shape) u32 {
+	match s {
+		Shape.Rect(w, h) -> {
+			return w * h
+		}
+		Shape.Circle(r) -> {
+			return 3 * r * r
+		}
+		Shape.Empty -> {
+			return 0
+		}
+	}
+}
+
+func sumTwo(t Two[u32]) u32 {
+	match t {
+		Both(a, b) -> {
+			return a + b
+		}
+		_ -> {
+			return 0
+		}
+	}
+}
+
+func mixed(m Mixed) u64 {
+	match m {
+		Mixed.Tri(a, true, c) -> {
+			return a + u64(c)
+		}
+		Mixed.Tri(a, false, _) -> {
+			return a
+		}
+		Mixed.Flag(_) -> {
+			return 1
+		}
+	}
+}
+
+// pick: a multi-value match as the constructor argument; untyped values
+// take the payload types, other arms are multi-result calls, nested
+// multi-value matches and folded comptime calls.
+func pick(k u32) Shape {
+	return Shape.Rect(match k {
+		0 -> 1, 2
+		1 -> pair(10)
+		2 -> cpair()
+		_ -> match k {
+			3 -> 7, 8
+			_ -> pair(k)
+		}
+	})
+}
+
+// split: a folded comptime call as an arm of a multi-value match.
+func split(k u32) (u32, u32) {
+	return match k {
+		0 -> cpair()
+		_ -> pair(k)
+	}
+}
+
+comptime func ctArea(k u32) u32 {
+	s := Shape.Rect(cpair())
+	t := Shape.Rect(match k {
+		0 -> 1, 2
+		_ -> cpair()
+	})
+	return area(s)*100 + area(t)
+}
+
+const CtArea = ctArea(0)
+
+driver func main(io Stdio) error {
+	a := Shape.Rect(pair(3))
+	b := Two[u32].Both(pair(20))
+	c := Shape.Rect(cpair())
+	d := Mixed.Tri(tri(4))
+	e := Mixed.Tri(tri(1))
+	n := u32(0)
+	if area(Shape.Rect(pair(2))) == 6 {
+		n = 1
+	}
+	x, y := split(0)
+	z, w := split(9)
+	var out [256]byte
+	m := formatTo(out[:], "%d %d %d %d %d %d\n", area(a), sumTwo(b), area(c), mixed(d), mixed(e), n)
+	m += formatTo(out[m:], "%d %d %d %d %d\n", area(pick(0)), area(pick(1)), area(pick(2)), area(pick(3)), area(pick(4)))
+	m += formatTo(out[m:], "%d %d %d %d %d\n", x, y, z, w, CtArea)
+	return io.WriteStdout(out[:m])
+}

@@ -708,6 +708,11 @@ func cgVariantCall(e u32, t u32, vi usize, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
+	n := l1len(e)
+	if n == 1 && trec(ntype[usize(l1at(e, 0))]) is Tuple(..) {
+		cgVariantSpread(e, t, vi, dp-1)
+		return
+	}
 	lay := cgLayout(e, t, dp-1)
 	p := cgWmark()
 	cgWc('{')
@@ -715,7 +720,6 @@ func cgVariantCall(e u32, t u32, vi usize, dp usize) decreases(dp) {
 		cgW("_tag: ")
 		cgWu(u64(vi))
 	}
-	n := l1len(e)
 	for i := usize(0); i < n; i++ {
 		if vi != 0 || i > 0 {
 			cgW(", ")
@@ -730,6 +734,85 @@ func cgVariantCall(e u32, t u32, vi usize, dp usize) decreases(dp) {
 	cgWrotate(p, q)
 	cgComposite(p)
 	cgLayRelease(lay)
+}
+
+// cgVariantSpread writes a variant construction whose only argument
+// supplies all payload values at once: a multi-result call or a v0.3
+// multi-value match, `T.V(g())` (decision 149). Like a call `f(g())` it
+// becomes a Go call that spreads the values over parameters,
+//
+//	func(_fc_v0 T0, _fc_v1 T1) T { return T{_tag: vi, slot0: _fc_v0, slot1: _fc_v1} }(g())
+//
+// and a folded comptime call `T.V(c())` writes its constant values into
+// the slots directly.
+func cgVariantSpread(e u32, t u32, vi usize, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	a0 := l1at(e, 0)
+	ts := u32(0)
+	tn := usize(0)
+	if trec(ntype[usize(a0)]) is Tuple(s, k) {
+		ts = s
+		tn = usize(k)
+	}
+	cs := cgConstValueSlot(a0)
+	folded := cs != 0 && slotGet(cs) is Tuple(..)
+	ref := u32(0)
+	if folded && slotGet(cs) is Tuple(r, nv) {
+		ref = r
+		if usize(nv) != tn {
+			cgFail(e, "malformed multi-value constant")
+			return
+		}
+	}
+	saveHeader := cgHeader
+	if !folded {
+		cgHeader = 0
+		cgW("func(")
+		for i := usize(0); i < tn; i++ {
+			if i > 0 {
+				cgW(", ")
+			}
+			cgWf(formatTo(mbuf[:], "_fc_v%d ", i))
+			cgGoType(e, tlist(ts, i), dp-1)
+		}
+		cgW(") ")
+		cgGoType(e, t, dp-1)
+		cgW(" { return ")
+	}
+	lay := cgLayout(e, t, dp-1)
+	p := cgWmark()
+	cgWc('{')
+	if vi != 0 {
+		cgW("_tag: ")
+		cgWu(u64(vi))
+	}
+	for i := usize(0); i < tn; i++ {
+		if vi != 0 || i > 0 {
+			cgW(", ")
+		}
+		cgWSlot(lay, vi, i)
+		cgW(": ")
+		if folded {
+			cgValue(a0, slotGet(ref+u32(i)), tlist(ts, i), dp-1)
+		} else {
+			cgWf(formatTo(mbuf[:], "_fc_v%d", i))
+		}
+	}
+	cgWc('}')
+	q := cgWmark()
+	cgGoType(e, t, dp-1)
+	cgWrotate(p, q)
+	cgLayRelease(lay)
+	if folded {
+		cgComposite(p)
+		return
+	}
+	cgW(" }(")
+	cgExpr(a0, dp-1)
+	cgWc(')')
+	cgHeader = saveHeader
 }
 
 func cgBuiltinMethod(e u32, b u8, m u32, recv u32, dp usize) decreases(dp) {

@@ -47,6 +47,13 @@ in [docs/v0_3.md](docs/v0_3.md), decisions 140–157 in
   totality checker.
 - Fixed: a string constant pattern on a `[]byte` scrutinee was accepted
   by the v0.2 checker but produced Go that did not compile.
+- Fixed: a variant constructor whose only argument has several values,
+  `Shape.Rect(pair())` (accepted by the v0.2 checker, but its Go did not
+  compile) or `Shape.Rect(match ...)`, is lowered like a call `f(g())`
+  (decision 153). A folded comptime multi-result call as a variant
+  argument or as a multi-value match arm (`Shape.Rect(cpair())`,
+  `0 -> cpair()`) no longer stops the code generator with `multi-value
+  constant in single-value context`.
 - `ErrReported` (decision 156): a predeclared sentinel error meaning "the
   failure has already been reported". A driver `main` returning it exits
   with status 1 without printing; any other error still prints
