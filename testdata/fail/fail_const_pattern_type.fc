@@ -1,0 +1,23 @@
+// fail_const_pattern_type (v0.2): a constant in a pattern position is
+// compared with ==, so its type must be assignable to the type of the
+// position (here the u8 payload of Builtin).
+package main
+
+type Call enum {
+	Builtin(u8, u32)
+	User(u32)
+}
+
+const Name = "panic"
+
+func f(c Call) u32 {
+	return match c {
+		Builtin(Name, n) -> n // ERROR E2002
+		_ -> 0
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(Call.User(1))
+	return nil
+}

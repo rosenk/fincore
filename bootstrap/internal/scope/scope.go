@@ -716,6 +716,11 @@ func (w *walker) patternBindings(p ast.Pattern, x ast.Expr) {
 			w.flow(w.define(p), x)
 		}
 	case *ast.CtorPattern:
+		if p.Qual == nil && !p.HasParens {
+			// v0.2: a bare name at the top level or in a tuple element
+			// (a binding, or a variant or constant without a definition).
+			w.flow(w.define(p.Name), x)
+		}
 		for _, a := range p.Args {
 			w.patternBindings(a, x)
 		}

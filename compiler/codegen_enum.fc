@@ -592,6 +592,12 @@ func cgFlatMatch(m u32) bool {
 			if ak != NkCtorPattern {
 				return false
 			}
+			// v0.2: a top-level binding (or a bare variant whose name is
+			// read as a binding) needs the if chain.
+			bsym := patBindSym(alt)
+			if bsym != 0 && (nvarEnum[usize(alt)] == 0 || cgSymUsed(bsym)) {
+				return false
+			}
 			nargs := l1len(alt)
 			for j := usize(0); j < nargs; j++ {
 				b := l1at(alt, j)
@@ -602,7 +608,7 @@ func cgFlatMatch(m u32) bool {
 				if bk != NkIdent {
 					return false
 				}
-				if nvarEnum[usize(b)] != 0 || (isOr && !isBlank(b)) {
+				if nvarEnum[usize(b)] != 0 || patConst(b) != 0 || (isOr && !isBlank(b)) {
 					return false
 				}
 			}
@@ -745,6 +751,13 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 			cgWPath(s)
 			cgW("._tag == ")
 			cgWu(u64(nvarIdx[usize(p)]))
+		} else {
+			cs := patConst(p)
+			if cs != 0 {
+				cgWPath(s)
+				cgW(" == ")
+				cgValue(p, slotGet(cs), cgSubT[s], dp-1)
+			}
 		}
 		return false
 	}
@@ -752,14 +765,13 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 		t := cgSubT[s]
 		en := nvarEnum[usize(p)]
 		if en == 0 {
+			cs := patConst(p)
+			if cs == 0 {
+				return false // a binding
+			}
 			cgWPath(s)
 			cgW(" == ")
-			v := nval[usize(nb(p))]
-			if v == 0 {
-				cgFail(p, BadPattern)
-				return false
-			}
-			cgValue(p, slotGet(v), t, dp-1)
+			cgValue(p, slotGet(cs), t, dp-1)
 			return false
 		}
 		vi := usize(nvarIdx[usize(p)])
@@ -842,6 +854,10 @@ func cgPatBindings(p u32, t u32, s usize, sn usize, region u32, dp usize) decrea
 			cgBindPush(sym, t)
 		}
 	} else if k == NkCtorPattern {
+		bsym := patBindSym(p)
+		if bsym != 0 && cgBindUsed(bsym, region) {
+			cgBindPush(bsym, t)
+		}
 		en := nvarEnum[usize(p)]
 		if en == 0 {
 			return
@@ -938,6 +954,17 @@ func cgEmitBinds(p u32, s usize, sn usize, x u32, region u32, assign bool, dp us
 			cgWc('\n')
 		}
 	} else if k == NkCtorPattern {
+		bsym := patBindSym(p)
+		if bsym != 0 && cgBindUsed(bsym, region) {
+			cgWSymName(bsym)
+			if assign {
+				cgW(" = ")
+			} else {
+				cgW(" := ")
+			}
+			cgWPath(s)
+			cgWc('\n')
+		}
 		en := nvarEnum[usize(p)]
 		if en == 0 {
 			return
@@ -1208,7 +1235,7 @@ func cgSingleTest(p u32) bool {
 		if bk == NkRestPattern {
 			continue
 		}
-		if bk != NkIdent || nvarEnum[usize(b)] != 0 {
+		if bk != NkIdent || nvarEnum[usize(b)] != 0 || patConst(b) != 0 {
 			return false
 		}
 	}

@@ -468,7 +468,7 @@ type Val enum {
 func f(v Val) bool {
 	return v is Int(a, _) && a > 0
 }
-`, nil}, // v0.2 flow bindings (decision 110)
+`, nil}, // v0.2 flow bindings (decision 118)
 		{"is binding never used", `package main
 type Shape enum {
 	Circle(u32)

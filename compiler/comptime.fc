@@ -797,18 +797,32 @@ func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
 		if nvarEnum[usize(p)] != 0 {
 			return isVariant(x, nvarIdx[usize(p)])
 		}
+		cs := patConst(p)
+		if cs != 0 {
+			return valsEqual(x, slotGet(cs))
+		}
 		if !isBlank(p) && defs[usize(p)] != 0 {
 			define(defs[usize(p)], x)
 		}
 		return true
 	}
 	if k == NkCtorPattern {
+		bsym := patBindSym(p)
 		if nvarEnum[usize(p)] == 0 {
-			s := nval[usize(nb(p))]
-			return s != 0 && valsEqual(x, slotGet(s))
+			cs := patConst(p)
+			if cs != 0 {
+				return valsEqual(x, slotGet(cs))
+			}
+			if bsym != 0 {
+				define(bsym, x) // v0.2: a top-level or tuple-element binding
+			}
+			return true
 		}
 		if !isVariant(x, nvarIdx[usize(p)]) {
 			return false
+		}
+		if bsym != 0 {
+			define(bsym, x)
 		}
 		np := variantPayN(nvarEnum[usize(p)], usize(nvarIdx[usize(p)]))
 		c := l1len(p)

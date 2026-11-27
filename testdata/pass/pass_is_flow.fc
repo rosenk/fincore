@@ -3,7 +3,9 @@
 // guards), || with false-outcome bindings, if/else outcomes, let-else
 // (return, continue, break, panic, exhaustive match; with ||, over a
 // negated && chain and inside loops), for conditions (three-clause and while form), ! and parentheses,
-// shadowing, is in match expression arms, and comptime.
+// shadowing, is in match expression arms, constant patterns (a let-else
+// over a constant payload, a top-level binding, tuple-element bindings
+// with && guards) and comptime.
 package main
 
 type Option[T any] enum {
@@ -218,6 +220,40 @@ func fallThrough(v Val) u32 {
 	return n
 }
 
+// Constant patterns combined with flow bindings: constants in an `is`
+// pattern compare (let-else over a constant payload), a top-level binding
+// in `is`, and tuple-element bindings whose guards use && chains.
+const BPanic = 61
+const Limit u32 = 5
+
+type Call enum {
+	Builtin(u32, u32)
+	User(u32)
+}
+
+func panicArgs(c Call) u32 {
+	if !(c is Builtin(BPanic, n)) {
+		return 0
+	}
+	return n
+}
+
+func atLimit(o Option[u32]) bool {
+	return o is Some(Limit) || o is None
+}
+
+func bigSum(a u32, b u32) bool {
+	return a+b is s && s > 10
+}
+
+func tupleGuard(a u32, b u32, o Option[u32]) u32 {
+	return match (a, b) {
+		(x, 0) | (0, x) if o is Some(k) && k > x -> k - x
+		(x, y) if !(o is Some(k)) || k == 0 -> x + y
+		_ -> 1000
+	}
+}
+
 // while-form for condition in a driver loop.
 driver func countDown(start Option[u32]) u32 {
 	cur := start
@@ -354,6 +390,19 @@ driver func main(io Stdio) error {
 		return err
 	}
 	if err := line(io, "fallThrough", u64(fallThrough(Val.Int(0, 1))*10+fallThrough(Val.Bool(true)))); err != nil {
+		return err
+	}
+	if err := line(io, "panicArgs", u64(panicArgs(Call.Builtin(61, 2))*100+panicArgs(Call.Builtin(60, 2))*10+panicArgs(Call.User(61)))); err != nil {
+		return err
+	}
+	if err := flag(io, "atLimit", atLimit(Option[u32].Some(5)) && atLimit(Option[u32].None) && !atLimit(Option[u32].Some(4))); err != nil {
+		return err
+	}
+	if err := flag(io, "bigSum", bigSum(6, 5) && !bigSum(5, 5)); err != nil {
+		return err
+	}
+	var tg u64 = u64(tupleGuard(3, 0, Option[u32].Some(10)))*1000000 + u64(tupleGuard(0, 3, Option[u32].Some(2)))*1000
+	if err := line(io, "tupleGuard", tg+u64(tupleGuard(4, 5, Option[u32].None))); err != nil {
 		return err
 	}
 	if err := line(io, "countDown", u64(countDown(Option[u32].Some(4)))); err != nil {

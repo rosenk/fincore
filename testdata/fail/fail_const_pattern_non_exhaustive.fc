@@ -1,0 +1,26 @@
+// fail_const_pattern_non_exhaustive (v0.2): a constant of enum type counts
+// as its variant and a bool constant as its value; together they do not
+// cover the scrutinee.
+package main
+
+type Color enum {
+	Red
+	Green
+	Blue
+}
+
+const Default = Color.Red
+const On = true
+
+func f(c Color, b bool) u32 {
+	return match (c, b) { // ERROR E2012
+		(Default, On) -> 1
+		(Default, false) -> 2
+		(Green, _) -> 3
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(Color.Red, true)
+	return nil
+}

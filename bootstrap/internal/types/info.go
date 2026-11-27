@@ -125,6 +125,58 @@ func (in *Info) ValueOf(n ast.Node) Value {
 	return nil
 }
 
+// BareName returns the identifier of a bare pattern name: a payload
+// *ast.Ident or an unqualified *ast.CtorPattern without parentheses (a
+// variant, constant or binding; v0.2), else nil.
+func BareName(p ast.Pattern) *ast.Ident {
+	switch p := p.(type) {
+	case *ast.Ident:
+		return p
+	case *ast.CtorPattern:
+		if p.Qual == nil && !p.HasParens {
+			return p.Name
+		}
+	}
+	return nil
+}
+
+// PatBinding returns the symbol bound by a bare pattern name (see
+// BareName) and its identifier, or nil. A bare variant name may be bound
+// too (to the value, which is that variant); constants never are.
+func (in *Info) PatBinding(p ast.Pattern) (*resolve.Symbol, *ast.Ident) {
+	id := BareName(p)
+	if id == nil || id.Name == "_" {
+		return nil, nil
+	}
+	if n := int(id.ID()); n < len(in.Prog.Defs) && in.Prog.Defs[n] != nil {
+		return in.Prog.Defs[n], id
+	}
+	return nil, nil
+}
+
+// IsBindingPat reports whether p is a binding that matches every value: a
+// bare name that is neither a variant nor a constant (checked patterns).
+func (in *Info) IsBindingPat(p ast.Pattern) bool {
+	sym, _ := in.PatBinding(p)
+	return sym != nil && in.VariantAt(p) == nil
+}
+
+// PatConst returns the value of a checked constant pattern that is not an
+// enum variant (a bare or qualified constant name), else nil. Constants of
+// enum type count as their variant (VariantAt).
+func (in *Info) PatConst(p ast.Pattern) Value {
+	if in.VariantAt(p) != nil {
+		return nil
+	}
+	switch p := p.(type) {
+	case *ast.Ident:
+		return in.ValueOf(p)
+	case *ast.CtorPattern:
+		return in.ValueOf(p.Name)
+	}
+	return nil
+}
+
 // IsImplicitBytes reports whether e is a constant string expression that is
 // implicitly converted to a fresh []byte (see Info.ImplicitBytes).
 func (in *Info) IsImplicitBytes(n ast.Node) bool {

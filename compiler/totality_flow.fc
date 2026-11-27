@@ -948,6 +948,9 @@ func killPattern(p u32, st u32, depth usize) decreases(depth) {
 	if k == NkIdent {
 		kill(symbolOf(p), st)
 	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
+		if k == NkCtorPattern && na(p) == 0 && !nflag(p) {
+			killPattern(nb(p), st, depth-1) // v0.2: top-level/tuple binding
+		}
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
 			killPattern(l1at(p, i), st, depth-1)

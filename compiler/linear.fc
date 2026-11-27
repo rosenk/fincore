@@ -582,6 +582,9 @@ func lnCollectVars(fl u32, n u32, dp usize) decreases(dp) {
 	} else if k == NkVarDecl {
 		lnCollectId(fl, na(n))
 	} else if k == NkCtorPattern {
+		if na(n) == 0 && !nflag(n) {
+			lnCollectId(fl, nb(n)) // v0.2: top-level/tuple binding
+		}
 		m := l1len(n)
 		for i := usize(0); i < m; i++ {
 			if nkind(l1at(n, i)) == NkIdent {
@@ -957,6 +960,9 @@ func lnBorrowBindings(fl u32, p u32, a u32, depth usize) decreases(depth) {
 			}
 		}
 	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
+		if k == NkCtorPattern && na(p) == 0 && !nflag(p) {
+			lnBorrowBindings(fl, nb(p), a, depth-1) // v0.2: top-level/tuple binding
+		}
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
 			lnBorrowBindings(fl, l1at(p, i), a, depth-1)

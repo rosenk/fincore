@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// v0.2 flow-scoped `is` bindings (decisions 110-117): outcome sets, the
+// v0.2 flow-scoped `is` bindings (decisions 118-125): outcome sets, the
 // positions where bindings are visible, let-else and the errors. These
 // sources are also diffcheck snippets (finc0 vs finc1).
 func TestIsFlowBindings(t *testing.T) {

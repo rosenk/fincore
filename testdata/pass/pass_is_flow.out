@@ -20,5 +20,9 @@ armIs: true
 nested: 127
 unused: true
 fallThrough: 12
+panicArgs: 200
+atLimit: true
+bigSum: true
+tupleGuard: 8000009
 countDown: 10
 comptime: 100001105

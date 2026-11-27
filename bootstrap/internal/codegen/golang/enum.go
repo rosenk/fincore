@@ -264,11 +264,16 @@ func (f *fnCtx) flatMatch(x ast.Expr, arms []*ast.MatchArm) bool {
 			switch p := alt.(type) {
 			case *ast.WildcardPattern, *ast.LiteralPattern:
 			case *ast.CtorPattern:
+				// v0.2: a top-level binding (or a bare variant whose
+				// name is read as a binding) needs the if chain.
+				if sym, _ := f.g.info.PatBinding(p); sym != nil && (f.g.info.VariantOf(p) == nil || f.g.p.Used(sym)) {
+					return false
+				}
 				for _, arg := range p.Args {
 					switch b := arg.(type) {
 					case *ast.RestPattern:
 					case *ast.Ident:
-						if f.g.info.VariantAt(b) != nil || (isOr && b.Name != "_") {
+						if f.g.info.VariantAt(b) != nil || f.g.info.PatConst(b) != nil || (isOr && b.Name != "_") {
 							return false
 						}
 					default:
@@ -420,11 +425,17 @@ func (f *fnCtx) patTest(p ast.Pattern, s subject) (cond string, compound bool) {
 		if v := f.g.info.VariantAt(p); v != nil {
 			return s.paths[0] + "._tag == " + strconv.Itoa(v.Index), false
 		}
+		if cv := f.g.info.PatConst(p); cv != nil {
+			return s.paths[0] + " == " + f.g.value(p, cv, s.types[0], f.env), false
+		}
 	case *ast.CtorPattern:
 		t := s.types[0]
 		v := f.g.info.VariantOf(p)
 		if v == nil {
-			return s.paths[0] + " == " + f.g.value(p, f.g.info.ValueOf(p.Name), t, f.env), false
+			if cv := f.g.info.PatConst(p); cv != nil {
+				return s.paths[0] + " == " + f.g.value(p, cv, t, f.env), false
+			}
+			return "", false // a binding
 		}
 		parts := []string{s.paths[0] + "._tag == " + strconv.Itoa(v.Index)}
 		lay := f.g.enumLayout(p, t, f.env)
@@ -467,6 +478,9 @@ func (f *fnCtx) patBindings(p ast.Pattern, t types.Type, region ast.Node, out *[
 			*out = append(*out, patBinding{sym: sym, name: f.g.p.Name(sym), typ: t})
 		}
 	case *ast.CtorPattern:
+		if sym, _ := f.g.info.PatBinding(p); sym != nil && f.bindUsed(sym, region) {
+			*out = append(*out, patBinding{sym: sym, name: f.g.p.Name(sym), typ: t})
+		}
 		v := f.g.info.VariantOf(p)
 		if v == nil {
 			return
@@ -529,6 +543,13 @@ func (f *fnCtx) emitBinds(p ast.Pattern, s subject, region ast.Node, assign bool
 			f.line("%s %s %s", f.g.p.Name(sym), op, s.paths[0])
 		}
 	case *ast.CtorPattern:
+		if sym, _ := f.g.info.PatBinding(p); sym != nil && f.bindUsed(sym, region) {
+			op := ":="
+			if assign {
+				op = "="
+			}
+			f.line("%s %s %s", f.g.p.Name(sym), op, s.paths[0])
+		}
 		v := f.g.info.VariantOf(p)
 		if v == nil {
 			return
@@ -722,7 +743,7 @@ func (f *fnCtx) singleTest(p ast.Pattern) bool {
 			switch b := a.(type) {
 			case *ast.RestPattern:
 			case *ast.Ident:
-				if f.g.info.VariantAt(b) != nil {
+				if f.g.info.VariantAt(b) != nil || f.g.info.PatConst(b) != nil {
 					return false
 				}
 			default:
