@@ -3,7 +3,7 @@
 Each `## vX.Y.Z` section is the release notes of that tag (the release
 workflow publishes it; docs/release.md).
 
-## Unreleased (v0.3)
+## v0.3.0
 
 Language v0.3, implemented only in the self-hosted compiler (`compiler/`,
 `finc version` prints `language v0.3`); finc0 stays frozen at v0.2. Details
