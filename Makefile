@@ -114,6 +114,10 @@ diff-prev-fuzz: finc1 seed ## diff-prev plus 20 random mutants per corpus file a
 	$(GO) run ./scripts/diffprev -mutate 20 -seed $(FUZZ_SEED)
 # --- end diff-prev
 
+.PHONY: spec-check
+spec-check: finc1 ## finc1 check on every complete FinCore program of the v0.2 spec
+	$(GO) run ./scripts/speccheck -finc $(BIN)/finc1 fincore_language_specification_v0_2.md
+
 finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3.go
 	@mkdir -p $(STAGE)
 	$(BIN)/finc1 build --emit-go=$(STAGE)/stage2.go -o $(BIN)/finc2 ./compiler

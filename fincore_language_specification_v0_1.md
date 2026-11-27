@@ -1,3 +1,5 @@
+> **Историческа версия:** заменена от [`fincore_language_specification_v0_2.md`](fincore_language_specification_v0_2.md) — основната спецификация на FinCore.
+
 # FinCore — Техническа спецификация на езика, Go бекенда и самохостващия бутстрап компилатор (v0.1)
 
 **Статус:** Изпълнима спецификация за имплементация (Draft v0.1 — Self-Hosting Go Backend Edition)

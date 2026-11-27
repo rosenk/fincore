@@ -12,7 +12,7 @@ files (spec 9.5.6); there are no local imports.
 | `diag.fc` | Diagnostic codes and the `file:line:col: error[E####]: msg` header; UTF-8 decoding and Go-compatible quoting (`strconv.Quote`, `%q`, `%c`) |
 | `lexer.fc` | Token kinds, keyword lookup, total lexer with semicolon insertion, literal/escape validation, E1001/E1002 messages |
 | `ast.fc` | Node kinds, the per-kind slot `layout`, post-order NodeID assignment, the `--dump-ast` dumper and the source printer |
-| `parser.fc` | Recursive-descent parser for the full grammar of spec section 3 |
+| `parser.fc` | Recursive-descent parser for the full grammar of spec section 3 (fincore_language_specification_v0_2.md) |
 | `sema.fc` | Semantic data model: interned names, symbols, scopes and the (scope, name) symbol table, packages, u32 lists and list cells, per-node resolver tables, the sorted diagnostic list, AST accessors |
 | `resolve.fc` | Port of `resolve`: universe (predeclared entities), package declarations, binder (defs/uses/captures, E2001/E2002) |
 | `types.fc` | Typed model: hash-consed `TypeArena`, predicates, type strings, value classes, builtin named types and capability methods, `FuncInfo`/`Call`/`Selection`/`Inst` records, per-node type tables, instantiation and substitution |

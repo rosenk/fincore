@@ -46,6 +46,8 @@ jobs:
         run: make diff-build
       - name: bootstrap fixed point (finc0 → finc-seed → finc1 → finc2 → finc3)
         run: make bootstrap
+      - name: spec examples (finc1 check on the programs of the v0.2 spec)
+        run: make spec-check
       - name: current compiler vs previous release (seed) regression
         run: make diff-prev
       - name: integration

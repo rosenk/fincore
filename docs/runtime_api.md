@@ -2,7 +2,7 @@
 
 Authoritative source: runtime/fincrt/*.go (see doc.go for FinCore→Go name mapping).
 
-Key deviations from the spec:
+Key deviations from the v0.1 spec (all folded into section 8 of [fincore_language_specification_v0_2.md](../fincore_language_specification_v0_2.md)):
 - `NewScope(maxTasks uint) *Scope` (pointer). Generated: `conns := fincrt.NewScope(N)` + `defer conns.Wait()`.
 - `fincrt.AcquireSlot(conns, ctx, pool[:])`, `fincrt.ReleaseSlot(conns, slot)`, `fincrt.Go(conns, slot, func(buf *T){...})`.
 - `Context.DoneChan()` returns `(<-chan struct{}, stop func())`.

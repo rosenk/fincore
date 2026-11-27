@@ -18,7 +18,7 @@ In practice this means:
 - **Structured concurrency only.** There is no free `go f()`.
 - **Every non-`driver` loop and recursion must be proven to terminate.** This uses rules T1–T3 plus `decreases(...)`.
 
-The full specification (in Bulgarian) is [`fincore_language_specification_v0_1.md`](fincore_language_specification_v0_1.md).
+The full specification (in Bulgarian) is [`fincore_language_specification_v0_2.md`](fincore_language_specification_v0_2.md): the consolidated language v0.2, self-contained (it folds in every decision of `docs/semantics_decisions.md` and `docs/v0_2.md`). Its complete examples are checked by `make spec-check`. The v0.1 specification is kept for history.
 
 ## Example
 
@@ -122,6 +122,7 @@ make check-corpus
 make integration
 make seed       # .stage/finc-seed: finc0 builds compiler/ at the bootstrap/SEED tag
 make bootstrap  # finc0 → finc-seed → finc1 → finc2 → finc3, fixed-point gate
+make spec-check # finc1 check on every complete example of the v0.2 spec
 make help       # all targets
 
 bin/finc0 parse --dump-ast examples/tcp_echo.fc
@@ -130,6 +131,7 @@ bin/finc0 check examples/tcp_echo.fc
 
 ## Design notes
 
+- [`fincore_language_specification_v0_2.md`](fincore_language_specification_v0_2.md) is the main reference; the documents below are the detailed record it was consolidated from.
 - [`docs/semantics_decisions.md`](docs/semantics_decisions.md) lists every place where the spec was ambiguous and how it was resolved. The compilers and tests follow it.
 - [`docs/runtime_api.md`](docs/runtime_api.md) describes the `fincrt` API that generated code targets.
 - [`docs/stdlib.md`](docs/stdlib.md) is the reference for the `std/` packages (`import "std/maps"`; resolved against `$FINCROOT` when set, else the module root).
