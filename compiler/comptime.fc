@@ -27,6 +27,8 @@ const (
 	CtlBreak      = 1
 	CtlContinue   = 2
 	CtlReturn     = 3
+	CtEval        = "comptime evaluation " // prefix of comptime diagnostics
+	NotStruct     = "field access on non-struct value"
 )
 
 type Frame struct {
@@ -64,9 +66,8 @@ var ifailMsg OutBuf
 func failf(code u32, k usize) {
 	ifail = true
 	ifailCode = code
-	o := &ifailMsg
-	o.Reset()
-	o.Extend(formatTo(o.Spare(), "comptime evaluation failed: %s", mbuf[:k]))
+	ifailMsg.Reset()
+	ifailMsg.Extend(formatTo(ifailMsg.Spare(), CtEval+"failed: %s", mbuf[:k]))
 }
 
 func failS(code u32, s string) {
@@ -75,14 +76,14 @@ func failS(code u32, s string) {
 
 // failErr reports the value error in errTxt.
 func failErr(code u32) {
-	failf(code, formatTo(mbuf[:], "%s", (&errTxt).Bytes()))
+	failf(code, formatTo(mbuf[:], "%s", errTxt.Bytes()))
 }
 
 // failSilent is a failure that was already reported (EvalError{}).
 func failSilent() {
 	ifail = true
 	ifailCode = 0
-	(&ifailMsg).Reset()
+	ifailMsg.Reset()
 }
 
 // CallStack renders the call stack above frame `base`, innermost first,
@@ -133,9 +134,8 @@ func tick() {
 	if inFuel == 0 {
 		ifail = true
 		ifailCode = E4001
-		o := &ifailMsg
-		o.Reset()
-		o.Extend(formatTo(o.Spare(), "comptime evaluation ran out of fuel (budget %d steps); %v", inBudget, CallStack(inBase)))
+		ifailMsg.Reset()
+		ifailMsg.Extend(formatTo(ifailMsg.Spare(), CtEval+"ran out of fuel (budget %d steps); %v", inBudget, CallStack(inBase)))
 		return
 	}
 	inFuel--
@@ -276,9 +276,8 @@ func icall(fn u32, recv Val, hasRecv bool, as usize, ae usize, site u32, dp usiz
 	if nframes-inBase >= CtMaxDepth || nframes >= MaxFrames {
 		ifail = true
 		ifailCode = E4001
-		o := &ifailMsg
-		o.Reset()
-		o.Extend(formatTo(o.Spare(), "comptime evaluation exceeded the maximum call depth (%d); %v", CtMaxDepth, CallStack(inBase)))
+		ifailMsg.Reset()
+		ifailMsg.Extend(formatTo(ifailMsg.Spare(), CtEval+"exceeded the maximum call depth (%d); %v", CtMaxDepth, CallStack(inBase)))
 		return z
 	}
 	vbase := nfv
@@ -370,14 +369,13 @@ func evalList(s u32, n usize, dp usize) decreases(dp) {
 		if ifail {
 			return
 		}
-		ref, nt := tupleOf(v)
-		if usize(nt) != n {
-			failf(E2002, formatTo(mbuf[:], "expected %d values", n))
+		if v is Tuple(ref, nt) && usize(nt) == n {
+			for i := usize(0); i < n; i++ {
+				vpush(slotGet(ref + u32(i)))
+			}
 			return
 		}
-		for i := usize(0); i < n; i++ {
-			vpush(slotGet(ref + u32(i)))
-		}
+		failf(E2002, formatTo(mbuf[:], "expected %d values", n))
 		return
 	}
 	for i := usize(0); i < ne2; i++ {
@@ -390,19 +388,7 @@ func evalList(s u32, n usize, dp usize) decreases(dp) {
 }
 
 func asgBinOp(op u8) u8 {
-	if op == AsgAdd {
-		return OpAdd
-	}
-	if op == AsgSub {
-		return OpSub
-	}
-	if op == AsgMul {
-		return OpMul
-	}
-	if op == AsgQuo {
-		return OpDiv
-	}
-	return OpAdd
+	return match op { AsgSub -> OpSub, AsgMul -> OpMul, AsgQuo -> OpDiv, _ -> OpAdd }
 }
 
 func istmt(s u32, dp usize) u8 decreases(dp) {
@@ -682,12 +668,11 @@ func icond(e u32, dp usize) bool decreases(dp) {
 	if ifail {
 		return false
 	}
-	b, ok := boolOf(v)
-	if !ok {
-		failS(E2002, "non-boolean condition")
-		return false
+	if v is Bool(b) {
+		return b
 	}
-	return b
+	failS(E2002, "non-boolean condition")
+	return false
 }
 
 func iequal(a Val, b Val) bool {
@@ -861,17 +846,16 @@ func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
 		return false
 	}
 	if k == NkTuplePattern {
-		ref, tn := tupleOf(x)
 		c := l1len(p)
-		if usize(tn) != c {
-			return false
-		}
-		for i := usize(0); i < c; i++ {
-			if !imatchPat(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
-				return false
+		if x is Tuple(ref, tn) && usize(tn) == c {
+			for i := usize(0); i < c; i++ {
+				if !imatchPat(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
+					return false
+				}
 			}
+			return true
 		}
-		return true
+		return false
 	}
 	return false
 }
@@ -897,13 +881,8 @@ func izero(t u32) Val {
 // Expressions
 
 func iderefSlot(v Val) u32 {
-	match v {
-		Ptr(r) -> {
-			if r != 0 {
-				return r
-			}
-		}
-		_ -> {}
+	if v is Ptr(r) && r != 0 {
+		return r
 	}
 	failS(E2002, "nil pointer dereference")
 	return 0
@@ -949,25 +928,22 @@ func failIndexRange(i usize, n usize) {
 // indexRef returns the slot of element i of an array or slice value.
 func indexRef(x Val, i usize) u32 {
 	match x {
-		Array(ref, n) -> {
-			if i >= usize(n) {
-				failIndexRange(i, usize(n))
-				return 0
-			}
-			return ref + u32(i)
-		}
-		Slice(_, _, _, _) | NilSlice -> {
-			ref, n := sliceElems(x)
-			if i >= usize(n) {
-				failIndexRange(i, usize(n))
-				return 0
-			}
-			return ref + u32(i)
-		}
+		Array(ref, n) -> return elemRef(ref, usize(n), i)
+		Slice(ref, lo, hi, _) -> return elemRef(ref+lo, usize(hi-lo), i)
+		NilSlice -> return elemRef(0, 0, i)
 		_ -> {}
 	}
 	failf(E2002, formatTo(mbuf[:], "cannot index value %v", ValRef(x)))
 	return 0
+}
+
+// elemRef returns the slot of element i of the n elements at ref.
+func elemRef(ref u32, n usize, i usize) u32 {
+	if i >= n {
+		failIndexRange(i, n)
+		return 0
+	}
+	return ref + u32(i)
 }
 
 func ieval(e u32, dp usize) Val decreases(dp) {
@@ -1095,7 +1071,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		if isPtrVal(x) {
+		if x is Ptr(_) {
 			r := iderefSlot(x)
 			if ifail {
 				return z
@@ -1106,13 +1082,12 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 			}
 			return slotGet(s)
 		}
-		if isStrVal(x) {
-			sb := strOf(x)
-			if i >= len(sb) {
-				failIndexRange(i, len(sb))
+		if x is Str(off, n) {
+			if i >= usize(n) {
+				failIndexRange(i, usize(n))
 				return z
 			}
-			return vIntU(u64(sb[i]))
+			return vIntU(u64(strSpan(off, n)[i]))
 		}
 		s := indexRef(x, i)
 		if ifail {
@@ -1136,18 +1111,18 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		if isPtrVal(x) {
+		if x is Ptr(_) {
 			r := iderefSlot(x)
 			if ifail {
 				return z
 			}
 			x = slotGet(r)
 		}
-		if !isStructVal(x) {
-			failS(E2002, "field access on non-struct value")
-			return z
+		if x is Struct(ref, _) {
+			return slotGet(ref + selTab.items[usize(sel)].index)
 		}
-		return slotGet(fieldSlot(x, selTab.items[usize(sel)].index))
+		failS(E2002, NotStruct)
+		return z
 	}
 	if k == NkStructLit {
 		t := ntype[usize(e)]
@@ -1155,7 +1130,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		if !isStructVal(sv) {
+		if !(sv is Struct(..)) {
 			failS(E2002, "invalid struct literal")
 			return z
 		}
@@ -1231,7 +1206,7 @@ func ilvalue(e u32, dp usize) u32 decreases(dp) {
 		if ifail {
 			return 0
 		}
-		if isPtrVal(v) {
+		if v is Ptr(_) {
 			r := iderefSlot(v)
 			if ifail {
 				return 0
@@ -1283,11 +1258,11 @@ func ilvalue(e u32, dp usize) u32 decreases(dp) {
 			}
 			base = slotGet(r)
 		}
-		if !isStructVal(base) {
-			failS(E2002, "field access on non-struct value")
-			return 0
+		if base is Struct(ref, _) {
+			return ref + selTab.items[usize(sel)].index
 		}
-		return fieldSlot(base, selTab.items[usize(sel)].index)
+		failS(E2002, NotStruct)
+		return 0
 	}
 	if k == NkUnaryExpr && nop(e) == OpDeref {
 		v := ieval(na(e), dp-1)
@@ -1325,7 +1300,7 @@ func islice(e u32, dp usize) Val decreases(dp) {
 	if ifail {
 		return z
 	}
-	if isPtrVal(x) {
+	if x is Ptr(_) {
 		r := iderefSlot(x)
 		if ifail {
 			return z
@@ -1414,9 +1389,10 @@ func iargs(e u32, dp usize) decreases(dp) {
 			if ifail {
 				return
 			}
-			ref, m := tupleOf(v)
-			for i := u32(0); i < m; i++ {
-				vpush(slotGet(ref + i))
+			if v is Tuple(ref, m) {
+				for i := u32(0); i < m; i++ {
+					vpush(slotGet(ref + i))
+				}
 			}
 			return
 		}
@@ -1431,28 +1407,16 @@ func iargs(e u32, dp usize) decreases(dp) {
 }
 
 func callKindString(k u8) string {
-	if k == CallFunc {
-		return "func"
+	return match k {
+		CallFunc -> "func"
+		CallMethod -> "method"
+		CallBuiltinMeth -> "builtin-method"
+		CallBuiltin -> "builtin"
+		CallConversion -> "conversion"
+		CallVariant -> "variant"
+		CallValue -> "value"
+		_ -> "invalid"
 	}
-	if k == CallMethod {
-		return "method"
-	}
-	if k == CallBuiltinMeth {
-		return "builtin-method"
-	}
-	if k == CallBuiltin {
-		return "builtin"
-	}
-	if k == CallConversion {
-		return "conversion"
-	}
-	if k == CallVariant {
-		return "variant"
-	}
-	if k == CallValue {
-		return "value"
-	}
-	return "invalid"
 }
 
 func icallExpr(e u32, dp usize) Val decreases(dp) {
@@ -1496,7 +1460,7 @@ func icallExpr(e u32, dp usize) Val decreases(dp) {
 			return z
 		}
 		ptr := isPointerT(c.recvType) && meths.items[usize(c.method)].ptrRecv
-		if !ptr && isPtrVal(recv) {
+		if !ptr && recv is Ptr(_) {
 			r := iderefSlot(recv)
 			if ifail {
 				return z
@@ -1548,11 +1512,10 @@ func bytesOfSlice(v Val) bool {
 		failS(E2002, "expected a byte slice")
 		return false
 	}
-	t := &tmpBuf
-	t.Reset()
+	tmpBuf.Reset()
 	ref, n := sliceElems(v)
 	for i := u32(0); i < n; i++ {
-		t.WriteByte(byte(intLo(slotGet(ref + i))))
+		tmpBuf.WriteByte(byte(intLo(slotGet(ref + i))))
 	}
 	return true
 }
@@ -1608,7 +1571,7 @@ func ibuiltin0(b u8, m usize) Val {
 	var z Val
 	if b == BFLen || b == BFCap {
 		x := vstack[m]
-		if isPtrVal(x) {
+		if x is Ptr(_) {
 			r := iderefSlot(x)
 			if ifail {
 				return z
@@ -1616,21 +1579,10 @@ func ibuiltin0(b u8, m usize) Val {
 			x = slotGet(r)
 		}
 		match x {
-			Str(_, n) -> {
-				return vIntU(u64(n))
-			}
-			Array(_, n) -> {
-				return vIntU(u64(n))
-			}
-			Slice(_, lo, hi, alen) -> {
-				if b == BFCap {
-					return vIntU(alen - u64(lo))
-				}
-				return vIntU(u64(hi - lo))
-			}
-			NilSlice -> {
-				return vIntU(0)
-			}
+			Str(_, n) | Array(_, n) -> return vIntU(u64(n))
+			Slice(_, lo, _, alen) if b == BFCap -> return vIntU(alen - u64(lo))
+			Slice(_, lo, hi, _) -> return vIntU(u64(hi - lo))
+			NilSlice -> return vIntU(0)
 			_ -> {}
 		}
 	} else if b == BFCopy {
@@ -1676,7 +1628,7 @@ func ibuiltin0(b u8, m usize) Val {
 		if !bytesOfSlice(vstack[m]) {
 			return z
 		}
-		return vStr((&tmpBuf).Bytes())
+		return vStr(tmpBuf.Bytes())
 	} else if b == BFFormatUint {
 		v := vstack[m]
 		vh, vl, _ := intParts(v)
@@ -1696,7 +1648,7 @@ func ibuiltin0(b u8, m usize) Val {
 		if !bytesOfSlice(vstack[m]) {
 			return z
 		}
-		v, okp := strconv.ParseUint((&tmpBuf).Bytes(), 10)
+		v, okp := strconv.ParseUint(tmpBuf.Bytes(), 10)
 		if !okp {
 			return tuple2(vIntU(0), vErr(BCErrParse))
 		}
@@ -1732,13 +1684,11 @@ func ibuiltin0(b u8, m usize) Val {
 		st := valAlloc(usize(n), true)
 		for i := u32(0); i < n; i++ {
 			f := slotGet(sref + i)
-			match f {
-				FieldCode(_, _, _) -> slotSet(st+i, f)
-				_ -> {
-					failS(E2002, "CodeStruct: zero FieldCode element")
-					return z
-				}
+			if !(f is FieldCode(..)) {
+				failS(E2002, "CodeStruct: zero FieldCode element")
+				return z
 			}
+			slotSet(st+i, f)
 		}
 		return Val.CodeStruct(st, n)
 	} else if b == BFCodeUniv {

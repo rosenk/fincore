@@ -44,6 +44,14 @@ const (
 	FeZero       = 5
 )
 
+// Shared message texts.
+const (
+	BadFormat = "invalid format for formatTo: "
+	BadArg    = "cannot use %v (type %v) as argument for %%"
+	NoFmtInfo = "formatTo without format information"
+	NoFmtOp   = "formatTo argument without a format operation"
+)
+
 type FmtDir struct {
 	kind  u8
 	err   u8
@@ -141,16 +149,13 @@ func fmtNext(s []byte, i usize) FmtDir {
 // returns its length.
 func fmtErrMsg(s []byte, d FmtDir) usize {
 	dir := Quoted(s[d.start:d.end])
-	if d.err == FeIncomplete {
-		return formatTo(mbuf[:], "invalid format for formatTo: incomplete directive %v at the end of the format", dir)
-	} else if d.err == FeUnknown {
-		return formatTo(mbuf[:], "invalid format for formatTo: unknown verb in directive %v", dir)
-	} else if d.err == FePercent {
-		return formatTo(mbuf[:], "invalid format for formatTo: directive %v cannot have flags or a width", dir)
-	} else if d.err == FeWidth {
-		return formatTo(mbuf[:], "invalid format for formatTo: width in directive %v exceeds 64", dir)
+	return match d.err {
+		FeIncomplete -> formatTo(mbuf[:], BadFormat+"incomplete directive %v at the end of the format", dir)
+		FeUnknown -> formatTo(mbuf[:], BadFormat+"unknown verb in directive %v", dir)
+		FePercent -> formatTo(mbuf[:], BadFormat+"directive %v cannot have flags or a width", dir)
+		FeWidth -> formatTo(mbuf[:], BadFormat+"width in directive %v exceeds 64", dir)
+		_ -> formatTo(mbuf[:], BadFormat+"flag 0 in directive %v is only valid with %%d and %%x", dir)
 	}
-	return formatTo(mbuf[:], "invalid format for formatTo: flag 0 in directive %v is only valid with %%d and %%x", dir)
 }
 
 // fmtCount validates s and returns its number of directives; on a
@@ -179,10 +184,10 @@ func fmtCount(s []byte, at u32) (usize, bool) {
 // fmtFormatString returns the constant format of a checked formatTo call.
 func fmtFormatString(e u32) []byte {
 	s := nval[usize(l1at(e, 1))]
-	if s == 0 || !isStrVal(slotGet(s)) {
-		return emptyBytes()
+	if slotGet(s) is Str(off, n) {
+		return strSpan(off, n)
 	}
-	return strOf(slotGet(s))
+	return emptyBytes()
 }
 
 func fmtArgOp(c u32, k usize) u8 {
@@ -211,8 +216,7 @@ func fmtIntOp(t u32, hex bool) u8 {
 
 // isByteSliceT: t's underlying type is []u8.
 func isByteSliceT(t u32) bool {
-	u := underlying(t)
-	return isSliceT(u) && elemOf(u) == TyU8
+	return trec(underlying(t)) == TypeRec.Slice(TyU8)
 }
 
 // formatMethodOK: m is a value-receiver, total `Format(dst []byte) usize`.
@@ -320,7 +324,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 	}
 	opStack.top = mark
 	if !ok {
-		(&ulists).Discard(um)
+		ulists.Discard(um)
 		return opMode(KValue, TyUsize)
 	}
 	fs, fn := ucommit(um)
@@ -364,7 +368,7 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 			m := lookupMethod(t, internStr("Format"), dp-1)
 			if m != 0 {
 				if !formatMethodOK(m) {
-					errAt(E2002, a, formatTo(mbuf[:], "cannot use %v (type %v) as argument for %%v in formatTo: method %v.Format must be a total value-receiver method func(dst []byte) usize", Expr(a), TypeRef(t), TypeRef(t)))
+					errAt(E2002, a, formatTo(mbuf[:], BadArg+"v in formatTo: method %v.Format must be a total value-receiver method func(dst []byte) usize", Expr(a), TypeRef(t), TypeRef(t)))
 					return FmtNone, 0
 				}
 				return FmtFormat, m
@@ -381,7 +385,7 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 		}
 	}
 	if op == FmtNone {
-		errAt(E2002, a, formatTo(mbuf[:], "cannot use %v (type %v) as argument for %%%c in formatTo", Expr(a), TypeRef(t), v))
+		errAt(E2002, a, formatTo(mbuf[:], BadArg+"%c in formatTo", Expr(a), TypeRef(t), v))
 		return FmtNone, 0
 	}
 	return op, 0
@@ -455,7 +459,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 	n := l1len(e)
 	ci := callTab.items[usize(c)]
 	if !ci.fmtOK || n < 2 || usize(ci.fmtN) != 2*(n-2) {
-		cgFail(e, "formatTo without format information")
+		cgFail(e, NoFmtInfo)
 		return
 	}
 	nargs := n - 2
@@ -490,7 +494,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 			continue
 		}
 		if p.kind != FdVerb || k >= nargs {
-			cgFail(e, "formatTo without format information")
+			cgFail(e, NoFmtInfo)
 			return
 		}
 		op := fmtArgOp(c, k)
@@ -518,7 +522,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 		} else if op == FmtFormat {
 			cgW("Advance(")
 		} else {
-			cgFail(e, "formatTo argument without a format operation")
+			cgFail(e, NoFmtOp)
 			return
 		}
 		cgW("_fc_a")
@@ -743,7 +747,7 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 	c := ncall[usize(e)]
 	n := vtop - m
 	if c == 0 || !callTab.items[usize(c)].fmtOK || n < 2 || usize(callTab.items[usize(c)].fmtN) != 2*(n-2) {
-		failS(E2002, "formatTo without format information")
+		failS(E2002, NoFmtInfo)
 		return z
 	}
 	d := vstack[m]
@@ -789,7 +793,7 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 			continue
 		}
 		if p.kind != FdVerb || 2+k >= n {
-			failS(E2002, "formatTo without format information")
+			failS(E2002, NoFmtInfo)
 			break
 		}
 		tick()
@@ -821,9 +825,9 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 				break
 			}
 			if op == FmtBytes {
-				cfBytes((&tmpBuf).Bytes(), width)
+				cfBytes(tmpBuf.Bytes(), width)
 			} else {
-				cfQuote((&tmpBuf).Bytes(), width)
+				cfQuote(tmpBuf.Bytes(), width)
 			}
 		} else if op == FmtByte {
 			cfPadLeft(1, width)
@@ -831,9 +835,9 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 			cfPadRight(1, width)
 		} else if op == FmtBool {
 			if v == Val.Bool(true) {
-				cfBytes(strBytes("true"), width)
+				cfBytes("true", width)
 			} else {
-				cfBytes(strBytes("false"), width)
+				cfBytes("false", width)
 			}
 		} else if op == FmtFormat {
 			am := vtop
@@ -846,7 +850,7 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 			rn, _ := valUint64(r)
 			cfAdvance(rn, width)
 		} else {
-			failS(E2002, "formatTo argument without a format operation")
+			failS(E2002, NoFmtOp)
 			break
 		}
 	}

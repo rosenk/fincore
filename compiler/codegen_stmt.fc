@@ -276,7 +276,7 @@ func cgRhs(s u32, ret bool, nl usize, dp usize) decreases(dp) {
 	if n == 1 && nl > 1 {
 		r0 := cgRhsItem(s, ret, 0)
 		cs := cgConstValueSlot(r0)
-		if cs != 0 && isTupleVal(slotGet(cs)) {
+		if cs != 0 && slotGet(cs) is Tuple(..) {
 			cgTupleValues(r0, slotGet(cs), dp-1)
 			return
 		}
@@ -327,8 +327,7 @@ func cgCountScopes() usize {
 }
 
 func cgStashStr(s string) {
-	o := &cgStash
-	o.WriteString(s)
+	cgStash.WriteString(s)
 }
 
 func cgReturnStmt(s u32, dp usize) decreases(dp) {
@@ -352,11 +351,11 @@ func cgReturnStmt(s u32, dp usize) decreases(dp) {
 		return
 	}
 	// Evaluate the results inside the scope, then wait, then return.
-	smark := (&cgStash).Len()
+	smark := cgStash.Len()
 	if nres == 1 && nw > 1 {
 		r0 := l1at(s, 0)
 		cs := cgConstValueSlot(r0)
-		if cs != 0 && isTupleVal(slotGet(cs)) {
+		if cs != 0 && slotGet(cs) is Tuple(..) {
 			p := cgWmark()
 			cgTupleValues(r0, slotGet(cs), dp-1)
 			cgStashCut(p)
@@ -414,9 +413,9 @@ func cgReturnStmt(s u32, dp usize) decreases(dp) {
 	}
 	_ = cgWaitScopes()
 	cgW("return ")
-	cgStashEmit(smark, (&cgStash).Len())
+	cgStashEmit(smark, cgStash.Len())
 	cgWc('\n')
-	(&cgStash).Truncate(smark)
+	cgStash.Truncate(smark)
 }
 
 func cgIfStmt(s u32, dp usize) decreases(dp) {

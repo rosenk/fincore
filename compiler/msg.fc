@@ -18,16 +18,15 @@ var fmtBuf OutBuf
 
 // fmtOut copies the scratch text into dst.
 func fmtOut(dst []byte) usize {
-	return copy(dst, (&fmtBuf).Bytes())
+	return copy(dst, fmtBuf.Bytes())
 }
 
 // TypeRef renders a type (types.TypeString).
 type TypeRef u32
 
 func (t TypeRef) Format(dst []byte) usize {
-	o := &fmtBuf
-	o.Reset()
-	putType(o, u32(t), SemaDepth)
+	fmtBuf.Reset()
+	putType(&fmtBuf, u32(t), SemaDepth)
 	return fmtOut(dst)
 }
 
@@ -35,9 +34,8 @@ func (t TypeRef) Format(dst []byte) usize {
 type ValRef Val
 
 func (v ValRef) Format(dst []byte) usize {
-	o := &fmtBuf
-	o.Reset()
-	putVal(o, Val(v), SemaDepth)
+	fmtBuf.Reset()
+	putVal(&fmtBuf, Val(v), SemaDepth)
 	return fmtOut(dst)
 }
 
@@ -45,11 +43,10 @@ func (v ValRef) Format(dst []byte) usize {
 type Expr u32
 
 func (e Expr) Format(dst []byte) usize {
-	o := &fmtBuf
-	o.Reset()
-	writeExpr(o, u32(e), SemaDepth)
-	if o.Len() > 60 {
-		return formatTo(dst, "%s...", o.Bytes()[:57])
+	fmtBuf.Reset()
+	writeExpr(&fmtBuf, u32(e), SemaDepth)
+	if fmtBuf.Len() > 60 {
+		return formatTo(dst, "%s...", fmtBuf.Bytes()[:57])
 	}
 	return fmtOut(dst)
 }
@@ -66,9 +63,8 @@ func (n NameRef) Format(dst []byte) usize {
 type Quoted []byte
 
 func (q Quoted) Format(dst []byte) usize {
-	o := &fmtBuf
-	o.Reset()
-	putQuoted(o, q)
+	fmtBuf.Reset()
+	putQuoted(&fmtBuf, q)
 	return fmtOut(dst)
 }
 

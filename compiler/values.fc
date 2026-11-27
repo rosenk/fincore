@@ -82,9 +82,8 @@ var errTxt OutBuf
 // etf sets errTxt to the first k bytes of mbuf:
 // etf(formatTo(mbuf[:], "...", ...)).
 func etf(k usize) {
-	o := &errTxt
-	o.Reset()
-	o.WriteBytes(mbuf[:k])
+	errTxt.Reset()
+	errTxt.WriteBytes(mbuf[:k])
 }
 
 // valAlloc reserves n zeroed slots in the heap or persistent region and
@@ -424,68 +423,41 @@ func cmp128(ah u64, al u64, bh u64, bl u64) int {
 // 0, 0 for IntOvf and non-integers).
 func intParts(v Val) (u64, u64, bool) {
 	match v {
-		Int(hi, lo) -> {
-			return hi, lo, true
-		}
-		_ -> {
-			return 0, 0, false
-		}
+		Int(hi, lo) -> return hi, lo, true
+		_ -> return 0, 0, false
 	}
 }
 
 func isIntVal(v Val) bool {
-	return match v { Int(_, _) | IntOvf -> true, _ -> false }
-}
-
-func isBoolVal(v Val) bool {
-	return match v { Bool(_) -> true, _ -> false }
+	return v is Int(..) | IntOvf
 }
 
 // intLo returns the low 64 bits of an exact integer value (0 for other
 // values).
 func intLo(v Val) u64 {
-	_, lo, _ := intParts(v)
-	return lo
+	return match v { Int(_, lo) -> lo, _ -> 0 }
 }
 
 // sliceElems returns the first element slot and the length of a slice
 // value ((0, 0) for nil slices and other values).
 func sliceElems(v Val) (u32, u32) {
-	match v {
-		Slice(ref, lo, hi, _) -> {
-			return ref + lo, hi - lo
-		}
-		_ -> {
-			return 0, 0
-		}
+	if v is Slice(ref, lo, hi, _) {
+		return ref + lo, hi - lo
 	}
+	return 0, 0
 }
 
 func isSliceVal(v Val) bool {
-	return match v { Slice(_, _, _, _) | NilSlice -> true, _ -> false }
-}
-
-func isPtrVal(v Val) bool {
-	return match v { Ptr(_) -> true, _ -> false }
-}
-
-func isStructVal(v Val) bool {
-	return match v { Struct(_, _) -> true, _ -> false }
-}
-
-func isStrVal(v Val) bool {
-	return match v { Str(_, _) -> true, _ -> false }
+	return v is Slice(..) | NilSlice
 }
 
 func intSign(v Val) int {
-	hi, lo, _ := intParts(v)
-	if isNeg128(hi) {
-		return -1
+	return match v {
+		Int(hi, _) if isNeg128(hi) -> -1
+		Int(0, 0) | IntOvf -> 0
+		Int(..) -> 1
+		_ -> 0
 	}
-	if hi == 0 && lo == 0 {
-		return 0
-	}
-	return 1
 }
 
 // putInt128 writes the decimal form of an integer value.
@@ -564,9 +536,9 @@ func inRange(v Val, bits u32, signed bool) bool {
 // representable reports whether constant v fits type t.
 func representable(v Val, t u32) bool {
 	return match v {
-		Int(_, _) | IntOvf -> intRepresentable(v, t)
+		Int(..) | IntOvf -> intRepresentable(v, t)
 		Bool(_) -> isBoolean(t)
-		Str(_, _) -> isString(t)
+		Str(..) -> isString(t)
 		_ -> true
 	}
 }
@@ -588,7 +560,7 @@ func wrapVal(v Val, t u32) Val {
 	if !ok || inRange(v, bits, signed) {
 		return v
 	}
-	_, lo, _ := intParts(v)
+	lo := intLo(v)
 	if bits < 64 {
 		lo = lo & ((u64(1) << u64(bits)) - 1)
 	}
@@ -604,11 +576,10 @@ func wrapVal(v Val, t u32) Val {
 
 // valUint64 returns v as a u64 if it is a non-negative integer that fits.
 func valUint64(v Val) (u64, bool) {
-	hi, lo, ok := intParts(v)
-	if !ok || hi != 0 {
-		return 0, false
+	if v is Int(0, lo) {
+		return lo, true
 	}
-	return lo, true
+	return 0, false
 }
 
 // ---------------------------------------------------------------------------
@@ -620,45 +591,24 @@ func putVal(o *OutBuf, v Val, depth usize) decreases(depth) {
 	}
 	match v {
 		None -> {}
-		Int(_, _) | IntOvf -> putInt128(o, v)
-		Bool(b) -> {
-			if b {
-				o.WriteString("true")
-			} else {
-				o.WriteString("false")
-			}
-		}
+		Int(..) | IntOvf -> putInt128(o, v)
+		Bool(true) -> o.WriteString("true")
+		Bool(false) -> o.WriteString("false")
 		Str(off, n) -> putQuoted(o, strSpan(off, n))
-		Err(b) -> {
-			if b == 0 {
-				o.WriteString("nil")
-			} else {
-				o.WriteString(builtinName(b))
-			}
-		}
-		Nil -> o.WriteString("nil")
+		Err(0) | Nil -> o.WriteString("nil")
+		Err(b) -> o.WriteString(builtinName(b))
 		Array(ref, n) -> putElems(o, ref, usize(n), depth-1)
 		Slice(ref, lo, hi, _) -> putElems(o, ref+lo, usize(hi-lo), depth-1)
 		NilSlice -> o.WriteString("[]")
-		Struct(ref, n) -> {
-			o.WriteByte('{')
-			putValList(o, ref, usize(n), depth-1)
-			o.WriteByte('}')
-		}
+		Struct(ref, n) -> putValList(o, "{", ref, n, "}", depth-1)
 		Enum(vi, ref, n) -> {
 			o.WriteString("variant#")
 			o.WriteUint(u64(vi))
 			if n > 0 {
-				o.WriteByte('(')
-				putValList(o, ref, usize(n), depth-1)
-				o.WriteByte(')')
+				putValList(o, "(", ref, n, ")", depth-1)
 			}
 		}
-		Tuple(ref, n) -> {
-			o.WriteByte('(')
-			putValList(o, ref, usize(n), depth-1)
-			o.WriteByte(')')
-		}
+		Tuple(ref, n) -> putValList(o, "(", ref, n, ")", depth-1)
 		CodeBasic(k) -> {
 			o.WriteString(codeKindName(k))
 			o.WriteString("()")
@@ -675,11 +625,7 @@ func putVal(o *OutBuf, v Val, depth usize) decreases(depth) {
 			putVal(o, slotGet(el), depth-1)
 			o.WriteByte(')')
 		}
-		CodeStruct(ref, n) -> {
-			o.WriteString("CodeStruct(")
-			putValList(o, ref, usize(n), depth-1)
-			o.WriteByte(')')
-		}
+		CodeStruct(ref, n) -> putValList(o, "CodeStruct(", ref, n, ")", depth-1)
 		CodeUniv(l) -> {
 			o.WriteString("CodeUniv(")
 			o.WriteUint(l)
@@ -703,16 +649,19 @@ func putVal(o *OutBuf, v Val, depth usize) decreases(depth) {
 	}
 }
 
-func putValList(o *OutBuf, ref u32, n usize, depth usize) decreases(depth) {
+// putValList writes open, the n values at ref separated by ", ", and close.
+func putValList(o *OutBuf, open string, ref u32, n u32, close string, depth usize) decreases(depth) {
 	if depth == 0 {
 		return
 	}
-	for i := usize(0); i < n; i++ {
+	o.WriteString(open)
+	for i := u32(0); i < n; i++ {
 		if i > 0 {
 			o.WriteString(", ")
 		}
-		putVal(o, slotGet(ref+u32(i)), depth-1)
+		putVal(o, slotGet(ref+i), depth-1)
 	}
+	o.WriteString(close)
 }
 
 func putElems(o *OutBuf, ref u32, n usize, depth usize) decreases(depth) {
@@ -799,7 +748,7 @@ func persistVal(v Val, depth usize) Val decreases(depth) {
 		return v
 	}
 	return match v {
-		None | Bool(_) | Err(_) | Nil | Str(_, _) | Int(_, _) | IntOvf | NilSlice | CodeBasic(_) | CodeUniv(_) -> v
+		None | Bool(_) | Err(_) | Nil | Str(..) | Int(..) | IntOvf | NilSlice | CodeBasic(_) | CodeUniv(_) -> v
 		Array(ref, n) -> Val.Array(copyRun(ref, n, false, depth-1), n)
 		Struct(ref, n) -> Val.Struct(copyRun(ref, n, false, depth-1), n)
 		Enum(vi, ref, n) -> Val.Enum(vi, copyRun(ref, n, false, depth-1), n)
@@ -859,9 +808,7 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 				return vErr(0), true
 			}
 		}
-		Code(_) -> {
-			return Val.CodeBasic(CKEmpty), true
-		}
+		Code(_) -> return Val.CodeBasic(CKEmpty), true
 		Array(elem, lenParam, alen) -> {
 			if lenParam != 0 {
 				etf(formatTo(mbuf[:], "array with generic length"))
@@ -883,10 +830,8 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 			}
 			return Val.Array(st, u32(n)), true
 		}
-		Slice(_) -> {
-			return Val.NilSlice, true
-		}
-		Struct(_, _) -> {
+		Slice(_) -> return Val.NilSlice, true
+		Struct(..) -> {
 			n := nfields(u)
 			st := valAlloc(n, heap)
 			for i := usize(0); i < n; i++ {
@@ -898,7 +843,7 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 			}
 			return Val.Struct(st, u32(n)), true
 		}
-		Enum(_, _) -> {
+		Enum(..) -> {
 			if nvariants(u) == 0 {
 				return Val.Enum(0, 0, 0), true
 			}
@@ -913,7 +858,7 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 			}
 			return Val.Enum(0, st, u32(n)), true
 		}
-		NoType | Sig(_, _, _, _, _, _, _, _) | Named(_) | Pointer(_) | TypeParam(_, _, _, _) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {}
+		NoType | Sig(..) | Named(_) | Pointer(_) | TypeParam(..) | ConstArg(_) | Tuple(..) | Opaque(..) -> {}
 	}
 	if builtinOf(t) == BTFieldCode {
 		c := valAlloc(1, heap)
@@ -951,12 +896,8 @@ func isCompareOp(op u8) bool {
 // boolOf returns the truth value of a Bool (ok == false for other values).
 func boolOf(v Val) (bool, bool) {
 	match v {
-		Bool(b) -> {
-			return b, true
-		}
-		_ -> {
-			return false, false
-		}
+		Bool(b) -> return b, true
+		_ -> return false, false
 	}
 }
 
@@ -966,18 +907,16 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 		return compareVals(op, x, y)
 	}
 	if op == OpLAnd || op == OpLOr {
-		a, aok := boolOf(x)
-		b, bok := boolOf(y)
-		if !aok || !bok {
-			etf(formatTo(mbuf[:], "non-boolean operands"))
-			return z, false
+		if x is Bool(a) && y is Bool(b) {
+			if op == OpLAnd {
+				return vBool(a && b), true
+			}
+			return vBool(a || b), true
 		}
-		if op == OpLAnd {
-			return vBool(a && b), true
-		}
-		return vBool(a || b), true
+		etf(formatTo(mbuf[:], "non-boolean operands"))
+		return z, false
 	}
-	if op == OpAdd && isStrVal(x) && isStrVal(y) {
+	if op == OpAdd && x is Str(..) && y is Str(..) {
 		return strConcat(x, y), true // constant string concatenation (v0.2)
 	}
 	if !isIntVal(x) || !isIntVal(y) {
@@ -1074,34 +1013,23 @@ func compareVals(op u8, x Val, y Val) (Val, bool) {
 		return vBool(eq == (op == OpEq)), true
 	}
 	c := 0
-	if isIntVal(x) {
-		if !isIntVal(y) {
+	match (x, y) {
+		(Int(..) | IntOvf, Int(..) | IntOvf) -> {
+			xh, xl, _ := intParts(x)
+			yh, yl, _ := intParts(y)
+			c = cmp128(xh, xl, yh, yl)
+		}
+		(Str(..), Str(..)) -> c = bytes.Compare(strOf(x), strOf(y))
+		(Int(..) | IntOvf | Str(..), _) -> {
 			etf(formatTo(mbuf[:], "mismatched operands"))
 			return z, false
 		}
-		xh, xl, _ := intParts(x)
-		yh, yl, _ := intParts(y)
-		c = cmp128(xh, xl, yh, yl)
-	} else if isStrVal(x) {
-		if !isStrVal(y) {
-			etf(formatTo(mbuf[:], "mismatched operands"))
+		_ -> {
+			opNotDefined(op, x, y, false)
 			return z, false
 		}
-		c = bytes.Compare(strOf(x), strOf(y))
-	} else {
-		opNotDefined(op, x, y, false)
-		return z, false
 	}
-	if op == OpLt {
-		return vBool(c < 0), true
-	}
-	if op == OpLe {
-		return vBool(c <= 0), true
-	}
-	if op == OpGt {
-		return vBool(c > 0), true
-	}
-	return vBool(c >= 0), true
+	return vBool(match op { OpLt -> c < 0, OpLe -> c <= 0, OpGt -> c > 0, _ -> c >= 0 }), true
 }
 
 func cannotCompare(x Val, y Val) {
@@ -1122,82 +1050,19 @@ func equalVals(x Val, y Val, depth usize) (bool, bool) decreases(depth) {
 	if depth == 0 {
 		return false, true
 	}
-	match x {
-		Int(_, _) | IntOvf | Bool(_) -> {
-			return x == y, true
-		}
-		Str(_, _) -> {
-			return isStrVal(y) && bytesEqual(strOf(x), strOf(y)), true
-		}
-		Err(a) -> {
-			return match y {
-				Err(b) -> a == b
-				Nil -> a == 0
-				_ -> false
-			}, true
-		}
-		Nil -> {
-			match y {
-				Err(b) -> {
-					return b == 0, true
-				}
-				Slice(_, _, _, _) | NilSlice -> {
-					return isNilSlice(y), true
-				}
-				Nil -> {
-					return true, true
-				}
-				_ -> {}
-			}
-		}
-		Slice(_, _, _, _) | NilSlice -> {
-			if y == Val.Nil {
-				return isNilSlice(x), true
-			}
-		}
-		CodeBasic(_) | CodeArray(_, _) | CodeSlice(_) | CodeStruct(_, _) | CodeUniv(_) -> {
-			return codeEqual(x, y, depth-1), true
-		}
-		Array(xr, xn) -> {
-			match y {
-				Array(yr, yn) -> {
-					if xn != yn {
-						return false, true
-					}
-					return equalList(xr, yr, usize(xn), depth-1)
-				}
-				_ -> {
-					return false, true
-				}
-			}
-		}
-		Struct(xr, xn) -> {
-			match y {
-				Struct(yr, yn) -> {
-					if xn != yn {
-						return false, true
-					}
-					return equalList(xr, yr, usize(xn), depth-1)
-				}
-				_ -> {
-					return false, true
-				}
-			}
-		}
-		Enum(xv, xr, xn) -> {
-			match y {
-				Enum(yv, yr, yn) -> {
-					if xv != yv || xn != yn {
-						return false, true
-					}
-					return equalList(xr, yr, usize(xn), depth-1)
-				}
-				_ -> {
-					return false, true
-				}
-			}
-		}
-		None | Tuple(_, _) | Ptr(_) | FieldCode(_, _, _) -> {}
+	match (x, y) {
+		(Int(..) | IntOvf | Bool(_), _) -> return x == y, true
+		(Str(a, m), Str(b, n)) -> return bytesEqual(strSpan(a, m), strSpan(b, n)), true
+		(Err(a), Err(b)) -> return a == b, true
+		(Err(a), Nil) | (Nil, Err(a)) -> return a == 0, true
+		(Nil, Nil) -> return true, true
+		(Nil, Slice(..) | NilSlice) -> return isNilSlice(y), true
+		(Slice(..) | NilSlice, Nil) -> return isNilSlice(x), true
+		(CodeBasic(_) | CodeArray(..) | CodeSlice(_) | CodeStruct(..) | CodeUniv(_), _) -> return codeEqual(x, y, depth-1), true
+		(Array(xr, xn), Array(yr, yn)) | (Struct(xr, xn), Struct(yr, yn)) if xn == yn -> return equalList(xr, yr, usize(xn), depth-1)
+		(Enum(xv, xr, xn), Enum(yv, yr, yn)) if xv == yv && xn == yn -> return equalList(xr, yr, usize(xn), depth-1)
+		(Str(..) | Err(_) | Array(..) | Struct(..) | Enum(..), _) -> return false, true
+		_ -> {}
 	}
 	cannotCompare(x, y)
 	return false, false
@@ -1222,24 +1087,12 @@ func codeEqual(x Val, y Val, depth usize) bool decreases(depth) {
 	if depth == 0 {
 		return false
 	}
-	return match x {
-		CodeArray(xn, xe) -> match y {
-			CodeArray(yn, ye) -> xn == yn && codeEqual(slotGet(xe), slotGet(ye), depth-1)
-			_ -> false
-		}
-		CodeSlice(xe) -> match y {
-			CodeSlice(ye) -> codeEqual(slotGet(xe), slotGet(ye), depth-1)
-			_ -> false
-		}
-		CodeStruct(xr, xn) -> match y {
-			CodeStruct(yr, yn) -> xn == yn && codeListEqual(xr, yr, xn, depth-1)
-			_ -> false
-		}
-		FieldCode(xo, xl, xc) -> match y {
-			FieldCode(yo, yl, yc) -> bytesEqual(strSpan(xo, xl), strSpan(yo, yl)) && codeEqual(slotGet(xc), slotGet(yc), depth-1)
-			_ -> false
-		}
-		_ -> x == y
+	return match (x, y) {
+		(CodeArray(xn, xe), CodeArray(yn, ye)) -> xn == yn && codeEqual(slotGet(xe), slotGet(ye), depth-1)
+		(CodeSlice(xe), CodeSlice(ye)) -> codeEqual(slotGet(xe), slotGet(ye), depth-1)
+		(CodeStruct(xr, xn), CodeStruct(yr, yn)) -> xn == yn && codeListEqual(xr, yr, xn, depth-1)
+		(FieldCode(xo, xl, xc), FieldCode(yo, yl, yc)) -> bytesEqual(strSpan(xo, xl), strSpan(yo, yl)) && codeEqual(slotGet(xc), slotGet(yc), depth-1)
+		_ -> x == y // different variants are never equal
 	}
 }
 
@@ -1259,25 +1112,12 @@ func codeListEqual(a u32, b u32, n u32, depth usize) bool decreases(depth) {
 func unaryOpVal(op u8, x Val) (Val, bool) {
 	var z Val
 	match x {
-		Bool(b) -> {
-			if op == OpNot {
-				return vBool(!b), true
-			}
+		Bool(b) if op == OpNot -> return vBool(!b), true
+		Int(hi, lo) if op == OpNeg -> {
+			h, l := neg128(hi, lo)
+			return intResult(h, l, hi == SignBit && lo == 0), true
 		}
-		Int(hi, lo) -> {
-			if op == OpNeg {
-				if hi == SignBit && lo == 0 {
-					return Val.IntOvf, true
-				}
-				h, l := neg128(hi, lo)
-				return vInt(h, l), true
-			}
-		}
-		IntOvf -> {
-			if op == OpNeg {
-				return x, true
-			}
-		}
+		IntOvf if op == OpNeg -> return x, true
 		_ -> {}
 	}
 	etf(formatTo(mbuf[:], "operator %s not defined on %v", unaryOpString(op), ValRef(x)))
@@ -1293,24 +1133,13 @@ func isVariant(v Val, vi u32) bool {
 // ((0, 0) for other values).
 func tupleOf(v Val) (u32, u32) {
 	match v {
-		Tuple(ref, n) -> {
-			return ref, n
-		}
-		_ -> {
-			return 0, 0
-		}
+		Tuple(ref, n) -> return ref, n
+		_ -> return 0, 0
 	}
-}
-
-func isTupleVal(v Val) bool {
-	return match v { Tuple(_, _) -> true, _ -> false }
 }
 
 func isCodeVal(v Val) bool {
-	return match v {
-		CodeBasic(_) | CodeArray(_, _) | CodeSlice(_) | CodeStruct(_, _) | CodeUniv(_) -> true
-		_ -> false
-	}
+	return v is CodeBasic(_) | CodeArray(..) | CodeSlice(_) | CodeStruct(..) | CodeUniv(_)
 }
 
 // fieldSlot returns the slot of field i of a struct value (0 if v is not a
@@ -1328,39 +1157,27 @@ func fieldCodeOf(name Val, c u32) Val {
 	return match name { Str(off, n) -> Val.FieldCode(off, n, c), _ -> Val.FieldCode(0, 0, c) }
 }
 
-// fieldCodeSlot returns the slot of the code of a FieldCode value.
-func fieldCodeSlot(f Val) u32 {
-	return match f { FieldCode(_, _, c) -> c, _ -> 0 }
-}
-
 // codeLevelOf returns the universe level of a code (CodeVal.Level).
 func codeLevelOf(v Val, depth usize) int decreases(depth) {
 	if depth == 0 {
 		return -1
 	}
 	match v {
-		CodeUniv(l) -> {
-			return int(l) + 1
-		}
-		CodeArray(_, el) -> {
-			return codeLevelOf(slotGet(el), depth-1)
-		}
-		CodeSlice(el) -> {
-			return codeLevelOf(slotGet(el), depth-1)
-		}
+		CodeUniv(l) -> return int(l) + 1
+		CodeArray(_, el) | CodeSlice(el) -> return codeLevelOf(slotGet(el), depth-1)
 		CodeStruct(ref, n) -> {
 			l := -1
 			for i := u32(0); i < n; i++ {
-				x := codeLevelOf(slotGet(fieldCodeSlot(slotGet(ref+i))), depth-1)
-				if x > l {
-					l = x
+				if slotGet(ref+i) is FieldCode(_, _, c) {
+					x := codeLevelOf(slotGet(c), depth-1)
+					if x > l {
+						l = x
+					}
 				}
 			}
 			return l
 		}
-		_ -> {
-			return -1
-		}
+		_ -> return -1
 	}
 }
 
@@ -1388,35 +1205,22 @@ func foldCode(v Val, depth usize) u32 decreases(depth) {
 		return TyInvalid
 	}
 	match v {
-		CodeBasic(k) -> {
-			return basicCodeType(k)
-		}
-		CodeArray(n, el) -> {
-			return mkArray(n, 0, foldCode(slotGet(el), depth-1))
-		}
-		CodeSlice(el) -> {
-			return mkSlice(foldCode(slotGet(el), depth-1))
-		}
+		CodeBasic(k) -> return basicCodeType(k)
+		CodeArray(n, el) -> return mkArray(n, 0, foldCode(slotGet(el), depth-1))
+		CodeSlice(el) -> return mkSlice(foldCode(slotGet(el), depth-1))
 		CodeStruct(ref, n) -> {
 			m := tmark()
 			for i := u32(0); i < n; i++ {
-				match slotGet(ref + i) {
-					FieldCode(off, ln, c) -> {
-						nm := intern(strSpan(off, ln))
-						ft := foldCode(slotGet(c), depth-1)
-						tpush(nm)
-						tpush(ft)
-					}
-					_ -> {}
+				if slotGet(ref+i) is FieldCode(off, ln, c) {
+					nm := intern(strSpan(off, ln))
+					ft := foldCode(slotGet(c), depth-1)
+					tpush(nm)
+					tpush(ft)
 				}
 			}
 			return mkStruct(m)
 		}
-		CodeUniv(l) -> {
-			return mkCode(int(l))
-		}
-		_ -> {
-			return TyInvalid
-		}
+		CodeUniv(l) -> return mkCode(int(l))
+		_ -> return TyInvalid
 	}
 }

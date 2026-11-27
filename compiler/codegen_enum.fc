@@ -200,7 +200,7 @@ func cgComputeLayout(n u32, en u32, dp usize) CgLay decreases(dp) {
 		for j := usize(0); j < np; j++ {
 			m := cgWmark()
 			cgGoType(n, variantPay(en, vi, j), dp-1)
-			gt := (&cgBuf).Bytes()[m:]
+			gt := cgBuf.Bytes()[m:]
 			gi := usize(0)
 			found := false
 			top2 := cgLayGTop
@@ -328,6 +328,8 @@ func cgWEnumStruct(n u32, en u32, dp usize) decreases(dp) {
 const (
 	CgArmStmt   = 0 // statement arms (expression statement or block)
 	CgArmReturn = 1 // `return <arm>` (match expression)
+
+	BadPattern = "unsupported match pattern"
 )
 
 func cgMatchStmt(s u32, dp usize) decreases(dp) {
@@ -426,7 +428,7 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 		}
 	}
 	cgHeader++
-	smark := (&cgStash).Len()
+	smark := cgStash.Len()
 	bTmp := u64(0)
 	if en == 0 {
 		cgW("switch ")
@@ -444,11 +446,10 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 		cgW("switch ")
 		p := cgWmark()
 		cgPrimary(x, dp-1)
-		o := &cgStash
-		o.WriteBytes((&cgBuf).Bytes()[p:])
+		cgStash.WriteBytes(cgBuf.Bytes()[p:])
 		cgW("._tag")
 	}
-	bEnd := (&cgStash).Len()
+	bEnd := cgStash.Len()
 	cgHeader--
 	cgW(" {\n")
 	for i := usize(0); i < cnt; i++ {
@@ -490,7 +491,7 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 	}
 	cgW("}\n")
 	cgArmTop = mark
-	(&cgStash).Truncate(smark)
+	cgStash.Truncate(smark)
 	if en != 0 {
 		cgLayRelease(lay)
 	}
@@ -539,7 +540,7 @@ func cgCaseLabel(x u32, a u32, pt u32, dp usize) decreases(dp) {
 			return
 		}
 	}
-	cgFail(a, "unsupported match pattern")
+	cgFail(a, BadPattern)
 }
 
 // cgArmBody writes the body of a match arm after its bindings: the arm's
@@ -647,15 +648,15 @@ func cgSubPush(a usize, b usize, t u32) usize {
 // cgSubCut makes everything written since mark the path of a new subject
 // entry of type t.
 func cgSubCut(mark usize, t u32) usize {
-	a := (&cgStash).Len()
+	a := cgStash.Len()
 	cgStashCut(mark)
-	return cgSubPush(a, (&cgStash).Len(), t)
+	return cgSubPush(a, cgStash.Len(), t)
 }
 
 // cgSubPop drops the subject entries from mark on (and their paths).
 func cgSubPop(mark usize) {
 	if mark < cgSubTop {
-		(&cgStash).Truncate(usize(cgSubA[mark]))
+		cgStash.Truncate(usize(cgSubA[mark]))
 		cgSubTop = mark
 	}
 }
@@ -755,7 +756,7 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 			cgW(" == ")
 			v := nval[usize(nb(p))]
 			if v == 0 {
-				cgFail(p, "unsupported match pattern")
+				cgFail(p, BadPattern)
 				return false
 			}
 			cgValue(p, slotGet(v), t, dp-1)
@@ -794,7 +795,7 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 		cgW(" == ")
 		v := nval[usize(na(p))]
 		if v == 0 {
-			cgFail(p, "unsupported match pattern")
+			cgFail(p, BadPattern)
 			return false
 		}
 		cgValue(p, slotGet(v), cgSubT[s], dp-1)
@@ -1031,7 +1032,7 @@ func cgMatchChain(m u32, mode u8, dp usize) decreases(dp) {
 	}
 	exhaustive := nexh[usize(m)]
 	x := na(m)
-	smark := (&cgStash).Len()
+	smark := cgStash.Len()
 	submark := cgSubTop
 	tmark := cgChainTmpTop
 	s, sn := cgScrutineeSubject(m, dp-1)
@@ -1091,7 +1092,7 @@ func cgMatchChain(m u32, mode u8, dp usize) decreases(dp) {
 	cgWrotate(start, q)
 	cgChainTmpTop = tmark
 	cgSubTop = submark
-	(&cgStash).Truncate(smark)
+	cgStash.Truncate(smark)
 }
 
 // cgGuardCond writes the guard of arm a; the bindings it reads are bound
@@ -1137,7 +1138,7 @@ func cgIsExpr(e u32, dp usize) decreases(dp) {
 	has := cgBindTop > bmark
 	cgBindTop = bmark
 	submark := cgSubTop
-	smark := (&cgStash).Len()
+	smark := cgStash.Len()
 	if !has && (cgIsPlainVar(x) || cgSingleTest(p)) {
 		pm := cgWmark()
 		cgPrimary(x, dp-1)
@@ -1150,7 +1151,7 @@ func cgIsExpr(e u32, dp usize) decreases(dp) {
 			cgWwrap(m0)
 		}
 		cgSubTop = submark
-		(&cgStash).Truncate(smark)
+		cgStash.Truncate(smark)
 		return
 	}
 	saveHeader := cgHeader
@@ -1186,7 +1187,7 @@ func cgIsExpr(e u32, dp usize) decreases(dp) {
 	cgW("}()")
 	cgHeader = saveHeader
 	cgSubTop = submark
-	(&cgStash).Truncate(smark)
+	cgStash.Truncate(smark)
 }
 
 // cgSingleTest reports whether the test of p reads the subject once: a
