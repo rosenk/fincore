@@ -7,6 +7,7 @@ import (
 
 	"fincore/bootstrap/internal/ast"
 	"fincore/bootstrap/internal/ir"
+	"fincore/bootstrap/internal/resolve"
 	"fincore/bootstrap/internal/types"
 )
 
@@ -182,8 +183,7 @@ func (g *gen) variantLit(n ast.Node, t types.Type, v *types.Variant, np int, pay
 }
 
 func (f *fnCtx) matchStmt(s *ast.MatchStmt) {
-	f.frames = append(f.frames, &frame{kind: frameSwitch})
-	f.matchSwitch(s.X, s.Arms, func(a *ast.MatchArm) {
+	body := func(a *ast.MatchArm) {
 		if a.Expr != nil {
 			if txt := f.exprStmt(a.Expr); txt != "" {
 				f.line("%s", txt)
@@ -192,7 +192,13 @@ func (f *fnCtx) matchStmt(s *ast.MatchStmt) {
 		if a.Block != nil {
 			f.stmts(a.Block.Stmts)
 		}
-	})
+	}
+	if !f.flatMatch(s.X, s.Arms) {
+		f.matchChain(s, s.X, s.Arms, body)
+		return
+	}
+	f.frames = append(f.frames, &frame{kind: frameSwitch})
+	f.matchSwitch(s, s.X, s.Arms, body)
 	f.frames = f.frames[:len(f.frames)-1]
 }
 
@@ -204,7 +210,7 @@ func (f *fnCtx) matchExpr(e *ast.MatchExpr) string {
 	f.w = &strings.Builder{}
 	f.header = 0
 	f.w.WriteString("func() " + f.goType(e, f.typeOf(e)) + " {\n")
-	f.matchSwitch(e.X, e.Arms, func(a *ast.MatchArm) {
+	f.matchArms(e, func(a *ast.MatchArm) {
 		f.returnValue(a.Expr)
 	})
 	f.w.WriteString("}()")
@@ -213,13 +219,22 @@ func (f *fnCtx) matchExpr(e *ast.MatchExpr) string {
 	return out
 }
 
+// matchArms emits a match expression's switch (or v0.2 if chain).
+func (f *fnCtx) matchArms(e *ast.MatchExpr, body func(a *ast.MatchArm)) {
+	if f.flatMatch(e.X, e.Arms) {
+		f.matchSwitch(e, e.X, e.Arms, body)
+	} else {
+		f.matchChain(e, e.X, e.Arms, body)
+	}
+}
+
 // returnValue emits `return e` (single result, no enclosing scope
 // blocks). A match expression is lowered to a switch whose arms return
 // their values (nested match expressions recursively), without a
 // function literal.
 func (f *fnCtx) returnValue(e ast.Expr) {
 	if me, ok := unparen(e).(*ast.MatchExpr); ok && f.constValue(me) == nil {
-		f.matchSwitch(me.X, me.Arms, func(a *ast.MatchArm) {
+		f.matchArms(me, func(a *ast.MatchArm) {
 			f.returnValue(a.Expr)
 		})
 		return
@@ -227,19 +242,63 @@ func (f *fnCtx) returnValue(e ast.Expr) {
 	f.line("return %s", f.expr(e))
 }
 
-// matchSwitch emits the Go switch of a match on x; body emits the body of
-// an arm after its payload bindings.
-func (f *fnCtx) matchSwitch(x ast.Expr, all []*ast.MatchArm, body func(a *ast.MatchArm)) {
+// flatMatch reports whether a match is lowered to a Go switch: no tuple
+// scrutinee, no guards, and every alternative is '_', a literal, a
+// constant or a variant whose payload patterns are bindings, '_' or '..'
+// (bindings only outside or-patterns). Other matches (v0.2) are lowered
+// to if chains (matchChain).
+func (f *fnCtx) flatMatch(x ast.Expr, arms []*ast.MatchArm) bool {
+	if _, ok := x.(*ast.TupleExpr); ok {
+		return false
+	}
+	for _, a := range arms {
+		if a.Guard != nil {
+			return false
+		}
+		op, isOr := a.Pattern.(*ast.OrPattern)
+		alts := []ast.Pattern{a.Pattern}
+		if isOr {
+			alts = op.Alts
+		}
+		for _, alt := range alts {
+			switch p := alt.(type) {
+			case *ast.WildcardPattern, *ast.LiteralPattern:
+			case *ast.CtorPattern:
+				for _, arg := range p.Args {
+					switch b := arg.(type) {
+					case *ast.RestPattern:
+					case *ast.Ident:
+						if f.g.info.VariantAt(b) != nil || (isOr && b.Name != "_") {
+							return false
+						}
+					default:
+						return false
+					}
+				}
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// matchSwitch emits the Go switch of a flat match m on x; body emits the
+// body of an arm after its payload bindings.
+func (f *fnCtx) matchSwitch(m ast.Node, x ast.Expr, all []*ast.MatchArm, body func(a *ast.MatchArm)) {
 	arms := ir.MatchArms(f.g.info, x, all)
+	hasDefault := arms.HasDefault || f.g.info.IsExhaustive(m)
 	var lay *enumLayout
 	needBind := false
 	if arms.Enum != nil {
 		lay = f.g.enumLayout(x, f.typeOf(x), f.env)
 		for _, a := range arms.Arms {
 			if cp, ok := a.Pattern.(*ast.CtorPattern); ok {
-				for _, b := range cp.Bindings {
-					if sym := f.g.p.Prog.Defs[b.ID()]; sym != nil && f.g.p.Used(sym) {
-						needBind = true
+				for _, b := range cp.Args {
+					if id, ok := b.(*ast.Ident); ok {
+						if sym := f.g.p.Prog.Defs[id.ID()]; sym != nil && f.g.p.Used(sym) {
+							needBind = true
+						}
 					}
 				}
 			}
@@ -260,19 +319,23 @@ func (f *fnCtx) matchSwitch(x ast.Expr, all []*ast.MatchArm, body func(a *ast.Ma
 	f.header--
 	f.w.WriteString(hdr + " {\n")
 	for i, a := range arms.Arms {
-		if i == len(arms.Arms)-1 && arms.HasDefault {
+		if i == len(arms.Arms)-1 && hasDefault {
 			f.w.WriteString("default:\n")
 		} else {
 			f.w.WriteString("case " + f.caseLabels(x, a) + ":\n")
 		}
 		if cp, ok := a.Pattern.(*ast.CtorPattern); ok && arms.Enum != nil {
 			if v := f.g.info.VariantOf(cp); v != nil {
-				for j, b := range cp.Bindings {
-					sym := f.g.p.Prog.Defs[b.ID()]
+				for j, b := range cp.Args {
+					id, ok := b.(*ast.Ident)
+					if !ok {
+						continue
+					}
+					sym := f.g.p.Prog.Defs[id.ID()]
 					if sym == nil || !f.g.p.Used(sym) {
 						continue
 					}
-					f.line("%s := %s.%s", f.g.p.Name(sym), base, lay.slots[v.Index][j])
+					f.line("%s := %s.%s", f.g.p.Name(sym), base, lay.slots[v.Index][types.PayloadIndex(cp, j, len(v.Payload))])
 				}
 			}
 		}
@@ -311,4 +374,389 @@ func (f *fnCtx) caseLabel(x ast.Expr, a *ast.MatchArm, pat ast.Pattern) string {
 	}
 	f.g.fail(a, "unsupported match pattern")
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// v0.2 patterns: if chains and `is` expressions
+
+// subject is the value a pattern is matched against: Go expressions
+// (paths) and types, one per element of a tuple scrutinee.
+type subject struct {
+	paths []string
+	types []types.Type
+}
+
+func single(path string, t types.Type) subject {
+	return subject{paths: []string{path}, types: []types.Type{t}}
+}
+
+// patTest returns the Go condition under which the subject matches p ("" if
+// it always does). compound is set if the condition is a conjunction of
+// several tests; disjunctions are parenthesized.
+func (f *fnCtx) patTest(p ast.Pattern, s subject) (cond string, compound bool) {
+	switch p := p.(type) {
+	case *ast.TuplePattern:
+		var parts []string
+		for i, el := range p.Elems {
+			if c, _ := f.patTest(el, single(s.paths[i], s.types[i])); c != "" {
+				parts = append(parts, c)
+			}
+		}
+		return strings.Join(parts, " && "), len(parts) > 1
+	case *ast.OrPattern:
+		parts := make([]string, len(p.Alts))
+		for i, alt := range p.Alts {
+			c, comp := f.patTest(alt, s)
+			if c == "" {
+				return "", false
+			}
+			if comp {
+				c = "(" + c + ")"
+			}
+			parts[i] = c
+		}
+		return "(" + strings.Join(parts, " || ") + ")", false
+	case *ast.Ident:
+		if v := f.g.info.VariantAt(p); v != nil {
+			return s.paths[0] + "._tag == " + strconv.Itoa(v.Index), false
+		}
+	case *ast.CtorPattern:
+		t := s.types[0]
+		v := f.g.info.VariantOf(p)
+		if v == nil {
+			return s.paths[0] + " == " + f.g.value(p, f.g.info.ValueOf(p.Name), t, f.env), false
+		}
+		parts := []string{s.paths[0] + "._tag == " + strconv.Itoa(v.Index)}
+		lay := f.g.enumLayout(p, t, f.env)
+		for i, a := range p.Args {
+			if _, ok := a.(*ast.RestPattern); ok {
+				continue
+			}
+			j := types.PayloadIndex(p, i, len(v.Payload))
+			if c, _ := f.patTest(a, single(s.paths[0]+"."+lay.slots[v.Index][j], v.Payload[j])); c != "" {
+				parts = append(parts, c)
+			}
+		}
+		return strings.Join(parts, " && "), len(parts) > 1
+	case *ast.LiteralPattern:
+		return s.paths[0] + " == " + f.g.value(p, f.g.info.ValueOf(p.Lit), s.types[0], f.env), false
+	}
+	return "", false
+}
+
+// patBinding is a variable bound by a pattern: Go name and type.
+type patBinding struct {
+	name string
+	typ  types.Type
+}
+
+// patBindings lists the bindings of p that are read in region, in source
+// order (for or-patterns those of the first alternative).
+func (f *fnCtx) patBindings(p ast.Pattern, t types.Type, region ast.Node, out *[]patBinding) {
+	switch p := p.(type) {
+	case *ast.TuplePattern:
+		tt, _ := t.(*types.Tuple)
+		for i, el := range p.Elems {
+			f.patBindings(el, tt.Types[i], region, out)
+		}
+	case *ast.OrPattern:
+		f.patBindings(p.Alts[0], t, region, out)
+	case *ast.Ident:
+		if sym := f.g.p.Prog.Defs[p.ID()]; sym != nil && f.bindUsed(sym, region) {
+			*out = append(*out, patBinding{name: f.g.p.Name(sym), typ: t})
+		}
+	case *ast.CtorPattern:
+		v := f.g.info.VariantOf(p)
+		if v == nil {
+			return
+		}
+		for i, a := range p.Args {
+			if _, ok := a.(*ast.RestPattern); ok {
+				continue
+			}
+			f.patBindings(a, v.Payload[types.PayloadIndex(p, i, len(v.Payload))], region, out)
+		}
+	}
+}
+
+// emitBinds emits the bindings of p that are read in region: `x := path`,
+// or `x = path` if assign. An or-pattern with bindings declares them
+// (`var x T`, unless assign) and assigns them in an if chain over its
+// alternatives.
+func (f *fnCtx) emitBinds(p ast.Pattern, s subject, region ast.Node, assign bool) {
+	switch p := p.(type) {
+	case *ast.TuplePattern:
+		for i, el := range p.Elems {
+			f.emitBinds(el, single(s.paths[i], s.types[i]), region, assign)
+		}
+	case *ast.OrPattern:
+		var bs []patBinding
+		f.patBindings(p, subjectType(s), region, &bs)
+		if len(bs) == 0 {
+			return
+		}
+		if !assign {
+			for _, b := range bs {
+				f.line("var %s %s", b.name, f.goType(p, b.typ))
+			}
+		}
+		for i, alt := range p.Alts {
+			c, _ := f.patTest(alt, s)
+			last := i == len(p.Alts)-1 || c == ""
+			switch {
+			case i == 0 && last:
+				f.w.WriteString("{\n")
+			case i == 0:
+				f.w.WriteString("if " + c + " {\n")
+			case last:
+				f.w.WriteString("} else {\n")
+			default:
+				f.w.WriteString("} else if " + c + " {\n")
+			}
+			f.emitBinds(alt, s, region, true)
+			if last {
+				break
+			}
+		}
+		f.w.WriteString("}\n")
+	case *ast.Ident:
+		if sym := f.g.p.Prog.Defs[p.ID()]; sym != nil && f.bindUsed(sym, region) {
+			op := ":="
+			if assign {
+				op = "="
+			}
+			f.line("%s %s %s", f.g.p.Name(sym), op, s.paths[0])
+		}
+	case *ast.CtorPattern:
+		v := f.g.info.VariantOf(p)
+		if v == nil {
+			return
+		}
+		lay := f.g.enumLayout(p, s.types[0], f.env)
+		for i, a := range p.Args {
+			if _, ok := a.(*ast.RestPattern); ok {
+				continue
+			}
+			j := types.PayloadIndex(p, i, len(v.Payload))
+			f.emitBinds(a, single(s.paths[0]+"."+lay.slots[v.Index][j], v.Payload[j]), region, assign)
+		}
+	}
+}
+
+// subjectType is the type of a subject (a *types.Tuple for a tuple).
+func subjectType(s subject) types.Type {
+	if len(s.types) == 1 {
+		return s.types[0]
+	}
+	return &types.Tuple{Types: s.types}
+}
+
+// scrutineeSubject evaluates the scrutinee of a general match (v0.2) into
+// temporaries (`_fc_tN := x`, one per tuple element) unless every element
+// is a local variable and no arm has a guard.
+func (f *fnCtx) scrutineeSubject(x ast.Expr, arms []*ast.MatchArm) (subject, []string) {
+	direct := true
+	for _, a := range arms {
+		if a.Guard != nil {
+			direct = false
+		}
+	}
+	elems := []ast.Expr{x}
+	if te, ok := x.(*ast.TupleExpr); ok {
+		elems = te.Elems
+	}
+	for _, el := range elems {
+		if !isPlainVar(f, el) {
+			direct = false
+		}
+	}
+	var s subject
+	var temps []string
+	for _, el := range elems {
+		s.types = append(s.types, f.typeOf(el))
+		if direct {
+			s.paths = append(s.paths, f.primary(el))
+			continue
+		}
+		t := f.newTemp()
+		f.line("%s := %s", t, f.expr(el))
+		temps = append(temps, t)
+		s.paths = append(s.paths, t)
+	}
+	return s, temps
+}
+
+// matchChain emits a general match m (v0.2: nested, tuple and or-patterns
+// with bindings, guards) as an if chain; the last arm of an exhaustive
+// match is the final else. Bindings read by a guard are bound in a
+// function literal evaluated in the condition; those read by the body are
+// bound at the start of the arm.
+func (f *fnCtx) matchChain(m ast.Node, x ast.Expr, arms []*ast.MatchArm, body func(a *ast.MatchArm)) {
+	exhaustive := f.g.info.IsExhaustive(m)
+	save := f.w
+	f.w = &strings.Builder{}
+	s, temps := f.scrutineeSubject(x, arms)
+	decl := f.w.String()
+	f.w = &strings.Builder{}
+	for i, a := range arms {
+		cond, _ := f.patTest(a.Pattern, s)
+		if a.Guard != nil {
+			g := f.guardCond(a, s)
+			if cond == "" {
+				cond = g
+			} else {
+				cond += " && " + g
+			}
+		}
+		isElse := i == len(arms)-1 && exhaustive && a.Guard == nil
+		if cond == "" && !isElse {
+			cond = "true"
+		}
+		switch {
+		case i == 0 && isElse:
+			f.w.WriteString("{\n")
+		case i == 0:
+			f.w.WriteString("if " + cond + " {\n")
+		case isElse:
+			f.w.WriteString("} else {\n")
+		default:
+			f.w.WriteString("} else if " + cond + " {\n")
+		}
+		var region ast.Node = a.Block
+		if a.Expr != nil {
+			region = a.Expr
+		}
+		f.emitBinds(a.Pattern, s, region, false)
+		body(a)
+	}
+	if len(arms) > 0 {
+		f.w.WriteString("}\n")
+	}
+	chain := f.w.String()
+	f.w = save
+	f.w.WriteString(decl)
+	for _, t := range temps {
+		if !strings.Contains(chain, t) {
+			f.line("_ = %s", t)
+		}
+	}
+	f.w.WriteString(chain)
+}
+
+// guardCond renders the guard of an arm; the bindings it reads are bound
+// in a function literal: `func() bool { x := path; return guard }()`.
+func (f *fnCtx) guardCond(a *ast.MatchArm, s subject) string {
+	var bs []patBinding
+	f.patBindings(a.Pattern, subjectType(s), a.Guard, &bs)
+	if len(bs) == 0 {
+		f.header++
+		g := "(" + f.expr(a.Guard) + ")"
+		f.header--
+		return g
+	}
+	save, saveHeader := f.w, f.header
+	f.w = &strings.Builder{}
+	f.header = 0
+	f.w.WriteString("func() bool {\n")
+	f.emitBinds(a.Pattern, s, a.Guard, false)
+	f.line("return %s", f.expr(a.Guard))
+	f.w.WriteString("}()")
+	out := f.w.String()
+	f.w, f.header = save, saveHeader
+	return out
+}
+
+// isExpr renders `X is P` (v0.2). Its bindings (only in if conditions)
+// are declared before the if statement (isDecls) and assigned here.
+func (f *fnCtx) isExpr(e *ast.IsExpr) string {
+	t := f.typeOf(e.X)
+	var bs []patBinding
+	f.patBindings(e.Pattern, t, nil, &bs)
+	if len(bs) == 0 && (isPlainVar(f, e.X) || f.singleTest(e.Pattern)) {
+		c, _ := f.patTest(e.Pattern, single(f.primary(e.X), t))
+		if c == "" {
+			return "true"
+		}
+		return "(" + c + ")"
+	}
+	save, saveHeader := f.w, f.header
+	f.w = &strings.Builder{}
+	f.header = 0
+	f.w.WriteString("func() bool {\n")
+	tmp := f.newTemp()
+	f.line("%s := %s", tmp, f.expr(e.X))
+	s := single(tmp, t)
+	c, _ := f.patTest(e.Pattern, s)
+	switch {
+	case len(bs) == 0 && c == "":
+		f.line("_ = %s", tmp)
+		f.line("return true")
+	case len(bs) == 0:
+		f.line("return %s", c)
+	case c == "":
+		f.emitBinds(e.Pattern, s, nil, true)
+		f.line("return true")
+	default:
+		f.w.WriteString("if " + c + " {\n")
+		f.emitBinds(e.Pattern, s, nil, true)
+		f.line("return true")
+		f.w.WriteString("}\n")
+		f.line("return false")
+	}
+	f.w.WriteString("}()")
+	out := f.w.String()
+	f.w, f.header = save, saveHeader
+	return out
+}
+
+// singleTest reports whether the test of p reads the subject once: a
+// literal, a constant or a variant whose payload patterns are bindings,
+// '_' or '..'.
+func (f *fnCtx) singleTest(p ast.Pattern) bool {
+	switch p := p.(type) {
+	case *ast.LiteralPattern:
+		return true
+	case *ast.CtorPattern:
+		for _, a := range p.Args {
+			switch b := a.(type) {
+			case *ast.RestPattern:
+			case *ast.Ident:
+				if f.g.info.VariantAt(b) != nil {
+					return false
+				}
+			default:
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// bindUsed reports whether a binding is read in region (anywhere if
+// region is nil: the bindings of an `is` expression).
+func (f *fnCtx) bindUsed(sym *resolve.Symbol, region ast.Node) bool {
+	if region == nil {
+		return f.g.p.Used(sym)
+	}
+	return f.g.p.UsedIn(region, sym)
+}
+
+// isDecls declares the variables bound by the `is` expressions of an if
+// condition (v0.2) that are read: `var x T`.
+func (f *fnCtx) isDecls(cond ast.Expr) []string {
+	var out []string
+	switch e := cond.(type) {
+	case *ast.IsExpr:
+		var bs []patBinding
+		f.patBindings(e.Pattern, f.typeOf(e.X), nil, &bs)
+		for _, b := range bs {
+			out = append(out, "var "+b.name+" "+f.goType(e, b.typ))
+		}
+	case *ast.BinaryExpr:
+		if e.Op == ast.OpLAnd {
+			out = append(f.isDecls(e.X), f.isDecls(e.Y)...)
+		}
+	}
+	return out
 }

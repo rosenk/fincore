@@ -195,6 +195,7 @@ func (w *walker) stmt(s ast.Stmt, st *state) *state {
 		for _, arm := range s.Arms {
 			a := st.clone()
 			w.killPattern(arm.Pattern, a)
+			w.expr(arm.Guard, a)
 			if arm.Expr != nil {
 				w.expr(arm.Expr, a)
 				if w.isPanic(arm.Expr) {
@@ -239,10 +240,23 @@ func (w *walker) stmt(s ast.Stmt, st *state) *state {
 	return st
 }
 
+// killPattern forgets the facts about the bindings of a pattern (v0.2:
+// nested, or- and tuple patterns; `is` expressions).
 func (w *walker) killPattern(p ast.Pattern, st *state) {
-	if cp, ok := p.(*ast.CtorPattern); ok {
-		for _, b := range cp.Bindings {
-			w.kill(w.c.info.SymbolOf(b), st)
+	switch p := p.(type) {
+	case *ast.Ident:
+		w.kill(w.c.info.SymbolOf(p), st)
+	case *ast.CtorPattern:
+		for _, a := range p.Args {
+			w.killPattern(a, st)
+		}
+	case *ast.OrPattern:
+		for _, a := range p.Alts {
+			w.killPattern(a, st)
+		}
+	case *ast.TuplePattern:
+		for _, a := range p.Elems {
+			w.killPattern(a, st)
 		}
 	}
 }
@@ -291,8 +305,13 @@ func (w *walker) expr(e ast.Expr, st *state) {
 		for _, arm := range x.Arms {
 			a := st.clone()
 			w.killPattern(arm.Pattern, a)
+			w.expr(arm.Guard, a)
 			w.expr(arm.Expr, a)
 		}
+		return
+	case *ast.IsExpr:
+		w.expr(x.X, st)
+		w.killPattern(x.Pattern, st)
 		return
 	case *ast.BinaryExpr:
 		if x.Op == ast.OpLAnd || x.Op == ast.OpLOr {
@@ -650,15 +669,8 @@ func minus1(b bnds) bnds {
 	return r
 }
 
-// exhaustive reports whether a match statement covers all cases: it has a
-// wildcard arm, or it matches an enum (v0.2: the type checker rejects
-// non-exhaustive enum matches with E2012).
+// exhaustive reports whether a match statement covers all cases (v0.2:
+// recorded by the type checker, see types.Info.Exhaustive).
 func (c *checker) exhaustive(m *ast.MatchStmt) bool {
-	for _, arm := range m.Arms {
-		if _, ok := arm.Pattern.(*ast.WildcardPattern); ok {
-			return true
-		}
-	}
-	_, ok := under(c.info.TypeOf(m.X)).(*types.Enum)
-	return ok
+	return c.info.IsExhaustive(m)
 }

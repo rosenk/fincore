@@ -125,6 +125,13 @@ func expr0(e u32, dp usize) Operand decreases(dp) {
 	if k == NkMatchExpr {
 		return matchExpr(e, dp-1)
 	}
+	if k == NkIsExpr {
+		return isExpr(e, dp-1)
+	}
+	if k == NkTupleExpr {
+		errAt(E2002, e, formatTo(mbuf[:], "tuple %v can only be the scrutinee of a match", Expr(e)))
+		return invalidOp(e)
+	}
 	return invalidOp(e)
 }
 

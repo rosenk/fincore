@@ -365,122 +365,6 @@ func (c *Checker) returnStmt(s *ast.ReturnStmt) {
 	}
 }
 
-// pattern checks a single (non-or) pattern against the scrutinee type t
-// and reports whether it is valid.
-func (c *Checker) pattern(p ast.Pattern, t Type) bool {
-	en, isEnum := t.Underlying().(*Enum)
-	switch p := p.(type) {
-	case *ast.WildcardPattern:
-	case *ast.LiteralPattern:
-		x := c.exprValue(p.Lit)
-		if !x.invalid() {
-			if !c.assignment(&x, t, "match pattern") {
-				return false
-			}
-			if !Comparable(t) {
-				c.errorf(diag.E2002, p.Range, "cannot match values of type %s against literals", t)
-				return false
-			}
-			return true
-		}
-		return false
-	case *ast.CtorPattern:
-		bindInvalid := func() {
-			for _, b := range p.Bindings {
-				c.setSymType(c.prog.Defs[b.ID()], Typ[Invalid])
-			}
-		}
-		// A constant pattern (pkg.Const or Const). An unqualified name that
-		// is a variant of the scrutinee's enum is that variant (v0.2).
-		isVariant := p.Qual == nil && isEnum && en.VariantByName(p.Name.Name) != nil
-		if sym := c.prog.Uses[p.Name.ID()]; sym != nil && sym.Kind == resolve.SymConst && !isVariant {
-			if p.HasParens {
-				c.errorf(diag.E2002, p.Range, "constant %s cannot have bindings", sym.Name)
-				bindInvalid()
-				return false
-			}
-			if isEnum {
-				c.errorf(diag.E2002, p.Range, "constant %s cannot be a pattern for enum type %s", sym.Name, t)
-				return false
-			}
-			x := c.symOperand(sym, p.Name)
-			x.expr = p.Name
-			c.record(&x)
-			return !x.invalid() && c.assignment(&x, t, "match pattern")
-		}
-		var v *Variant
-		switch {
-		case p.Qual != nil:
-			qs := c.prog.Uses[p.Qual.ID()]
-			if qs == nil {
-				bindInvalid()
-				return false
-			}
-			if qs.Kind != resolve.SymType {
-				c.errorf(diag.E2002, p.Qual.Range, "%s is not an enum type", p.Qual.Name)
-				bindInvalid()
-				return false
-			}
-			qt := c.typeSym(qs, p.Qual)
-			c.info.Types[p.Qual.ID()] = qt
-			c.info.Kinds[p.Qual.ID()] = KindType
-			if IsInvalid(qt) {
-				bindInvalid()
-				return false
-			}
-			qe, ok := qt.Underlying().(*Enum)
-			if !ok {
-				c.errorf(diag.E2002, p.Qual.Range, "%s is not an enum type", qt)
-				bindInvalid()
-				return false
-			}
-			// v0.2: a generic enum qualifies patterns on its instances
-			// (Option.Some(x) on an Option[u32]); the variant comes from
-			// the instance.
-			if tn, ok := t.(*Named); ok && tn.Origin != nil && tn.Origin == qt && isEnum {
-				qe = en
-			} else if !Identical(qt, t) {
-				c.errorf(diag.E2002, p.Range, "pattern of type %s does not match scrutinee of type %s", qt, t)
-				bindInvalid()
-				return false
-			}
-			v = qe.VariantByName(p.Name.Name)
-			if v == nil {
-				c.errorf(diag.E2001, p.Name.Range, "enum %s has no variant %s", qt, p.Name.Name)
-				bindInvalid()
-				return false
-			}
-		case isEnum:
-			v = en.VariantByName(p.Name.Name)
-			if v == nil {
-				c.errorf(diag.E2001, p.Name.Range, "undefined: %s (no constant or variant of %s)", p.Name.Name, t)
-				bindInvalid()
-				return false
-			}
-		default:
-			c.errorf(diag.E2001, p.Name.Range, "undefined: %s", p.Name.Name)
-			bindInvalid()
-			return false
-		}
-		c.info.Variants[p.ID()] = v
-		c.info.Types[p.ID()] = t
-		if len(p.Bindings) != len(v.Payload) || (p.HasParens && len(v.Payload) == 0) {
-			c.errorf(diag.E2003, p.Range, "variant %s has %d payload values, pattern binds %d", v.Name, len(v.Payload), len(p.Bindings))
-			bindInvalid()
-			return false
-		}
-		for i, b := range p.Bindings {
-			if sym := c.prog.Defs[b.ID()]; sym != nil {
-				c.setSymType(sym, v.Payload[i])
-			} else {
-				c.info.Types[b.ID()] = v.Payload[i]
-			}
-		}
-		return true
-	}
-	return true
-}
-
 // ---------------------------------------------------------------------------
 // Terminating statements (Go spec rules, adapted)
 
@@ -503,13 +387,9 @@ func (c *Checker) isTerminating(s ast.Stmt) bool {
 	case *ast.ScopeStmt:
 		return c.isTerminatingList(s.Body.Stmts)
 	case *ast.MatchStmt:
-		// v0.2: a match on an enum is exhaustive (E2012 otherwise), so it
-		// terminates if all arms do; other matches need a '_' arm.
-		exhaustive := false
+		// v0.2: a match is a terminating statement if it is exhaustive
+		// (see Info.Exhaustive) and all its arms terminate.
 		for _, arm := range s.Arms {
-			if _, ok := arm.Pattern.(*ast.WildcardPattern); ok {
-				exhaustive = true
-			}
 			if arm.Expr != nil && !c.isPanicCall(arm.Expr) {
 				return false
 			}
@@ -517,14 +397,7 @@ func (c *Checker) isTerminating(s ast.Stmt) bool {
 				return false
 			}
 		}
-		if !exhaustive && len(s.Arms) > 0 {
-			if t := c.info.TypeOf(s.X); t != nil {
-				if _, ok := t.Underlying().(*Enum); ok {
-					exhaustive = true
-				}
-			}
-		}
-		return exhaustive
+		return len(s.Arms) > 0 && c.info.IsExhaustive(s)
 	}
 	return false
 }

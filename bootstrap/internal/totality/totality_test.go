@@ -760,12 +760,14 @@ func TestCompilerSCCs(t *testing.T) {
 	}
 	slices.Sort(sizes)
 	// The M6 front end contributes the Parser SCC (31 members; 33 since the
-	// v0.2 matchExpr and patternAlt methods) and the
+	// v0.2 matchExpr and patternAlt methods; 38 since the v0.2 pattern
+	// methods scrutinee, guard, patterns, payloadListPush and
+	// patternAltBody) and the
 	// 4-member Printer SCC; the semantic phases added since (M7: resolver,
 	// checker + comptime interpreter, value and type helpers) add their
 	// own SCCs, so only require the M6 ones to be intact.
-	if !slices.Contains(sizes, 33) || !slices.Contains(sizes, 4) {
-		t.Errorf("nontrivial SCC sizes = %v, want the Parser (33) and Printer (4) SCCs among them", sizes)
+	if !slices.Contains(sizes, 38) || !slices.Contains(sizes, 4) {
+		t.Errorf("nontrivial SCC sizes = %v, want the Parser (38) and Printer (4) SCCs among them", sizes)
 	}
 }
 

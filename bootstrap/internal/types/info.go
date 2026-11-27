@@ -50,9 +50,17 @@ type Info struct {
 	// Instances describes every IndexExpr / NamedType that instantiates a
 	// generic function or type, by NodeID.
 	Instances []*Instance
-	// Variants maps match-arm patterns (*ast.CtorPattern) to the enum
-	// variant they match, by NodeID.
+	// Variants maps variant patterns (*ast.CtorPattern, and v0.2 payload
+	// *ast.Ident patterns that name a variant) to the enum variant they
+	// match, by NodeID.
 	Variants []*Variant
+
+	// Exhaustive records, by NodeID of a *ast.MatchStmt / *ast.MatchExpr,
+	// whether the match counts as exhaustive (v0.2): its unguarded arms
+	// cover every value, or its scrutinee is an enum or a tuple (whose
+	// matches must be exhaustive, E2012 otherwise), or, if its patterns
+	// are invalid, it has an unguarded '_' arm.
+	Exhaustive []bool
 
 	// SymTypes is the type of each symbol by SymID: variables and constants
 	// (their declared/inferred type), functions (*Signature), types (the
@@ -164,6 +172,24 @@ func (in *Info) InstanceOf(n ast.Node) *Instance {
 }
 
 // VariantOf returns the enum variant matched by a constructor pattern.
+// VariantAt returns the variant matched by a variant pattern node
+// (*ast.CtorPattern or a payload *ast.Ident), or nil.
+func (in *Info) VariantAt(n ast.Node) *Variant {
+	if id := int(n.ID()); id < len(in.Variants) {
+		return in.Variants[id]
+	}
+	return nil
+}
+
+// IsExhaustive reports whether a match statement or expression counts as
+// exhaustive (see Exhaustive).
+func (in *Info) IsExhaustive(n ast.Node) bool {
+	if id := int(n.ID()); id < len(in.Exhaustive) {
+		return in.Exhaustive[id]
+	}
+	return false
+}
+
 func (in *Info) VariantOf(p *ast.CtorPattern) *Variant {
 	if id := int(p.ID()); id < len(in.Variants) {
 		return in.Variants[id]

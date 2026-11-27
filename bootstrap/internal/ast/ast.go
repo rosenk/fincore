@@ -374,11 +374,14 @@ type MatchStmt struct {
 	Arms []*MatchArm
 }
 
-// MatchArm is `Pattern -> Expr` or `Pattern -> Block`. Exactly one of Expr,
-// Block is non-nil.
+// MatchArm is `Pattern [if Guard] -> Expr` or `Pattern [if Guard] -> Block`.
+// Exactly one of Expr, Block is non-nil. A statement arm whose body is a
+// simple statement, return, break or continue (v0.2) is parsed as a Block
+// holding that one statement.
 type MatchArm struct {
 	Base
 	Pattern Pattern
+	Guard   Expr // nil if absent (v0.2)
 	Expr    Expr
 	Block   *BlockStmt
 }
@@ -388,13 +391,17 @@ type WildcardPattern struct {
 	Base
 }
 
-// CtorPattern is `[Qual.]Name[(a, b)]`.
+// CtorPattern is `[Qual.]Name[(p1, p2)]`. A payload pattern (v0.2) is an
+// *Ident (a binding, `_`, or an unqualified variant of the payload's enum
+// type, decided by the type checker), a *CtorPattern, a *LiteralPattern,
+// an *OrPattern (written `(P1 | P2)` or as a whole payload `V(1 | 2)`) or
+// a *RestPattern.
 type CtorPattern struct {
 	Base
 	Qual      *Ident // nil if unqualified
 	Name      *Ident
 	HasParens bool
-	Bindings  []*Ident
+	Args      []Pattern
 }
 
 // LiteralPattern is a literal pattern (INT, STRING, CHAR, true, false, nil).
@@ -408,6 +415,19 @@ type LiteralPattern struct {
 type OrPattern struct {
 	Base
 	Alts []Pattern
+}
+
+// TuplePattern is `(P1, P2, ...)` (v0.2): two or more element patterns,
+// matched against a tuple scrutinee of the same arity.
+type TuplePattern struct {
+	Base
+	Elems []Pattern
+}
+
+// RestPattern is `..` in a variant's payload list (v0.2): it matches the
+// remaining payloads.
+type RestPattern struct {
+	Base
 }
 
 // ForStmt is `[driver] for [header] [decreases(M)] Body`.
@@ -635,6 +655,20 @@ type MatchExpr struct {
 	Arms []*MatchArm
 }
 
+// TupleExpr is `(X1, X2, ...)` (v0.2): two or more expressions. It is
+// only valid as the scrutinee of a match.
+type TupleExpr struct {
+	Base
+	Elems []Expr
+}
+
+// IsExpr is `X is Pattern` (v0.2), a variant test of type bool.
+type IsExpr struct {
+	Base
+	X       Expr
+	Pattern Pattern
+}
+
 // TypeExpr is a syntactic type appearing in expression position (generic
 // arguments, Code/El in TypeOrExpr contexts).
 type TypeExpr struct {
@@ -660,6 +694,8 @@ func (*FuncLit) exprNode()      {}
 func (*StructLit) exprNode()    {}
 func (*TypeExpr) exprNode()     {}
 func (*MatchExpr) exprNode()    {}
+func (*TupleExpr) exprNode()    {}
+func (*IsExpr) exprNode()       {}
 
 func (*NamedType) typeNode()   {}
 func (*ArrayType) typeNode()   {}
@@ -696,3 +732,6 @@ func (*WildcardPattern) patternNode() {}
 func (*CtorPattern) patternNode()     {}
 func (*LiteralPattern) patternNode()  {}
 func (*OrPattern) patternNode()       {}
+func (*TuplePattern) patternNode()    {}
+func (*RestPattern) patternNode()     {}
+func (*Ident) patternNode()           {}

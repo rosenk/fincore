@@ -277,6 +277,15 @@ func (f *fnCtx) returnStmt(s *ast.ReturnStmt) {
 }
 
 func (f *fnCtx) ifStmt(s *ast.IfStmt) {
+	// v0.2: variables bound by `is` in the condition are declared in a
+	// block around the if statement.
+	decls := f.isDecls(s.Cond)
+	if len(decls) > 0 {
+		f.w.WriteString("{\n")
+		for _, d := range decls {
+			f.line("%s", d)
+		}
+	}
 	f.header++
 	hdr := "if "
 	if s.Init != nil {
@@ -296,6 +305,9 @@ func (f *fnCtx) ifStmt(s *ast.IfStmt) {
 		f.w.WriteString(" else {\n")
 		f.stmts(e.Stmts)
 		f.w.WriteString("}")
+	}
+	if len(decls) > 0 {
+		f.w.WriteString("\n}")
 	}
 }
 

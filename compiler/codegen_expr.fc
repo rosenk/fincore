@@ -130,6 +130,8 @@ func cgExpr(e u32, dp usize) decreases(dp) {
 		cgStructLit(e, dp-1)
 	} else if k == NkMatchExpr {
 		cgMatchExpr(e, dp-1)
+	} else if k == NkIsExpr {
+		cgIsExpr(e, dp-1)
 	} else if k == NkBasicLit || k == NkBoolLit || k == NkNilLit {
 		cgFail(e, "literal without a recorded value")
 	} else {

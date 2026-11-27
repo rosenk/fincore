@@ -1,0 +1,333 @@
+// pass_patterns (v0.2): patterns. Binding or-patterns, nested patterns
+// (bindings, '_', literals incl. negative ones and strings, variants of
+// the payload's enum, parenthesized or-patterns), nested generic
+// Option[Option[u32]], tuple scrutinees over enums and bools, rest
+// patterns `..`, guards (with fall-through to later arms), `is` variant
+// tests (with bindings in if conditions and && chains), simple-statement
+// arm bodies (assignment, inc/dec, call, return, break, continue), the
+// same forms in match expressions, `return match` and comptime.
+package main
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+type Val enum {
+	Int(u32, u32)
+	Bool(bool)
+	Str(string)
+	Code(Val2)
+}
+
+type Val2 enum {
+	Lit(i32)
+	Pair(u32, u32)
+	Unit
+}
+
+type Ty enum {
+	Struct(u32, u32)
+	Array(u32, u32)
+	Slice(u32, bool, u32)
+	Sig(u32, u32, u32, u32, u32, u32, u32, u32)
+	Named(u32)
+	Ptr
+}
+
+// Binding or-patterns and rest patterns.
+func size(t Ty) u32 {
+	return match t {
+		Struct(r, n) | Array(r, n) -> r * n
+		Slice(r, ..) -> r
+		Sig(.., last) -> last
+		Named(_) | Ptr -> 8
+	}
+}
+
+// Nested generic enums.
+func depth(o Option[Option[u32]]) u32 {
+	return match o {
+		Some(Some(0)) -> 100
+		Some(Some(x)) -> x
+		Some(None) -> 1
+		None -> 0
+	}
+}
+
+// Literals (negative, or-patterns in parentheses) and variants of the
+// payload's enum in payload positions.
+func code(v Val) u32 {
+	match v {
+		Code(Lit(-1)) -> return 1
+		Code(Lit(1 | 2)) -> return 2
+		Code(Lit(_)) -> return 3
+		Code(Pair(0, y) | Pair(y, 0)) -> return 10 + y
+		Code(Pair(..)) -> return 4
+		Code(Unit) -> return 5
+		Str("hi") -> return 6
+		Str(_) -> return 7
+		Int(..) | Bool(_) -> return 8
+	}
+}
+
+// Tuple scrutinees: two values compared without nested matches.
+func equalVals(a Val, b Val) bool {
+	return match (a, b) {
+		(Int(h1, l1), Int(h2, l2)) -> h1 == h2 && l1 == l2
+		(Bool(x), Bool(y)) -> x == y
+		(Str(s), Str(t)) -> s == t
+		(Code(c), Code(d)) -> c == d
+		_ -> false
+	}
+}
+
+// A tuple of bools is exhaustive without '_'.
+func both(a bool, b bool) u32 {
+	return match (a, b) {
+		(true, true) -> 3
+		(true, false) -> 2
+		(false, true) -> 1
+		(false, false) -> 0
+	}
+}
+
+// A statement match on bool that covers true and false terminates.
+func boolStmt(b bool) u32 {
+	match b {
+		true -> return 1
+		false -> return 2
+	}
+}
+
+// Guards: a failing guard falls through to the next arm.
+func classify(v Val) u32 {
+	return match v {
+		Int(h, l) if h == 0 && l < 10 -> 1
+		Int(h, _) if h == 0 -> 2
+		Int(..) -> 3
+		Bool(b) if b -> 4
+		Str(s) if len(s) > 3 -> 5
+		_ -> 6
+	}
+}
+
+// `is`: variant tests; bindings in if conditions and && chains.
+func lowWord(v Val) u32 {
+	if v is Int(h, l) && h == 0 {
+		return l
+	} else if v is Code(Pair(a, b)) && a < b {
+		return b - a
+	} else if v is Bool(_) | Str(_) {
+		return 1000
+	}
+	return 0
+}
+
+func countInts(vs []Val) u32 {
+	var n u32 = 0
+	for i := usize(0); i < len(vs); i++ {
+		if vs[i] is Int(..) {
+			n++
+		}
+	}
+	return n
+}
+
+// Simple-statement arm bodies.
+func walk(ts []Ty) u32 {
+	var n u32 = 100
+	var last u32 = 0
+	for i := usize(0); i < len(ts); i++ {
+		match ts[i] {
+			Named(_) -> n--
+			Ptr -> continue
+			Sig(..) -> break
+			Struct(r, _) -> last = r
+			Array(_, k) -> n += k
+			Slice(..) -> n = touch(n)
+		}
+	}
+	return n*1000 + last
+}
+
+func touch(n u32) u32 {
+	return n + 7
+}
+
+// A statement match with a guard and a tuple scrutinee computed by calls.
+func pairs(a Option[u32], b Option[u32]) u32 {
+	var r u32 = 0
+	match (a, b) {
+		(Some(x), Some(y)) if x > y -> r = x - y
+		(Some(x), Some(y)) -> r = y - x + 100
+		(Some(x), None) | (None, Some(x)) -> r = x + 1000
+		(None, None) -> r = 7
+	}
+	return r
+}
+
+// comptime evaluates the new forms.
+comptime func ctDepth(n u32) u32 {
+	var o Option[Option[u32]] = Option[Option[u32]].None
+	if n > 0 {
+		o = Option[Option[u32]].Some(Option[u32].Some(n))
+	}
+	var r u32 = 0
+	match o {
+		Some(Some(x)) if x > 5 -> r = x * 2
+		Some(Some(x)) -> r = x
+		_ -> r = 99
+	}
+	if o is Some(Some(y)) && y == 3 {
+		r += 1000
+	}
+	return r + match (n > 4, n == 0) {
+		(true, _) -> 10
+		(false, true) -> 20
+		(false, false) -> 30
+	}
+}
+
+const CT1 = ctDepth(3)
+const CT2 = ctDepth(7)
+const CT3 = ctDepth(0)
+const IsRed = Val2.Unit is Unit
+
+driver func line(io Stdio, label string, v u64) error {
+	var b [64]byte
+	n := formatTo(b[:], "%s: %d\n", label, v)
+	return io.WriteStdout(b[:n])
+}
+
+driver func flag(io Stdio, label string, v bool) error {
+	var b [64]byte
+	n := formatTo(b[:], "%s: %v\n", label, v)
+	return io.WriteStdout(b[:n])
+}
+
+driver func main(io Stdio) error {
+	if err := line(io, "size struct", u64(size(Ty.Struct(3, 4)))); err != nil {
+		return err
+	}
+	if err := line(io, "size array", u64(size(Ty.Array(5, 6)))); err != nil {
+		return err
+	}
+	if err := line(io, "size slice", u64(size(Ty.Slice(9, true, 1)))); err != nil {
+		return err
+	}
+	if err := line(io, "size sig", u64(size(Ty.Sig(1, 2, 3, 4, 5, 6, 7, 8)))); err != nil {
+		return err
+	}
+	if err := line(io, "size ptr", u64(size(Ty.Ptr))); err != nil {
+		return err
+	}
+	if err := line(io, "depth 0", u64(depth(Option[Option[u32]].Some(Option[u32].Some(0))))); err != nil {
+		return err
+	}
+	if err := line(io, "depth 42", u64(depth(Option[Option[u32]].Some(Option[u32].Some(42))))); err != nil {
+		return err
+	}
+	if err := line(io, "depth some none", u64(depth(Option[Option[u32]].Some(Option[u32].None)))); err != nil {
+		return err
+	}
+	if err := line(io, "depth none", u64(depth(Option[Option[u32]].None))); err != nil {
+		return err
+	}
+	var codes [10]Val
+	codes[0] = Val.Code(Val2.Lit(-1))
+	codes[1] = Val.Code(Val2.Lit(2))
+	codes[2] = Val.Code(Val2.Lit(9))
+	codes[3] = Val.Code(Val2.Pair(0, 5))
+	codes[4] = Val.Code(Val2.Pair(6, 0))
+	codes[5] = Val.Code(Val2.Pair(1, 1))
+	codes[6] = Val.Code(Val2.Unit)
+	codes[7] = Val.Str("hi")
+	codes[8] = Val.Str("ho")
+	codes[9] = Val.Bool(true)
+	var sum u64 = 0
+	for i := usize(0); i < 10; i++ {
+		sum = sum*10 + u64(code(codes[i]))
+	}
+	if err := line(io, "codes", sum); err != nil {
+		return err
+	}
+	if err := flag(io, "eq int", equalVals(Val.Int(1, 2), Val.Int(1, 2))); err != nil {
+		return err
+	}
+	if err := flag(io, "eq int ne", equalVals(Val.Int(1, 2), Val.Int(1, 3))); err != nil {
+		return err
+	}
+	if err := flag(io, "eq str", equalVals(Val.Str("a"), Val.Str("a"))); err != nil {
+		return err
+	}
+	if err := flag(io, "eq code", equalVals(Val.Code(Val2.Pair(1, 2)), Val.Code(Val2.Pair(1, 2)))); err != nil {
+		return err
+	}
+	if err := flag(io, "eq mixed", equalVals(Val.Bool(true), Val.Str("a"))); err != nil {
+		return err
+	}
+	if err := line(io, "both", u64(both(true, false)*10+both(false, true))); err != nil {
+		return err
+	}
+	if err := line(io, "boolStmt", u64(boolStmt(true)*10+boolStmt(false))); err != nil {
+		return err
+	}
+	var vals [7]Val
+	vals[0] = Val.Int(0, 5)
+	vals[1] = Val.Int(0, 50)
+	vals[2] = Val.Int(1, 5)
+	vals[3] = Val.Bool(true)
+	vals[4] = Val.Bool(false)
+	vals[5] = Val.Str("long!")
+	vals[6] = Val.Str("s")
+	sum = 0
+	for i := usize(0); i < 7; i++ {
+		sum = sum*10 + u64(classify(vals[i]))
+	}
+	if err := line(io, "classify", sum); err != nil {
+		return err
+	}
+	if err := line(io, "low int", u64(lowWord(Val.Int(0, 77)))); err != nil {
+		return err
+	}
+	if err := line(io, "low int high", u64(lowWord(Val.Int(1, 77)))); err != nil {
+		return err
+	}
+	if err := line(io, "low pair", u64(lowWord(Val.Code(Val2.Pair(3, 10))))); err != nil {
+		return err
+	}
+	if err := line(io, "low str", u64(lowWord(Val.Str("x")))); err != nil {
+		return err
+	}
+	if err := line(io, "ints", u64(countInts(vals[:]))); err != nil {
+		return err
+	}
+	var ts [7]Ty
+	ts[0] = Ty.Named(1)
+	ts[1] = Ty.Ptr
+	ts[2] = Ty.Struct(4, 4)
+	ts[3] = Ty.Array(1, 20)
+	ts[4] = Ty.Slice(1, false, 2)
+	ts[5] = Ty.Sig(0, 0, 0, 0, 0, 0, 0, 0)
+	ts[6] = Ty.Named(2)
+	if err := line(io, "walk", u64(walk(ts[:]))); err != nil {
+		return err
+	}
+	if err := line(io, "pairs gt", u64(pairs(Option[u32].Some(9), Option[u32].Some(4)))); err != nil {
+		return err
+	}
+	if err := line(io, "pairs le", u64(pairs(Option[u32].Some(4), Option[u32].Some(9)))); err != nil {
+		return err
+	}
+	if err := line(io, "pairs one", u64(pairs(Option[u32].None, Option[u32].Some(9)))); err != nil {
+		return err
+	}
+	if err := line(io, "pairs none", u64(pairs(Option[u32].None, Option[u32].None))); err != nil {
+		return err
+	}
+	if err := line(io, "comptime", u64(CT1)*1000000+u64(CT2)*1000+u64(CT3)); err != nil {
+		return err
+	}
+	return flag(io, "const is", IsRed)
+}

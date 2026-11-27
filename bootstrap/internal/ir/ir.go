@@ -42,8 +42,10 @@ type Program struct {
 	// Caps are the capability types of main's parameters, in order.
 	Caps []resolve.Builtin
 
-	names  []string // Go name by SymID ("" = not assigned yet)
-	used   []bool   // by SymID: local variable is used (read) somewhere
+	names  []string        // Go name by SymID ("" = not assigned yet)
+	used   []bool          // by SymID: local variable is used (read) somewhere
+	track  *resolve.Symbol // UsedIn: the symbol looked for
+	found  bool            // UsedIn: track was read
 	funcs  map[*types.FuncInfo]*Func
 	prefix map[*resolve.Package]string
 }
@@ -452,7 +454,30 @@ func (p *Program) Used(s *resolve.Symbol) bool {
 func (p *Program) use(id *ast.Ident) {
 	if s := p.Prog.Uses[id.ID()]; s != nil && int(s.ID) < len(p.used) {
 		p.used[s.ID] = true
+		if s == p.track {
+			p.found = true
+		}
 	}
+}
+
+// UsedIn reports whether the local variable s is read in n (an expression
+// or a statement; live code only). Used for the bindings of a match arm,
+// which are emitted separately for its guard and its body (v0.2).
+func (p *Program) UsedIn(n ast.Node, s *resolve.Symbol) bool {
+	if s == nil || n == nil {
+		return false
+	}
+	p.track, p.found = s, false
+	switch n := n.(type) {
+	case ast.Expr:
+		p.markExpr(n)
+	case *ast.BlockStmt:
+		p.markStmts(n.Stmts)
+	case ast.Stmt:
+		p.markStmt(n)
+	}
+	p.track = nil
+	return p.found
 }
 
 func (p *Program) markUses(b *ast.BlockStmt) { p.markStmts(b.Stmts) }
@@ -502,6 +527,9 @@ func (p *Program) markStmt(s ast.Stmt) {
 		for _, a := range s.Arms {
 			if lp, ok := a.Pattern.(*ast.LiteralPattern); ok {
 				p.markExpr(lp.Lit)
+			}
+			if a.Guard != nil {
+				p.markExpr(a.Guard)
 			}
 			if a.Expr != nil {
 				p.markExpr(a.Expr)
@@ -586,11 +614,11 @@ func IsTerminating(info *types.Info, s ast.Stmt) bool {
 	case *ast.ScopeStmt:
 		return IsTerminatingList(info, s.Body.Stmts)
 	case *ast.MatchStmt:
-		arms := MatchArms(info, s.X, s.Arms)
-		if !arms.HasDefault {
+		// v0.2: exhaustive (types.Info.Exhaustive) and every arm terminates.
+		if len(s.Arms) == 0 || !info.IsExhaustive(s) {
 			return false
 		}
-		for _, a := range arms.Arms {
+		for _, a := range s.Arms {
 			if a.Expr != nil && !isPanicCall(info, a.Expr) {
 				return false
 			}

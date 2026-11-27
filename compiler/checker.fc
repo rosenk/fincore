@@ -206,6 +206,14 @@ func writeExpr(o *OutBuf, e u32, dp usize) decreases(dp) {
 		o.WriteString("type expression")
 	} else if k == NkMatchExpr {
 		o.WriteString("match expression")
+	} else if k == NkTupleExpr {
+		o.WriteString("(")
+		writeExprList(o, e, dp-1)
+		o.WriteString(")")
+	} else if k == NkIsExpr {
+		writeExpr(o, na(e), dp-1)
+		o.WriteString(" is ")
+		writePattern(o, nb(e), dp-1)
 	} else {
 		o.WriteString("expression")
 	}

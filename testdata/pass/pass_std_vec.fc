@@ -120,11 +120,11 @@ driver func main(io Stdio) error {
 	inner := la.Mark()
 	la.Push(7)
 	la.Push(8)
-	is, in := la.Commit(inner)
-	la.Push(is)
+	ist, in := la.Commit(inner)
+	la.Push(ist)
 	la.Push(3)
 	os, on := la.Commit(outer)
-	if err := put(io, "inner run: ", u64(is)*10+u64(in)); err != nil {
+	if err := put(io, "inner run: ", u64(ist)*10+u64(in)); err != nil {
 		return err
 	}
 	if err := put(io, "outer run: ", u64(os)*10+u64(on)); err != nil {

@@ -49,6 +49,7 @@ const (
 	TkNil       = 31
 	TkAny       = 32
 	TkDecreases = 33
+	TkIs        = 34 // v0.2 variant tests
 
 	// operators and punctuation
 	TkAdd       = 40 // +
@@ -90,6 +91,7 @@ const (
 	TkSemicolon = 76 // ;
 	TkArrow     = 77 // ->
 	TkEllipsis  = 78 // ...
+	TkDotDot    = 79 // .. (v0.2 rest pattern)
 )
 
 // Lexical error reasons (Token.errKind of ILLEGAL tokens).
@@ -132,7 +134,7 @@ const (
 )
 
 func isKeyword(k u8) bool {
-	return k >= TkPackage && k <= TkDecreases
+	return k >= TkPackage && k <= TkIs
 }
 
 // kindString returns the source spelling of keywords and operators and the
@@ -234,6 +236,9 @@ func keywordString(k u8) string {
 	}
 	if k == TkDecreases {
 		return "decreases"
+	}
+	if k == TkIs {
+		return "is"
 	}
 	return "Kind(?)"
 }
@@ -356,6 +361,9 @@ func operatorString(k u8) string {
 	if k == TkEllipsis {
 		return "..."
 	}
+	if k == TkDotDot {
+		return ".."
+	}
 	return "Kind(?)"
 }
 
@@ -369,7 +377,7 @@ func lookupKeyword(w []byte) u8 {
 	if c < 'a' || c > 'v' {
 		return TkIdent
 	}
-	for k := u8(TkPackage); k < TkDecreases+1; k++ {
+	for k := u8(TkPackage); k < TkIs+1; k++ {
 		if bytesEqual(w, strBytes(keywordString(k))) {
 			return k
 		}
@@ -992,6 +1000,9 @@ func (l *Lexer) opKind() (u8, usize) {
 	if c == '.' {
 		if n1 == '.' && n2 == '.' {
 			return TkEllipsis, 3
+		}
+		if n1 == '.' {
+			return TkDotDot, 2
 		}
 		return TkPeriod, 1
 	}

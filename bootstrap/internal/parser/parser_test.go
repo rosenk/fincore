@@ -402,7 +402,7 @@ func TestMatchPatterns(t *testing.T) {
 		}
 	}
 	cp := m.Arms[4].Pattern.(*ast.CtorPattern)
-	if cp.Qual.Name != "Token" || cp.Name.Name != "Int" || len(cp.Bindings) != 2 || !cp.HasParens {
+	if cp.Qual.Name != "Token" || cp.Name.Name != "Int" || len(cp.Args) != 2 || !cp.HasParens {
 		t.Errorf("ctor pattern %+v", cp)
 	}
 	if m.Arms[4].Block == nil || m.Arms[4].Expr != nil || m.Arms[0].Expr == nil {
@@ -622,7 +622,7 @@ func TestErrors(t *testing.T) {
 		{"package p\nfunc f(a, b ...u8) {}", "2:13: error[E1001]: variadic parameter must have exactly one name"},
 		{"package p\nfunc f(a) {}", "2:9: error[E1001]: expected parameter type, found ')'"},
 		{"package p\nfunc f() {\n\tmatch x {\n\t\t1\n\t}\n}", "4:4: error[E1001]: expected '->', found newline"},
-		{"package p\nfunc f() {\n\tmatch x {\n\t\t-1 -> a()\n\t}\n}", "4:3: error[E1001]: expected pattern"},
+		{"package p\nfunc f() {\n\tmatch x {\n\t\t-x -> a()\n\t}\n}", "4:3: error[E1001]: expected pattern"},
 		{"package p\nfunc f() {\n\tfor i := 0; i < n; j := 1 {\n\t}\n}", "3:21: error[E1001]: cannot declare in post statement of for loop"},
 		{"package p\nfunc f() {\n\tfor i := 0; i < n {\n\t}\n}", "3:20: error[E1001]: expected ';' in for clause, found '{'"},
 		{"package p\nfunc f() {\n\tif x := 1 {\n\t}\n}", "3:5: error[E1001]: cannot use x := 1 as value in if condition"},

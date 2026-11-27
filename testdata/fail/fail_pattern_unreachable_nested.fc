@@ -1,0 +1,21 @@
+// fail_pattern_unreachable_nested (v0.2): an arm covered by an earlier
+// nested wildcard is unreachable.
+package main
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+func f(o Option[Option[u32]]) u32 {
+	return match o {
+		Some(_) -> 1
+		Some(Some(3)) -> 2 // ERROR E2012
+		None -> 0
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(Option[Option[u32]].None)
+	return nil
+}

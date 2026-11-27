@@ -56,6 +56,8 @@ var cgFailed bool
 
 // Per-symbol and per-node lowering tables.
 var cgUsed [MaxSyms]bool         // local variable is read somewhere (live code)
+var cgTrack u32                  // usedIn: the symbol looked for (0 = none)
+var cgFound bool                 // usedIn: cgTrack was read
 var cgScopeIdx [MaxNodes]u32     // ScopeStmt -> 1 + index within its function
 var cgScopeCount [MaxFuncs]u32   // FuncInfo -> number of scope statements
 var cgPrefix [MaxPkgs]string     // package -> Go name prefix ("" for the root)
@@ -457,6 +459,9 @@ func cgWalkMarkExpr(n u32, dp usize) decreases(dp) {
 		s := uses[usize(n)]
 		if s != 0 {
 			cgUsed[usize(s)] = true
+			if s == cgTrack {
+				cgFound = true
+			}
 		}
 		return
 	}
@@ -541,6 +546,9 @@ func cgMarkStmt(s u32, dp usize) decreases(dp) {
 			if nkind(na(a)) == NkLiteralPattern {
 				cgWalkMarkExpr(na(na(a)), dp-1)
 			}
+			if nd(a) != 0 {
+				cgWalkMarkExpr(nd(a), dp-1)
+			}
 			if nb(a) != 0 {
 				cgWalkMarkExpr(nb(a), dp-1)
 			}
@@ -564,6 +572,33 @@ func cgMarkStmt(s u32, dp usize) decreases(dp) {
 			cgWalkMarkExpr(l1at(s, i), dp-1)
 		}
 	}
+}
+
+// usedIn reports whether local variable sym is read in n (a block or an
+// expression; live code only): Program.UsedIn, for the bindings of a match
+// arm, which are emitted separately for its guard and its body (v0.2).
+func cgUsedIn(n u32, sym u32) bool {
+	if sym == 0 || n == 0 {
+		return false
+	}
+	cgTrack = sym
+	cgFound = false
+	if nkind(n) == NkBlockStmt {
+		cgMarkStmts(n, WalkDepth)
+	} else {
+		cgWalkMarkExpr(n, WalkDepth)
+	}
+	cgTrack = 0
+	return cgFound
+}
+
+// wcontains reports whether gw.data[a:b] contains pat.
+func cgWcontains(a usize, b usize, pat []byte) bool {
+	w := (&cgBuf).Bytes()
+	if a > b || b > len(w) {
+		return false
+	}
+	return bytes.Contains(w[a:b], pat)
 }
 
 // numberScopes numbers the scope statements of a function body in source
@@ -674,23 +709,21 @@ func cgIsTerm(s u32, dp usize) bool decreases(dp) {
 		return cgIsTermList(nc(s), dp-1)
 	}
 	if k == NkMatchStmt {
-		mark, cnt, hasDef, _ := cgMatchArms(s)
-		ok := hasDef
-		if ok {
-			for i := usize(0); i < cnt; i++ {
-				a := cgArms[mark+i]
-				if nb(a) != 0 && !cgIsPanicCall(nb(a)) {
-					ok = false
-					break
-				}
-				if nc(a) != 0 && !cgIsTermList(nc(a), dp-1) {
-					ok = false
-					break
-				}
+		// v0.2: exhaustive (nexh) and every arm terminates.
+		n := l1len(s)
+		if n == 0 || !nexh[usize(s)] {
+			return false
+		}
+		for i := usize(0); i < n; i++ {
+			a := l1at(s, i)
+			if nb(a) != 0 && !cgIsPanicCall(nb(a)) {
+				return false
+			}
+			if nc(a) != 0 && !cgIsTermList(nc(a), dp-1) {
+				return false
 			}
 		}
-		cgArmTop = mark
-		return ok
+		return true
 	}
 	return false
 }

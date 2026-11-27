@@ -295,6 +295,8 @@ func (l *Lexer) operator(start diag.Pos) Token {
 		k = PERIOD
 		if n1 == '.' && n2 == '.' {
 			k, size = ELLIPSIS, 3
+		} else if n1 == '.' {
+			k, size = DOTDOT, 2
 		}
 	}
 	if k == ILLEGAL {

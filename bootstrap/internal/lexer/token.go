@@ -40,6 +40,7 @@ const (
 	NIL
 	ANY
 	DECREASES
+	IS // v0.2 variant tests
 	keywordEnd
 
 	operatorBeg
@@ -82,6 +83,7 @@ const (
 	SEMICOLON  // ; (explicit or automatically inserted)
 	ARROW      // ->
 	ELLIPSIS   // ...
+	DOTDOT     // .. (v0.2 rest pattern)
 	operatorEnd
 )
 
@@ -117,6 +119,7 @@ var kindStrings = [...]string{
 	NIL:       "nil",
 	ANY:       "any",
 	DECREASES: "decreases",
+	IS:        "is",
 
 	ADD:        "+",
 	SUB:        "-",
@@ -157,6 +160,7 @@ var kindStrings = [...]string{
 	SEMICOLON:  ";",
 	ARROW:      "->",
 	ELLIPSIS:   "...",
+	DOTDOT:     "..",
 }
 
 // String returns the source spelling for keywords/operators and the class

@@ -85,6 +85,7 @@ func Check(prog *resolve.Program, cfg Config) (*Info, diag.List) {
 			Selections: make([]*Selection, n),
 			Instances:  make([]*Instance, n),
 			Variants:   make([]*Variant, n),
+			Exhaustive: make([]bool, n),
 			funcOf:     map[ast.Node]*FuncInfo{},
 			methodOf:   map[*resolve.Symbol]*Method{},
 		},
@@ -824,6 +825,18 @@ func writeExpr(b *strings.Builder, e ast.Expr) {
 		b.WriteString("type expression")
 	case *ast.MatchExpr:
 		b.WriteString("match expression")
+	case *ast.TupleExpr:
+		b.WriteString("(")
+		for i, a := range e.Elems {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			writeExpr(b, a)
+		}
+		b.WriteString(")")
+	case *ast.IsExpr:
+		writeExpr(b, e.X)
+		b.WriteString(" is " + ast.Format(e.Pattern))
 	default:
 		b.WriteString("expression")
 	}

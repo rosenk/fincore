@@ -36,7 +36,7 @@ func TestSumTypesNegative(t *testing.T) {
 		{"arm typed mismatch", "package main\nfunc f(n u32, a u8, b u16) u16 {\n\treturn match n {\n\t\t0 -> a\n\t\t_ -> b\n\t}\n}\n",
 			"E2002@5", "match arm has type u16, want u8"},
 		{"or binds", "package main\ntype S enum {\n\tA(u32)\n\tB(u32)\n}\nfunc f(s S) u32 {\n\treturn match s {\n\t\tA(x) | B(_) -> 1\n\t}\n}\n",
-			"E2002@8", "or-pattern alternatives cannot bind variables (x)"},
+			"E2002@8", "or-pattern alternatives must bind the same variables (x is not bound here)"},
 		{"or wildcard", "package main\nfunc f(n u32) u32 {\n\treturn match n {\n\t\t1 | _ -> 1\n\t}\n}\n",
 			"E2002@4", "'_' cannot be an alternative of an or-pattern"},
 		{"const on enum", "package main\ntype S enum {\n\tA\n\tB\n}\nconst K = S.A\nfunc f(s S) {\n\tmatch s {\n\t\tK -> {}\n\t\t_ -> {}\n\t}\n}\n",

@@ -1,28 +1,20 @@
-// check_match.fc — the type checker, part 4 (v0.2 sum types): match
-// statements and expressions, or-patterns, exhaustiveness and
-// reachability (E2012). Port of finc0's types/match.go. Functions taking
-// `dp` are members of the checker SCC (see checker.fc).
+// check_match.fc — the type checker, part 4 (v0.2 sum types and
+// patterns): match statements and expressions, tuple scrutinees, nested,
+// or-, tuple and rest patterns with bindings, guards, `is` expressions,
+// reachability and exhaustiveness (E2012) by pattern usefulness. Port of
+// finc0's types/match.go and types/usefulness.go. Functions taking `dp`
+// are members of the checker SCC (see checker.fc).
 package main
 
-// Scratch for the coverage phase of matchPatterns (not re-entrant: the
-// phase evaluates no expressions).
-const (
-	MaxMatchVariants = 65536
-	MaxMatchCases    = 65536
-)
-
-var mCovered [MaxMatchVariants]bool
-var mSeen [MaxMatchCases]u32
+// ---------------------------------------------------------------------------
+// Matches
 
 func matchStmt(s u32, dp usize) decreases(dp) {
 	if dp == 0 {
 		tooDeep()
 		return
 	}
-	x := exprValue(na(s), dp-1)
-	if !isInvalidOp(&x) && isUntyped(x.typ) {
-		_ = defaultTypeOp(&x, mkCtx(CtxMatch))
-	}
+	x := scrutinee(na(s), dp-1)
 	_ = matchPatterns(s, &x, false, dp-1)
 	n := l1len(s)
 	for i := usize(0); i < n; i++ {
@@ -34,6 +26,45 @@ func matchStmt(s u32, dp usize) decreases(dp) {
 			stmtList(nc(arm), dp-1)
 		}
 	}
+}
+
+// scrutinee checks the scrutinee of a match: an expression (untyped
+// constants get their default type) or a tuple of expressions (a tuple
+// type, v0.2).
+func scrutinee(e u32, dp usize) Operand decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return invalidOp(e)
+	}
+	if nkind(e) != NkTupleExpr {
+		x := exprValue(e, dp-1)
+		if !isInvalidOp(&x) && isUntyped(x.typ) {
+			_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+		}
+		return x
+	}
+	n := l1len(e)
+	bad := false
+	m := tmark()
+	for i := usize(0); i < n; i++ {
+		x := exprValue(l1at(e, i), dp-1)
+		if !isInvalidOp(&x) && isUntyped(x.typ) {
+			_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+		}
+		if isInvalidOp(&x) {
+			bad = true
+		}
+		tpush(x.typ)
+	}
+	t := mkTupleStack(m)
+	if bad {
+		return invalidOp(e)
+	}
+	x := opMode(KValue, t)
+	x.expr = e
+	ntype[usize(e)] = t
+	nmode[usize(e)] = KValue
+	return x
 }
 
 // armOperand rebuilds the operand of a checked arm expression from the
@@ -68,10 +99,7 @@ func matchExpr(e u32, dp usize) Operand decreases(dp) {
 		tooDeep()
 		return invalidOp(e)
 	}
-	x := exprValue(na(e), dp-1)
-	if !isInvalidOp(&x) && isUntyped(x.typ) {
-		_ = defaultTypeOp(&x, mkCtx(CtxMatch))
-	}
+	x := scrutinee(na(e), dp-1)
 	valid := matchPatterns(e, &x, true, dp-1)
 	n := l1len(e)
 	rt := u32(0)
@@ -174,39 +202,185 @@ func valsEqual(a Val, b Val) bool {
 }
 
 // selectArm returns the index of the arm of match m selected by the
-// constant scrutinee value v (the arm count if none).
+// constant scrutinee value v (the arm count if none, or if a guard on the
+// way is not a constant).
 func selectArm(v Val, m u32) usize {
 	n := l1len(m)
 	for i := usize(0); i < n; i++ {
-		p := na(l1at(m, i))
-		na2 := patAltN(p)
-		for j := usize(0); j < na2; j++ {
-			alt := patAlt(p, j)
-			k := nkind(alt)
-			if k == NkWildcardPattern {
-				return i
-			}
-			if k == NkCtorPattern {
-				if nvarEnum[usize(alt)] != 0 {
-					if isVariant(v, nvarIdx[usize(alt)]) {
-						return i
-					}
-				} else if nval[usize(nb(alt))] != 0 && valsEqual(v, slotGet(nval[usize(nb(alt))])) {
-					return i
-				}
-			} else if k == NkLiteralPattern {
-				if nval[usize(na(alt))] != 0 && valsEqual(v, slotGet(nval[usize(na(alt))])) {
-					return i
-				}
-			}
+		arm := l1at(m, i)
+		if !matchVal(na(arm), v, SemaDepth) {
+			continue
+		}
+		g := nd(arm)
+		if g == 0 {
+			return i
+		}
+		if nval[usize(g)] == 0 {
+			return n
+		}
+		b, ok := boolOf(slotGet(nval[usize(g)]))
+		if !ok {
+			return n
+		}
+		if b {
+			return i
 		}
 	}
 	return n
 }
 
-// matchPatterns checks the patterns of match m (statement or expression)
-// on x and reports E2012 for unreachable arms and non-exhaustive matches.
-// It reports whether every pattern is valid.
+// payloadIndex returns the payload position matched by argument i of a
+// variant pattern p with n payloads (v0.2: arguments after a `..` count
+// from the end). Argument i must not be the RestPattern itself.
+func payloadIndex(p u32, i usize, n usize) usize {
+	c := l1len(p)
+	for r := usize(0); r < i; r++ {
+		if nkind(l1at(p, r)) == NkRestPattern {
+			return n - (c - i)
+		}
+	}
+	return i
+}
+
+// enumPaySlot returns the slot of payload j of an enum value.
+func enumPaySlot(v Val, j usize) u32 {
+	return match v { Enum(_, s, _) -> s + u32(j), _ -> 0 }
+}
+
+// matchVal reports whether the constant value v matches the checked
+// pattern p (finc0's types.MatchValue without bindings).
+func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
+	if depth == 0 || p == 0 {
+		return false
+	}
+	k := nkind(p)
+	if k == NkWildcardPattern || k == NkRestPattern {
+		return true
+	}
+	if k == NkIdent {
+		if nvarEnum[usize(p)] != 0 {
+			return isVariant(v, nvarIdx[usize(p)])
+		}
+		return true
+	}
+	if k == NkCtorPattern {
+		if nvarEnum[usize(p)] == 0 {
+			s := nval[usize(nb(p))]
+			return s != 0 && valsEqual(v, slotGet(s))
+		}
+		if !isVariant(v, nvarIdx[usize(p)]) {
+			return false
+		}
+		np := variantPayN(nvarEnum[usize(p)], usize(nvarIdx[usize(p)]))
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			a := l1at(p, i)
+			if nkind(a) == NkRestPattern {
+				continue
+			}
+			if !matchVal(a, slotGet(enumPaySlot(v, payloadIndex(p, i, np))), depth-1) {
+				return false
+			}
+		}
+		return true
+	}
+	if k == NkLiteralPattern {
+		s := nval[usize(na(p))]
+		return s != 0 && valsEqual(v, slotGet(s))
+	}
+	if k == NkOrPattern {
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			if matchVal(l1at(p, i), v, depth-1) {
+				return true
+			}
+		}
+		return false
+	}
+	if k == NkTuplePattern {
+		ref, tn := tupleOf(v)
+		c := l1len(p)
+		if usize(tn) != c {
+			return false
+		}
+		for i := usize(0); i < c; i++ {
+			if !matchVal(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// isExpr checks `X is Pattern` (v0.2). Bindings are declared by the
+// resolver only in if conditions; elsewhere they are E2002.
+func isExpr(e u32, dp usize) Operand decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return invalidOp(e)
+	}
+	x := exprValue(na(e), dp-1)
+	if !isInvalidOp(&x) && isUntyped(x.typ) {
+		_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+	}
+	if isInvalidOp(&x) {
+		invalidBindings(nb(e), SemaDepth)
+		return invalidOp(e)
+	}
+	if !topPattern(nb(e), x.typ, dp-1) {
+		return invalidOp(e)
+	}
+	if x.mode == KConst && !hasBindings(nb(e), SemaDepth) {
+		return opConst(TyUntypedBool, Val.Bool(matchVal(nb(e), x.val, SemaDepth)))
+	}
+	return opMode(KValue, TyBool)
+}
+
+// hasBindings reports whether a checked pattern binds a variable.
+func hasBindings(p u32, depth usize) bool decreases(depth) {
+	if depth == 0 || p == 0 {
+		return false
+	}
+	k := nkind(p)
+	if k == NkIdent {
+		return !isBlank(p) && nvarEnum[usize(p)] == 0
+	}
+	if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			if hasBindings(l1at(p, i), depth-1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// invalidBindings gives every binding of p without a type the type Invalid
+// (after an error).
+func invalidBindings(p u32, depth usize) decreases(depth) {
+	if depth == 0 || p == 0 {
+		return
+	}
+	k := nkind(p)
+	if k == NkIdent {
+		s := defs[usize(p)]
+		if s != 0 && syms.items[usize(s)].typ == 0 {
+			setSymType(s, TyInvalid)
+		}
+	} else if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			invalidBindings(l1at(p, i), depth-1)
+		}
+	}
+}
+
+// matchPatterns checks the patterns and guards of match m (statement or
+// expression) on x and reports E2012 for unreachable arms and
+// non-exhaustive matches. It records whether the match counts as
+// exhaustive (nexh) and reports whether every pattern is valid.
 func matchPatterns(m u32, x *Operand, isExpr bool, dp usize) bool decreases(dp) {
 	if dp == 0 {
 		tooDeep()
@@ -215,169 +389,1148 @@ func matchPatterns(m u32, x *Operand, isExpr bool, dp usize) bool decreases(dp) 
 	valid := !isInvalidOp(x)
 	n := l1len(m)
 	for i := usize(0); i < n; i++ {
-		pat := na(l1at(m, i))
+		arm := l1at(m, i)
+		pat := na(arm)
 		if isInvalidOp(x) {
-			if nkind(pat) == NkCtorPattern {
-				bindInvalid(pat)
-			}
-			continue
-		}
-		if !armPattern(pat, x.typ, dp-1) {
+			invalidBindings(pat, SemaDepth)
+		} else if !topPattern(pat, x.typ, dp-1) {
 			valid = false
 		}
+		g := nd(arm)
+		if g != 0 {
+			gx := exprValue(g, dp-1)
+			if !isInvalidOp(&gx) {
+				if !isBoolean(gx.typ) {
+					errAt(E2002, g, formatTo(mbuf[:], "non-boolean guard %v in match arm (type %v)", Expr(g), TypeRef(gx.typ)))
+				} else if isUntyped(gx.typ) {
+					_ = convertUntyped(&gx, TyBool)
+				}
+			}
+		}
+	}
+	required := false
+	if !isInvalidOp(x) {
+		u := underlying(x.typ)
+		required = isEnumT(u) || isTupleT(u)
 	}
 	if !valid {
+		exh := required
+		for i := usize(0); i < n; i++ {
+			arm := l1at(m, i)
+			if nkind(na(arm)) == NkWildcardPattern && nd(arm) == 0 {
+				exh = true
+			}
+		}
+		nexh[usize(m)] = exh
 		return false
 	}
-	matchCoverage(m, x.typ, isExpr)
+	exhaustive := checkCoverage(m, x.typ, isExpr)
+	nexh[usize(m)] = exhaustive || required
 	return true
 }
 
-func mAllCovered(nv usize) bool {
-	for i := usize(0); i < nv; i++ {
-		if !mCovered[i] {
-			return false
-		}
-	}
-	return true
-}
+// ---------------------------------------------------------------------------
+// Pattern checking
 
-// matchCoverage is the reachability and exhaustiveness phase of
-// matchPatterns (all patterns are valid).
-func matchCoverage(m u32, t u32, isExpr bool) {
-	en := underlying(t)
-	isEnum := isEnumT(en)
-	nv := usize(0)
-	if isEnum {
-		nv = nvariants(en)
-		if nv > MaxMatchVariants {
-			setFull("match variants")
-			return
-		}
-	}
-	for i := usize(0); i < nv; i++ {
-		mCovered[i] = false
-	}
-	nseen := usize(0)
-	wild := false
-	n := l1len(m)
-	for i := usize(0); i < n; i++ {
-		pat := na(l1at(m, i))
-		if wild {
-			errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the '_' arm"))
-			continue
-		}
-		na2 := patAltN(pat)
-		for j := usize(0); j < na2; j++ {
-			alt := patAlt(pat, j)
-			k := nkind(alt)
-			vi := -1
-			val := u32(0)
-			lit := u32(0)
-			if k == NkWildcardPattern {
-				if isEnum && nv > 0 && mAllCovered(nv) {
-					errAt(E2012, alt, formatTo(mbuf[:], "unreachable '_' arm: all variants of %v are covered", TypeRef(t)))
-				}
-				wild = true
-				continue
-			}
-			if k == NkCtorPattern {
-				if nvarEnum[usize(alt)] != 0 {
-					vi = int(nvarIdx[usize(alt)])
-				} else {
-					val = nval[usize(nb(alt))]
-					lit = nb(alt)
-				}
-			} else if k == NkLiteralPattern {
-				val = nval[usize(na(alt))]
-				lit = na(alt)
-			}
-			if vi >= 0 {
-				if mCovered[usize(vi)] {
-					errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: variant %v is already covered", NameRef(variantName(en, usize(vi)))))
-				}
-				mCovered[usize(vi)] = true
-				continue
-			}
-			if val == 0 {
-				continue
-			}
-			dup := false
-			for s := usize(0); s < nseen; s++ {
-				if valsEqual(slotGet(mSeen[s]), slotGet(val)) {
-					dup = true
-				}
-			}
-			if dup {
-				errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: duplicate case %v", Expr(lit)))
-				continue
-			}
-			if nseen >= MaxMatchCases {
-				setFull("match cases")
-				return
-			}
-			mSeen[nseen] = val
-			nseen++
-		}
-	}
-	if wild {
+// Bindings of the pattern being checked (a LIFO stack: or-pattern
+// alternatives push their lists above the enclosing pattern's).
+const MaxPatBinds = 4096
+
+var pbSym [MaxPatBinds]u32
+var pbId [MaxPatBinds]u32
+var pbTyp [MaxPatBinds]u32
+var pbN usize
+
+func pbPush(sym u32, id u32, t u32) {
+	if pbN >= MaxPatBinds {
+		setFull("pattern bindings")
 		return
 	}
-	if isEnum {
-		k := usize(0) // message length; 0 while no variant is missing
-		for i := usize(0); i < nv; i++ {
-			if mCovered[i] {
-				continue
-			}
-			if k == 0 {
-				k = formatTo(mbuf[:], "non-exhaustive match on %v: missing %v", TypeRef(t), NameRef(variantName(en, i)))
-			} else {
-				k += formatTo(mbuf[k:], ", %v", NameRef(variantName(en, i)))
-			}
-		}
-		if k > 0 {
-			errAt(E2012, m, k)
-		}
-	} else if isExpr {
-		errAt(E2012, m, formatTo(mbuf[:], "non-exhaustive match expression on %v: missing '_' arm", TypeRef(t)))
-	}
+	pbSym[pbN] = sym
+	pbId[pbN] = id
+	pbTyp[pbN] = t
+	pbN++
 }
 
-// armPattern checks an arm's pattern (or each alternative of an
-// or-pattern) against the scrutinee type t and reports whether it is
-// valid. Or-pattern alternatives may not be '_' and may not bind names.
-func armPattern(p u32, t u32, dp usize) bool decreases(dp) {
+// pbFind returns the index of sym in [lo, hi) (hi if absent).
+func pbFind(sym u32, lo usize, hi usize) usize {
+	for i := lo; i < hi; i++ {
+		if pbSym[i] == sym {
+			return i
+		}
+	}
+	return hi
+}
+
+// uniqBindings reports variables bound twice in [mark, pbN) (E2002) and
+// removes the duplicates.
+func uniqBindings(mark usize) {
+	w := mark
+	top := pbN
+	for r := mark; r < top; r++ {
+		if pbFind(pbSym[r], mark, w) < w {
+			errAt(E2002, pbId[r], formatTo(mbuf[:], "variable %v is bound more than once in a pattern", NameRef(idName(pbId[r]))))
+			continue
+		}
+		pbSym[w] = pbSym[r]
+		pbId[w] = pbId[r]
+		pbTyp[w] = pbTyp[r]
+		w++
+	}
+	pbN = w
+}
+
+// topPattern checks the pattern of an arm or `is` expression against the
+// scrutinee type t, then gives the bindings their types. It reports
+// whether the pattern is valid.
+func topPattern(p u32, t u32, dp usize) bool decreases(dp) {
 	if dp == 0 {
 		tooDeep()
 		return false
 	}
-	if nkind(p) != NkOrPattern {
-		return pattern(p, t, dp-1)
+	mark := pbN
+	ok := pat(p, t, false, dp-1)
+	uniqBindings(mark)
+	top := pbN
+	for i := mark; i < top; i++ {
+		if syms.items[usize(pbSym[i])].typ == 0 {
+			setSymType(pbSym[i], pbTyp[i])
+		}
+	}
+	pbN = mark
+	invalidBindings(p, SemaDepth)
+	return ok
+}
+
+// pat checks pattern p against type t and pushes its bindings. payload is
+// set for payload positions of a variant pattern, where a bare identifier
+// is a binding or a variant of t's enum.
+func pat(p u32, t u32, payload bool, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
+	}
+	k := nkind(p)
+	if k == NkWildcardPattern {
+		return true
+	}
+	if k == NkRestPattern {
+		errAt(E2002, p, formatTo(mbuf[:], "'..' is only allowed in the payload list of a variant pattern"))
+		return false
+	}
+	if k == NkIdent {
+		ntype[usize(p)] = t
+		if isBlank(p) {
+			return true
+		}
+		en := underlying(t)
+		if isEnumT(en) {
+			v, found := variantByName(en, idName(p))
+			if found {
+				np := variantPayN(en, v)
+				if np != 0 {
+					errAt(E2003, p, formatTo(mbuf[:], "variant %v has %d payload values, pattern binds 0", NameRef(idName(p)), np))
+					return false
+				}
+				nvarEnum[usize(p)] = en
+				nvarIdx[usize(p)] = u32(v)
+				// A name declared by the resolver for it is bound to the
+				// payload (which is that variant).
+				s := defs[usize(p)]
+				if s != 0 && syms.items[usize(s)].typ == 0 {
+					setSymType(s, t)
+				}
+				return true
+			}
+		}
+		s := defs[usize(p)]
+		if s == 0 {
+			errAt(E2002, p, formatTo(mbuf[:], "cannot bind %v: an 'is' pattern can bind variables only in the condition of an if statement", NameRef(idName(p))))
+			return false
+		}
+		pbPush(s, p, t)
+		return true
+	}
+	if k == NkLiteralPattern {
+		x := exprValue(na(p), dp-1)
+		if isInvalidOp(&x) {
+			return false
+		}
+		if isTupleT(t) {
+			errAt(E2002, p, formatTo(mbuf[:], "pattern %v does not match a tuple scrutinee of type %v", Expr(na(p)), TypeRef(t)))
+			return false
+		}
+		if !assignment(&x, t, mkCtx(CtxPattern)) {
+			return false
+		}
+		if !comparable(t, SemaDepth) {
+			errAt(E2002, p, formatTo(mbuf[:], "cannot match values of type %v against literals", TypeRef(t)))
+			return false
+		}
+		return true
+	}
+	if k == NkCtorPattern {
+		return ctorPat(p, t, dp-1)
+	}
+	if k == NkOrPattern {
+		return orPat(p, t, payload, dp-1)
+	}
+	if k == NkTuplePattern {
+		if !isTupleT(t) {
+			errAt(E2002, p, formatTo(mbuf[:], "tuple pattern %v does not match type %v", PatRef(p), TypeRef(t)))
+			return false
+		}
+		c := l1len(p)
+		if tupleN(t) != c {
+			errAt(E2003, p, formatTo(mbuf[:], "tuple pattern has %d elements, scrutinee has %d", c, tupleN(t)))
+			return false
+		}
+		valid := true
+		for i := usize(0); i < c; i++ {
+			if !pat(l1at(p, i), tupleAt(t, i), false, dp-1) {
+				valid = false
+			}
+		}
+		return valid
+	}
+	return true
+}
+
+// orPat checks an or-pattern: every alternative must bind the same
+// variables with identical types (v0.2).
+func orPat(p u32, t u32, payload bool, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
 	}
 	valid := true
-	n := l1len(p)
-	for i := usize(0); i < n; i++ {
+	haveFirst := false
+	f0 := pbN
+	f1 := pbN
+	c := l1len(p)
+	for i := usize(0); i < c; i++ {
 		alt := l1at(p, i)
-		if nkind(alt) == NkWildcardPattern {
+		ak := nkind(alt)
+		if ak == NkWildcardPattern || (ak == NkIdent && isBlank(alt)) {
 			errAt(E2002, alt, formatTo(mbuf[:], "'_' cannot be an alternative of an or-pattern"))
 			valid = false
 			continue
 		}
-		if !pattern(alt, t, dp-1) {
+		mark := pbN
+		if !pat(alt, t, payload, dp-1) {
 			valid = false
+			pbN = mark
 			continue
 		}
-		if nkind(alt) == NkCtorPattern {
-			nbind := l1len(alt)
-			for j := usize(0); j < nbind; j++ {
-				b := l1at(alt, j)
-				if idName(b) != nameBlank {
-					errAt(E2002, b, formatTo(mbuf[:], "or-pattern alternatives cannot bind variables (%v)", NameRef(idName(b))))
+		uniqBindings(mark)
+		if i == 0 {
+			haveFirst = true
+			f0 = mark
+			f1 = pbN
+			continue
+		}
+		if haveFirst {
+			for j := f0; j < f1; j++ {
+				top := pbN
+				if pbFind(pbSym[j], mark, top) == top {
+					errAt(E2002, alt, formatTo(mbuf[:], "or-pattern alternatives must bind the same variables (%v is not bound here)", NameRef(idName(pbId[j]))))
 					valid = false
-					break
+				}
+			}
+			top := pbN
+			for j := mark; j < top; j++ {
+				q := pbFind(pbSym[j], f0, f1)
+				if q == f1 {
+					errAt(E2002, pbId[j], formatTo(mbuf[:], "or-pattern alternatives must bind the same variables (%v is not bound in the first alternative)", NameRef(idName(pbId[j]))))
+					valid = false
+				} else if pbTyp[j] != pbTyp[q] {
+					errAt(E2002, pbId[j], formatTo(mbuf[:], "variable %v has type %v here but %v in the first alternative", NameRef(idName(pbId[j])), TypeRef(pbTyp[j]), TypeRef(pbTyp[q])))
+					valid = false
 				}
 			}
 		}
+		pbN = mark
+	}
+	if !haveFirst {
+		pbN = f0
 	}
 	return valid
+}
+
+// ctorPat checks a variant or constant pattern `[Qual.]Name[(args)]`.
+func ctorPat(p u32, t u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
+	}
+	en := underlying(t)
+	isEnum := isEnumT(en)
+	name := nb(p)
+	sym := uses[usize(name)]
+	// A constant pattern (pkg.Const or Const). An unqualified name that is
+	// a variant of the scrutinee's enum is that variant (v0.2).
+	isVar := false
+	if na(p) == 0 && isEnum {
+		_, isVar = variantByName(en, idName(name))
+	}
+	if sym != 0 && symKind(sym) == SymConst && !isVar {
+		if nflag(p) {
+			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot have bindings", NameRef(symName(sym))))
+			return false
+		}
+		if isEnum {
+			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot be a pattern for enum type %v", NameRef(symName(sym)), TypeRef(t)))
+			return false
+		}
+		if isTupleT(t) {
+			errAt(E2002, p, formatTo(mbuf[:], "pattern %v does not match a tuple scrutinee of type %v", NameRef(symName(sym)), TypeRef(t)))
+			return false
+		}
+		x := symOperand(sym, name, dp-1)
+		x.expr = name
+		record(&x)
+		return !isInvalidOp(&x) && assignment(&x, t, mkCtx(CtxPattern))
+	}
+	nm := idName(name)
+	venum := u32(0)
+	vi := usize(0)
+	q := na(p)
+	if q != 0 {
+		qs := uses[usize(q)]
+		if qs == 0 {
+			return false
+		}
+		if symKind(qs) != SymType {
+			errAt(E2002, q, formatTo(mbuf[:], "%v is not an enum type", NameRef(idName(q))))
+			return false
+		}
+		qt := typeSym(qs, q, dp-1)
+		ntype[usize(q)] = qt
+		nmode[usize(q)] = KType
+		if isInvalid(qt) {
+			return false
+		}
+		qe := underlying(qt)
+		if !isEnumT(qe) {
+			errAt(E2002, q, formatTo(mbuf[:], "%v is not an enum type", TypeRef(qt)))
+			return false
+		}
+		// v0.2: a generic enum qualifies patterns on its instances
+		// (Option.Some(x) on an Option[u32]); the variant comes from the
+		// instance.
+		if isNamedT(t) && namedOrigin(t) != 0 && namedOrigin(t) == qt && isEnum {
+			qe = en
+		} else if qt != t {
+			errAt(E2002, p, formatTo(mbuf[:], "pattern of type %v does not match scrutinee of type %v", TypeRef(qt), TypeRef(t)))
+			return false
+		}
+		v, found := variantByName(qe, nm)
+		if !found {
+			errAt(E2001, name, formatTo(mbuf[:], "enum %v has no variant %v", TypeRef(qt), NameRef(nm)))
+			return false
+		}
+		venum = qe
+		vi = v
+	} else if isEnum {
+		v, found := variantByName(en, nm)
+		if !found {
+			errAt(E2001, name, formatTo(mbuf[:], "undefined: %v (no constant or variant of %v)", NameRef(nm), TypeRef(t)))
+			return false
+		}
+		venum = en
+		vi = v
+	} else {
+		errAt(E2001, name, formatTo(mbuf[:], "undefined: %v", NameRef(nm)))
+		return false
+	}
+	nvarEnum[usize(p)] = venum
+	nvarIdx[usize(p)] = u32(vi)
+	ntype[usize(p)] = t
+	c := l1len(p)
+	nargs := c
+	rest := false
+	for i := usize(0); i < c; i++ {
+		a := l1at(p, i)
+		if nkind(a) == NkRestPattern {
+			if rest {
+				errAt(E2002, a, formatTo(mbuf[:], "at most one '..' is allowed in a payload list"))
+				return false
+			}
+			nargs--
+			rest = true
+		}
+	}
+	npay := variantPayN(venum, vi)
+	if (!rest && nargs != npay) || (rest && nargs > npay) || (nflag(p) && npay == 0 && !rest) {
+		errAt(E2003, p, formatTo(mbuf[:], "variant %v has %d payload values, pattern binds %d", NameRef(nm), npay, nargs))
+		return false
+	}
+	valid := true
+	for i := usize(0); i < c; i++ {
+		a := l1at(p, i)
+		if nkind(a) == NkRestPattern {
+			continue
+		}
+		if !pat(a, variantPay(venum, vi, payloadIndex(p, i, npay)), true, dp-1) {
+			valid = false
+		}
+	}
+	return valid
+}
+
+// PatRef renders a pattern (ast.Format of a pattern).
+type PatRef u32
+
+func (p PatRef) Format(dst []byte) usize {
+	o := &fmtBuf
+	o.Reset()
+	writePattern(o, u32(p), SemaDepth)
+	return fmtOut(dst)
+}
+
+// writePattern writes the canonical source of a pattern.
+func writePattern(o *OutBuf, p u32, dp usize) decreases(dp) {
+	if dp == 0 || p == 0 {
+		return
+	}
+	k := nkind(p)
+	if k == NkWildcardPattern {
+		o.WriteString("_")
+	} else if k == NkRestPattern {
+		o.WriteString("..")
+	} else if k == NkIdent {
+		o.WriteBytes(ntext(p))
+	} else if k == NkLiteralPattern {
+		writeExpr(o, na(p), dp-1)
+	} else if k == NkCtorPattern {
+		if na(p) != 0 {
+			o.WriteBytes(ntext(na(p)))
+			o.WriteString(".")
+		}
+		o.WriteBytes(ntext(nb(p)))
+		if nflag(p) {
+			o.WriteString("(")
+			c := l1len(p)
+			for i := usize(0); i < c; i++ {
+				if i > 0 {
+					o.WriteString(", ")
+				}
+				writePattern(o, l1at(p, i), dp-1)
+			}
+			o.WriteString(")")
+		}
+	} else if k == NkOrPattern {
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			if i > 0 {
+				o.WriteString(" | ")
+			}
+			writePattern(o, l1at(p, i), dp-1)
+		}
+	} else if k == NkTuplePattern {
+		o.WriteString("(")
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			if i > 0 {
+				o.WriteString(", ")
+			}
+			writePattern(o, l1at(p, i), dp-1)
+		}
+		o.WriteString(")")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reachability and exhaustiveness: pattern usefulness (Maranget, "Warnings
+// for pattern matching"), see finc0's types/usefulness.go for the
+// algorithm. A matrix is a block of rows on uStk (row-major, ncols node
+// IDs per row, 0 = wildcard); column types are a run on uCol. Matrices and
+// column runs are built LIFO above their sources and popped after use.
+
+const (
+	MaxUStack       = 1_048_576
+	MaxUCols        = 65536
+	MaxUSeen        = 262_144
+	MaxWCells       = 262_144
+	MaxWRows        = 65536
+	MaxPatternDepth = 1000 // fuel: useful/witnesses give up (useful, exhaustive)
+	MaxWitnesses    = 32   // listed missing patterns (more: ", ...")
+)
+
+// head kinds
+const (
+	HWild = 0
+	HCtor = 1
+	HLit  = 2
+	HOr   = 3
+)
+
+var uStk [MaxUStack]u32
+var uTop usize
+var uCol [MaxUCols]u32
+var uColTop usize
+var uSeen [MaxUSeen]bool
+var uSeenTop usize
+
+// Witnesses: cons cells (token, next) and a stack of row heads.
+// wKind: 0 wildcard, 1 constructor, 2 constructor missing from its column.
+var wKind [MaxWCells]u8
+var wTy [MaxWCells]u32
+var wC [MaxWCells]u32
+var wNext [MaxWCells]u32
+var wTop usize
+var wRows [MaxWRows]u32
+var wRowTop usize
+
+func uPush(x u32) {
+	if uTop >= MaxUStack {
+		setFull("pattern matrix")
+		return
+	}
+	uStk[uTop] = x
+	uTop++
+}
+
+func uColPush(t u32) {
+	if uColTop >= MaxUCols {
+		setFull("pattern columns")
+		return
+	}
+	uCol[uColTop] = t
+	uColTop++
+}
+
+// uCtorCount returns the number of constructors of a finite column type (0
+// for infinite domains).
+func uCtorCount(t u32) usize {
+	u := underlying(t)
+	if isEnumT(u) {
+		return nvariants(u)
+	}
+	if isBoolean(t) {
+		return 2
+	}
+	return 0
+}
+
+// uArity returns the number of payloads of constructor c of t.
+func uArity(t u32, c usize) usize {
+	u := underlying(t)
+	if isEnumT(u) {
+		return variantPayN(u, c)
+	}
+	return 0
+}
+
+func uArgType(t u32, c usize, j usize) u32 {
+	return variantPay(underlying(t), c, j)
+}
+
+// uHead classifies the pattern p of a column of type t: kind, constructor
+// and literal value slot.
+func uHead(p u32, t u32) (u8, usize, u32) {
+	if p == 0 {
+		return HWild, 0, 0
+	}
+	k := nkind(p)
+	if k == NkIdent {
+		if nvarEnum[usize(p)] != 0 {
+			return HCtor, usize(nvarIdx[usize(p)]), 0
+		}
+		return HWild, 0, 0
+	}
+	if k == NkCtorPattern {
+		if nvarEnum[usize(p)] != 0 {
+			return HCtor, usize(nvarIdx[usize(p)]), 0
+		}
+		return uLitHead(nval[usize(nb(p))], t)
+	}
+	if k == NkLiteralPattern {
+		return uLitHead(nval[usize(na(p))], t)
+	}
+	if k == NkOrPattern {
+		return HOr, 0, 0
+	}
+	return HWild, 0, 0
+}
+
+func uLitHead(s u32, t u32) (u8, usize, u32) {
+	b, ok := boolOf(slotGet(s))
+	if ok && isBoolean(t) {
+		if b {
+			return HCtor, 0, 0
+		}
+		return HCtor, 1, 0
+	}
+	return HLit, 0, s
+}
+
+// uPushArgs pushes the a sub-patterns of head p for specialization.
+func uPushArgs(p u32, a usize) {
+	base := uTop
+	for j := usize(0); j < a; j++ {
+		uPush(0)
+	}
+	if p == 0 || nkind(p) != NkCtorPattern || nvarEnum[usize(p)] == 0 || uTop != base+a {
+		return
+	}
+	c := l1len(p)
+	for i := usize(0); i < c; i++ {
+		x := l1at(p, i)
+		if nkind(x) == NkRestPattern {
+			continue
+		}
+		uStk[base+payloadIndex(p, i, a)] = x
+	}
+}
+
+// uSpecRow pushes the rows of S(c, P) (kind HCtor, arity a) or S(v, P)
+// (kind HLit, value slot v) produced by the row at offset row of width w
+// whose head is h (or-pattern heads are expanded). It returns the number
+// of rows pushed.
+func uSpecRow(row usize, w usize, h u32, t u32, kind u8, c usize, v u32, a usize, depth usize) usize decreases(depth) {
+	if depth == 0 {
+		return 0
+	}
+	k, rc, rv := uHead(h, t)
+	if k == HOr {
+		n := usize(0)
+		m := l1len(h)
+		for i := usize(0); i < m; i++ {
+			n += uSpecRow(row, w, l1at(h, i), t, kind, c, v, a, depth-1)
+		}
+		return n
+	}
+	if k == HWild {
+		for j := usize(0); j < a; j++ {
+			uPush(0)
+		}
+	} else if k == HCtor && kind == HCtor && rc == c {
+		uPushArgs(h, a)
+	} else if k == HLit && kind == HLit && valsEqual(slotGet(rv), slotGet(v)) {
+	} else {
+		return 0
+	}
+	for j := usize(1); j < w; j++ {
+		uPush(uStk[row+j])
+	}
+	return 1
+}
+
+// uSpecialize pushes S(c, P) / S(v, P) of the matrix at offset at (rows,
+// width w, first column type t) and returns its row count.
+func uSpecialize(at usize, rows usize, w usize, t u32, kind u8, c usize, v u32) usize {
+	a := usize(0)
+	if kind == HCtor {
+		a = uArity(t, c)
+	}
+	n := usize(0)
+	for r := usize(0); r < rows; r++ {
+		row := at + r*w
+		n += uSpecRow(row, w, uStk[row], t, kind, c, v, a, MaxPatternDepth)
+	}
+	return n
+}
+
+// uDefRow pushes the rows of D(P) produced by one row (head h).
+func uDefRow(row usize, w usize, h u32, t u32, depth usize) usize decreases(depth) {
+	if depth == 0 {
+		return 0
+	}
+	k, _, _ := uHead(h, t)
+	if k == HOr {
+		n := usize(0)
+		m := l1len(h)
+		for i := usize(0); i < m; i++ {
+			n += uDefRow(row, w, l1at(h, i), t, depth-1)
+		}
+		return n
+	}
+	if k != HWild {
+		return 0
+	}
+	for j := usize(1); j < w; j++ {
+		uPush(uStk[row+j])
+	}
+	return 1
+}
+
+// uDefaults pushes the default matrix D(P) and returns its row count.
+func uDefaults(at usize, rows usize, w usize, t u32) usize {
+	n := usize(0)
+	for r := usize(0); r < rows; r++ {
+		row := at + r*w
+		n += uDefRow(row, w, uStk[row], t, MaxPatternDepth)
+	}
+	return n
+}
+
+// uMarkHead marks the constructors of head h in uSeen[base:] and returns
+// how many were new.
+func uMarkHead(h u32, t u32, base usize, depth usize) usize decreases(depth) {
+	if depth == 0 {
+		return 0
+	}
+	k, c, _ := uHead(h, t)
+	if k == HOr {
+		n := usize(0)
+		m := l1len(h)
+		for i := usize(0); i < m; i++ {
+			n += uMarkHead(l1at(h, i), t, base, depth-1)
+		}
+		return n
+	}
+	if k == HCtor && !uSeen[base+c] {
+		uSeen[base+c] = true
+		return 1
+	}
+	return 0
+}
+
+// uPresent allocates n flags on uSeen marking the constructors heading a
+// row of the matrix and returns the base offset and the count of distinct
+// constructors (the caller pops uSeenTop).
+func uPresent(at usize, rows usize, w usize, t u32, n usize) (usize, usize) {
+	base := uSeenTop
+	if uSeenTop+n > MaxUSeen {
+		setFull("pattern constructors")
+		return base, 0
+	}
+	for i := usize(0); i < n; i++ {
+		uSeen[base+i] = false
+	}
+	uSeenTop += n
+	cnt := usize(0)
+	for r := usize(0); r < rows; r++ {
+		cnt += uMarkHead(uStk[at+r*w], t, base, MaxPatternDepth)
+	}
+	return base, cnt
+}
+
+// uPushCols pushes the column run [args of c of t, cols[cs+1:cs+cn]].
+func uPushCols(t u32, c usize, a usize, cs usize, cn usize) {
+	for j := usize(0); j < a; j++ {
+		uColPush(uArgType(t, c, j))
+	}
+	for j := usize(1); j < cn; j++ {
+		uColPush(uCol[cs+j])
+	}
+}
+
+// useful reports whether the row q (offset qa on uStk, width w) is useful
+// with respect to the matrix at (at, rows) with column types cs..cs+w.
+func useful(at usize, rows usize, qa usize, w usize, cs usize, depth usize) bool decreases(depth) {
+	if depth == 0 {
+		return true
+	}
+	if w == 0 {
+		return rows == 0
+	}
+	t := uCol[cs]
+	q0 := uStk[qa]
+	k, c, v := uHead(q0, t)
+	um := uTop
+	cm := uColTop
+	r := false
+	if k == HOr {
+		m := l1len(q0)
+		for i := usize(0); i < m; i++ {
+			na2 := uTop
+			uPush(l1at(q0, i))
+			for j := usize(1); j < w; j++ {
+				uPush(uStk[qa+j])
+			}
+			if useful(at, rows, na2, w, cs, depth-1) {
+				r = true
+				break
+			}
+			uTop = na2
+		}
+	} else if k == HCtor {
+		a := uArity(t, c)
+		sa := uTop
+		sn := uSpecialize(at, rows, w, t, HCtor, c, 0)
+		nq := uTop
+		uPushArgs(q0, a)
+		for j := usize(1); j < w; j++ {
+			uPush(uStk[qa+j])
+		}
+		ncs := uColTop
+		uPushCols(t, c, a, cs, w)
+		r = useful(sa, sn, nq, a+w-1, ncs, depth-1)
+	} else if k == HLit {
+		sa := uTop
+		sn := uSpecialize(at, rows, w, t, HLit, 0, v)
+		nq := uTop
+		for j := usize(1); j < w; j++ {
+			uPush(uStk[qa+j])
+		}
+		r = useful(sa, sn, nq, w-1, cs+1, depth-1)
+	} else {
+		n := uCtorCount(t)
+		complete := false
+		if n > 0 {
+			sb := uSeenTop
+			_, cnt := uPresent(at, rows, w, t, n)
+			uSeenTop = sb
+			complete = cnt == n
+		}
+		if complete {
+			for ci := usize(0); ci < n; ci++ {
+				a := uArity(t, ci)
+				sa := uTop
+				sn := uSpecialize(at, rows, w, t, HCtor, ci, 0)
+				nq := uTop
+				for j := usize(0); j < a; j++ {
+					uPush(0)
+				}
+				for j := usize(1); j < w; j++ {
+					uPush(uStk[qa+j])
+				}
+				ncs := uColTop
+				uPushCols(t, ci, a, cs, w)
+				ok := useful(sa, sn, nq, a+w-1, ncs, depth-1)
+				uTop = sa
+				uColTop = ncs
+				if ok {
+					r = true
+					break
+				}
+			}
+		} else {
+			da := uTop
+			dn := uDefaults(at, rows, w, t)
+			nq := uTop
+			for j := usize(1); j < w; j++ {
+				uPush(uStk[qa+j])
+			}
+			r = useful(da, dn, nq, w-1, cs+1, depth-1)
+		}
+	}
+	uTop = um
+	uColTop = cm
+	return r
+}
+
+// wCell allocates a witness cell.
+func wCell(kind u8, t u32, c u32, next u32) u32 {
+	if wTop >= MaxWCells {
+		setFull("pattern witnesses")
+		return 0
+	}
+	wKind[wTop] = kind
+	wTy[wTop] = t
+	wC[wTop] = c
+	wNext[wTop] = next
+	wTop++
+	return u32(wTop - 1)
+}
+
+func wPushRow(h u32) {
+	if wRowTop >= MaxWRows {
+		setFull("pattern witnesses")
+		return
+	}
+	wRows[wRowTop] = h
+	wRowTop++
+}
+
+// witnesses pushes up to limit witness rows (cons lists in preorder)
+// matched by no row of the matrix and returns their count. top is set for
+// the single column of a non-tuple scrutinee. Rows produced by recursive
+// calls are moved down so the result is the topmost count rows.
+func witnesses(at usize, rows usize, w usize, cs usize, top bool, limit usize, depth usize) usize decreases(depth) {
+	if depth == 0 || limit == 0 {
+		return 0
+	}
+	if w == 0 {
+		if rows == 0 {
+			wPushRow(0)
+			return 1
+		}
+		return 0
+	}
+	t := uCol[cs]
+	n := uCtorCount(t)
+	um := uTop
+	cm := uColTop
+	sb := uSeenTop
+	out := wRowTop
+	base, cnt := uPresent(at, rows, w, t, n)
+	if n == 0 || (cnt == 0 && !top) {
+		da := uTop
+		dn := uDefaults(at, rows, w, t)
+		k := witnesses(da, dn, w-1, cs+1, false, limit, depth-1)
+		for i := usize(0); i < k; i++ {
+			wRows[out+i] = wCell(0, 0, 0, wRows[out+i])
+		}
+		uTop = um
+		uColTop = cm
+		uSeenTop = sb
+		return k
+	}
+	// Witnesses of the default matrix (for missing constructors).
+	dk := usize(0)
+	dpos := wRowTop
+	if cnt < n {
+		da := uTop
+		dn := uDefaults(at, rows, w, t)
+		dk = witnesses(da, dn, w-1, cs+1, false, limit, depth-1)
+		uTop = da
+	}
+	res := wRowTop // result rows are built from here, then moved to out
+	for c := usize(0); c < n; c++ {
+		if wRowTop-res >= limit {
+			break
+		}
+		a := uArity(t, c)
+		if uSeen[base+c] {
+			sa := uTop
+			sn := uSpecialize(at, rows, w, t, HCtor, c, 0)
+			ncs := uColTop
+			uPushCols(t, c, a, cs, w)
+			cpos := wRowTop
+			k := witnesses(sa, sn, a+w-1, ncs, false, limit-(wRowTop-res), depth-1)
+			for i := usize(0); i < k; i++ {
+				wRows[cpos+i] = wCell(1, t, u32(c), wRows[cpos+i])
+			}
+			uTop = sa
+			uColTop = ncs
+			continue
+		}
+		for i := usize(0); i < dk; i++ {
+			if wRowTop-res >= limit {
+				break
+			}
+			h := wRows[dpos+i]
+			for j := usize(0); j < a; j++ {
+				h = wCell(0, 0, 0, h)
+			}
+			wPushRow(wCell(2, t, u32(c), h))
+		}
+	}
+	k := wRowTop - res
+	for i := usize(0); i < k; i++ {
+		wRows[out+i] = wRows[res+i]
+	}
+	wRowTop = out + k
+	uTop = um
+	uColTop = cm
+	uSeenTop = sb
+	return k
+}
+
+// renderTok writes the witness subtree at cell h and returns the cell
+// after it. At the top of a non-tuple scrutinee a missing variant whose
+// payloads are all wildcards is written by name.
+func renderTok(o *OutBuf, h u32, top bool, depth usize) u32 decreases(depth) {
+	if depth == 0 || h == 0 {
+		return 0
+	}
+	kind := wKind[usize(h)]
+	next := wNext[usize(h)]
+	if kind == 0 {
+		o.WriteString("_")
+		return next
+	}
+	t := wTy[usize(h)]
+	c := usize(wC[usize(h)])
+	u := underlying(t)
+	if !isEnumT(u) {
+		if c == 0 {
+			o.WriteString("true")
+		} else {
+			o.WriteString("false")
+		}
+		return next
+	}
+	a := variantPayN(u, c)
+	nm := variantName(u, c)
+	if a == 0 {
+		o.WriteBytes(nameBytes(nm))
+		return next
+	}
+	if top && kind == 2 {
+		allWild := true
+		x := next
+		for j := usize(0); j < a; j++ {
+			if x == 0 || wKind[usize(x)] != 0 {
+				allWild = false
+				break
+			}
+			x = wNext[usize(x)]
+		}
+		if allWild {
+			o.WriteBytes(nameBytes(nm))
+			return x
+		}
+	}
+	o.WriteBytes(nameBytes(nm))
+	o.WriteString("(")
+	x := next
+	for j := usize(0); j < a; j++ {
+		if j > 0 {
+			o.WriteString(", ")
+		}
+		x = renderTok(o, x, false, depth-1)
+	}
+	o.WriteString(")")
+	return x
+}
+
+// checkCoverage reports unreachable arms and patterns and non-exhaustive
+// matches (E2012) of match m on type t. It reports whether the unguarded
+// arms cover every value.
+func checkCoverage(m u32, t u32, isExpr bool) bool {
+	uTop = 0
+	uColTop = 0
+	uSeenTop = 0
+	wTop = 1 // cell 0 is the empty list
+	wRowTop = 0
+	isTuple := isTupleT(t)
+	w := usize(1)
+	if isTuple {
+		w = tupleN(t)
+		for i := usize(0); i < w; i++ {
+			uColPush(tupleAt(t, i))
+		}
+	} else {
+		uColPush(t)
+	}
+	rows := usize(0) // rows of the earlier unguarded arms, at offset 0
+	wild := false
+	n := l1len(m)
+	for i := usize(0); i < n; i++ {
+		arm := l1at(m, i)
+		pat := na(arm)
+		if wild {
+			errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the '_' arm"))
+			continue
+		}
+		armRows := usize(0)
+		na2 := patAltN(pat)
+		for j := usize(0); j < na2; j++ {
+			alt := patAlt(pat, j)
+			qa := uTop
+			uPushRow(alt, w, isTuple)
+			// The matrix is rows + armRows rows at offset 0; the
+			// alternative's row is above it.
+			if !useful(0, rows+armRows, qa, w, 0, MaxPatternDepth) {
+				reportUnreachable(alt, t)
+			}
+			armRows++
+		}
+		if nd(arm) == 0 {
+			rows += armRows
+			if nkind(pat) == NkWildcardPattern {
+				wild = true
+			}
+		} else {
+			uTop = rows * w
+		}
+	}
+	k := witnesses(0, rows, w, 0, !isTuple, MaxWitnesses+1, MaxPatternDepth)
+	if k == 0 {
+		return true
+	}
+	u := underlying(t)
+	if isEnumT(u) || isTuple {
+		ml := formatTo(mbuf[:], "non-exhaustive match on %v: missing ", TypeRef(t))
+		o := &fmtBuf
+		o.Reset()
+		lim := k
+		if lim > MaxWitnesses {
+			lim = MaxWitnesses
+		}
+		for i := usize(0); i < lim; i++ {
+			if i > 0 {
+				o.WriteString(", ")
+			}
+			h := wRows[i]
+			if isTuple {
+				o.WriteString("(")
+				for j := usize(0); j < w; j++ {
+					if j > 0 {
+						o.WriteString(", ")
+					}
+					h = renderTok(o, h, false, MaxPatternDepth)
+				}
+				o.WriteString(")")
+			} else {
+				_ = renderTok(o, h, true, MaxPatternDepth)
+			}
+		}
+		if k > MaxWitnesses {
+			o.WriteString(", ...")
+		}
+		ml += copy(mbuf[ml:], o.Bytes())
+		errAt(E2012, m, ml)
+	} else if isExpr {
+		errAt(E2012, m, formatTo(mbuf[:], "non-exhaustive match expression on %v: missing '_' arm", TypeRef(t)))
+	}
+	return false
+}
+
+// uPushRow pushes the matrix row of an arm alternative.
+func uPushRow(alt u32, w usize, isTuple bool) {
+	if !isTuple {
+		uPush(alt)
+		return
+	}
+	if nkind(alt) == NkTuplePattern && l1len(alt) == w {
+		for i := usize(0); i < w; i++ {
+			uPush(l1at(alt, i))
+		}
+		return
+	}
+	for i := usize(0); i < w; i++ {
+		uPush(0)
+	}
+}
+
+// reportUnreachable reports an alternative that matches no value left by
+// the earlier arms.
+func reportUnreachable(alt u32, t u32) {
+	k := nkind(alt)
+	if k == NkWildcardPattern {
+		if isEnumT(underlying(t)) {
+			errAt(E2012, alt, formatTo(mbuf[:], "unreachable '_' arm: all variants of %v are covered", TypeRef(t)))
+		} else {
+			errAt(E2012, alt, formatTo(mbuf[:], "unreachable '_' arm: all values of %v are covered", TypeRef(t)))
+		}
+		return
+	}
+	if k == NkCtorPattern {
+		if nvarEnum[usize(alt)] != 0 {
+			if flatArgs(alt) {
+				errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: variant %v is already covered", NameRef(variantName(nvarEnum[usize(alt)], usize(nvarIdx[usize(alt)])))))
+				return
+			}
+		} else {
+			errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: duplicate case %v", Expr(nb(alt))))
+			return
+		}
+	} else if k == NkLiteralPattern {
+		errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: duplicate case %v", Expr(na(alt))))
+		return
+	}
+	errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: it is covered by earlier patterns"))
+}
+
+// flatArgs reports whether the payload patterns of p are all bindings, '_'
+// or '..'.
+func flatArgs(p u32) bool {
+	c := l1len(p)
+	for i := usize(0); i < c; i++ {
+		a := l1at(p, i)
+		k := nkind(a)
+		if k == NkIdent {
+			if nvarEnum[usize(a)] != 0 {
+				return false
+			}
+		} else if k != NkRestPattern {
+			return false
+		}
+	}
+	return true
 }

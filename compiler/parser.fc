@@ -56,6 +56,7 @@ type Parser struct {
 	exprLev int // < 0: in a control clause (no struct literals)
 	nest    usize
 	failed  bool
+	tupleOK bool // the next operand may be a tuple (match scrutinee, v0.2)
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,7 +1412,7 @@ func (p *Parser) matchStmt(depth usize) u32 decreases(depth) {
 	p.expect(TkMatch)
 	old := p.exprLev
 	p.exprLev = -1
-	p.setA(m, p.expr(depth-1))
+	p.setA(m, p.scrutinee(depth-1))
 	p.exprLev = 0
 	p.expectOpenBrace("a match statement")
 	mark := p.ls.Mark()
@@ -1429,19 +1430,71 @@ func (p *Parser) matchStmt(depth usize) u32 decreases(depth) {
 	return p.finish(m)
 }
 
+// scrutinee parses the scrutinee of a match: an expression or (v0.2) a
+// tuple `(X1, X2, ...)` of two or more expressions.
+func (p *Parser) scrutinee(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	p.tupleOK = true
+	x := p.expr(depth - 1)
+	p.tupleOK = false
+	return x
+}
+
+// matchArm parses a statement arm (v0.2: optional guard; the body may be
+// a block, an expression, a simple statement, return, break or continue;
+// a statement body is wrapped in a Block).
 func (p *Parser) matchArm(depth usize) u32 decreases(depth) {
 	if depth == 0 {
 		return p.tooDeep()
 	}
 	a := p.mk(NkMatchArm, p.start())
 	p.setA(a, p.pattern(depth-1))
+	p.setD(a, p.guard(depth-1))
 	p.expect(TkArrow)
-	if p.tok.kind == TkLBrace {
+	k := p.tok.kind
+	if k == TkLBrace {
 		p.setC(a, p.block(depth-1))
+	} else if k == TkReturn || k == TkBreak || k == TkContinue {
+		p.setC(a, p.armBlock(p.stmt(depth-1)))
 	} else {
-		p.setB(a, p.expr(depth-1))
+		st, x := p.simpleStmtOrExpr(depth - 1)
+		if st == 0 {
+			p.setB(a, x)
+		} else {
+			if p.kindOf(st) == NkShortVarDecl {
+				p.errorNode(st, "cannot declare variables in a match arm without a block")
+			}
+			p.setC(a, p.armBlock(st))
+		}
 	}
 	return p.finish(a)
+}
+
+// armBlock wraps the statement body of a match arm in a Block.
+func (p *Parser) armBlock(st u32) u32 {
+	if st == 0 {
+		return 0
+	}
+	n := p.na.items[usize(st)]
+	b := p.mk(NkBlockStmt, Pos{line: n.sLine, col: n.sCol})
+	mark := p.ls.Mark()
+	p.ls.Push(st)
+	p.setL1(b, mark)
+	return p.finish(b)
+}
+
+// guard parses an optional `if Expr` after an arm's pattern (v0.2).
+func (p *Parser) guard(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	if p.tok.kind != TkIf {
+		return 0
+	}
+	p.next()
+	return p.expr(depth - 1)
 }
 
 // pattern parses `Pattern { "|" Pattern }` (v0.2 or-patterns); a single
@@ -1450,8 +1503,18 @@ func (p *Parser) pattern(depth usize) u32 decreases(depth) {
 	if depth == 0 {
 		return p.tooDeep()
 	}
+	return p.patterns(false, depth-1)
+}
+
+// patterns parses alternatives separated by '|'. In a payload position
+// (payload) a bare identifier is a binding (or a variant of the payload's
+// enum type, decided by the type checker).
+func (p *Parser) patterns(payload bool, depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
 	s := p.start()
-	first := p.patternAlt(depth - 1)
+	first := p.patternAlt(payload, depth-1)
 	if p.tok.kind != TkOr {
 		return first
 	}
@@ -1464,10 +1527,40 @@ func (p *Parser) pattern(depth usize) u32 decreases(depth) {
 			break
 		}
 		p.next()
-		p.ls.Push(p.patternAlt(depth - 1))
+		p.ls.Push(p.patternAlt(payload, depth-1))
 	}
 	p.setL1(op, mark)
 	return p.finish(op)
+}
+
+// payloadListPush pushes the patterns between the parentheses of a variant
+// pattern: `[ PayloadPattern { "," PayloadPattern } ]` where a payload
+// pattern is `..` (at most once, checked by the type checker) or Patterns.
+func (p *Parser) payloadListPush(depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	if p.tok.kind == TkRParen {
+		return 0
+	}
+	lim := p.ntok
+	for g := usize(0); g < lim; g++ {
+		if p.failed {
+			break
+		}
+		if p.tok.kind == TkDotDot {
+			rs := p.mk(NkRestPattern, p.start())
+			p.next()
+			p.ls.Push(p.finish(rs))
+		} else {
+			p.ls.Push(p.patterns(true, depth-1))
+		}
+		if p.tok.kind != TkComma {
+			break
+		}
+		p.next()
+	}
+	return 0
 }
 
 // matchExpr parses a match expression (v0.2):
@@ -1482,7 +1575,7 @@ func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
 	p.expect(TkMatch)
 	old := p.exprLev
 	p.exprLev = -1
-	p.setA(m, p.expr(depth-1))
+	p.setA(m, p.scrutinee(depth-1))
 	p.exprLev = 0
 	p.expectOpenBrace("a match expression")
 	mark := p.ls.Mark()
@@ -1493,6 +1586,7 @@ func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
 		}
 		a := p.mk(NkMatchArm, p.start())
 		p.setA(a, p.pattern(depth-1))
+		p.setD(a, p.guard(depth-1))
 		p.expect(TkArrow)
 		p.setB(a, p.expr(depth-1))
 		p.ls.Push(p.finish(a))
@@ -1512,13 +1606,36 @@ func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
 	return p.finish(m)
 }
 
-func (p *Parser) patternAlt(depth usize) u32 decreases(depth) {
+// patternAlt parses one alternative (v0.2 grammar):
+//
+//	PatternAlt = "_" | IDENT [ "." IDENT ] [ "(" [ PayloadList ] ")" ]
+//	           | [ "-" ] Literal | "(" Patterns { "," Patterns } ")" .
+//
+// In a payload position a bare IDENT (not followed by '.' or '(') is an
+// Ident node. A parenthesized single pattern is returned unwrapped.
+func (p *Parser) patternAlt(payload bool, depth usize) u32 decreases(depth) {
+	if depth == 0 {
+		return p.tooDeep()
+	}
+	p.enter()
+	r := p.patternAltBody(payload, depth-1)
+	p.leave()
+	return r
+}
+
+func (p *Parser) patternAltBody(payload bool, depth usize) u32 decreases(depth) {
 	if depth == 0 {
 		return p.tooDeep()
 	}
 	s := p.start()
 	k := p.tok.kind
 	if k == TkIdent {
+		if payload {
+			k1 := p.peek(1).kind
+			if k1 != TkPeriod && k1 != TkLParen {
+				return p.ident()
+			}
+		}
 		if p.tokIs("_") {
 			p.next()
 			return p.finish(p.mk(NkWildcardPattern, s))
@@ -1535,7 +1652,7 @@ func (p *Parser) patternAlt(depth usize) u32 decreases(depth) {
 			p.setFlag(cp, Flag1)
 			p.next()
 			mark := p.ls.Mark()
-			p.identListPush()
+			_ = p.payloadListPush(depth - 1)
 			p.setL1(cp, mark)
 			p.expect(TkRParen)
 		}
@@ -1546,6 +1663,39 @@ func (p *Parser) patternAlt(depth usize) u32 decreases(depth) {
 		lp := p.mk(NkLiteralPattern, s)
 		p.setA(lp, lit)
 		return p.finish(lp)
+	}
+	if k == TkSub && p.peek(1).kind == TkInt {
+		p.next()
+		lit := p.basicLit()
+		neg := p.mk(NkUnaryExpr, s)
+		p.setOp(neg, OpNeg)
+		p.setA(neg, lit)
+		neg = p.finish(neg)
+		lp := p.mk(NkLiteralPattern, s)
+		p.setA(lp, neg)
+		return p.finish(lp)
+	}
+	if k == TkLParen {
+		p.next()
+		first := p.patterns(payload, depth-1)
+		if p.tok.kind != TkComma {
+			p.expect(TkRParen)
+			return first
+		}
+		tp := p.mk(NkTuplePattern, s)
+		mark := p.ls.Mark()
+		p.ls.Push(first)
+		lim := p.ntok
+		for g := usize(0); g < lim; g++ {
+			if p.failed || p.tok.kind != TkComma {
+				break
+			}
+			p.next()
+			p.ls.Push(p.patterns(payload, depth-1))
+		}
+		p.setL1(tp, mark)
+		p.expect(TkRParen)
+		return p.finish(tp)
 	}
 	p.errorExpected("pattern ('_', identifier, variant or literal)")
 	return 0
@@ -1649,6 +1799,16 @@ func (p *Parser) binary(prec u8, depth usize) u32 decreases(depth) {
 	x := p.unary(depth - 1)
 	lim := p.ntok
 	for g := usize(0); g < lim; g++ {
+		if p.tok.kind == TkIs && binOpPrec(OpLt) >= prec {
+			// v0.2: `X is Pattern` has the precedence of the relational
+			// operators.
+			p.next()
+			ie := p.mk(NkIsExpr, s)
+			p.setA(ie, x)
+			p.setB(ie, p.pattern(depth-1))
+			x = p.finish(ie)
+			continue
+		}
 		op, ok := binOpOf(p.tok.kind)
 		if !ok || binOpPrec(op) < prec {
 			return x
@@ -1895,6 +2055,8 @@ func (p *Parser) operand(depth usize) u32 decreases(depth) {
 	}
 	s := p.start()
 	k := p.tok.kind
+	tuple := p.tupleOK
+	p.tupleOK = false
 	if k == TkInt || k == TkString || k == TkChar {
 		return p.basicLit()
 	}
@@ -1923,6 +2085,23 @@ func (p *Parser) operand(depth usize) u32 decreases(depth) {
 		p.next()
 		p.exprLev++
 		x := p.expr(depth - 1)
+		if tuple && p.tok.kind == TkComma {
+			te := p.mk(NkTupleExpr, s)
+			mark := p.ls.Mark()
+			p.ls.Push(x)
+			lim := p.ntok
+			for g := usize(0); g < lim; g++ {
+				if p.failed || p.tok.kind != TkComma {
+					break
+				}
+				p.next()
+				p.ls.Push(p.expr(depth - 1))
+			}
+			p.setL1(te, mark)
+			p.exprLev--
+			p.expect(TkRParen)
+			return p.finish(te)
+		}
 		p.exprLev--
 		p.expect(TkRParen)
 		pe := p.mk(NkParenExpr, s)

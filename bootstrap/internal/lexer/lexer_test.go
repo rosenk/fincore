@@ -44,7 +44,7 @@ func lex(t *testing.T, src string) []Token {
 
 func TestKeywords(t *testing.T) {
 	kws := Keywords()
-	want := "package import const type var func driver comptime scope for if else return break continue defer struct enum match true false nil any decreases"
+	want := "package import const type var func driver comptime scope for if else return break continue defer struct enum match true false nil any decreases is"
 	if got := strings.Join(kws, " "); got != want {
 		t.Fatalf("keywords:\n got %s\nwant %s", got, want)
 	}
@@ -93,7 +93,7 @@ func TestLongestMatch(t *testing.T) {
 		"a--b":     "a -- b ⏚",
 		"a- -b":    "a - - b ⏚",
 		"x....":    "x ... .",
-		"a..b":     "a . . b ⏚",
+		"a..b":     "a .. b ⏚",
 		"a:=b":     "a := b ⏚",
 		"!==":      "!= =",
 		"a&&&b":    "a && & b ⏚",
