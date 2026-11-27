@@ -103,8 +103,8 @@ var wMode WalkMode
 var wTrack bool
 var twDepth usize
 var wWhy u32
-var wRem u32  // T2: the shrinking slice
-var t3X u32   // T3: measure leaves (Y may be 0) and post statement
+var wRem u32 // T2: the shrinking slice
+var t3X u32  // T3: measure leaves (Y may be 0) and post statement
 var t3Y u32
 var t3Post u32
 var t3Trk [MaxSyms]bool   // T3: tracked variables

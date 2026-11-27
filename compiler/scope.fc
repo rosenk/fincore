@@ -46,9 +46,9 @@ var scNDefs usize
 var scMaxDepth u32
 
 // Whole-pass tables.
-var scLeaked [MaxSyms]bool    // E3005 is reported once per variable
-var scSliceMemo [MaxTypes]u8  // hasSlice memo: 0 unknown, 1 false (or in progress), 2 true
-var scLitDone [MaxFuncs]bool  // literals whose linearity was analysed
+var scLeaked [MaxSyms]bool   // E3005 is reported once per variable
+var scSliceMemo [MaxTypes]u8 // hasSlice memo: 0 unknown, 1 false (or in progress), 2 true
+var scLitDone [MaxFuncs]bool // literals whose linearity was analysed
 
 // Walker state (phase 1 collects, phase 2 checks).
 var wDepth u32

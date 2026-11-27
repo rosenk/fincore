@@ -22,12 +22,12 @@ const (
 	MaxNameBytes = 1 << 20
 	NameBuckets  = 131_072
 
-	MaxSyms    = 131_072
-	SymBuckets = 524_288 // key (scp, name)
-	MaxScopes  = 524_288
-	MaxPkgs    = 64
-	MaxULists  = 1 << 20
-	MaxCells   = 524_288
+	MaxSyms     = 131_072
+	SymBuckets  = 524_288 // key (scp, name)
+	MaxScopes   = 524_288
+	MaxPkgs     = 64
+	MaxULists   = 1 << 20
+	MaxCells    = 524_288
 	MaxFuncNest = 4096
 
 	MaxDiags     = 8192
@@ -208,9 +208,9 @@ const (
 type Sym struct {
 	kind     u8
 	varKind  u8
-	builtin  u8  // predeclared entity (Builtin), 0 otherwise
-	objState u8  // checker: 0 unchecked, 1 in progress, 2 done
-	body     u8  // checker (functions): 0 unchecked, 1 in progress, 2 ok, 3 errors
+	builtin  u8   // predeclared entity (Builtin), 0 otherwise
+	objState u8   // checker: 0 unchecked, 1 in progress, 2 done
+	body     u8   // checker (functions): 0 unchecked, 1 in progress, 2 ok, 3 errors
 	untyped  bool // checker: untyped constant (UntypedConsts)
 	name     u32  // NameID
 	ident    u32  // defining Ident node (0 for predeclared symbols)
@@ -219,7 +219,7 @@ type Sym struct {
 	fn       u32  // enclosing FuncDecl/FuncLit node of locals (0 = package level)
 	imported u32  // SymPackage: the imported package
 	recvType u32  // methods: NameID of the receiver type name (0 for funcs)
-	scp    u32  // scope the symbol was inserted into (0 if none)
+	scp      u32  // scope the symbol was inserted into (0 if none)
 	typ      u32  // checker: SymTypes
 	val      u32  // checker: SymValues (value slot, 0 = none)
 	method   u32  // checker: MethodOf (method symbols)
@@ -441,7 +441,7 @@ type Pkg struct {
 	path  string // import path ("" for the root package)
 	key   string // cleaned path (cycle detection)
 	state u8     // loader: 1 visiting, 2 done
-	scp u32    // package scope
+	scp   u32    // package scope
 	f0    usize  // source files [f0, f1) (only files with ok == true belong to it)
 	f1    usize
 	impS  u32 // imported packages (ulists), first-import order
@@ -453,11 +453,11 @@ type Pkg struct {
 }
 
 type PkgTable struct {
-	items [MaxPkgs]Pkg
-	count usize // including the reserved slot 0
-	order [MaxPkgs]u32 // dependency order; root last
+	items  [MaxPkgs]Pkg
+	count  usize        // including the reserved slot 0
+	order  [MaxPkgs]u32 // dependency order; root last
 	norder usize
-	root  u32
+	root   u32
 }
 
 var pkgs PkgTable

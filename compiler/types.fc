@@ -399,7 +399,10 @@ func mkCode(level int) u32 {
 }
 
 func codeLevel(t u32) int {
-	return match trec(t) { Code(l) -> int(l) - 1, _ -> -1 }
+	return match trec(t) {
+		Code(l) -> int(l) - 1
+		_ -> -1
+	}
 }
 
 func mkConstArg(v u64) u32 {
@@ -511,7 +514,10 @@ func isTupleT(t u32) bool {
 
 // namedID returns the NamedRec of a named type (0 for other types).
 func namedID(t u32) u32 {
-	return match trec(t) { Named(id) -> id, _ -> 0 }
+	return match trec(t) {
+		Named(id) -> id
+		_ -> 0
+	}
 }
 
 func underlying(t u32) u32 {
@@ -558,7 +564,10 @@ func isInvalid(t u32) bool {
 }
 
 func basicKind(t u32) u8 {
-	return match trec(underlying(t)) { Basic(k) -> k, _ -> BkInvalid }
+	return match trec(underlying(t)) {
+		Basic(k) -> k
+		_ -> BkInvalid
+	}
 }
 
 func isInteger(t u32) bool {
@@ -630,13 +639,19 @@ func typeName(t u32) u32 {
 
 // Type parameters.
 func tpSym(t u32) u32 {
-	return match trec(t) { TypeParam(_, sym, ..) -> sym, _ -> 0 }
+	return match trec(t) {
+		TypeParam(_, sym, ..) -> sym
+		_ -> 0
+	}
 }
 
 // tpConstType returns the type of a const type parameter (0 for a type
 // parameter).
 func tpConstType(t u32) u32 {
-	return match trec(t) { TypeParam(.., ct) -> ct, _ -> 0 }
+	return match trec(t) {
+		TypeParam(.., ct) -> ct
+		_ -> 0
+	}
 }
 
 func tpIsConst(t u32) bool {
@@ -645,15 +660,24 @@ func tpIsConst(t u32) bool {
 
 // Struct fields: pairs (name, type).
 func nfields(st u32) usize {
-	return match trec(st) { Struct(_, n) -> usize(n) / 2, _ -> 0 }
+	return match trec(st) {
+		Struct(_, n) -> usize(n) / 2
+		_ -> 0
+	}
 }
 
 func fieldName(st u32, i usize) u32 {
-	return match trec(st) { Struct(s, _) -> tlist(s, 2*i), _ -> 0 }
+	return match trec(st) {
+		Struct(s, _) -> tlist(s, 2*i)
+		_ -> 0
+	}
 }
 
 func fieldType(st u32, i usize) u32 {
-	return match trec(st) { Struct(s, _) -> tlist(s, 2*i+1), _ -> 0 }
+	return match trec(st) {
+		Struct(s, _) -> tlist(s, 2*i+1)
+		_ -> 0
+	}
 }
 
 func fieldByName(st u32, name u32) (usize, bool) {
@@ -668,19 +692,31 @@ func fieldByName(st u32, name u32) (usize, bool) {
 
 // Enum variants: triples (name, payload start, payload len).
 func nvariants(en u32) usize {
-	return match trec(en) { Enum(_, n) -> usize(n) / 3, _ -> 0 }
+	return match trec(en) {
+		Enum(_, n) -> usize(n) / 3
+		_ -> 0
+	}
 }
 
 func variantName(en u32, i usize) u32 {
-	return match trec(en) { Enum(s, _) -> tlist(s, 3*i), _ -> 0 }
+	return match trec(en) {
+		Enum(s, _) -> tlist(s, 3*i)
+		_ -> 0
+	}
 }
 
 func variantPayS(en u32, i usize) u32 {
-	return match trec(en) { Enum(s, _) -> tlist(s, 3*i+1), _ -> 0 }
+	return match trec(en) {
+		Enum(s, _) -> tlist(s, 3*i+1)
+		_ -> 0
+	}
 }
 
 func variantPayN(en u32, i usize) usize {
-	return match trec(en) { Enum(s, _) -> usize(tlist(s, 3*i+2)), _ -> 0 }
+	return match trec(en) {
+		Enum(s, _) -> usize(tlist(s, 3*i+2))
+		_ -> 0
+	}
 }
 
 func variantPay(en u32, i usize, j usize) u32 {
@@ -699,39 +735,66 @@ func variantByName(en u32, name u32) (usize, bool) {
 
 // Signatures.
 func sigEffect(s u32) u8 {
-	return match trec(s) { Sig(eff, ..) -> eff, _ -> EffComptime }
+	return match trec(s) {
+		Sig(eff, ..) -> eff
+		_ -> EffComptime
+	}
 }
 
 func sigVariadic(s u32) bool {
-	return match trec(s) { Sig(_, va, ..) -> va, _ -> false }
+	return match trec(s) {
+		Sig(_, va, ..) -> va
+		_ -> false
+	}
 }
 
 func sigNParams(s u32) usize {
-	return match trec(s) { Sig(_, _, _, pn, ..) -> usize(pn), _ -> 0 }
+	return match trec(s) {
+		Sig(_, _, _, pn, ..) -> usize(pn)
+		_ -> 0
+	}
 }
 
 func sigParam(s u32, i usize) u32 {
-	return match trec(s) { Sig(_, _, ps, ..) -> tlist(ps, i), _ -> 0 }
+	return match trec(s) {
+		Sig(_, _, ps, ..) -> tlist(ps, i)
+		_ -> 0
+	}
 }
 
 func sigParamsSlice(s u32) []u32 {
-	return match trec(s) { Sig(_, _, ps, pn, ..) -> tlistSlice(ps, pn), _ -> emptyU32() }
+	return match trec(s) {
+		Sig(_, _, ps, pn, ..) -> tlistSlice(ps, pn)
+		_ -> emptyU32()
+	}
 }
 
 func sigNResults(s u32) usize {
-	return match trec(s) { Sig(_, _, _, _, _, rn, ..) -> usize(rn), _ -> 0 }
+	return match trec(s) {
+		Sig(_, _, _, _, _, rn, ..) -> usize(rn)
+		_ -> 0
+	}
 }
 
 func sigResult(s u32, i usize) u32 {
-	return match trec(s) { Sig(_, _, _, _, rs, ..) -> tlist(rs, i), _ -> 0 }
+	return match trec(s) {
+		Sig(_, _, _, _, rs, ..) -> tlist(rs, i)
+		_ -> 0
+	}
 }
 
 func sigResultsSlice(s u32) []u32 {
-	return match trec(s) { Sig(_, _, _, _, rs, rn, ..) -> tlistSlice(rs, rn), _ -> emptyU32() }
+	return match trec(s) {
+		Sig(_, _, _, _, rs, rn, ..) -> tlistSlice(rs, rn)
+		_ -> emptyU32()
+	}
 }
 
 func sigNTParams(s u32) usize {
-	return match trec(s) { Sig(.., tn) -> usize(tn), _ -> 0 }
+	return match trec(s) {
+		Sig(.., tn) -> usize(tn)
+		_ -> 0
+	}
 }
 
 // sigResultType: 0 for no results, the result, or a Tuple.
@@ -1482,24 +1545,24 @@ const (
 
 // FuncInfo describes a function declaration, method or function literal.
 type FuncInfo struct {
-	sym       u32 // 0 for literals
-	decl      u32 // FuncDecl node (0 for literals)
-	lit       u32 // FuncLit node (0 for declarations)
-	outer     u32 // enclosing FuncInfo of a literal
-	effect    u8
-	sig       u32
-	method    u32
-	recvSym   u32
-	parS      u32 // parameter Ident nodes in order (ulists); symbol = defs[ident] (0 for `_`)
-	parN      u32
-	tpS       u32 // TypeParams (type lists)
-	tpN       u32
+	sym     u32 // 0 for literals
+	decl    u32 // FuncDecl node (0 for literals)
+	lit     u32 // FuncLit node (0 for declarations)
+	outer   u32 // enclosing FuncInfo of a literal
+	effect  u8
+	sig     u32
+	method  u32
+	recvSym u32
+	parS    u32 // parameter Ident nodes in order (ulists); symbol = defs[ident] (0 for `_`)
+	parN    u32
+	tpS     u32 // TypeParams (type lists)
+	tpN     u32
 	measure u32 // measure expression node (0 = none)
-	body      u32 // BlockStmt node
-	callH     u32 // calls in the body, source order (cells of CallExpr nodes)
-	callT     u32
-	litH      u32 // directly nested literals (cells of FuncInfo IDs)
-	litT      u32
+	body    u32 // BlockStmt node
+	callH   u32 // calls in the body, source order (cells of CallExpr nodes)
+	callT   u32
+	litH    u32 // directly nested literals (cells of FuncInfo IDs)
+	litT    u32
 }
 
 type FuncTable struct {
@@ -1530,14 +1593,14 @@ func newFuncInfo(fi FuncInfo) u32 {
 // types.Call. The variant order fixes the compact layout (u32 x 3, bool,
 // u8: 20 bytes).
 type CallKind enum {
-	Invalid                       // not checked or erroneous
-	Func(u32, u32, u32)           // function symbol, type args (type lists run)
-	Method(u32, u32, u32, bool)   // method symbol, MethodID, receiver node, autoAddr
-	BuiltinMeth(u32, u32, bool)   // MethodID, receiver node, autoAddr (capability methods)
-	Builtin(u8, bool, u32, u32)   // builtin; formatTo (v0.2): checked without errors, (op, method) pairs (ulists)
-	Conversion(u32)               // target type
-	Variant(u32, u32)             // enum type (as written), variant index
-	Value                         // call through a function value
+	Invalid                     // not checked or erroneous
+	Func(u32, u32, u32)         // function symbol, type args (type lists run)
+	Method(u32, u32, u32, bool) // method symbol, MethodID, receiver node, autoAddr
+	BuiltinMeth(u32, u32, bool) // MethodID, receiver node, autoAddr (capability methods)
+	Builtin(u8, bool, u32, u32) // builtin; formatTo (v0.2): checked without errors, (op, method) pairs (ulists)
+	Conversion(u32)             // target type
+	Variant(u32, u32)           // enum type (as written), variant index
+	Value                       // call through a function value
 }
 
 // Call describes a CallExpr (types.Call). For method calls the receiver is

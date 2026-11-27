@@ -504,7 +504,7 @@ func cgForStmt(s u32, dp usize) decreases(dp) {
 	cgPopFrame()
 	if lbl != 0 {
 		q := cgWmark()
-		cgWf(formatTo(mbuf[:], "_fc_L%d:\n", lbl - 1))
+		cgWf(formatTo(mbuf[:], "_fc_L%d:\n", lbl-1))
 		cgWrotate(p, q)
 	}
 }
@@ -542,7 +542,7 @@ func cgBranch(s u32, isBreak bool) {
 			cgFrameLabel[loop] = cgLabel + 1
 			cgLabel++
 		}
-		cgWf(formatTo(mbuf[:], "break _fc_L%d\n", cgFrameLabel[loop] - 1))
+		cgWf(formatTo(mbuf[:], "break _fc_L%d\n", cgFrameLabel[loop]-1))
 		return
 	}
 	if isBreak {
@@ -569,7 +569,7 @@ func cgScopeStmt(s u32, dp usize) decreases(dp) {
 	cgWc('\n')
 	idx := cgScopeIdx[usize(s)]
 	if idx > 0 {
-		cgWf(formatTo(mbuf[:], "_fc_s%d = ", idx - 1))
+		cgWf(formatTo(mbuf[:], "_fc_s%d = ", idx-1))
 		cgWScopeVar(fr)
 		cgWc('\n')
 	}
@@ -593,4 +593,3 @@ func cgIsPlainVar(e u32) bool {
 	s := uses[usize(e)]
 	return s != 0 && symKind(s) == SymVar && syms.items[usize(s)].fn != 0
 }
-

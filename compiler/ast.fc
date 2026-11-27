@@ -257,7 +257,11 @@ func assignOpString(op u8) string {
 }
 
 func litKindString(op u8) string {
-	return match op { LitString -> "string", LitChar -> "char", _ -> "int" }
+	return match op {
+		LitString -> "string"
+		LitChar -> "char"
+		_ -> "int"
+	}
 }
 
 // kindName returns the finc0 Go type name of a node kind.
@@ -619,11 +623,11 @@ func (d *Dumper) dumpNode(id u32, indent usize, depth usize) decreases(depth) {
 			start, cnt := slotList(n, slot)
 			m := usize(cnt)
 			if m > 0 {
-				o.WriteRepeat(' ', 2 * (indent + 1))
+				o.WriteRepeat(' ', 2*(indent+1))
 				o.WriteString(name)
 				o.WriteString(":\n")
 				for j := usize(0); j < m; j++ {
-					o.WriteRepeat(' ', 2 * (indent + 2))
+					o.WriteRepeat(' ', 2*(indent+2))
 					o.WriteString("- ")
 					d.dumpNode(d.na.listItem(start, j), indent+2, depth-1)
 				}
@@ -631,7 +635,7 @@ func (d *Dumper) dumpNode(id u32, indent usize, depth usize) decreases(depth) {
 		} else {
 			c := slotChild(n, slot)
 			if c != 0 {
-				o.WriteRepeat(' ', 2 * (indent + 1))
+				o.WriteRepeat(' ', 2*(indent+1))
 				o.WriteString(name)
 				o.WriteString(": ")
 				d.dumpNode(c, indent+1, depth-1)

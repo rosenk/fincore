@@ -873,7 +873,10 @@ func cgBuiltinCall(e u32, c u32, b u8, dp usize) decreases(dp) {
 	}
 	match b {
 		BFLen | BFCap -> {
-			cgW(match b { BFLen -> "uint(len(", _ -> "uint(cap(" })
+			cgW(match b {
+				BFLen -> "uint(len("
+				_ -> "uint(cap("
+			})
 			cgExpr(l1at(e, 0), dp-1)
 			cgW("))")
 		}
@@ -886,7 +889,10 @@ func cgBuiltinCall(e u32, c u32, b u8, dp usize) decreases(dp) {
 		BFMin | BFMax -> {
 			// v0.3: Go's min/max builtins (user names min/max are
 			// renamed _fc_u_min/_fc_u_max, so these always resolve).
-			cgW(match b { BFMin -> "min(", _ -> "max(" })
+			cgW(match b {
+				BFMin -> "min("
+				_ -> "max("
+			})
 			cgArgs(e, dp-1)
 			cgWc(')')
 		}

@@ -558,7 +558,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 			t := tlist(ts, i)
 			w := sigResult(sig, i)
 			if !assignable(t, w) && !isInvalid(w) {
-				errAt(E2002, r0, formatTo(mbuf[:], "cannot use result %d of type %v as type %v in return statement", i + 1, TypeRef(t), TypeRef(w)))
+				errAt(E2002, r0, formatTo(mbuf[:], "cannot use result %d of type %v as type %v in return statement", i+1, TypeRef(t), TypeRef(w)))
 			}
 		}
 		return

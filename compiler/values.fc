@@ -161,7 +161,10 @@ func strSpan(off u32, n u32) []byte {
 
 // strOf returns the bytes of a string value (empty for other values).
 func strOf(v Val) []byte {
-	return match v { Str(off, n) -> strSpan(off, n), _ -> strPool[0:0] }
+	return match v {
+		Str(off, n) -> strSpan(off, n)
+		_ -> strPool[0:0]
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +429,10 @@ func isIntVal(v Val) bool {
 // intLo returns the low 64 bits of an exact integer value (0 for other
 // values).
 func intLo(v Val) u64 {
-	return match v { Int(_, lo) -> lo, _ -> 0 }
+	return match v {
+		Int(_, lo) -> lo
+		_ -> 0
+	}
 }
 
 // sliceElems returns the first element slot and the length of a slice
@@ -1007,7 +1013,12 @@ func compareVals(op u8, x Val, y Val) (Val, bool) {
 			return z, false
 		}
 	}
-	return vBool(match op { OpLt -> c < 0, OpLe -> c <= 0, OpGt -> c > 0, _ -> c >= 0 }), true
+	return vBool(match op {
+		OpLt -> c < 0
+		OpLe -> c <= 0
+		OpGt -> c > 0
+		_ -> c >= 0
+	}), true
 }
 
 func cannotCompare(x Val, y Val) {
@@ -1108,7 +1119,10 @@ func isCodeVal(v Val) bool {
 // fieldCodeOf is the FieldCode value with the name of string value name and
 // the code in slot c.
 func fieldCodeOf(name Val, c u32) Val {
-	return match name { Str(off, n) -> Val.FieldCode(off, n, c), _ -> Val.FieldCode(0, 0, c) }
+	return match name {
+		Str(off, n) -> Val.FieldCode(off, n, c)
+		_ -> Val.FieldCode(0, 0, c)
+	}
 }
 
 // codeLevelOf returns the universe level of a code (CodeVal.Level).
@@ -1122,7 +1136,7 @@ func codeLevelOf(v Val, depth usize) int decreases(depth) {
 		CodeStruct(ref, n) -> {
 			l := -1
 			for i := u32(0); i < n; i++ {
-				if slotGet(ref+i) is FieldCode(_, _, c) {
+				if slotGet(ref + i) is FieldCode(_, _, c) {
 					x := codeLevelOf(slotGet(c), depth-1)
 					if x > l {
 						l = x
@@ -1165,7 +1179,7 @@ func foldCode(v Val, depth usize) u32 decreases(depth) {
 		CodeStruct(ref, n) -> {
 			m := tmark()
 			for i := u32(0); i < n; i++ {
-				if slotGet(ref+i) is FieldCode(off, ln, c) {
+				if slotGet(ref + i) is FieldCode(off, ln, c) {
 					nm := intern(strSpan(off, ln))
 					ft := foldCode(slotGet(c), depth-1)
 					tpush(nm)

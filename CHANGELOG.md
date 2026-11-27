@@ -35,6 +35,12 @@ in [docs/v0_3.md](docs/v0_3.md), decisions 140–157 in
 ### Compiler and tooling
 
 - `LangVersion` 0.3; `finc test` runs the `// SINCE: v0.3` tests.
+- compiler/ is formatted with `finc fmt` (like std/ and examples/), and
+  `make fmt-fc-check` (CI) fails if a file of compiler/, std/ or
+  examples/ is not formatted.
+- The TCP echo integration tests listen on ports picked by the kernel
+  (`127.0.0.1:0`, the program reports its address) instead of fixed
+  ports 18101–18104, so concurrent runs of the suite no longer collide.
 - Totality: `min`/`max` of loop-invariant operands are loop-invariant
   bounds.
 - `make diff-prev` now `go vet`s the emitted Go of programs only the

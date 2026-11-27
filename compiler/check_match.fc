@@ -1740,7 +1740,10 @@ func renderTok(o *OutBuf, h u32, top bool, depth usize) u32 decreases(depth) {
 	c := usize(wC[usize(h)])
 	u := underlying(t)
 	if !isEnumT(u) {
-		o.WriteString(match c { 0 -> "true", _ -> "false" })
+		o.WriteString(match c {
+			0 -> "true"
+			_ -> "false"
+		})
 		return next
 	}
 	a := variantPayN(u, c)

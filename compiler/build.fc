@@ -100,7 +100,6 @@ driver func emsg(io Stdio, s string) error {
 	return io.WriteStderr(strBytes(s))
 }
 
-
 // ---------------------------------------------------------------------------
 // Flags (Go flag package syntax)
 

@@ -11,7 +11,13 @@
 // syntax-error fixtures) are skipped and counted. With -list the files
 // whose formatting differs from the checked-in source are printed.
 //
-//	go run ./scripts/fmtcheck [-finc bin/finc1] [-list] [path...]
+// The directories of -formatted (default compiler, std and examples) must
+// also be in canonical form already: a file there that `finc fmt` would
+// change fails the check (reformat with `finc fmt -w <dir>`). testdata/
+// and scripts/*/cases are exempt, since their `// ERROR` markers and the
+// diagnostics the differential tests compare depend on positions.
+//
+//	go run ./scripts/fmtcheck [-finc bin/finc1] [-list] [-formatted compiler,std,examples] [path...]
 package main
 
 import (
@@ -38,7 +44,14 @@ var posRE = regexp.MustCompile(` #\d+ @\d+:\d+-\d+:\d+| Path="[^"]*"`)
 func main() {
 	finc := flag.String("finc", "bin/finc1", "compiler under test")
 	list := flag.Bool("list", false, "print the files whose formatting differs")
+	formattedDirs := flag.String("formatted", "compiler,std,examples", "comma-separated directories whose files must already be formatted (empty: none)")
 	flag.Parse()
+	var mustBeFormatted []string
+	for _, d := range strings.Split(*formattedDirs, ",") {
+		if d = strings.TrimSpace(d); d != "" {
+			mustBeFormatted = append(mustBeFormatted, filepath.Clean(d))
+		}
+	}
 	roots := flag.Args()
 	if len(roots) == 0 {
 		roots = corpus
@@ -71,7 +84,7 @@ func main() {
 	defer os.RemoveAll(tmp)
 
 	var same, changed, skipped int
-	var bad []string
+	var bad, unformatted []string
 	for i, f := range files {
 		src, err := os.ReadFile(f)
 		if err != nil {
@@ -116,17 +129,39 @@ func main() {
 			if *list {
 				fmt.Println(f)
 			}
+			if under(f, mustBeFormatted) {
+				unformatted = append(unformatted, f)
+			}
 		}
 	}
 	checked := len(files) - skipped
 	fmt.Printf("fmt-fc-check: %d files: %d checked (%d already formatted, %d would change), %d skipped (do not parse); idempotent and AST-equivalent: %d/%d\n",
 		len(files), checked, same, changed, skipped, checked-len(bad), checked)
-	if len(bad) > 0 {
-		for _, b := range bad {
-			fmt.Println("FAIL", b)
-		}
+	for _, b := range bad {
+		fmt.Println("FAIL", b)
+	}
+	for _, f := range unformatted {
+		fmt.Printf("FAIL %s: not formatted (finc fmt -w %s)\n", f, f)
+	}
+	if len(unformatted) > 0 {
+		fmt.Printf("fmt-fc-check: %d files of %s are not formatted\n", len(unformatted), strings.Join(mustBeFormatted, ", "))
+	} else if len(mustBeFormatted) > 0 {
+		fmt.Printf("fmt-fc-check: %s: all formatted\n", strings.Join(mustBeFormatted, ", "))
+	}
+	if len(bad) > 0 || len(unformatted) > 0 {
 		os.Exit(1)
 	}
+}
+
+// under reports whether the file path f lies in one of the directories.
+func under(f string, dirs []string) bool {
+	f = filepath.Clean(f)
+	for _, d := range dirs {
+		if f == d || strings.HasPrefix(f, d+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func run(finc string, args ...string) ([]byte, error) {

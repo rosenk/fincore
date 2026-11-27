@@ -35,7 +35,7 @@ type Operand struct {
 	// pointer-receiver method may be called on it (auto-&, v0.2)
 	addressable bool
 	vEnum       u32 // KVariantCtor: underlying Enum TypeID
-	vIndex   u32 //   and variant index
+	vIndex      u32 //   and variant index
 }
 
 // opStack holds operand lists (call arguments, assignment sides) in LIFO
@@ -441,7 +441,11 @@ func assignable(v u32, t u32) bool {
 // hasTypeName reports whether t is a named type in the sense of Go's
 // assignability rule: a Named type or a typed predeclared basic type.
 func hasTypeName(t u32) bool {
-	return match trec(t) { Named(_) -> true, Basic(_) -> !isUntyped(t), _ -> false }
+	return match trec(t) {
+		Named(_) -> true
+		Basic(_) -> !isUntyped(t)
+		_ -> false
+	}
 }
 
 // convertUntyped converts an untyped operand to type t.
@@ -1748,7 +1752,6 @@ func checkRecursiveTypes() {
 		}
 	}
 }
-
 
 // The parts shared by the "invalid main signature" messages.
 const (

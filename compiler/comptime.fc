@@ -19,16 +19,16 @@ package main
 import "std/strconv"
 
 const (
-	DefaultFuel   = 1_000_000
-	CtMaxDepth    = 10_000
-	MaxFrames     = CtMaxDepth + 2
-	MaxFrameVars  = 262_144
-	CtlNone       = 0
-	CtlBreak      = 1
-	CtlContinue   = 2
-	CtlReturn     = 3
-	CtEval        = "comptime evaluation " // prefix of comptime diagnostics
-	NotStruct     = "field access on non-struct value"
+	DefaultFuel  = 1_000_000
+	CtMaxDepth   = 10_000
+	MaxFrames    = CtMaxDepth + 2
+	MaxFrameVars = 262_144
+	CtlNone      = 0
+	CtlBreak     = 1
+	CtlContinue  = 2
+	CtlReturn    = 3
+	CtEval       = "comptime evaluation " // prefix of comptime diagnostics
+	NotStruct    = "field access on non-struct value"
 )
 
 type Frame struct {
@@ -388,7 +388,12 @@ func evalList(s u32, n usize, dp usize) decreases(dp) {
 }
 
 func asgBinOp(op u8) u8 {
-	return match op { AsgSub -> OpSub, AsgMul -> OpMul, AsgQuo -> OpDiv, _ -> OpAdd }
+	return match op {
+		AsgSub -> OpSub
+		AsgMul -> OpMul
+		AsgQuo -> OpDiv
+		_ -> OpAdd
+	}
 }
 
 func istmt(s u32, dp usize) u8 decreases(dp) {

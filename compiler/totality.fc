@@ -120,19 +120,19 @@ const (
 	WhyBoundVariant = 16
 	WhyNoCond       = 17
 
-	WhyShrinkPost     = 20
-	WhyInitDeclSlice  = 21
-	WhyInitAsgSlice   = 22
-	WhyInitSlice      = 23
-	WhySliceUnstable  = 24
-	WhySliceModified  = 25
-	WhyNotShortened   = 26
-	WhyLenMeasure     = 30
-	WhyMeasureForm    = 31
-	WhyMeasureVar     = 32
-	WhyMeasureNonNeg  = 33
-	WhyMeasureUnsign  = 34
-	WhyNoDecrease     = 35
+	WhyShrinkPost    = 20
+	WhyInitDeclSlice = 21
+	WhyInitAsgSlice  = 22
+	WhyInitSlice     = 23
+	WhySliceUnstable = 24
+	WhySliceModified = 25
+	WhyNotShortened  = 26
+	WhyLenMeasure    = 30
+	WhyMeasureForm   = 31
+	WhyMeasureVar    = 32
+	WhyMeasureNonNeg = 33
+	WhyMeasureUnsign = 34
+	WhyNoDecrease    = 35
 )
 
 var totWhySym u32

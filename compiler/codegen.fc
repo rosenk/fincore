@@ -37,10 +37,10 @@ const (
 	CgMaxMonos    = 4096
 	CgMaxMonoVals = 32_768
 	CgMaxEnv      = 256
-	CgMaxFrames = 65_536
-	CgMaxPend   = 65_536
-	CgMaxArms   = 262_144
-	CgMaxSeen   = 4096
+	CgMaxFrames   = 65_536
+	CgMaxPend     = 65_536
+	CgMaxArms     = 262_144
+	CgMaxSeen     = 4096
 )
 
 // Output sections and scratch buffers.
@@ -55,12 +55,12 @@ var cgUsesRT bool
 var cgFailed bool
 
 // Per-symbol and per-node lowering tables.
-var cgUsed [MaxSyms]bool         // local variable is read somewhere (live code)
-var cgTrack u32                  // usedIn: the symbol looked for (0 = none)
-var cgFound bool                 // usedIn: cgTrack was read
-var cgScopeIdx [MaxNodes]u32     // ScopeStmt -> 1 + index within its function
-var cgScopeCount [MaxFuncs]u32   // FuncInfo -> number of scope statements
-var cgPrefix [MaxPkgs]string     // package -> Go name prefix ("" for the root)
+var cgUsed [MaxSyms]bool       // local variable is read somewhere (live code)
+var cgTrack u32                // usedIn: the symbol looked for (0 = none)
+var cgFound bool               // usedIn: cgTrack was read
+var cgScopeIdx [MaxNodes]u32   // ScopeStmt -> 1 + index within its function
+var cgScopeCount [MaxFuncs]u32 // FuncInfo -> number of scope statements
+var cgPrefix [MaxPkgs]string   // package -> Go name prefix ("" for the root)
 
 // Monomorphized instances (const parameters), in discovery order.
 var cgMonoKind [CgMaxMonos]u8 // 1 type, 2 function
@@ -88,7 +88,7 @@ var cgTmp u64
 var cgLabel u64
 var cgHeader u32
 var cgTyped bool
-var cgFrameKind [CgMaxFrames]u8 // 1 loop, 2 switch, 3 scope
+var cgFrameKind [CgMaxFrames]u8   // 1 loop, 2 switch, 3 scope
 var cgFrameLabel [CgMaxFrames]u64 // loops: 1 + label number (0 = none)
 var cgFrameSym [CgMaxFrames]u32   // scopes: symbol of the scope variable
 var cgFrameTmp [CgMaxFrames]u64   // scopes: 1 + temporary number (when unnamed)
@@ -1286,7 +1286,6 @@ func cgTypeLit(n u32, t u32, dp usize) decreases(dp) {
 		NoType | Basic(_) | Named(_) | Code(_) | TypeParam(..) | ConstArg(_) | Tuple(..) | Opaque(..) -> cgGoType(n, t, dp-1)
 	}
 }
-
 
 // sigTypes writes `(T1, T2) (R1, R2)` for a signature type.
 func cgSigTypes(n u32, s u32, dp usize) decreases(dp) {

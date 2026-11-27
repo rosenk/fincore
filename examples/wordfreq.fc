@@ -40,7 +40,7 @@ const Sample = "The quick brown fox jumps over the lazy dog. The dog sleeps; " +
 // on the stack. They are Value types, so S1 (no global Scoped values) is
 // satisfied.
 var input [MaxInput]byte
-var counts maps.StrMap[2 * MaxWords, WordArena, MaxWords, u32]
+var counts maps.StrMap[2*MaxWords, WordArena, MaxWords, u32]
 var order [MaxWords]u32
 
 type Stats struct {

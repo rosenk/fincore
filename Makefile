@@ -153,7 +153,7 @@ finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3
 fmt-fc: finc1 ## list the .fc files of compiler/ std/ examples/ whose formatting differs from `finc fmt`
 	@$(BIN)/finc1 fmt -l compiler std examples
 
-fmt-fc-check: finc1 ## finc fmt on every .fc file of the repo: idempotent and AST-preserving (scripts/fmtcheck)
+fmt-fc-check: finc1 ## finc fmt on every .fc file of the repo: idempotent and AST-preserving; compiler/ std/ examples/ already formatted (scripts/fmtcheck)
 	$(GO) run ./scripts/fmtcheck
 
 context-test: finc1 ## golden `check --context` output of testdata/context (UPDATE=1 rewrites the .out files)

@@ -256,7 +256,11 @@ func lookupKeyword(w []byte) u8 {
 func describeToken(o *OutBuf, t Token, text []byte) {
 	k := t.kind
 	if k == TkSemicolon {
-		o.WriteString(match t.semi { SemiNewline -> "newline", SemiEOF -> "EOF", _ -> "';'" })
+		o.WriteString(match t.semi {
+			SemiNewline -> "newline"
+			SemiEOF -> "EOF"
+			_ -> "';'"
+		})
 		return
 	}
 	if k == TkEOF {
@@ -502,10 +506,10 @@ func stringLitEmpty(raw []byte) bool {
 // Lexer
 
 type Lexer struct {
-	src        []byte
-	n          usize
-	off        usize
-	line       u32
+	src          []byte
+	n            usize
+	off          usize
+	line         u32
 	lineStart    usize
 	insertSemi   bool
 	keepComments bool // record comments in the side table (finc fmt)

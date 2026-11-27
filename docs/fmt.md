@@ -126,23 +126,26 @@ the two ordered streams by offset.
   idempotence (`fmt(fmt(x)) == fmt(x)`) and AST equivalence
   (`finc parse --dump-ast` with IDs, positions and the path stripped).
   Files that do not parse (syntax-error fixtures) are skipped and counted.
+  It also requires `compiler/`, `std/` and `examples/` to be formatted
+  already (`-formatted`, default `compiler,std,examples`): a file there
+  that `finc fmt` would change fails the check, so CI (the
+  `fmt-fc-check` step) keeps them in canonical form. Fix with
+  `bin/finc1 fmt -w compiler std examples`.
 
-Result at the time of writing: 181 files, 177 checked, 4 skipped
-(deliberate syntax errors in `scripts/diffcheck/cases` and
-`testdata/context/syntax.fc`), all 177 idempotent and AST-equivalent; 141
-are already formatted, 36 would change.
+Result at the time of writing: 254 files, 240 checked, 14 skipped
+(deliberate syntax errors in `scripts/diffcheck/cases`, `testdata/context`
+and `testdata/fail`), all 240 idempotent and AST-equivalent; 209 are
+already formatted, 31 would change (all in `testdata/` and
+`scripts/*/cases`, which stay as they are).
 
 ### What is formatted in the repository
 
-- `std/` and `examples/` are already in canonical form (`finc fmt -l`
-  prints nothing).
-- `compiler/`: `compiler/fmt.fc` is formatted. The other files are not
-  reformatted yet: 18 of them would change, mostly one-line `match`
-  expressions being split and alignment that was not quite gofmt's. Doing
-  it in one sweep while several branches change compiler/ would only
-  cause merge conflicts; `make fmt-fc` lists the files. A reformat changes
-  line numbers in compiler/ only, not the emitted Go of any program, and
-  `make bootstrap` checks it.
+- `compiler/`, `std/` and `examples/` are in canonical form (`finc fmt -l`
+  prints nothing), and `make fmt-fc-check` enforces it. `compiler/` was
+  reformatted in one sweep before v0.3.0 (mostly one-line `match`
+  expressions split into one arm per line, and alignment that was not
+  quite gofmt's). A reformat changes positions in compiler/ only; `make
+  bootstrap` checks that the compiler still reaches the fixed point.
 - `testdata/` and `scripts/*/cases` are left as they are: fail tests carry
   positional `// ERROR` markers, and the cases pin positions in
   diagnostics that the differential tests compare.

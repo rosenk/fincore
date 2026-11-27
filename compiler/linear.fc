@@ -1274,8 +1274,14 @@ func lnCall(fl u32, x u32, e u32, deferred bool, dp usize) decreases(dp) {
 		}
 		return
 	}
-	finalize := match deferred { true -> Consume.Defer, false -> Consume.Finalize }
-	move := match deferred { true -> Consume.Defer, false -> Consume.Move }
+	finalize := match deferred {
+		true -> Consume.Defer
+		false -> Consume.Finalize
+	}
+	move := match deferred {
+		true -> Consume.Defer
+		false -> Consume.Move
+	}
 	c := callTab.items[usize(ci)]
 	fun := unparen(na(x))
 	funLit := fun != 0 && nkind(fun) == NkFuncLit
@@ -1360,7 +1366,10 @@ func lnInlineLit(fl u32, lit u32, e u32, deferred bool, dp usize) decreases(dp) 
 	mid := lnNTmp
 	lnPushParams(fi, false)
 	lnRun(g, nb(lit), mark, mid, dp-1)
-	kind := match deferred { true -> Consume.Defer, false -> Consume.Finalize }
+	kind := match deferred {
+		true -> Consume.Defer
+		false -> Consume.Finalize
+	}
 	ex := lnFlows[usize(g)].exits
 	c2 := litCapHead[usize(lit)]
 	for q := usize(0); q < MaxCells; q++ {

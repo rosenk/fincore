@@ -28,7 +28,13 @@ type NodeID u32
 type Op enum { Add; Sub; Mul; Div; Mod }
 
 func (o Op) Format(dst []byte) usize {
-	return formatTo(dst, "%c", match o { Add -> '+', Sub -> '-', Mul -> '*', Div -> '/', Mod -> '%' })
+	return formatTo(dst, "%c", match o {
+		Add -> '+'
+		Sub -> '-'
+		Mul -> '*'
+		Div -> '/'
+		Mod -> '%'
+	})
 }
 
 type Node enum {

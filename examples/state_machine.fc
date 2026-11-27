@@ -61,7 +61,10 @@ type Reply struct {
 // body text, even one that reads "QUIT".
 func parse(s State, line []byte) Cmd {
 	if s is Data(..) {
-		return match bytesEqual(line, ".") { true -> Cmd.Dot, false -> Cmd.Line }
+		return match bytesEqual(line, ".") {
+			true -> Cmd.Dot
+			false -> Cmd.Line
+		}
 	}
 	if bytes.HasPrefix(line, "HELO ") || bytes.HasPrefix(line, "EHLO ") {
 		return Cmd.Helo

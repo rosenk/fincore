@@ -54,9 +54,9 @@ const (
 
 type Token struct {
 	kind    u8
-	semi    u8 // SEMICOLON flavour
-	errKind u8 // ILLEGAL tokens: LexErr* reason
-	errByte u8 // ILLEGAL tokens: offending byte (escapes, UTF-8)
+	semi    u8  // SEMICOLON flavour
+	errKind u8  // ILLEGAL tokens: LexErr* reason
+	errByte u8  // ILLEGAL tokens: offending byte (escapes, UTF-8)
 	off     u32 // file-relative byte offset of the first byte
 	end     u32 // file-relative offset just past the last byte
 	line    u32
