@@ -1,5 +1,6 @@
-// fail_is_flow_or_true (v0.2): `A || B` has no true-outcome bindings, so
-// a binding of A is not in scope where the whole disjunction is true.
+// fail_is_flow_or_true (v0.2): the true outcome of `A || B` binds only the
+// names bound by both operands (an intersection), so a binding of A alone
+// is not in scope where the whole disjunction is true.
 package main
 
 type Option[T any] enum {

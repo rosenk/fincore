@@ -1,0 +1,21 @@
+// fail_is_flow_intersect_dup (v0.2): the intersection on the true side of
+// || binds x, so binding x again in the same && chain is still a
+// redeclaration (both are in the true outcome of the chain).
+package main
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+func f(a Option[u32], b Option[u32], c Option[u32]) u32 {
+	if (a is Some(x) || b is Some(x)) && c is Some(x) { // ERROR E2001
+		return x
+	}
+	return 0
+}
+
+driver func main(io Stdio) error {
+	_ = f(Option[u32].None, Option[u32].None, Option[u32].None)
+	return nil
+}

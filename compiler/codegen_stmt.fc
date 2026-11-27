@@ -64,6 +64,7 @@ func cgStmt(s u32, dp usize) decreases(dp) {
 	if s == 0 {
 		return
 	}
+	cgHoistGen++
 	cgHoistIs(s, dp-1)
 	k := nkind(s)
 	if k == NkBlockStmt {

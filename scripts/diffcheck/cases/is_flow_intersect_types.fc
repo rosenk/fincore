@@ -1,0 +1,41 @@
+// is_flow_intersect_types (v0.2): an intersected name must have identical
+// types in both tests (E2002 at the later binding, on the true side of ||
+// and on the false side of &&); the same name in both operands of ||
+// (true side) and of && (false side) is not a redeclaration.
+package main
+
+type Val enum {
+	Int(u32, u32)
+	Bool(bool)
+}
+
+func mismatch(v Val, w Val) bool {
+	return (v is Int(x, _) || w is Bool(x)) && x == x
+}
+
+func falseMismatch(v Val, w Val) u32 {
+	if !(v is Bool(y)) && !(w is Int(_, y)) {
+		return 0
+	}
+	return 1
+}
+
+func fine(v Val, w Val) u32 {
+	if v is Int(a, _) || w is Int(_, a) {
+		return a
+	}
+	if !(v is Bool(b)) && !(w is Bool(b)) {
+		return 1
+	}
+	if b {
+		return 2
+	}
+	return 3
+}
+
+driver func main(io Stdio) error {
+	_ = mismatch(Val.Bool(true), Val.Bool(true))
+	_ = falseMismatch(Val.Bool(true), Val.Bool(true))
+	_ = fine(Val.Bool(true), Val.Bool(true))
+	return nil
+}

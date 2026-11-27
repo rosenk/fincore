@@ -1,0 +1,74 @@
+// is_flow_intersect (v0.2): `is` flow intersections in every pass. An
+// intersected name is one variable whose origin is the join of both
+// operands' origins: returning it is fine when both are parameters and
+// E3002 when one operand is a local (on either side); a Linear binding
+// is borrowed through both tests (E3003 on close); totality: measured
+// recursion after an intersected let-else with || (n != 0); bindings are
+// fresh. Errors are in is_flow_intersect_errors.fc.
+package main
+
+type Opt[T any] enum {
+	Some(T)
+	None
+}
+
+type Res enum {
+	Got(Conn, u32)
+	Nothing
+}
+
+type PtrOpt enum {
+	PSome(*u32)
+	PNone
+}
+
+var global u32
+
+func bothParams(o PtrOpt, q PtrOpt) *u32 {
+	if !(o is PSome(p)) && !(q is PSome(p)) {
+		return &global
+	}
+	return p
+}
+
+func leftLocal(q PtrOpt) *u32 {
+	var local u32
+	o := PtrOpt.PSome(&local)
+	if o is PSome(p) || q is PSome(p) {
+		return p
+	}
+	return &global
+}
+
+func rightLocal(o PtrOpt) *u32 {
+	var local u32
+	q := PtrOpt.PSome(&local)
+	if !(o is PSome(p)) && !(q is PSome(p)) {
+		return &global
+	}
+	return p
+}
+
+func closeEither(r Res, s Res) {
+	if r is Got(c, _) || s is Got(c, _) {
+		_ = c.Close()
+	}
+}
+
+func depthOf(n usize, o Opt[u32], q Opt[u32]) u32 decreases(n) {
+	if !(o is Some(k)) && !(q is Some(k)) || n == 0 {
+		return 0
+	}
+	return k + depthOf(n-1, o, q)
+}
+
+driver func main(io Stdio) error {
+	var x u32 = 1
+	_ = bothParams(PtrOpt.PSome(&x), PtrOpt.PNone)
+	_ = leftLocal(PtrOpt.PNone)
+	_ = rightLocal(PtrOpt.PNone)
+	closeEither(Res.Nothing, Res.Nothing)
+	_ = depthOf(3, Opt[u32].Some(2), Opt[u32].None)
+	global = x
+	return nil
+}
