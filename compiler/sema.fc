@@ -115,8 +115,7 @@ func l2at(n u32, i usize) u32 {
 
 // listAt returns element i of the node list starting at start.
 func listAt(start u32, i usize) u32 {
-	np := &nodes
-	return np.listItem(start, i)
+	return nodes.listItem(start, i)
 }
 
 func ntext(n u32) []byte {
@@ -135,14 +134,12 @@ func nfile(n u32) usize {
 var names maps.Interner[NameBuckets, MaxNameBytes, MaxNames]
 
 func nameBytes(id u32) []byte {
-	np := &names
-	return np.Bytes(id)
+	return names.Bytes(id)
 }
 
 // intern returns the NameID of b (allocating it if new; 0 if full).
 func intern(b []byte) u32 {
-	np := &names
-	id, ok := np.Intern(b)
+	id, ok := names.Intern(b)
 	if !ok {
 		setFull("names")
 	}
@@ -297,12 +294,11 @@ type ScopeRec struct {
 var scopes vec.Vec[MaxScopes, ScopeRec] // ScopeID -> record (slot 0 reserved)
 
 func newScope(parent u32, kind u8, node u32) u32 {
-	sp := &scopes
-	if sp.Len() == 0 {
-		_ = sp.Push(ScopeRec{})
+	if scopes.Len() == 0 {
+		_ = scopes.Push(ScopeRec{})
 	}
-	id := u32(sp.Len())
-	if !sp.Push(ScopeRec{parent: parent, kind: kind, node: node}) {
+	id := u32(scopes.Len())
+	if !scopes.Push(ScopeRec{parent: parent, kind: kind, node: node}) {
 		setFull("scopes")
 		return 0
 	}
@@ -312,14 +308,13 @@ func newScope(parent u32, kind u8, node u32) u32 {
 // symSlot returns the slot of (scp, name) in symTab: the one holding its
 // symbol or the empty one where it goes; false if every slot is taken.
 func symSlot(scp u32, name u32) (usize, bool) {
-	tp := &symTab
-	s := tp.Start(maps.Mix(maps.HashU64(u64(scp)), u64(name)))
+	s := symTab.Start(maps.Mix(maps.HashU64(u64(scp)), u64(name)))
 	for g := usize(0); g < SymBuckets; g++ {
-		id := usize(tp.At(s))
+		id := usize(symTab.At(s))
 		if id == 0 || syms.items[id].scp == scp && syms.items[id].name == name {
 			return s, true
 		}
-		s = tp.Next(s)
+		s = symTab.Next(s)
 	}
 	return 0, false
 }
@@ -330,7 +325,7 @@ func lookupLocal(scp u32, name u32) u32 {
 	if !ok {
 		return 0
 	}
-	return (&symTab).At(s)
+	return symTab.At(s)
 }
 
 // lookupChain finds name in scope or its parents.
@@ -344,8 +339,7 @@ func lookupChain(scp u32, name u32) u32 {
 		if s != 0 {
 			return s
 		}
-		sp := &scopes
-		r, _ := sp.At(usize(sc))
+		r, _ := scopes.At(usize(sc))
 		sc = r.parent
 	}
 	return 0
@@ -362,11 +356,10 @@ func scopeInsert(scp u32, sym u32) u32 {
 		setFull("symbol table")
 		return 0
 	}
-	tp := &symTab
-	if old := tp.At(s); old != 0 {
+	if old := symTab.At(s); old != 0 {
 		return old
 	}
-	tp.Set(s, sym)
+	symTab.Set(s, sym)
 	syms.items[usize(sym)].scp = scp
 	return 0
 }
@@ -379,31 +372,29 @@ func scopeInsert(scp u32, sym u32) u32 {
 var ulists vec.ListArena[MaxULists, MaxULists, u32]
 
 func upush(v u32) {
-	lp := &ulists
-	lp.Push(v)
-	if lp.Full() {
+	ulists.Push(v)
+	if ulists.Full() {
 		setFull("lists")
 	}
 }
 
 // umark returns the scratch stack height (the start of a new list).
 func umark() usize {
-	return (&ulists).Mark()
+	return ulists.Mark()
 }
 
 // ucommit moves the scratch stack above mark into ulists and returns
 // (start, len).
 func ucommit(mark usize) (u32, u32) {
-	lp := &ulists
-	st, n := lp.Commit(mark)
-	if lp.Full() {
+	st, n := ulists.Commit(mark)
+	if ulists.Full() {
 		setFull("lists")
 	}
 	return st, n
 }
 
 func uat(start u32, i usize) u32 {
-	return (&ulists).At(usize(start) + i)
+	return ulists.At(usize(start) + i)
 }
 
 type Cell struct {
@@ -415,31 +406,30 @@ var cells vec.Vec[MaxCells, Cell] // slot 0 reserved
 
 // cellAppend appends v to the list (head, tail) and returns the new pair.
 func cellAppend(head u32, tail u32, v u32) (u32, u32) {
-	cp := &cells
-	if cp.Len() == 0 {
-		_ = cp.Push(Cell{})
+	if cells.Len() == 0 {
+		_ = cells.Push(Cell{})
 	}
-	c := u32(cp.Len())
-	if !cp.Push(Cell{v: v, next: 0}) {
+	c := u32(cells.Len())
+	if !cells.Push(Cell{v: v, next: 0}) {
 		setFull("cells")
 		return head, tail
 	}
 	if head == 0 {
 		return c, c
 	}
-	t, _ := cp.At(usize(tail))
+	t, _ := cells.At(usize(tail))
 	t.next = c
-	_ = cp.Set(usize(tail), t)
+	_ = cells.Set(usize(tail), t)
 	return head, c
 }
 
 func cellVal(c u32) u32 {
-	x, _ := (&cells).At(usize(c))
+	x, _ := cells.At(usize(c))
 	return x.v
 }
 
 func cellNext(c u32) u32 {
-	x, _ := (&cells).At(usize(c))
+	x, _ := cells.At(usize(c))
 	return x.next
 }
 
@@ -528,8 +518,7 @@ var mbuf [MaxOutputBytes]byte
 
 // addDiag records "file:line:col: error[E####]: <msg>".
 func addDiag(file usize, line u32, col u32, code u32, msg []byte) {
-	tp := &diags.text
-	room := tp.Spare()
+	room := diags.text.Spare()
 	n := formatTo(room, "%s:%d:%d: error[E%04d]: %s", sources.files[file].path, line, col, code, msg)
 	if diags.count >= MaxDiags || n >= len(room) {
 		setFull("diagnostics")
@@ -537,14 +526,14 @@ func addDiag(file usize, line u32, col u32, code u32, msg []byte) {
 	}
 	i := diags.count
 	diags.count++
-	diags.off[i] = u32(tp.Len())
+	diags.off[i] = u32(diags.text.Len())
 	diags.ln[i] = u32(n)
-	diags.moff[i] = u32(tp.Len() + n - len(msg))
+	diags.moff[i] = u32(diags.text.Len() + n - len(msg))
 	diags.file[i] = u32(file)
 	diags.line[i] = line
 	diags.col[i] = col
 	diags.code[i] = code
-	tp.Extend(n)
+	diags.text.Extend(n)
 }
 
 // errAt records the diagnostic mbuf[:k] at the start of node n.
@@ -555,9 +544,9 @@ func errAt(code u32, n u32, k usize) {
 // addParseDiag records a finished parser diagnostic line (with or without
 // the trailing newline) for source file `file`.
 func addParseDiag(file usize, b []byte) {
-	line := bytes.TrimSuffix(b, strBytes("\n"))
+	line := bytes.TrimSuffix(b, "\n")
 	n := len(line)
-	ln, i := parseDigits(line, len(strBytes(sources.files[file].path))+1, n) // after "path:"
+	ln, i := parseDigits(line, len(sources.files[file].path)+1, n) // after "path:"
 	col, j := parseDigits(line, i+1, n)
 	code, k := parseDigits(line, j+9, 4) // after ": error[E"
 	k += 3                               // "]: "
@@ -591,12 +580,12 @@ func diagLess(a u32, b u32) bool {
 
 func diagMsg(i usize) []byte {
 	e := usize(diags.off[i]) + usize(diags.ln[i])
-	return (&diags.text).Bytes()[usize(diags.moff[i]):e]
+	return diags.text.Bytes()[usize(diags.moff[i]):e]
 }
 
 func diagLine(i usize) []byte {
 	s := usize(diags.off[i])
-	return (&diags.text).Bytes()[s : s+usize(diags.ln[i])]
+	return diags.text.Bytes()[s : s+usize(diags.ln[i])]
 }
 
 // sortDiags sorts diags.order (stable) and removes exact

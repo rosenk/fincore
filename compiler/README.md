@@ -422,11 +422,12 @@ function; overflow is reported as capacity exceeded.
   same SCCs. The M7 semantic SCCs use `dp usize` and `SemaDepth` (see
   "Recursion and scratch stacks"). Recursion between driver functions
   (`visitPackage` / `loadImport`) is not totality-checked.
-- Methods with pointer receivers are always called through a pointer
-  (`eb := &errBuf; eb.putStr(...)`, `(&errTxt).Bytes()`), and byte
-  strings are built with `strBytes("...")`: v0.2's auto-& (decision 86),
-  implicit `[]byte` (89) and constant `+` (91) are not used yet, so that
-  compilers older than them can still build compiler/ (decision 93).
+- compiler/ uses v0.2's auto-& (decision 86: `errBuf.Reset()`), implicit
+  `[]byte` for constant strings (89), constant `+` (91) and the pattern
+  forms (decisions 94–109: `trec(t) is Pointer(e)`, `k is TkInt | TkChar`,
+  guards, `..`, binding or-patterns, statement arm bodies), so it needs a
+  compiler that has them (this supersedes decision 93). Dispatch on a
+  node, token or operator kind is a `match` over the kind constants.
 - No results are discarded silently: `_ = f()` is used where needed.
 
 ## Where finc0's future checker may struggle

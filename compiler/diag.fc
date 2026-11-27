@@ -40,73 +40,31 @@ const (
 
 // codeName returns the symbolic name of a diagnostic code ("" if unknown).
 func codeName(code u32) string {
-	if code == E1001 {
-		return "SYNTAX_ERROR"
+	return match code {
+		E1001 -> "SYNTAX_ERROR"
+		E1002 -> "UNTERMINATED_LITERAL"
+		E2001 -> "UNDEFINED_SYMBOL"
+		E2002 -> "TYPE_MISMATCH"
+		E2003 -> "ARITY_MISMATCH"
+		E2004 -> "INVALID_NIL"
+		E2005 -> "UNINITIALIZED_SCOPED"
+		E2006 -> "IMPORT_CYCLE"
+		E2010 -> "UNIVERSE_LEVEL_MISMATCH"
+		E2011 -> "NON_PARAMETRIC_OP"
+		E2012 -> "NON_EXHAUSTIVE_MATCH"
+		E3001 -> "GLOBAL_SCOPED_VAR"
+		E3002 -> "SCOPE_ESCAPE"
+		E3003 -> "USE_AFTER_MOVE"
+		E3004 -> "DISCARDED_LINEAR"
+		E3005 -> "LINEAR_RESOURCE_LEAK"
+		E4001 -> "COMPTIME_OUT_OF_FUEL"
+		E4002 -> "UNPROVEN_TERMINATION"
+		E4003 -> "ARRAY_BOUNDS_COMPTIME"
+		E4004 -> "MUTUAL_RECURSION_NO_MEASURE"
+		E5001 -> "DRIVER_CALL_IN_TOTAL"
+		E5002 -> "INVALID_MAIN_SIGNATURE"
+		_ -> ""
 	}
-	if code == E1002 {
-		return "UNTERMINATED_LITERAL"
-	}
-	if code == E2001 {
-		return "UNDEFINED_SYMBOL"
-	}
-	if code == E2002 {
-		return "TYPE_MISMATCH"
-	}
-	if code == E2003 {
-		return "ARITY_MISMATCH"
-	}
-	if code == E2004 {
-		return "INVALID_NIL"
-	}
-	if code == E2005 {
-		return "UNINITIALIZED_SCOPED"
-	}
-	if code == E2006 {
-		return "IMPORT_CYCLE"
-	}
-	if code == E2010 {
-		return "UNIVERSE_LEVEL_MISMATCH"
-	}
-	if code == E2011 {
-		return "NON_PARAMETRIC_OP"
-	}
-	if code == E2012 {
-		return "NON_EXHAUSTIVE_MATCH"
-	}
-	if code == E3001 {
-		return "GLOBAL_SCOPED_VAR"
-	}
-	if code == E3002 {
-		return "SCOPE_ESCAPE"
-	}
-	if code == E3003 {
-		return "USE_AFTER_MOVE"
-	}
-	if code == E3004 {
-		return "DISCARDED_LINEAR"
-	}
-	if code == E3005 {
-		return "LINEAR_RESOURCE_LEAK"
-	}
-	if code == E4001 {
-		return "COMPTIME_OUT_OF_FUEL"
-	}
-	if code == E4002 {
-		return "UNPROVEN_TERMINATION"
-	}
-	if code == E4003 {
-		return "ARRAY_BOUNDS_COMPTIME"
-	}
-	if code == E4004 {
-		return "MUTUAL_RECURSION_NO_MEASURE"
-	}
-	if code == E5001 {
-		return "DRIVER_CALL_IN_TOTAL"
-	}
-	if code == E5002 {
-		return "INVALID_MAIN_SIGNATURE"
-	}
-	return ""
 }
 
 // diagHeader writes "path:line:col: error[E####]: ". The caller appends the

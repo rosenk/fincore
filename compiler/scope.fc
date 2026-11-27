@@ -289,13 +289,9 @@ func scHasSlice(t u32, dp usize) bool decreases(dp) {
 				r = scHasSlice(u, dp-1)
 			}
 		}
-		Slice(_) -> {
-			r = true
-		}
-		Array(e, _, _) -> {
-			r = scHasSlice(e, dp-1)
-		}
-		Struct(_, _) -> {
+		Slice(_) -> r = true
+		Array(e, ..) -> r = scHasSlice(e, dp-1)
+		Struct(..) -> {
 			n := nfields(t)
 			for i := usize(0); i < n; i++ {
 				if !r {
@@ -303,7 +299,7 @@ func scHasSlice(t u32, dp usize) bool decreases(dp) {
 				}
 			}
 		}
-		Enum(_, _) -> {
+		Enum(..) -> {
 			n := nvariants(t)
 			for i := usize(0); i < n; i++ {
 				m2 := variantPayN(t, i)
@@ -314,7 +310,7 @@ func scHasSlice(t u32, dp usize) bool decreases(dp) {
 				}
 			}
 		}
-		Tuple(_, _) -> {
+		Tuple(..) -> {
 			n := tupleN(t)
 			for i := usize(0); i < n; i++ {
 				if !r {
@@ -322,7 +318,7 @@ func scHasSlice(t u32, dp usize) bool decreases(dp) {
 				}
 			}
 		}
-		NoType | Basic(_) | Sig(_, _, _, _, _, _, _, _) | Pointer(_) | Code(_) | TypeParam(_, _, _, _) | ConstArg(_) | Opaque(_, _) -> {}
+		NoType | Basic(_) | Sig(..) | Pointer(_) | Code(_) | TypeParam(..) | ConstArg(_) | Opaque(..) -> {}
 	}
 	if r {
 		scSliceMemo[usize(t)] = 2
@@ -333,9 +329,6 @@ func scHasSlice(t u32, dp usize) bool decreases(dp) {
 }
 
 func scIsArray(t u32) bool {
-	if t == 0 {
-		return false
-	}
 	return isArrayT(underlying(t))
 }
 
@@ -561,7 +554,7 @@ func scCallOrigin(e u32, dp usize) u64 decreases(dp) {
 		o = scOrigin(na(e), dp-1)
 	} else if kind == CallBuiltin {
 		b := callTab.items[usize(ci)].builtin
-		if b == BFStrBytes || b == BFBytesToStr || b == BFNewContext || b == BFNewScope || b == BFFormatTo {
+		if b is BFStrBytes | BFBytesToStr | BFNewContext | BFNewScope | BFFormatTo {
 			return o // views of immutable strings / fresh runtime resources
 		}
 	}
@@ -626,7 +619,7 @@ func wDiscard(rhs u32, idx int, at u32) {
 		return
 	}
 	t := ntype[usize(rhs)]
-	if t != 0 && isTupleT(t) && idx >= 0 && usize(idx) < tupleN(t) {
+	if isTupleT(t) && idx >= 0 && usize(idx) < tupleN(t) {
 		t = tupleAt(t, usize(idx))
 	}
 	if t != 0 && isLinear(t) {

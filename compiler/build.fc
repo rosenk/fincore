@@ -337,7 +337,7 @@ driver func goModInfo(fs FS, dir string) (bool, string) {
 			isRoot = true
 		}
 		st2, en2, ok2 := goModWord(line, "go")
-		if ok2 && len(strBytes(goVer)) == 0 {
+		if ok2 && len(goVer) == 0 {
 			goVer = bytesToStr(line[st2:en2])
 		}
 	}
@@ -365,10 +365,10 @@ driver func findRootFrom(fs FS, start string) string {
 // error).
 driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 	r, ok := env.GetEnv("FINCORE_ROOT")
-	if ok && len(strBytes(r)) > 0 {
+	if ok && len(r) > 0 {
 		abs := absPath(env, r)
 		isRoot := false
-		if len(strBytes(abs)) > 0 {
+		if len(abs) > 0 {
 			isRoot, _ = goModInfo(fs, abs)
 		}
 		if !isRoot {
@@ -382,16 +382,16 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 	wd, okw := env.GetEnv("PWD")
 	if okw && path.IsAbs(strBytes(wd)) {
 		root := findRootFrom(fs, cleanStr(wd))
-		if len(strBytes(root)) > 0 {
+		if len(root) > 0 {
 			return root
 		}
 	}
 	exe := env.Arg(0)
 	if bytes.IndexByte(strBytes(exe), '/') >= 0 {
 		ae := absPath(env, exe)
-		if len(strBytes(ae)) > 0 {
+		if len(ae) > 0 {
 			root := findRootFrom(fs, dirOf(ae))
-			if len(strBytes(root)) > 0 {
+			if len(root) > 0 {
 				return root
 			}
 		}
@@ -404,7 +404,7 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 
 driver func goTool(env Env) string {
 	p, ok := env.GetEnv("FINC_GO")
-	if ok && len(strBytes(p)) > 0 {
+	if ok && len(p) > 0 {
 		return p
 	}
 	return "go"
@@ -444,7 +444,7 @@ driver func compileGo(fs FS, io Stdio, src string) error {
 		if semaFull {
 			return capacityFail(io, src, semaFullWhat)
 		}
-		if err := sayf(io, formatTo(mbuf[:], "finc1: %s\n", (&cgErrBuf).Bytes())); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc1: %s\n", cgErrBuf.Bytes())); err != nil {
 			return err
 		}
 		return ErrParse
@@ -480,7 +480,7 @@ driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []strin
 // temporary module directory dir.
 driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string, emitGo string) error {
 	mainGo := joinPath(dir, "main.go")
-	if err := fs.WriteFile(mainGo, (&outBuf).Bytes()); err != nil {
+	if err := fs.WriteFile(mainGo, outBuf.Bytes()); err != nil {
 		return ioFail(io, "write ", mainGo, err)
 	}
 	root := findModuleRoot(fs, env, io, true)
@@ -489,7 +489,7 @@ driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string,
 	var envs [8]string
 	envs[0] = "GOWORK=off"
 	gofmt, okf := env.GetEnv("FINC_GOFMT")
-	if okf && len(strBytes(gofmt)) > 0 {
+	if okf && len(gofmt) > 0 {
 		argv[0] = "-w"
 		argv[1] = mainGo
 		if err := runTool(io, exec, gofmt, argv[:2], envs[:1], wdir, "codegen: generated Go does not parse (gofmt)", dir); err != nil {
@@ -504,29 +504,28 @@ driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string,
 			return err
 		}
 	}
-	ob := &outBuf
-	ob.Reset()
-	n, rerr := fs.ReadFileInto(mainGo, ob.Spare())
+	outBuf.Reset()
+	n, rerr := fs.ReadFileInto(mainGo, outBuf.Spare())
 	if rerr != nil {
 		return ioFail(io, "read ", mainGo, rerr)
 	}
-	ob.Extend(n)
-	if len(strBytes(emitGo)) > 0 {
-		if err := fs.WriteFile(emitGo, ob.Bytes()); err != nil {
+	outBuf.Extend(n)
+	if len(emitGo) > 0 {
+		if err := fs.WriteFile(emitGo, outBuf.Bytes()); err != nil {
 			return ioFail(io, "write ", emitGo, err)
 		}
 	}
-	if len(strBytes(root)) == 0 {
+	if len(root) == 0 {
 		_ = findModuleRoot(fs, env, io, false)
 		return ErrNotFound
 	}
 	absOut := absPath(env, out)
-	if len(strBytes(absOut)) == 0 {
+	if len(absOut) == 0 {
 		_ = sayf(io, formatTo(mbuf[:], "finc1: cannot make %s absolute ($PWD is not set)\n", out))
 		return ErrNotFound
 	}
 	_, goVer := goModInfo(fs, root)
-	if len(strBytes(goVer)) == 0 {
+	if len(goVer) == 0 {
 		goVer = "1.22"
 	}
 	gm := formatTo(mbuf[:], "module fincprog\n\ngo %s\n\nrequire fincore v0.0.0\n\nreplace fincore => %s\n", goVer, root)
@@ -599,10 +598,10 @@ driver func runBuild(fs FS, env Env, io Stdio, exec Exec) error {
 		return ErrParse
 	}
 	src := env.Arg(first)
-	if len(strBytes(bOut)) == 0 {
+	if len(bOut) == 0 {
 		base := baseOf(src)
 		o := base
-		if bytes.HasSuffix(strBytes(base), strBytes(".fc")) {
+		if bytes.HasSuffix(strBytes(base), ".fc") {
 			bb := strBytes(base)
 			o = bytesToStr(bb[:len(bb)-3])
 		}
@@ -822,7 +821,7 @@ func scanMarkers(base string, lineNo u64, line []byte) {
 			}
 			i++
 		}
-		ok := bytes.HasPrefix(line[i:], strBytes("ERROR"))
+		ok := bytes.HasPrefix(line[i:], "ERROR")
 		if ok {
 			i += 5
 			ws := i
@@ -948,7 +947,7 @@ func addDiagLine(line []byte) {
 	// (\S+\.fc):(\d+):(\d+): error\[(E\d{4})\] with the longest path.
 	for g := usize(0); g < ws; g++ {
 		j := ws - g
-		if j < 4 || j >= n || line[j] != ':' || !bytes.HasSuffix(line[:j], strBytes(".fc")) {
+		if j < 4 || j >= n || line[j] != ':' || !bytes.HasSuffix(line[:j], ".fc") {
 			continue
 		}
 		ln, e1 := parseDigits(line, j+1, 20)
@@ -1135,7 +1134,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		a := env.Arg(i)
 		if nops == 0 && (strEq(a, "-v") || strEq(a, "--v") || strEq(a, "-v=true") || strEq(a, "--v=true")) {
 			verbose = true
-		} else if nops == 0 && len(strBytes(a)) > 1 && strBytes(a)[0] == '-' {
+		} else if nops == 0 && len(a) > 1 && strBytes(a)[0] == '-' {
 			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
 				return err
 			}
@@ -1191,14 +1190,12 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		kind := "pass"
 		if nf == 0 {
 			kind = "?"
-			mb := &tmpBuf
-			mb.Reset()
-			mb.WriteString("no source files")
+			tmpBuf.Reset()
+			tmpBuf.WriteString("no source files")
 		} else if err := readHeader(fs, nf); err != nil {
 			kind = "?"
-			mb := &tmpBuf
-			mb.Reset()
-			mb.WriteString("cannot read test sources")
+			tmpBuf.Reset()
+			tmpBuf.WriteString("cannot read test sources")
 		} else if nWant > 0 {
 			kind = "fail"
 			runFailTest(exec, self, tName[i])
@@ -1212,7 +1209,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 			}
 			runPassTest(fs, exec, self, tName[i], outPath, work, i)
 		}
-		msg := (&tmpBuf).Bytes()
+		msg := tmpBuf.Bytes()
 		bad := len(msg) > 0
 		if bad {
 			failed++

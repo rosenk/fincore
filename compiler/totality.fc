@@ -147,68 +147,39 @@ type LoopWhy struct {
 func (w LoopWhy) Format(dst []byte) usize {
 	why := w.why
 	v := NameRef(symName(w.sym))
-	if why == WhyNoPost {
-		return formatTo(dst, "not a counting loop (no post statement), slice-shrink loop, or loop with decreases clause")
-	} else if why == WhyPostForm {
-		return formatTo(dst, "post statement must be i++, i--, i += c or i -= c")
-	} else if why == WhyStep {
-		return formatTo(dst, "step of the counting loop must be a positive constant")
-	} else if why == WhyPostCounter {
-		return formatTo(dst, "post statement must update a local counter variable")
-	} else if why == WhyCtrNotInt {
-		return formatTo(dst, "loop counter %v is not an integer", v)
-	} else if why == WhyInitDeclCtr {
-		return formatTo(dst, "init statement must declare only the counter")
-	} else if why == WhyInitAsgCtr {
-		return formatTo(dst, "init statement must assign only the counter")
-	} else if why == WhyInitCtr {
-		return formatTo(dst, "init statement must initialize the counter")
-	} else if why == WhyCtrUnstable {
-		return formatTo(dst, "loop counter %v may be modified through a pointer or closure", v)
-	} else if why == WhyCondCompare {
-		return formatTo(dst, "condition must compare the counter with a bound")
-	} else if why == WhyCondCtr {
-		return formatTo(dst, "condition must compare the counter %v with a bound", v)
-	} else if why == WhyUpCond {
-		return formatTo(dst, "a counter counting up needs a condition %v < bound", v)
-	} else if why == WhyDownCond {
-		return formatTo(dst, "a counter counting down needs a condition %v > bound", v)
-	} else if why == WhyWrap {
-		return formatTo(dst, "the counter may wrap around: use step 1 with a strict comparison, or a constant bound")
-	} else if why == WhyCtrModified {
-		return formatTo(dst, "loop counter %v is modified in the loop body", v)
-	} else if why == WhyBoundVariant {
-		return formatTo(dst, "loop bound is not invariant in the loop body")
-	} else if why == WhyNoCond {
-		return formatTo(dst, "a loop without condition needs a decreases clause")
-	} else if why == WhyShrinkPost {
-		return formatTo(dst, "a slice-shrink loop must not have a post statement")
-	} else if why == WhyInitDeclSlice {
-		return formatTo(dst, "init statement must declare only the slice %v", v)
-	} else if why == WhyInitAsgSlice {
-		return formatTo(dst, "init statement must assign only the slice %v", v)
-	} else if why == WhyInitSlice {
-		return formatTo(dst, "init statement must initialize the slice %v", v)
-	} else if why == WhySliceUnstable {
-		return formatTo(dst, "slice %v may be modified through a pointer or closure", v)
-	} else if why == WhySliceModified {
-		return formatTo(dst, "slice %v is modified other than by %v = %v[k:]", v, v, v)
-	} else if why == WhyNotShortened {
-		return formatTo(dst, "slice %v is not provably shortened on every path (need %v = %v[k:] with k > 0: a positive constant, or after `if k == 0 { return }`)", v, v, v)
-	} else if why == WhyLenMeasure {
-		return formatTo(dst, "len(...) in the measure must be of an unmodified local slice")
-	} else if why == WhyMeasureForm {
-		return formatTo(dst, "measure must be X or X - Y with X, Y local variables, constants or len(s)")
-	} else if why == WhyMeasureVar {
-		return formatTo(dst, "measure variable %v may be modified through a pointer or closure", v)
-	} else if why == WhyMeasureNonNeg {
-		return formatTo(dst, "the loop condition must imply that the measure is non-negative (e.g. lo < hi for hi - lo)")
-	} else if why == WhyMeasureUnsign {
-		return formatTo(dst, "a single-variable measure must be unsigned")
-	} else if why == WhyNoDecrease {
-		return formatTo(dst, "measure does not provably decrease on every path through the loop body")
+	return match why {
+		WhyNoPost -> formatTo(dst, "not a counting loop (no post statement), slice-shrink loop, or loop with decreases clause")
+		WhyPostForm -> formatTo(dst, "post statement must be i++, i--, i += c or i -= c")
+		WhyStep -> formatTo(dst, "step of the counting loop must be a positive constant")
+		WhyPostCounter -> formatTo(dst, "post statement must update a local counter variable")
+		WhyCtrNotInt -> formatTo(dst, "loop counter %v is not an integer", v)
+		WhyInitDeclCtr -> formatTo(dst, "init statement must declare only the counter")
+		WhyInitAsgCtr -> formatTo(dst, "init statement must assign only the counter")
+		WhyInitCtr -> formatTo(dst, "init statement must initialize the counter")
+		WhyCtrUnstable -> formatTo(dst, "loop counter %v may be modified through a pointer or closure", v)
+		WhyCondCompare -> formatTo(dst, "condition must compare the counter with a bound")
+		WhyCondCtr -> formatTo(dst, "condition must compare the counter %v with a bound", v)
+		WhyUpCond -> formatTo(dst, "a counter counting up needs a condition %v < bound", v)
+		WhyDownCond -> formatTo(dst, "a counter counting down needs a condition %v > bound", v)
+		WhyWrap -> formatTo(dst, "the counter may wrap around: use step 1 with a strict comparison, or a constant bound")
+		WhyCtrModified -> formatTo(dst, "loop counter %v is modified in the loop body", v)
+		WhyBoundVariant -> formatTo(dst, "loop bound is not invariant in the loop body")
+		WhyNoCond -> formatTo(dst, "a loop without condition needs a decreases clause")
+		WhyShrinkPost -> formatTo(dst, "a slice-shrink loop must not have a post statement")
+		WhyInitDeclSlice -> formatTo(dst, "init statement must declare only the slice %v", v)
+		WhyInitAsgSlice -> formatTo(dst, "init statement must assign only the slice %v", v)
+		WhyInitSlice -> formatTo(dst, "init statement must initialize the slice %v", v)
+		WhySliceUnstable -> formatTo(dst, "slice %v may be modified through a pointer or closure", v)
+		WhySliceModified -> formatTo(dst, "slice %v is modified other than by %v = %v[k:]", v, v, v)
+		WhyNotShortened -> formatTo(dst, "slice %v is not provably shortened on every path (need %v = %v[k:] with k > 0: a positive constant, or after `if k == 0 { return }`)", v, v, v)
+		WhyLenMeasure -> formatTo(dst, "len(...) in the measure must be of an unmodified local slice")
+		WhyMeasureForm -> formatTo(dst, "measure must be X or X - Y with X, Y local variables, constants or len(s)")
+		WhyMeasureVar -> formatTo(dst, "measure variable %v may be modified through a pointer or closure", v)
+		WhyMeasureNonNeg -> formatTo(dst, "the loop condition must imply that the measure is non-negative (e.g. lo < hi for hi - lo)")
+		WhyMeasureUnsign -> formatTo(dst, "a single-variable measure must be unsigned")
+		WhyNoDecrease -> formatTo(dst, "measure does not provably decrease on every path through the loop body")
+		_ -> 0
 	}
-	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -536,41 +507,25 @@ func exprUnsigned(e u32) bool {
 }
 
 func negateOp(op u8) u8 {
-	if op == OpLt {
-		return OpGe
+	return match op {
+		OpLt -> OpGe
+		OpLe -> OpGt
+		OpGt -> OpLe
+		OpGe -> OpLt
+		OpEq -> OpNe
+		OpNe -> OpEq
+		_ -> op
 	}
-	if op == OpLe {
-		return OpGt
-	}
-	if op == OpGt {
-		return OpLe
-	}
-	if op == OpGe {
-		return OpLt
-	}
-	if op == OpEq {
-		return OpNe
-	}
-	if op == OpNe {
-		return OpEq
-	}
-	return op
 }
 
 func flipOp(op u8) u8 {
-	if op == OpLt {
-		return OpGt
+	return match op {
+		OpLt -> OpGt
+		OpLe -> OpGe
+		OpGt -> OpLt
+		OpGe -> OpLe
+		_ -> op
 	}
-	if op == OpLe {
-		return OpGe
-	}
-	if op == OpGt {
-		return OpLt
-	}
-	if op == OpGe {
-		return OpLe
-	}
-	return op
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +596,7 @@ func atomsOf(e u32, fnode u32, dp usize) bool decreases(dp) {
 	}
 	if k == NkBinaryExpr {
 		op := nop(e)
-		if op == OpAdd || op == OpSub || op == OpMul || op == OpDiv || op == OpRem || op == OpAnd || op == OpOr || op == OpXor || op == OpShl || op == OpShr {
+		if op is OpAdd | OpSub | OpMul | OpDiv | OpRem | OpAnd | OpOr | OpXor | OpShl | OpShr {
 			return atomsOf(na(e), fnode, dp-1) && atomsOf(nb(e), fnode, dp-1)
 		}
 		return false
@@ -732,9 +687,8 @@ func pathAtom(e u32, fnode u32) bool {
 			atomPush(0, fieldName(ct, fx))
 			atomPush(2, fieldType(ct, fx))
 			owner := ntype[usize(na(x))]
-			u := underlying(owner)
-			if isPointerT(u) {
-				owner = elemOf(u)
+			if trec(underlying(owner)) is Pointer(pt) {
+				owner = pt
 			}
 			atomPush(1, owner)
 			x = na(x)
@@ -952,24 +906,21 @@ func heapWriteConflicts(w0 u32, ai usize) bool {
 			return atomPathHas(ai, fieldName(ct, fx)) || containsAnyStr(fieldType(ct, fx), ai)
 		}
 		if k == NkIndexExpr {
-			u := underlying(ntype[usize(na(w))])
-			if isSliceT(u) {
-				return containsAnyStr(elemOf(u), ai)
-			}
-			if isArrayT(u) {
-				if containsAnyStr(elemOf(u), ai) {
-					return true
+			match trec(underlying(ntype[usize(na(w))])) {
+				Slice(el) -> return containsAnyStr(el, ai)
+				Array(el, ..) -> {
+					if containsAnyStr(el, ai) {
+						return true
+					}
+					w = unparen(na(w))
+					continue
 				}
-				w = unparen(na(w))
-				continue
+				_ -> return true
 			}
-			return true
 		}
 		if k == NkUnaryExpr {
 			if nop(w) == OpDeref {
-				u := underlying(ntype[usize(na(w))])
-				if isPointerT(u) {
-					el := elemOf(u)
+				if trec(underlying(ntype[usize(na(w))])) is Pointer(el) {
 					return containsAnyStr(el, ai) || containsAnyLeaf(el, ai)
 				}
 			}
@@ -1002,9 +953,8 @@ func callConflicts(call u32, ai usize) bool {
 					return true
 				}
 			}
-			u := underlying(ntype[usize(l1at(call, 0))])
-			if isSliceT(u) {
-				return containsAnyStr(elemOf(u), ai)
+			if trec(underlying(ntype[usize(l1at(call, 0))])) is Slice(el) {
+				return containsAnyStr(el, ai)
 			}
 			return true
 		}
@@ -1017,9 +967,8 @@ func callConflicts(call u32, ai usize) bool {
 			if b == BFCopy {
 				dst = ntype[usize(l1at(call, 0))]
 			}
-			u := underlying(dst)
-			if isSliceT(u) {
-				return containsAnyStr(elemOf(u), ai)
+			if trec(underlying(dst)) is Slice(el) {
+				return containsAnyStr(el, ai)
 			}
 			return true
 		}
@@ -1062,7 +1011,7 @@ func containsType(t u32, s u32, dp usize) bool decreases(dp) {
 	}
 	u := underlying(t)
 	match trec(u) {
-		Struct(_, _) -> {
+		Struct(..) -> {
 			n := nfields(u)
 			for i := usize(0); i < n; i++ {
 				if containsType(fieldType(u, i), s, dp-1) {
@@ -1071,10 +1020,8 @@ func containsType(t u32, s u32, dp usize) bool decreases(dp) {
 			}
 			return false
 		}
-		Array(e, _, _) -> {
-			return containsType(e, s, dp-1)
-		}
-		Enum(_, _) -> {
+		Array(e, ..) -> return containsType(e, s, dp-1)
+		Enum(..) -> {
 			nv := nvariants(u)
 			for i := usize(0); i < nv; i++ {
 				np := variantPayN(u, i)
@@ -1086,12 +1033,8 @@ func containsType(t u32, s u32, dp usize) bool decreases(dp) {
 			}
 			return false
 		}
-		TypeParam(_, _, _, _) -> {
-			return true
-		}
-		NoType | Basic(_) | Sig(_, _, _, _, _, _, _, _) | Named(_) | Slice(_) | Pointer(_) | Code(_) | ConstArg(_) | Tuple(_, _) | Opaque(_, _) -> {
-			return false
-		}
+		TypeParam(..) -> return true
+		NoType | Basic(_) | Sig(..) | Named(_) | Slice(_) | Pointer(_) | Code(_) | ConstArg(_) | Tuple(..) | Opaque(..) -> return false
 	}
 }
 

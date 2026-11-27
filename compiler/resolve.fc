@@ -106,249 +106,99 @@ func builtinName(b u8) string {
 }
 
 func builtinTypeName(b u8) string {
-	if b == BTBool {
-		return "bool"
+	return match b {
+		BTBool -> "bool"
+		BTU8 -> "u8"
+		BTU16 -> "u16"
+		BTU32 -> "u32"
+		BTU64 -> "u64"
+		BTI8 -> "i8"
+		BTI16 -> "i16"
+		BTI32 -> "i32"
+		BTI64 -> "i64"
+		BTInt -> "int"
+		BTUsize -> "usize"
+		BTByte -> "byte"
+		BTString -> "string"
+		BTError -> "error"
+		BTDuration -> "Duration"
+		BTSignal -> "Signal"
+		BTExitStatus -> "ExitStatus"
+		BTNet -> "Net"
+		BTSignals -> "Signals"
+		BTClock -> "Clock"
+		BTListener -> "Listener"
+		BTConn -> "Conn"
+		BTContext -> "Context"
+		BTCancelFunc -> "CancelFunc"
+		BTScope -> "Scope"
+		BTSlot -> "Slot"
+		BTFS -> "FS"
+		BTEnv -> "Env"
+		BTStdio -> "Stdio"
+		BTExec -> "Exec"
+		BTCode -> "Code"
+		BTEl -> "El"
+		BTFieldCode -> "FieldCode"
+		_ -> "?"
 	}
-	if b == BTU8 {
-		return "u8"
-	}
-	if b == BTU16 {
-		return "u16"
-	}
-	if b == BTU32 {
-		return "u32"
-	}
-	if b == BTU64 {
-		return "u64"
-	}
-	if b == BTI8 {
-		return "i8"
-	}
-	if b == BTI16 {
-		return "i16"
-	}
-	if b == BTI32 {
-		return "i32"
-	}
-	if b == BTI64 {
-		return "i64"
-	}
-	if b == BTInt {
-		return "int"
-	}
-	if b == BTUsize {
-		return "usize"
-	}
-	if b == BTByte {
-		return "byte"
-	}
-	if b == BTString {
-		return "string"
-	}
-	if b == BTError {
-		return "error"
-	}
-	if b == BTDuration {
-		return "Duration"
-	}
-	if b == BTSignal {
-		return "Signal"
-	}
-	if b == BTExitStatus {
-		return "ExitStatus"
-	}
-	if b == BTNet {
-		return "Net"
-	}
-	if b == BTSignals {
-		return "Signals"
-	}
-	if b == BTClock {
-		return "Clock"
-	}
-	if b == BTListener {
-		return "Listener"
-	}
-	if b == BTConn {
-		return "Conn"
-	}
-	if b == BTContext {
-		return "Context"
-	}
-	if b == BTCancelFunc {
-		return "CancelFunc"
-	}
-	if b == BTScope {
-		return "Scope"
-	}
-	if b == BTSlot {
-		return "Slot"
-	}
-	if b == BTFS {
-		return "FS"
-	}
-	if b == BTEnv {
-		return "Env"
-	}
-	if b == BTStdio {
-		return "Stdio"
-	}
-	if b == BTExec {
-		return "Exec"
-	}
-	if b == BTCode {
-		return "Code"
-	}
-	if b == BTEl {
-		return "El"
-	}
-	if b == BTFieldCode {
-		return "FieldCode"
-	}
-	return "?"
 }
 
 func builtinConstName(b u8) string {
-	if b == BCNanosecond {
-		return "Nanosecond"
+	return match b {
+		BCNanosecond -> "Nanosecond"
+		BCMicrosecond -> "Microsecond"
+		BCMillisecond -> "Millisecond"
+		BCSecond -> "Second"
+		BCSIGINT -> "SIGINT"
+		BCSIGTERM -> "SIGTERM"
+		BCErrEOF -> "ErrEOF"
+		BCErrTimeout -> "ErrTimeout"
+		BCErrCancelled -> "ErrCancelled"
+		BCErrZeroWrite -> "ErrZeroWrite"
+		BCErrClosed -> "ErrClosed"
+		BCErrIO -> "ErrIO"
+		BCErrNotFound -> "ErrNotFound"
+		BCErrMaxDepth -> "ErrMaxDepth"
+		BCErrArenaFull -> "ErrArenaFull"
+		BCErrExec -> "ErrExec"
+		BCErrParse -> "ErrParse"
+		_ -> "?"
 	}
-	if b == BCMicrosecond {
-		return "Microsecond"
-	}
-	if b == BCMillisecond {
-		return "Millisecond"
-	}
-	if b == BCSecond {
-		return "Second"
-	}
-	if b == BCSIGINT {
-		return "SIGINT"
-	}
-	if b == BCSIGTERM {
-		return "SIGTERM"
-	}
-	if b == BCErrEOF {
-		return "ErrEOF"
-	}
-	if b == BCErrTimeout {
-		return "ErrTimeout"
-	}
-	if b == BCErrCancelled {
-		return "ErrCancelled"
-	}
-	if b == BCErrZeroWrite {
-		return "ErrZeroWrite"
-	}
-	if b == BCErrClosed {
-		return "ErrClosed"
-	}
-	if b == BCErrIO {
-		return "ErrIO"
-	}
-	if b == BCErrNotFound {
-		return "ErrNotFound"
-	}
-	if b == BCErrMaxDepth {
-		return "ErrMaxDepth"
-	}
-	if b == BCErrArenaFull {
-		return "ErrArenaFull"
-	}
-	if b == BCErrExec {
-		return "ErrExec"
-	}
-	if b == BCErrParse {
-		return "ErrParse"
-	}
-	return "?"
 }
 
 func builtinFuncName(b u8) string {
-	if b == BFLen {
-		return "len"
+	return match b {
+		BFLen -> "len"
+		BFCap -> "cap"
+		BFCopy -> "copy"
+		BFBytesEqual -> "bytesEqual"
+		BFStrBytes -> "strBytes"
+		BFBytesToStr -> "bytesToStr"
+		BFFormatUint -> "formatUint"
+		BFParseUint -> "parseUint"
+		BFNewContext -> "NewContext"
+		BFNewScope -> "NewScope"
+		BFPanic -> "panic"
+		BFFormatTo -> "formatTo"
+		BFCodeEmpty -> "CodeEmpty"
+		BFCodeUnit -> "CodeUnit"
+		BFCodeBool -> "CodeBool"
+		BFCodeU8 -> "CodeU8"
+		BFCodeU16 -> "CodeU16"
+		BFCodeU32 -> "CodeU32"
+		BFCodeU64 -> "CodeU64"
+		BFCodeI8 -> "CodeI8"
+		BFCodeI16 -> "CodeI16"
+		BFCodeI32 -> "CodeI32"
+		BFCodeI64 -> "CodeI64"
+		BFCodeArray -> "CodeArray"
+		BFCodeSlice -> "CodeSlice"
+		BFCodeStruct -> "CodeStruct"
+		BFCodeField -> "CodeField"
+		BFCodeUniv -> "CodeUniv"
+		_ -> "?"
 	}
-	if b == BFCap {
-		return "cap"
-	}
-	if b == BFCopy {
-		return "copy"
-	}
-	if b == BFBytesEqual {
-		return "bytesEqual"
-	}
-	if b == BFStrBytes {
-		return "strBytes"
-	}
-	if b == BFBytesToStr {
-		return "bytesToStr"
-	}
-	if b == BFFormatUint {
-		return "formatUint"
-	}
-	if b == BFParseUint {
-		return "parseUint"
-	}
-	if b == BFNewContext {
-		return "NewContext"
-	}
-	if b == BFNewScope {
-		return "NewScope"
-	}
-	if b == BFPanic {
-		return "panic"
-	}
-	if b == BFFormatTo {
-		return "formatTo"
-	}
-	if b == BFCodeEmpty {
-		return "CodeEmpty"
-	}
-	if b == BFCodeUnit {
-		return "CodeUnit"
-	}
-	if b == BFCodeBool {
-		return "CodeBool"
-	}
-	if b == BFCodeU8 {
-		return "CodeU8"
-	}
-	if b == BFCodeU16 {
-		return "CodeU16"
-	}
-	if b == BFCodeU32 {
-		return "CodeU32"
-	}
-	if b == BFCodeU64 {
-		return "CodeU64"
-	}
-	if b == BFCodeI8 {
-		return "CodeI8"
-	}
-	if b == BFCodeI16 {
-		return "CodeI16"
-	}
-	if b == BFCodeI32 {
-		return "CodeI32"
-	}
-	if b == BFCodeI64 {
-		return "CodeI64"
-	}
-	if b == BFCodeArray {
-		return "CodeArray"
-	}
-	if b == BFCodeSlice {
-		return "CodeSlice"
-	}
-	if b == BFCodeStruct {
-		return "CodeStruct"
-	}
-	if b == BFCodeField {
-		return "CodeField"
-	}
-	if b == BFCodeUniv {
-		return "CodeUniv"
-	}
-	return "?"
 }
 
 func builtinIsType(b u8) bool {
@@ -511,7 +361,7 @@ func declarePackage(pkg u32) {
 			continue
 		}
 		old := u32(0)
-		prev := (&ulists).Pending(mark2)
+		prev := ulists.Pending(mark2)
 		for j := usize(0); j < len(prev); j++ {
 			m := prev[j]
 			if syms.items[usize(m)].recvType == syms.items[usize(s)].recvType && syms.items[usize(m)].name == syms.items[usize(s)].name {
@@ -1009,7 +859,7 @@ func bStmt(s u32, depth usize) decreases(depth) {
 		for i := usize(0); i < nr; i++ {
 			bindExpr(l2at(s, i), depth-1)
 		}
-	} else if k == NkIncDecStmt || k == NkExprStmt || k == NkDeferStmt {
+	} else if k is NkIncDecStmt | NkExprStmt | NkDeferStmt {
 		bindExpr(na(s), depth-1)
 	} else if k == NkReturnStmt {
 		n := l1len(s)

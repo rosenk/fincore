@@ -325,16 +325,13 @@ type MeasureWhy struct {
 }
 
 func (w MeasureWhy) Format(dst []byte) usize {
-	if w.why == 1 {
-		return formatTo(dst, "the measure must be a parameter of the function")
-	} else if w.why == 2 {
-		return formatTo(dst, "the measure parameter must be unsigned")
-	} else if w.why == 3 {
-		return formatTo(dst, "the measure parameter must not be variadic")
-	} else if w.why == 4 {
-		return formatTo(dst, "the measure parameter %v must not be addressed or written by a function literal", NameRef(symName(w.sym)))
+	return match w.why {
+		1 -> formatTo(dst, "the measure must be a parameter of the function")
+		2 -> formatTo(dst, "the measure parameter must be unsigned")
+		3 -> formatTo(dst, "the measure parameter must not be variadic")
+		4 -> formatTo(dst, "the measure parameter %v must not be addressed or written by a function literal", NameRef(symName(w.sym)))
+		_ -> formatTo(dst, "the measure parameter %v must not be assigned", NameRef(symName(w.sym)))
 	}
-	return formatTo(dst, "the measure parameter %v must not be assigned", NameRef(symName(w.sym)))
 }
 
 // spanBefore orders FuncInfo nodes by (file path, position).
@@ -525,14 +522,10 @@ func smaller(arg u32, d u32, st u32) bool {
 	}
 	lb := lbGet(st, d)
 	op := nop(b)
-	if op == OpSub {
-		return k >= 1 && lb >= k
+	return match op {
+		OpSub -> k >= 1 && lb >= k
+		OpDiv -> k >= 2 && lb >= 1
+		OpShr -> k >= 1 && lb >= 1
+		_ -> false
 	}
-	if op == OpDiv {
-		return k >= 2 && lb >= 1
-	}
-	if op == OpShr {
-		return k >= 1 && lb >= 1
-	}
-	return false
 }

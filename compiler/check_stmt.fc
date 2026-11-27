@@ -191,7 +191,7 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 		if isInvalidOp(&x) {
 			return false
 		}
-		if x.typ == 0 || !isTupleT(x.typ) || x.mode != KValue {
+		if !isTupleT(x.typ) || x.mode != KValue {
 			singleValue(&x)
 			if isInvalidOp(&x) {
 				return false
@@ -286,7 +286,7 @@ func assignValue(x *Operand, t u32) {
 	e := x.expr
 	if nkind(e) == NkCallExpr {
 		rt := ntype[usize(e)]
-		if rt != 0 && isTupleT(rt) {
+		if isTupleT(rt) {
 			if !assignable(x.typ, t) && !isInvalid(t) {
 				errAt(E2002, e, formatTo(mbuf[:], "cannot assign value of type %v to variable of type %v", TypeRef(x.typ), TypeRef(t)))
 			}
@@ -398,7 +398,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		if isInvalidOp(&x) {
 			return
 		}
-		if x.typ == 0 || !isTupleT(x.typ) {
+		if !isTupleT(x.typ) {
 			singleValue(&x)
 			if !isInvalidOp(&x) {
 				errAt(E2003, r0, formatTo(mbuf[:], "not enough return values: have 1, want %d", want))
@@ -447,40 +447,30 @@ func isTerminating(s u32, dp usize) bool decreases(dp) {
 		return false
 	}
 	k := nkind(s)
-	if k == NkReturnStmt {
-		return true
-	}
-	if k == NkExprStmt {
-		return isPanicCall(na(s))
-	}
-	if k == NkBlockStmt {
-		return isTerminatingList(s, dp-1)
-	}
-	if k == NkIfStmt {
-		return nd(s) != 0 && isTerminatingList(nc(s), dp-1) && isTerminating(nd(s), dp-1)
-	}
-	if k == NkForStmt {
-		return nb(s) == 0 && !hasBreak(ne(s), dp-1)
-	}
-	if k == NkScopeStmt {
-		return isTerminatingList(nc(s), dp-1)
-	}
-	if k == NkMatchStmt {
-		// v0.2: a match is a terminating statement if it is exhaustive
-		// (nexh) and all its arms terminate.
-		n := l1len(s)
-		for i := usize(0); i < n; i++ {
-			arm := l1at(s, i)
-			if nb(arm) != 0 && !isPanicCall(nb(arm)) {
-				return false
+	match k {
+		NkReturnStmt -> return true
+		NkExprStmt -> return isPanicCall(na(s))
+		NkBlockStmt -> return isTerminatingList(s, dp-1)
+		NkIfStmt -> return nd(s) != 0 && isTerminatingList(nc(s), dp-1) && isTerminating(nd(s), dp-1)
+		NkForStmt -> return nb(s) == 0 && !hasBreak(ne(s), dp-1)
+		NkScopeStmt -> return isTerminatingList(nc(s), dp-1)
+		NkMatchStmt -> {
+			// v0.2: a match is a terminating statement if it is exhaustive
+			// (nexh) and all its arms terminate.
+			n := l1len(s)
+			for i := usize(0); i < n; i++ {
+				arm := l1at(s, i)
+				if nb(arm) != 0 && !isPanicCall(nb(arm)) {
+					return false
+				}
+				if nc(arm) != 0 && !isTerminatingList(nc(arm), dp-1) {
+					return false
+				}
 			}
-			if nc(arm) != 0 && !isTerminatingList(nc(arm), dp-1) {
-				return false
-			}
+			return n > 0 && nexh[usize(s)]
 		}
-		return n > 0 && nexh[usize(s)]
+		_ -> return false
 	}
-	return false
 }
 
 func isPanicCall(e u32) bool {
@@ -512,27 +502,21 @@ func stmtHasBreak(s u32, dp usize) bool decreases(dp) {
 		return false
 	}
 	k := nkind(s)
-	if k == NkBreakStmt {
-		return true
-	}
-	if k == NkBlockStmt {
-		return hasBreak(s, dp-1)
-	}
-	if k == NkIfStmt {
-		return hasBreak(nc(s), dp-1) || (nd(s) != 0 && stmtHasBreak(nd(s), dp-1))
-	}
-	if k == NkMatchStmt {
-		n := l1len(s)
-		for i := usize(0); i < n; i++ {
-			arm := l1at(s, i)
-			if nc(arm) != 0 && hasBreak(nc(arm), dp-1) {
-				return true
+	match k {
+		NkBreakStmt -> return true
+		NkBlockStmt -> return hasBreak(s, dp-1)
+		NkIfStmt -> return hasBreak(nc(s), dp-1) || (nd(s) != 0 && stmtHasBreak(nd(s), dp-1))
+		NkMatchStmt -> {
+			n := l1len(s)
+			for i := usize(0); i < n; i++ {
+				arm := l1at(s, i)
+				if nc(arm) != 0 && hasBreak(nc(arm), dp-1) {
+					return true
+				}
 			}
+			return false
 		}
-		return false
+		NkScopeStmt -> return hasBreak(nc(s), dp-1)
+		_ -> return false
 	}
-	if k == NkScopeStmt {
-		return hasBreak(nc(s), dp-1)
-	}
-	return false
 }

@@ -141,8 +141,7 @@ func (na *NodeArena) alloc(kind u8, file u16, line u32, col u32) u32 {
 
 // listItem returns element i of the list starting at start.
 func (na *NodeArena) listItem(start u32, i usize) u32 {
-	lp := &na.lists
-	return lp.At(usize(start) + i)
+	return na.lists.At(usize(start) + i)
 }
 
 // ---------------------------------------------------------------------------
