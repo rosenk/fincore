@@ -29,6 +29,7 @@ files (spec 9.5.6); there are no local imports.
 | `codegen.fc` | Code generator part 1 (finc0's `ir` + `codegen/golang` gen.go, types.go, values.go): emission buffers, Go names, usage/scope/dead-code analyses, match arm lowering, monomorphization, types, constant values, declarations, entry point |
 | `codegen_expr.fc` | Code generator part 2 (expr.go): expressions and calls |
 | `codegen_stmt.fc` | Code generator part 3 (stmt.go): bodies, statements, scope barriers, labeled breaks, returns through scopes |
+| `msg.fc` | Diagnostic message construction with `formatTo`: the `%v` newtypes `TypeRef`, `ValRef`, `Expr`, `NameRef`, `Quoted`, `PosRef` (more next to their data: `Ctx`/`CallName`/`VarName` in checker.fc, `FuncName` in types.fc, `Origin` in scope.fc, `LoopWhy`/`CalleeName` in totality.fc, `RecMembers`/`MeasureWhy` in totality_rec.fc, `CallStack` in comptime.fc, `DiagCode` in build.fc) |
 | `format.fc` | The v0.2 builtin `formatTo` (finc0's types/format.go plus the formatTo parts of codegen and comptime): lazy format parser, argument checking, Go lowering over `fincrt.Fmt`, comptime writer (port of runtime/fincrt/fmt.go) |
 | `codegen_enum.fc` | Code generator part 4 (v0.2 sum types, enum.go): compact enum layouts (LIFO layout pools), match switches, match expressions, `return match` |
 | `build.fc` | `build`, `run`, `test` (finc0's build.go / test.go): temporary module, gofmt and `go build` via Exec, test conventions of testdata/README.md |
@@ -137,7 +138,10 @@ is still available as `Node.id`).
    every function, `checkRecursiveTypes`, `checkMain`, `finishInfo`.
 4. Diagnostics are collected in `diags` (sema.fc) and printed sorted by
    (file path, line, column, code, message) with exact duplicates removed,
-   as `diag.List.Sort` does. `--comptime-fuel=N` sets `evalFuel`.
+   as `diag.List.Sort` does. `--comptime-fuel=N` sets `evalFuel`. A
+   message is one `formatTo` call into the buffer `mbuf`, whose length goes
+   to the reporter: `errAt(E2002, e, formatTo(mbuf[:], "mismatched types
+   %v and %v", TypeRef(x.typ), TypeRef(y.typ)))` (msg.fc).
 5. If the type checker reported nothing, the semantic passes run in
    order and the first pass with diagnostics stops the pipeline
    (finc0's `check.Passes`): the scope pass, then `totalityProgram`
@@ -177,7 +181,7 @@ types are unique records. Helpers: `underlying`, `basicKind`, `isInteger`,
 `nvariants/variantName/variantPay*/variantByName`, `sig*` (effect,
 variadic, params, results, type params, `sigResultType`), `namedOrigin`,
 `namedSym`, `builtinOf`, `isResource`, `isCapability`, `comparable`,
-`hasTypeParam`, `putType`/`mtype` (types.Type.String). Lists (fields as
+`hasTypeParam`, `putType`/`TypeRef` (types.Type.String). Lists (fields as
 (name, type) pairs, variants as (name, payload start, payload len) triples,
 params, results, type args) live in `typs.lists`.
 
@@ -371,7 +375,7 @@ function; overflow is reported as capacity exceeded.
   `match`, closures, `defer` or `scope`. The M7 files use free functions
   over package-level arenas instead of methods on Scoped helper structs
   (total functions read and write globals directly); pointers appear only
-  as `*Operand` / `*OutBuf` parameters (`&opStack.items[i]`, `&msgBuf`).
+  as `*Operand` / `*OutBuf` parameters (`&opStack.items[i]`, `&fmtBuf`).
 - No compound assignment other than `+= -= *= /=` (no `|=`); `scope`,
   `any` and `decreases` are keywords and cannot name fields or variables.
 - No `iota`: every constant is spelled out. Token, node and operator kinds

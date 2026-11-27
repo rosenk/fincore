@@ -274,10 +274,7 @@ func cgComputeLayout(n u32, en u32, dp usize) CgLay decreases(dp) {
 
 // cgWSlotName writes slot j of group g: `_<key>_<j>`.
 func cgWSlotName(g usize, j u32) {
-	cgWc('_')
-	cgWb(cgLayKey(g))
-	cgWc('_')
-	cgWu(u64(j))
+	cgWf(formatTo(mbuf[:], "_%s_%d", cgLayKey(g), j))
 }
 
 // cgWSlot writes the slot field of payload j of variant vi.
@@ -317,9 +314,7 @@ func cgWEnumStruct(n u32, en u32, dp usize) decreases(dp) {
 		cnt := cgLayGCnt[g]
 		for j := u32(0); j < cnt; j++ {
 			cgWSlotName(g, j)
-			cgWc(' ')
-			cgWb(cgLayGoType(g))
-			cgWc('\n')
+			cgWf(formatTo(mbuf[:], " %s\n", cgLayGoType(g)))
 		}
 	}
 	cgWc('}')

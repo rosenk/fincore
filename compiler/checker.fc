@@ -128,22 +128,7 @@ func setSymType(s u32, t u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Expression strings (types.exprString): at most 60 bytes.
-
-var exprBuf OutBuf
-
-func mexpr(e u32) {
-	o := &exprBuf
-	o.reset()
-	writeExpr(o, e, SemaDepth)
-	n := exprBuf.len
-	if n > 60 {
-		mbytes(exprBuf.data[:57])
-		ms("...")
-		return
-	}
-	mbytes(exprBuf.data[:n])
-}
+// Expression strings (types.exprString; rendered by Expr in msg.fc).
 
 func writeExprList(o *OutBuf, n u32, dp usize) decreases(dp) {
 	if dp == 0 {
@@ -227,19 +212,19 @@ func writeExpr(o *OutBuf, e u32, dp usize) decreases(dp) {
 }
 
 // errAtOp reports at the operator of a BinaryExpr (OpPos).
-func errAtOp(code u32, e u32) {
+func errAtOp(code u32, e u32, k usize) {
 	p := nival(e)
-	addDiag(nfile(e), u32(p>>32), u32(p&0xFFFFFFFF), code)
+	addDiag(nfile(e), u32(p>>32), u32(p&0xFFFFFFFF), code, mbuf[:k])
 }
 
 // errAtEnd reports at the last byte of a node (missing return).
-func errAtEnd(code u32, n u32) {
+func errAtEnd(code u32, n u32, k usize) {
 	line := nodes.items[usize(n)].eLine
 	col := nodes.items[usize(n)].eCol
 	if col > 1 {
 		col--
 	}
-	addDiag(nfile(n), line, col, code)
+	addDiag(nfile(n), line, col, code, mbuf[:k])
 }
 
 func unparen(e u32) u32 {
@@ -362,48 +347,46 @@ func mkCtx(kind u8) Ctx {
 	return Ctx{kind: kind, a: 0, b: 0}
 }
 
-// mcallName writes the callee name of an argument context.
-func mcallName(c Ctx) {
+// CallName renders the callee name of an argument context.
+type CallName Ctx
+
+func (c CallName) Format(dst []byte) usize {
 	if c.kind == CtxArgExpr {
-		mexpr(c.a)
+		return formatTo(dst, "%v", Expr(c.a))
 	} else if c.kind == CtxArgMethod {
 		m := meths.items[usize(c.a)]
-		mname(u32(typs.items[usize(m.recv)].n))
-		mbyte('.')
-		mname(m.name)
+		return formatTo(dst, "%v.%v", NameRef(u32(typs.items[usize(m.recv)].n)), NameRef(m.name))
 	} else if c.kind == CtxArgBuiltin {
-		ms(builtinName(u8(c.a)))
+		return formatTo(dst, "%s", builtinName(u8(c.a)))
 	} else if c.kind == CtxArgVariant {
-		mtype(c.a)
-		mbyte('.')
-		mname(c.b)
+		return formatTo(dst, "%v.%v", TypeRef(c.a), NameRef(c.b))
 	}
+	return 0
 }
 
-func mctx(c Ctx) {
+func (c Ctx) Format(dst []byte) usize {
 	k := c.kind
+	s := "match"
 	if k == CtxConstDecl {
-		ms("constant declaration")
+		s = "constant declaration"
 	} else if k == CtxVarDecl {
-		ms("variable declaration")
+		s = "variable declaration"
 	} else if k == CtxAssign {
-		ms("assignment")
+		s = "assignment"
 	} else if k == CtxDecreases {
-		ms("decreases clause")
+		s = "decreases clause"
 	} else if k == CtxStructLit {
-		ms("struct literal")
+		s = "struct literal"
 	} else if k == CtxReturn {
-		ms("return statement")
+		s = "return statement"
 	} else if k == CtxPattern {
-		ms("match pattern")
+		s = "match pattern"
 	} else if k == CtxTypeArg {
-		ms("type argument")
-	} else if k == CtxMatch {
-		ms("match")
-	} else {
-		ms("argument to ")
-		mcallName(c)
+		s = "type argument"
+	} else if k != CtxMatch {
+		return formatTo(dst, "argument to %v", CallName(c))
 	}
+	return formatTo(dst, "%s", s)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,16 +410,7 @@ func assignment(x *Operand, t u32, c Ctx) bool {
 				return true
 			}
 			if codeLevel(ct) >= 0 && codeLevel(ct) != codeLevel(x.typ) {
-				mreset()
-				ms("universe level mismatch: cannot use ")
-				mexpr(x.expr)
-				ms(" (Code ")
-				mu(u64(codeLevel(x.typ)))
-				ms(") as Code ")
-				mu(u64(codeLevel(ct)))
-				ms(" in ")
-				mctx(c)
-				errAt(E2010, x.expr)
+				errAt(E2010, x.expr, formatTo(mbuf[:], "universe level mismatch: cannot use %v (Code %d) as Code %d in %v", Expr(x.expr), u64(codeLevel(x.typ)), u64(codeLevel(ct)), c))
 				return false
 			}
 		}
@@ -444,16 +418,7 @@ func assignment(x *Operand, t u32, c Ctx) bool {
 	if assignable(x.typ, t) {
 		return true
 	}
-	mreset()
-	ms("cannot use ")
-	mexpr(x.expr)
-	ms(" (type ")
-	mtype(x.typ)
-	ms(") as type ")
-	mtype(t)
-	ms(" in ")
-	mctx(c)
-	errAt(E2002, x.expr)
+	errAt(E2002, x.expr, formatTo(mbuf[:], "cannot use %v (type %v) as type %v in %v", Expr(x.expr), TypeRef(x.typ), TypeRef(t), c))
 	return false
 }
 
@@ -500,27 +465,17 @@ func convertUntypedDp(x *Operand, t u32, dp usize) bool decreases(dp) {
 		if tk(u) == TCSlice || basicKind(t) == BkError {
 			ok = true
 		} else {
-			mreset()
-			ms("cannot use nil as ")
-			mtype(t)
 			if tk(u) == TCPointer || isScoped(t) {
-				ms(" value: nil is only valid for error and slices")
-				errAt(E2004, x.expr)
+				errAt(E2004, x.expr, formatTo(mbuf[:], "cannot use nil as %v value: nil is only valid for error and slices", TypeRef(t)))
 			} else {
-				ms(" value")
-				errAt(E2002, x.expr)
+				errAt(E2002, x.expr, formatTo(mbuf[:], "cannot use nil as %v value", TypeRef(t)))
 			}
 			return false
 		}
 	} else if k == BkUntypedInt || k == BkUntypedChar {
 		if isInteger(t) && !isUntyped(t) {
 			if x.val.kind != VNone && !representable(x.val, t) {
-				mreset()
-				ms("constant ")
-				mval(x.val)
-				ms(" overflows ")
-				mtype(t)
-				errAt(E2002, x.expr)
+				errAt(E2002, x.expr, formatTo(mbuf[:], "constant %v overflows %v", ValRef(x.val), TypeRef(t)))
 				return false
 			}
 			ok = true
@@ -536,14 +491,7 @@ func convertUntypedDp(x *Operand, t u32, dp usize) bool decreases(dp) {
 		ok = false
 	}
 	if !ok {
-		mreset()
-		ms("cannot use ")
-		mexpr(x.expr)
-		ms(" (")
-		mtype(x.typ)
-		ms(" constant) as type ")
-		mtype(t)
-		errAt(E2002, x.expr)
+		errAt(E2002, x.expr, formatTo(mbuf[:], "cannot use %v (%v constant) as type %v", Expr(x.expr), TypeRef(x.typ), TypeRef(t)))
 		return false
 	}
 	x.typ = t
@@ -558,10 +506,7 @@ func defaultTypeOp(x *Operand, c Ctx) u32 {
 		return TyInvalid
 	}
 	if basicKind(x.typ) == BkUntypedNil {
-		mreset()
-		ms("use of untyped nil in ")
-		mctx(c)
-		errAt(E2004, x.expr)
+		errAt(E2004, x.expr, formatTo(mbuf[:], "use of untyped nil in %v", c))
 		return TyInvalid
 	}
 	if isUntyped(x.typ) || isPolyCode(x.typ) {
@@ -616,65 +561,33 @@ func singleValue(x *Operand) {
 	}
 	if m == KValue || m == KVar || m == KConst {
 		if x.typ != 0 && tk(x.typ) == TCTuple {
-			mreset()
-			ms("multiple-value ")
-			mexpr(x.expr)
-			ms(" (")
-			mu(u64(tl1n(x.typ)))
-			ms(" values) in single-value context")
-			errAt(E2003, x.expr)
+			errAt(E2003, x.expr, formatTo(mbuf[:], "multiple-value %v (%d values) in single-value context", Expr(x.expr), tl1n(x.typ)))
 			x.mode = KNone
 		}
 		return
 	}
-	mreset()
 	if m == KNoValue {
-		mexpr(x.expr)
-		ms(" (no value) used as value")
-		errAt(E2002, x.expr)
+		errAt(E2002, x.expr, formatTo(mbuf[:], "%v (no value) used as value", Expr(x.expr)))
 	} else if m == KType {
-		ms("type ")
-		mtype(x.typ)
-		ms(" is not an expression")
-		errAt(E2002, x.expr)
+		errAt(E2002, x.expr, formatTo(mbuf[:], "type %v is not an expression", TypeRef(x.typ)))
 	} else if m == KBuiltin {
-		ms("builtin ")
-		mexpr(x.expr)
-		ms(" must be called")
-		errAt(E2002, x.expr)
+		errAt(E2002, x.expr, formatTo(mbuf[:], "builtin %v must be called", Expr(x.expr)))
 	} else if m == KFunc {
 		isSig := x.typ != 0 && tk(x.typ) == TCSig
 		if x.method != 0 {
-			ms("method value ")
-			mexpr(x.expr)
-			ms(" is not supported; call the method")
-			errAt(E2002, x.expr)
+			errAt(E2002, x.expr, formatTo(mbuf[:], "method value %v is not supported; call the method", Expr(x.expr)))
 		} else if isSig && sigNTParams(x.typ) > 0 {
-			ms("generic function ")
-			mexpr(x.expr)
-			ms(" must be instantiated with explicit type arguments")
-			errAt(E2002, x.expr)
+			errAt(E2002, x.expr, formatTo(mbuf[:], "generic function %v must be instantiated with explicit type arguments", Expr(x.expr)))
 		} else if isSig && sigEffect(x.typ) == EffComptime {
-			ms("comptime function ")
-			mexpr(x.expr)
-			ms(" can only be called")
-			errAt(E2002, x.expr)
+			errAt(E2002, x.expr, formatTo(mbuf[:], "comptime function %v can only be called", Expr(x.expr)))
 		} else {
 			x.mode = KValue
 			return
 		}
 	} else if m == KPackage {
-		ms("package ")
-		mexpr(x.expr)
-		ms(" is not an expression")
-		errAt(E2002, x.expr)
+		errAt(E2002, x.expr, formatTo(mbuf[:], "package %v is not an expression", Expr(x.expr)))
 	} else if m == KVariantCtor {
-		ms("variant ")
-		mexpr(x.expr)
-		ms(" requires ")
-		mu(u64(variantPayN(x.vEnum, usize(x.vIndex))))
-		ms(" payload values")
-		errAt(E2003, x.expr)
+		errAt(E2003, x.expr, formatTo(mbuf[:], "variant %v requires %d payload values", Expr(x.expr), variantPayN(x.vEnum, usize(x.vIndex))))
 	}
 	x.mode = KNone
 	x.typ = TyInvalid
@@ -728,11 +641,7 @@ func hostEnsureBody(fn u32, dp usize) bool decreases(dp) {
 	}
 	objDecl(fn, dp-1)
 	if fn != 0 && syms.items[usize(fn)].body == 1 {
-		mreset()
-		ms("comptime evaluation cycle: ")
-		mname(symName(fn))
-		ms(" is evaluated while its own body is being checked")
-		errAt(E4001, syms.items[usize(fn)].ident)
+		errAt(E4001, syms.items[usize(fn)].ident, formatTo(mbuf[:], "comptime evaluation cycle: %v is evaluated while its own body is being checked", NameRef(symName(fn))))
 		syms.items[usize(fn)].body = 3
 		return false
 	}
@@ -763,25 +672,21 @@ func objDecl(s u32, dp usize) decreases(dp) {
 	}
 	k := symKind(s)
 	if st == 1 {
-		mreset()
+		id := syms.items[usize(s)].ident
+		name := NameRef(symName(s))
 		if k == SymType {
 			t := syms.items[usize(s)].typ
 			if t != 0 && tk(t) == TCNamed {
 				return
 			}
-			ms("invalid recursive type alias ")
+			errAt(E2002, id, formatTo(mbuf[:], "invalid recursive type alias %v", name))
 		} else if k == SymConst {
-			ms("initialization cycle: constant ")
+			errAt(E2002, id, formatTo(mbuf[:], "initialization cycle: constant %v refers to itself", name))
 		} else if k == SymVar {
-			ms("initialization cycle: variable ")
+			errAt(E2002, id, formatTo(mbuf[:], "initialization cycle: variable %v refers to itself", name))
 		} else {
 			return
 		}
-		mname(symName(s))
-		if k == SymConst || k == SymVar {
-			ms(" refers to itself")
-		}
-		errAt(E2002, syms.items[usize(s)].ident)
 		syms.items[usize(s)].typ = TyInvalid
 		return
 	}
@@ -901,10 +806,7 @@ func constSpecIn(s u32, d u32, dp usize) decreases(dp) {
 		return
 	}
 	if x.mode != KConst {
-		mreset()
-		mexpr(nc(d))
-		ms(" is not constant")
-		errAt(E2002, nc(d))
+		errAt(E2002, nc(d), formatTo(mbuf[:], "%v is not constant", Expr(nc(d))))
 		setSymType(s, TyInvalid)
 		return
 	}
@@ -915,12 +817,7 @@ func constSpecIn(s u32, d u32, dp usize) decreases(dp) {
 		}
 	}
 	if isScoped(x.typ) {
-		mreset()
-		ms("constant ")
-		mname(symName(s))
-		ms(" cannot have Scoped type ")
-		mtype(x.typ)
-		errAt(E2002, nc(d))
+		errAt(E2002, nc(d), formatTo(mbuf[:], "constant %v cannot have Scoped type %v", NameRef(symName(s)), TypeRef(x.typ)))
 		setSymType(s, TyInvalid)
 		return
 	}
@@ -948,11 +845,7 @@ func typeDeclIn(s u32, d u32, dp usize) decreases(dp) {
 	}
 	if nflag(d) {
 		if nb(d) != 0 {
-			mreset()
-			ms("generic type alias ")
-			mname(symName(s))
-			ms(" is not supported")
-			errAt(E2002, na(d))
+			errAt(E2002, na(d), formatTo(mbuf[:], "generic type alias %v is not supported", NameRef(symName(s))))
 		}
 		t := typExpr(nc(d), dp-1)
 		setSymType(s, t)
@@ -976,10 +869,7 @@ func typeDeclIn(s u32, d u32, dp usize) decreases(dp) {
 	if uk == TCNamed {
 		ua := typs.items[usize(under)].a
 		if ua == 0 {
-			mreset()
-			ms("invalid recursive type ")
-			mname(symName(s))
-			errAt(E2002, na(d))
+			errAt(E2002, na(d), formatTo(mbuf[:], "invalid recursive type %v", NameRef(symName(s))))
 			typs.items[usize(n)].a = TyInvalid
 		} else {
 			typs.items[usize(n)].a = ua
@@ -989,10 +879,7 @@ func typeDeclIn(s u32, d u32, dp usize) decreases(dp) {
 			}
 		}
 	} else if uk == TCTypeParam {
-		mreset()
-		ms("cannot use a type parameter as the underlying type of ")
-		mname(symName(s))
-		errAt(E2002, nc(d))
+		errAt(E2002, nc(d), formatTo(mbuf[:], "cannot use a type parameter as the underlying type of %v", NameRef(symName(s))))
 		typs.items[usize(n)].a = TyInvalid
 	} else {
 		typs.items[usize(n)].a = under
@@ -1024,12 +911,14 @@ func setVarType(s u32, d u32, t u32) {
 	}
 }
 
-func mvarName(s u32) {
+// VarName renders a variable name; 0 is the blank `var _`.
+type VarName u32
+
+func (s VarName) Format(dst []byte) usize {
 	if s == 0 {
-		ms("_")
-	} else {
-		mname(symName(s))
+		return formatTo(dst, "_")
 	}
+	return formatTo(dst, "%v", NameRef(symName(u32(s))))
 }
 
 func varDeclIn(s u32, d u32, dp usize) decreases(dp) {
@@ -1049,25 +938,14 @@ func varDeclIn(s u32, d u32, dp usize) decreases(dp) {
 			return
 		}
 		if global && isScoped(t) {
-			mreset()
-			ms("package-level variable ")
-			mvarName(s)
-			ms(" cannot have Scoped type ")
-			mtype(t)
-			errAt(E3001, na(d))
+			errAt(E3001, na(d), formatTo(mbuf[:], "package-level variable %v cannot have Scoped type %v", VarName(s), TypeRef(t)))
 			setVarType(s, d, t)
 			return
 		}
 	}
 	if nc(d) == 0 {
 		if t != 0 && isScoped(t) {
-			mreset()
-			ms("variable ")
-			mvarName(s)
-			ms(" of Scoped type ")
-			mtype(t)
-			ms(" must be initialized")
-			errAt(E2005, na(d))
+			errAt(E2005, na(d), formatTo(mbuf[:], "variable %v of Scoped type %v must be initialized", VarName(s), TypeRef(t)))
 		}
 		setVarType(s, d, t)
 		return
@@ -1091,18 +969,11 @@ func varDeclIn(s u32, d u32, dp usize) decreases(dp) {
 	} else {
 		t = defaultTypeOp(&x, mkCtx(CtxVarDecl))
 		if global && isScoped(t) {
-			mreset()
-			ms("package-level variable ")
-			mvarName(s)
-			ms(" cannot have Scoped type ")
-			mtype(t)
-			errAt(E3001, na(d))
+			errAt(E3001, na(d), formatTo(mbuf[:], "package-level variable %v cannot have Scoped type %v", VarName(s), TypeRef(t)))
 		}
 	}
 	if global && x.mode != KConst && !isInvalidOp(&x) {
-		mreset()
-		ms("package-level variable initializer must be a constant expression")
-		errAt(E2002, nc(d))
+		errAt(E2002, nc(d), formatTo(mbuf[:], "package-level variable initializer must be a constant expression"))
 	}
 	setVarType(s, d, t)
 }
@@ -1125,11 +996,7 @@ func typeParams(l u32, dp usize) (u32, u32) decreases(dp) {
 			if ok {
 				constT = ct
 			} else if !isInvalid(ct) {
-				mreset()
-				ms("unsupported constraint ")
-				mtype(ct)
-				ms(" (want any or an integer type such as usize)")
-				errAt(E2002, na(p))
+				errAt(E2002, na(p), formatTo(mbuf[:], "unsupported constraint %v (want any or an integer type such as usize)", TypeRef(ct)))
 			}
 		}
 		nn := l1len(p)
@@ -1184,9 +1051,7 @@ func funcDeclIn(s u32, d u32, dp usize) decreases(dp) {
 	if nc(d) != 0 {
 		ts, tn := typeParams(nc(d), dp-1)
 		if na(d) != 0 {
-			mreset()
-			ms("methods cannot have their own type parameters")
-			errAt(E2002, nc(d))
+			errAt(E2002, nc(d), formatTo(mbuf[:], "methods cannot have their own type parameters"))
 		} else {
 			funcs.items[usize(fid)].tpS = ts
 			funcs.items[usize(fid)].tpN = tn
@@ -1269,11 +1134,7 @@ func receiver(fid u32, d u32, dp usize) decreases(dp) {
 	}
 	named := symType(tsym, dp-1)
 	if named == 0 || tk(named) != TCNamed || namedSym(named) != tsym {
-		mreset()
-		ms("invalid receiver type ")
-		mname(idName(tn))
-		ms(" (must be a named type declared in this package)")
-		errAt(E2002, tn)
+		errAt(E2002, tn, formatTo(mbuf[:], "invalid receiver type %v (must be a named type declared in this package)", NameRef(idName(tn))))
 		setSymType(rs, TyInvalid)
 		return
 	}
@@ -1283,14 +1144,7 @@ func receiver(fid u32, d u32, dp usize) decreases(dp) {
 	nr := l1len(r)
 	ntp := tl2n(named)
 	if nr != ntp {
-		mreset()
-		ms("receiver ")
-		mname(u32(typs.items[usize(named)].n))
-		ms(" needs ")
-		mu(u64(ntp))
-		ms(" type parameters, got ")
-		mu(u64(nr))
-		errAt(E2003, r)
+		errAt(E2003, r, formatTo(mbuf[:], "receiver %v needs %d type parameters, got %d", NameRef(u32(typs.items[usize(named)].n)), ntp, nr))
 	} else if ntp > 0 {
 		mark := tmark()
 		for i := usize(0); i < nr; i++ {
@@ -1418,10 +1272,7 @@ func funcBody(fi u32, dp usize) decreases(dp) {
 	body := funcs.items[usize(fi)].body
 	stmtList(body, dp-1)
 	if sigNResults(funcs.items[usize(fi)].sig) > 0 && !isTerminatingList(body, SemaDepth) {
-		mreset()
-		ms("missing return at end of ")
-		mfuncName(fi)
-		errAtEnd(E2003, body)
+		errAtEnd(E2003, body, formatTo(mbuf[:], "missing return at end of %v", FuncName(fi)))
 	}
 }
 
@@ -1496,10 +1347,7 @@ func typExpr0(t u32, dp usize) u32 decreases(dp) {
 					cnt := (typs.top - mark) / 2
 					for q := usize(0); q < cnt; q++ {
 						if typs.stack[mark+2*q] == nm {
-							mreset()
-							ms("duplicate field ")
-							mname(nm)
-							errAt(E2002, id)
+							errAt(E2002, id, formatTo(mbuf[:], "duplicate field %v", NameRef(nm)))
 							break
 						}
 					}
@@ -1520,10 +1368,7 @@ func typExpr0(t u32, dp usize) u32 decreases(dp) {
 			cnt := (typs.top - mark) / 3
 			for q := usize(0); q < cnt; q++ {
 				if typs.stack[mark+3*q] == nm {
-					mreset()
-					ms("duplicate variant ")
-					mname(nm)
-					errAt(E2002, na(v))
+					errAt(E2002, na(v), formatTo(mbuf[:], "duplicate variant %v", NameRef(nm)))
 					break
 				}
 			}
@@ -1559,9 +1404,7 @@ func typExpr0(t u32, dp usize) u32 decreases(dp) {
 		return r
 	}
 	if k == NkAnyType {
-		mreset()
-		ms("any is only allowed as a type parameter constraint")
-		errAt(E2002, t)
+		errAt(E2002, t, formatTo(mbuf[:], "any is only allowed as a type parameter constraint"))
 		return TyInvalid
 	}
 	return TyInvalid
@@ -1577,19 +1420,13 @@ func codeTypeLevel(e u32, dp usize) u32 decreases(dp) {
 		return TyInvalid
 	}
 	if x.mode != KConst || !isInteger(x.typ) {
-		mreset()
-		ms("Code level must be a constant natural number, not ")
-		mexpr(e)
-		errAt(E2010, e)
+		errAt(E2010, e, formatTo(mbuf[:], "Code level must be a constant natural number, not %v", Expr(e)))
 		return TyInvalid
 	}
 	_ = convertUntyped(&x, TyUsize)
 	lvl, ok := valUint64(x.val)
 	if !ok || lvl > 1<<20 {
-		mreset()
-		ms("invalid Code level ")
-		mval(x.val)
-		errAt(E2010, e)
+		errAt(E2010, e, formatTo(mbuf[:], "invalid Code level %v", ValRef(x.val)))
 		return TyInvalid
 	}
 	return mkCode(int(lvl))
@@ -1606,21 +1443,11 @@ func elType(e u32, dp usize) u32 decreases(dp) {
 		return TyInvalid
 	}
 	if tk(x.typ) != TCCode {
-		mreset()
-		ms("El expects a Code value, got ")
-		mexpr(e)
-		ms(" (type ")
-		mtype(x.typ)
-		ms(")")
-		errAt(E2002, e)
+		errAt(E2002, e, formatTo(mbuf[:], "El expects a Code value, got %v (type %v)", Expr(e), TypeRef(x.typ)))
 		return TyInvalid
 	}
 	if x.mode != KConst || x.val.kind != VCode {
-		mreset()
-		ms("El argument ")
-		mexpr(e)
-		ms(" is not a compile-time constant")
-		errAt(E2002, e)
+		errAt(E2002, e, formatTo(mbuf[:], "El argument %v is not a compile-time constant", Expr(e)))
 		return TyInvalid
 	}
 	return foldCode(x.val, SemaDepth)
@@ -1650,29 +1477,16 @@ func arrayLen(e u32, dp usize) (u64, u32, bool) decreases(dp) {
 		return 0, 0, false
 	}
 	if x.mode != KConst {
-		mreset()
-		ms("array length ")
-		mexpr(e)
-		ms(" is not a compile-time constant")
-		errAt(E4003, e)
+		errAt(E4003, e, formatTo(mbuf[:], "array length %v is not a compile-time constant", Expr(e)))
 		return 0, 0, false
 	}
 	if !isInteger(x.typ) {
-		mreset()
-		ms("array length ")
-		mexpr(e)
-		ms(" must be an integer (have ")
-		mtype(x.typ)
-		ms(")")
-		errAt(E4003, e)
+		errAt(E4003, e, formatTo(mbuf[:], "array length %v must be an integer (have %v)", Expr(e), TypeRef(x.typ)))
 		return 0, 0, false
 	}
 	n, ok := valUint64(x.val)
 	if !ok || n > 1<<48 {
-		mreset()
-		ms("invalid array length ")
-		mval(x.val)
-		errAt(E4003, e)
+		errAt(E4003, e, formatTo(mbuf[:], "invalid array length %v", ValRef(x.val)))
 		return 0, 0, false
 	}
 	if isUntyped(x.typ) {
@@ -1736,20 +1550,13 @@ func namedTypeExpr(t u32, dp usize) u32 decreases(dp) {
 	nmode[usize(name)] = KType
 	if tk(r) == TCNamed && tl2n(r) > 0 {
 		if l1len(t) == 0 {
-			mreset()
-			ms("generic type ")
-			mname(u32(typs.items[usize(r)].n))
-			ms(" used without type arguments")
-			errAt(E2002, t)
+			errAt(E2002, t, formatTo(mbuf[:], "generic type %v used without type arguments", NameRef(u32(typs.items[usize(r)].n))))
 			return TyInvalid
 		}
 		return instantiateArgs(r, t, t, t, dp-1)
 	}
 	if l1len(t) > 0 {
-		mreset()
-		mtype(r)
-		ms(" is not a generic type")
-		errAt(E2002, t)
+		errAt(E2002, t, formatTo(mbuf[:], "%v is not a generic type", TypeRef(r)))
 		return TyInvalid
 	}
 	return r
@@ -1765,15 +1572,11 @@ func typeSym(sym u32, id u32, dp usize) u32 decreases(dp) {
 	if k == SymType {
 		b := syms.items[usize(sym)].builtin
 		if b == BTCode {
-			mreset()
-			ms("Code requires a level (Code n)")
-			errAt(E2010, id)
+			errAt(E2010, id, formatTo(mbuf[:], "Code requires a level (Code n)"))
 			return TyInvalid
 		}
 		if b == BTEl {
-			mreset()
-			ms("El requires an argument (El(code))")
-			errAt(E2002, id)
+			errAt(E2002, id, formatTo(mbuf[:], "El requires an argument (El(code))"))
 			return TyInvalid
 		}
 		t := symType(sym, dp-1)
@@ -1788,18 +1591,12 @@ func typeSym(sym u32, id u32, dp usize) u32 decreases(dp) {
 			return TyInvalid
 		}
 		if tpIsConst(tp) {
-			mreset()
-			mname(symName(sym))
-			ms(" is a const parameter, not a type")
-			errAt(E2002, id)
+			errAt(E2002, id, formatTo(mbuf[:], "%v is a const parameter, not a type", NameRef(symName(sym))))
 			return TyInvalid
 		}
 		return tp
 	}
-	mreset()
-	mname(symName(sym))
-	ms(" is not a type")
-	errAt(E2002, id)
+	errAt(E2002, id, formatTo(mbuf[:], "%v is not a type", NameRef(symName(sym))))
 	return TyInvalid
 }
 
@@ -1814,14 +1611,7 @@ func instantiateArgs(n u32, args u32, node u32, sp u32, dp usize) u32 decreases(
 	na1 := l1len(args)
 	ntp := tl2n(n)
 	if na1 != ntp {
-		mreset()
-		ms("wrong number of type arguments for ")
-		mname(u32(typs.items[usize(n)].n))
-		ms(": have ")
-		mu(u64(na1))
-		ms(", want ")
-		mu(u64(ntp))
-		errAt(E2003, sp)
+		errAt(E2003, sp, formatTo(mbuf[:], "wrong number of type arguments for %v: have %d, want %d", NameRef(u32(typs.items[usize(n)].n)), na1, ntp))
 		return TyInvalid
 	}
 	mark := tmark()
@@ -1863,13 +1653,7 @@ func typeArg(e u32, tp u32, dp usize) u32 decreases(dp) {
 			return TyInvalid
 		}
 		if x.mode != KConst || !isInteger(x.typ) {
-			mreset()
-			ms("type argument ")
-			mexpr(e)
-			ms(" for const parameter ")
-			mname(u32(typs.items[usize(tp)].n))
-			ms(" must be an integer constant")
-			errAt(E2002, e)
+			errAt(E2002, e, formatTo(mbuf[:], "type argument %v for const parameter %v must be an integer constant", Expr(e), NameRef(u32(typs.items[usize(tp)].n))))
 			return TyInvalid
 		}
 		if !assignment(&x, typs.items[usize(tp)].a, mkCtx(CtxTypeArg)) {
@@ -1877,20 +1661,14 @@ func typeArg(e u32, tp u32, dp usize) u32 decreases(dp) {
 		}
 		v, ok := valUint64(x.val)
 		if !ok {
-			mreset()
-			ms("invalid const argument ")
-			mval(x.val)
-			errAt(E2002, e)
+			errAt(E2002, e, formatTo(mbuf[:], "invalid const argument %v", ValRef(x.val)))
 			return TyInvalid
 		}
 		return mkConstArg(v)
 	}
 	at := exprAsType(e, SemaDepth)
 	if at == 0 {
-		mreset()
-		mexpr(e)
-		ms(" is not a type")
-		errAt(E2002, e)
+		errAt(E2002, e, formatTo(mbuf[:], "%v is not a type", Expr(e)))
 		return TyInvalid
 	}
 	t := typExpr(at, dp-1)
@@ -1898,11 +1676,7 @@ func typeArg(e u32, tp u32, dp usize) u32 decreases(dp) {
 		return t
 	}
 	if classOfT(t) != ClassValue {
-		mreset()
-		ms("type argument ")
-		mtype(t)
-		ms(" must be a Value type (type parameters range over Value types)")
-		errAt(E2002, e)
+		errAt(E2002, e, formatTo(mbuf[:], "type argument %v must be a Value type (type parameters range over Value types)", TypeRef(t)))
 		return TyInvalid
 	}
 	return t
@@ -1974,25 +1748,12 @@ func checkRecursiveTypes() {
 		if recState[usize(t)] == 0 && recVisitNamed(t, SemaDepth) {
 			s := namedSym(t)
 			if s != 0 && syms.items[usize(s)].ident != 0 {
-				mreset()
-				ms("invalid recursive type ")
-				mname(u32(typs.items[usize(t)].n))
-				ms(" (contains itself by value)")
-				errAt(E2002, syms.items[usize(s)].ident)
+				errAt(E2002, syms.items[usize(s)].ident, formatTo(mbuf[:], "invalid recursive type %v (contains itself by value)", NameRef(u32(typs.items[usize(t)].n))))
 			}
 		}
 	}
 }
 
-func badMainBegin() {
-	mreset()
-	ms("invalid main signature: ")
-}
-
-func badMainEnd(d u32) {
-	ms(" (want driver func main(<capabilities>) error)")
-	errAt(E5002, nb(d))
-}
 
 // checkMain validates the entry point of the root package.
 func checkMain() {
@@ -2006,23 +1767,17 @@ func checkMain() {
 	}
 	d := syms.items[usize(sym)].decl
 	if symKind(sym) != SymFunc || d == 0 || nkind(d) != NkFuncDecl {
-		mreset()
-		ms("main must be a function")
-		errAt(E5002, syms.items[usize(sym)].ident)
+		errAt(E5002, syms.items[usize(sym)].ident, formatTo(mbuf[:], "main must be a function"))
 		return
 	}
 	fi := nfunc[usize(d)]
 	funcs.main = fi
 	if nop(d) != ModDriver {
-		badMainBegin()
-		ms("main must be a driver func")
-		badMainEnd(d)
+		errAt(E5002, nb(d), formatTo(mbuf[:], "invalid main signature: main must be a driver func (want driver func main(<capabilities>) error)"))
 		return
 	}
 	if nc(d) != 0 {
-		badMainBegin()
-		ms("main cannot have type parameters")
-		badMainEnd(d)
+		errAt(E5002, nb(d), formatTo(mbuf[:], "invalid main signature: main cannot have type parameters (want driver func main(<capabilities>) error)"))
 		return
 	}
 	if fi == 0 || funcs.items[usize(fi)].sig == 0 {
@@ -2037,27 +1792,18 @@ func checkMain() {
 			return
 		}
 		if !isCapability(p) || (sigVariadic(sig) && i == np-1) {
-			badMainBegin()
-			ms("parameter of type ")
-			mtype(p)
-			ms(" is not a capability (Net, Signals, Clock, FS, Env, Stdio, Exec)")
-			badMainEnd(d)
+			errAt(E5002, nb(d), formatTo(mbuf[:], "invalid main signature: parameter of type %v is not a capability (Net, Signals, Clock, FS, Env, Stdio, Exec) (want driver func main(<capabilities>) error)", TypeRef(p)))
 			return
 		}
 		b := builtinOf(p)
 		if seen[usize(b)] {
-			badMainBegin()
-			ms("duplicate capability ")
-			mtype(p)
-			badMainEnd(d)
+			errAt(E5002, nb(d), formatTo(mbuf[:], "invalid main signature: duplicate capability %v (want driver func main(<capabilities>) error)", TypeRef(p)))
 			return
 		}
 		seen[usize(b)] = true
 	}
 	if sigNResults(sig) != 1 || basicKind(sigResult(sig, 0)) != BkError {
-		badMainBegin()
-		ms("main must return exactly error")
-		badMainEnd(d)
+		errAt(E5002, nb(d), formatTo(mbuf[:], "invalid main signature: main must return exactly error (want driver func main(<capabilities>) error)"))
 	}
 }
 

@@ -55,12 +55,7 @@ func isUntypedNumeric(t u32) bool {
 }
 
 func mArmType(a u32, have u32, want u32) {
-	mreset()
-	ms("match arm has type ")
-	mtype(have)
-	ms(", want ")
-	mtype(want)
-	errAt(E2002, a)
+	errAt(E2002, a, formatTo(mbuf[:], "match arm has type %v, want %v", TypeRef(have), TypeRef(want)))
 }
 
 // matchExpr checks a match expression. The arms' types must agree;
@@ -269,9 +264,7 @@ func matchCoverage(m u32, t u32, isExpr bool) {
 	for i := usize(0); i < n; i++ {
 		pat := na(l1at(m, i))
 		if wild {
-			mreset()
-			ms("unreachable match arm: it follows the '_' arm")
-			errAt(E2012, pat)
+			errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the '_' arm"))
 			continue
 		}
 		na2 := patAltN(pat)
@@ -283,11 +276,7 @@ func matchCoverage(m u32, t u32, isExpr bool) {
 			lit := u32(0)
 			if k == NkWildcardPattern {
 				if isEnum && nv > 0 && mAllCovered(nv) {
-					mreset()
-					ms("unreachable '_' arm: all variants of ")
-					mtype(t)
-					ms(" are covered")
-					errAt(E2012, alt)
+					errAt(E2012, alt, formatTo(mbuf[:], "unreachable '_' arm: all variants of %v are covered", TypeRef(t)))
 				}
 				wild = true
 				continue
@@ -305,11 +294,7 @@ func matchCoverage(m u32, t u32, isExpr bool) {
 			}
 			if vi >= 0 {
 				if mCovered[usize(vi)] {
-					mreset()
-					ms("unreachable pattern: variant ")
-					mname(variantName(en, usize(vi)))
-					ms(" is already covered")
-					errAt(E2012, alt)
+					errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: variant %v is already covered", NameRef(variantName(en, usize(vi)))))
 				}
 				mCovered[usize(vi)] = true
 				continue
@@ -324,10 +309,7 @@ func matchCoverage(m u32, t u32, isExpr bool) {
 				}
 			}
 			if dup {
-				mreset()
-				ms("unreachable pattern: duplicate case ")
-				mexpr(lit)
-				errAt(E2012, alt)
+				errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: duplicate case %v", Expr(lit)))
 				continue
 			}
 			if nseen >= MaxMatchCases {
@@ -342,30 +324,22 @@ func matchCoverage(m u32, t u32, isExpr bool) {
 		return
 	}
 	if isEnum {
-		missing := false
+		k := usize(0) // message length; 0 while no variant is missing
 		for i := usize(0); i < nv; i++ {
-			if !mCovered[i] {
-				if !missing {
-					mreset()
-					ms("non-exhaustive match on ")
-					mtype(t)
-					ms(": missing ")
-				} else {
-					ms(", ")
-				}
-				missing = true
-				mname(variantName(en, i))
+			if mCovered[i] {
+				continue
+			}
+			if k == 0 {
+				k = formatTo(mbuf[:], "non-exhaustive match on %v: missing %v", TypeRef(t), NameRef(variantName(en, i)))
+			} else {
+				k += formatTo(mbuf[k:], ", %v", NameRef(variantName(en, i)))
 			}
 		}
-		if missing {
-			errAt(E2012, m)
+		if k > 0 {
+			errAt(E2012, m, k)
 		}
 	} else if isExpr {
-		mreset()
-		ms("non-exhaustive match expression on ")
-		mtype(t)
-		ms(": missing '_' arm")
-		errAt(E2012, m)
+		errAt(E2012, m, formatTo(mbuf[:], "non-exhaustive match expression on %v: missing '_' arm", TypeRef(t)))
 	}
 }
 
@@ -385,9 +359,7 @@ func armPattern(p u32, t u32, dp usize) bool decreases(dp) {
 	for i := usize(0); i < n; i++ {
 		alt := l1at(p, i)
 		if nkind(alt) == NkWildcardPattern {
-			mreset()
-			ms("'_' cannot be an alternative of an or-pattern")
-			errAt(E2002, alt)
+			errAt(E2002, alt, formatTo(mbuf[:], "'_' cannot be an alternative of an or-pattern"))
 			valid = false
 			continue
 		}
@@ -400,11 +372,7 @@ func armPattern(p u32, t u32, dp usize) bool decreases(dp) {
 			for j := usize(0); j < nbind; j++ {
 				b := l1at(alt, j)
 				if idName(b) != nameBlank {
-					mreset()
-					ms("or-pattern alternatives cannot bind variables (")
-					mname(idName(b))
-					ms(")")
-					errAt(E2002, b)
+					errAt(E2002, b, formatTo(mbuf[:], "or-pattern alternatives cannot bind variables (%v)", NameRef(idName(b))))
 					valid = false
 					break
 				}

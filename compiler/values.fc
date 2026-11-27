@@ -758,12 +758,8 @@ func putCode(o *OutBuf, v Val, depth usize) decreases(depth) {
 	}
 }
 
-// mval writes a value into the diagnostic message; etval into errTxt.
-func mval(v Val) {
-	o := &msgBuf
-	putVal(o, v, SemaDepth)
-}
-
+// etval writes a value into errTxt (ValRef in msg.fc renders values in
+// diagnostics).
 func etval(v Val) {
 	o := &errTxt
 	putVal(o, v, SemaDepth)

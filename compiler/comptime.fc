@@ -57,95 +57,69 @@ var ifail bool
 var ifailCode u32
 var ifailMsg OutBuf
 
-// failBegin starts a "comptime evaluation failed: ..." message.
-func failBegin(code u32) {
+// failf fails with "comptime evaluation failed: " + mbuf[:k]; callers
+// format the detail with formatTo(mbuf[:], ...).
+func failf(code u32, k usize) {
 	ifail = true
 	ifailCode = code
-	o := &ifailMsg
-	o.reset()
-	o.putStr("comptime evaluation failed: ")
+	ifailMsg.len = formatTo(ifailMsg.data[:], "comptime evaluation failed: %s", mbuf[:k])
 }
 
 func failS(code u32, s string) {
-	failBegin(code)
-	o := &ifailMsg
-	o.putStr(s)
+	failf(code, formatTo(mbuf[:], "%s", s))
 }
 
 // failErr reports the value error in errTxt.
 func failErr(code u32) {
-	failBegin(code)
-	o := &ifailMsg
-	o.putBytes(errTxt.data[:errTxt.len])
+	failf(code, formatTo(mbuf[:], "%s", errTxt.data[:errTxt.len]))
 }
 
 // failSilent is a failure that was already reported (EvalError{}).
 func failSilent() {
 	ifail = true
 	ifailCode = 0
-	o := &ifailMsg
-	o.reset()
+	ifailMsg.len = 0
 }
 
-func putFuncName(o *OutBuf, fi u32) {
-	s := funcs.items[usize(fi)].sym
-	if s == 0 {
-		o.putStr("func literal")
-		return
-	}
-	if syms.items[usize(s)].recvType != 0 {
-		o.putBytes(nameBytes(syms.items[usize(s)].recvType))
-		o.putByte('.')
-	}
-	o.putBytes(nameBytes(syms.items[usize(s)].name))
-}
+// CallStack renders the call stack above frame `base`, innermost first,
+// collapsing runs of identical frames.
+type CallStack usize
 
-func putNodePos(o *OutBuf, n u32) {
-	o.putStr(sources.files[nfile(n)].path)
-	o.putByte(':')
-	o.putUint(u64(nodes.items[usize(n)].sLine))
-	o.putByte(':')
-	o.putUint(u64(nodes.items[usize(n)].sCol))
-}
-
-// putStack renders the call stack, innermost first, collapsing runs of
-// identical frames.
-func putStack(o *OutBuf) {
-	o.putStr("call stack (innermost first): ")
-	if nframes <= inBase {
-		return
+func (base CallStack) Format(dst []byte) usize {
+	k := formatTo(dst, "call stack (innermost first): ")
+	b := usize(base)
+	if nframes <= b {
+		return k
 	}
 	i := nframes - 1
 	first := true
 	for g := usize(0); g < MaxFrames; g++ {
 		f := frames[i]
 		if !first {
-			o.putStr(" <- ")
+			k += formatTo(dst[k:], " <- ")
 		}
 		first = false
-		putFuncName(o, f.fn)
+		k += formatTo(dst[k:], "%v", FuncName(f.fn))
 		if f.site != 0 {
-			o.putStr(" called at ")
-			putNodePos(o, f.site)
+			k += formatTo(dst[k:], " called at %v", PosRef(f.site))
 		}
 		j := i
 		for h := usize(0); h < MaxFrames; h++ {
-			if j == inBase || frames[j-1].fn != f.fn || frames[j-1].site != f.site {
+			if j == b || frames[j-1].fn != f.fn || frames[j-1].site != f.site {
 				break
 			}
 			j--
 		}
 		cnt := i - j + 1
 		if cnt > 1 {
-			o.putStr(" (x")
-			o.putUint(u64(cnt))
-			o.putByte(')')
+			k += formatTo(dst[k:], " (x%d)", cnt)
 		}
-		if j == inBase {
+		if j == b {
 			break
 		}
 		i = j - 1
 	}
+	return k
 }
 
 func tick() {
@@ -155,12 +129,7 @@ func tick() {
 	if inFuel == 0 {
 		ifail = true
 		ifailCode = E4001
-		o := &ifailMsg
-		o.reset()
-		o.putStr("comptime evaluation ran out of fuel (budget ")
-		o.putUint(inBudget)
-		o.putStr(" steps); ")
-		putStack(o)
+		ifailMsg.len = formatTo(ifailMsg.data[:], "comptime evaluation ran out of fuel (budget %d steps); %v", inBudget, CallStack(inBase))
 		return
 	}
 	inFuel--
@@ -265,16 +234,10 @@ func lookupCell(sym u32, id u32) u32 {
 		return fvSlot[i]
 	}
 	if symIsGlobal(sym) && symKind(sym) == SymVar {
-		failS(E2002, "cannot read package variable ")
-		o := &ifailMsg
-		o.putBytes(nameBytes(symName(sym)))
-		o.putStr(" at compile time")
+		failf(E2002, formatTo(mbuf[:], "cannot read package variable %v at compile time", NameRef(symName(sym))))
 		return 0
 	}
-	failBegin(E2002)
-	o := &ifailMsg
-	o.putBytes(ntext(id))
-	o.putStr(" is not available at compile time")
+	failf(E2002, formatTo(mbuf[:], "%s is not available at compile time", ntext(id)))
 	return 0
 }
 
@@ -293,17 +256,11 @@ func icall(fn u32, recv Val, hasRecv bool, as usize, ae usize, site u32, dp usiz
 	}
 	fi := funcOfSym(fn)
 	if fi == 0 || funcs.items[usize(fi)].body == 0 {
-		failBegin(E2002)
-		o := &ifailMsg
-		o.putBytes(nameBytes(symName(fn)))
-		o.putStr(" has no body")
+		failf(E2002, formatTo(mbuf[:], "%v has no body", NameRef(symName(fn))))
 		return z
 	}
 	if funcs.items[usize(fi)].effect == EffDriver {
-		failS(E5001, "cannot call driver function ")
-		o := &ifailMsg
-		putFuncName(o, fi)
-		o.putStr(" at compile time")
+		failf(E5001, formatTo(mbuf[:], "cannot call driver function %v at compile time", FuncName(fi)))
 		return z
 	}
 	tick()
@@ -313,12 +270,7 @@ func icall(fn u32, recv Val, hasRecv bool, as usize, ae usize, site u32, dp usiz
 	if nframes-inBase >= CtMaxDepth || nframes >= MaxFrames {
 		ifail = true
 		ifailCode = E4001
-		o := &ifailMsg
-		o.reset()
-		o.putStr("comptime evaluation exceeded the maximum call depth (")
-		o.putUint(CtMaxDepth)
-		o.putStr("); ")
-		putStack(o)
+		ifailMsg.len = formatTo(ifailMsg.data[:], "comptime evaluation exceeded the maximum call depth (%d); %v", CtMaxDepth, CallStack(inBase))
 		return z
 	}
 	vbase := nfv
@@ -373,10 +325,7 @@ func icall(fn u32, recv Val, hasRecv bool, as usize, ae usize, site u32, dp usiz
 		return z
 	}
 	if sigNResults(sig) > 0 && !hasRet {
-		failBegin(E2002)
-		o := &ifailMsg
-		putFuncName(o, fi)
-		o.putStr(" finished without returning a value")
+		failf(E2002, formatTo(mbuf[:], "%v finished without returning a value", FuncName(fi)))
 		return z
 	}
 	return ret
@@ -421,11 +370,7 @@ func evalList(s u32, n usize, dp usize) decreases(dp) {
 			return
 		}
 		if v.kind != VTuple || usize(v.aux) != n {
-			failBegin(E2002)
-			o := &ifailMsg
-			o.putStr("expected ")
-			o.putUint(u64(n))
-			o.putStr(" values")
+			failf(E2002, formatTo(mbuf[:], "expected %d values", n))
 			return
 		}
 		for i := usize(0); i < n; i++ {
@@ -919,22 +864,14 @@ func intArg(e u32, dp usize) usize decreases(dp) {
 		return 0
 	}
 	if v.hi != 0 || v.lo > 1<<40 {
-		failS(E4003, "index ")
-		o := &ifailMsg
-		putInt128(o, v)
-		o.putStr(" out of range")
+		failf(E4003, formatTo(mbuf[:], "index %v out of range", ValRef(v)))
 		return 0
 	}
 	return usize(v.lo)
 }
 
 func failIndexRange(i usize, n usize) {
-	failS(E4003, "index ")
-	o := &ifailMsg
-	o.putUint(u64(i))
-	o.putStr(" out of range [0:")
-	o.putUint(u64(n))
-	o.putByte(']')
+	failf(E4003, formatTo(mbuf[:], "index %d out of range [0:%d]", i, n))
 }
 
 // indexRef returns the slot of element i of an array or slice value.
@@ -954,9 +891,7 @@ func indexRef(x Val, i usize) u32 {
 		}
 		return x.ref + x.aux + u32(i)
 	}
-	failS(E2002, "cannot index value ")
-	o := &ifailMsg
-	putVal(o, x, SemaDepth)
+	failf(E2002, formatTo(mbuf[:], "cannot index value %v", ValRef(x)))
 	return 0
 }
 
@@ -977,9 +912,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 	if k == NkIdent {
 		sym := symbolOf(e)
 		if sym == 0 {
-			failS(E2002, "unresolved identifier ")
-			o := &ifailMsg
-			o.putBytes(ntext(e))
+			failf(E2002, formatTo(mbuf[:], "unresolved identifier %s", ntext(e)))
 			return z
 		}
 		sk := symKind(sym)
@@ -998,10 +931,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 			}
 			return slotGet(c)
 		}
-		failBegin(E2002)
-		o := &ifailMsg
-		o.putBytes(ntext(e))
-		o.putStr(" cannot be used as a value at compile time")
+		failf(E2002, formatTo(mbuf[:], "%s cannot be used as a value at compile time", ntext(e)))
 		return z
 	}
 	if k == NkBinaryExpr {
@@ -1122,10 +1052,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 			if uses[usize(nb(e))] != 0 {
 				return ieval(nb(e), dp-1)
 			}
-			failS(E2002, "unsupported selector ")
-			o := &ifailMsg
-			o.putBytes(ntext(nb(e)))
-			o.putStr(" at compile time")
+			failf(E2002, formatTo(mbuf[:], "unsupported selector %s at compile time", ntext(nb(e))))
 			return z
 		}
 		x := ieval(na(e), dp-1)
@@ -1208,9 +1135,7 @@ func ilvalue(e u32, dp usize) u32 decreases(dp) {
 	if k == NkIdent {
 		sym := symbolOf(e)
 		if sym == 0 || symKind(sym) != SymVar {
-			failS(E2002, "cannot assign to ")
-			o := &ifailMsg
-			o.putBytes(ntext(e))
+			failf(E2002, formatTo(mbuf[:], "cannot assign to %s", ntext(e)))
 			return 0
 		}
 		return lookupCell(sym, e)
@@ -1253,9 +1178,7 @@ func ilvalue(e u32, dp usize) u32 decreases(dp) {
 	if k == NkSelectorExpr {
 		sel := nsel[usize(e)]
 		if sel == 0 || selTab.items[usize(sel)].kind != SelField {
-			failS(E2002, "cannot assign to ")
-			o := &ifailMsg
-			o.putBytes(ntext(nb(e)))
+			failf(E2002, formatTo(mbuf[:], "cannot assign to %s", ntext(nb(e))))
 			return 0
 		}
 		var base Val
@@ -1294,14 +1217,7 @@ func ilvalue(e u32, dp usize) u32 decreases(dp) {
 }
 
 func failSliceBounds(lo usize, hi usize, n usize) {
-	failS(E4003, "slice bounds [")
-	o := &ifailMsg
-	o.putUint(u64(lo))
-	o.putByte(':')
-	o.putUint(u64(hi))
-	o.putStr("] out of range [0:")
-	o.putUint(u64(n))
-	o.putByte(']')
+	failf(E4003, formatTo(mbuf[:], "slice bounds [%d:%d] out of range [0:%d]", lo, hi, n))
 }
 
 func islice(e u32, dp usize) Val decreases(dp) {
@@ -1543,9 +1459,7 @@ func icallExpr(e u32, dp usize) Val decreases(dp) {
 	if c.kind == CallBuiltin {
 		return ibuiltin(e, c.builtin, dp-1)
 	}
-	failS(E2002, callKindString(c.kind))
-	o := &ifailMsg
-	o.putStr(" calls are not supported at compile time")
+	failf(E2002, formatTo(mbuf[:], "%s calls are not supported at compile time", callKindString(c.kind)))
 	return z
 }
 
@@ -1741,9 +1655,7 @@ func ibuiltin0(b u8, m usize) Val {
 		}
 		return tuple2(vIntU(v), vErr(0))
 	} else if b == BFPanic {
-		failS(E5001, "panic at compile time: ")
-		o := &ifailMsg
-		putVal(o, vstack[m], SemaDepth)
+		failf(E5001, formatTo(mbuf[:], "panic at compile time: %v", ValRef(vstack[m])))
 		return z
 	} else if b == BFCodeArray {
 		n, _ := valUint64(vstack[m])
@@ -1804,9 +1716,6 @@ func ibuiltin0(b u8, m usize) Val {
 	} else if b >= BFCodeEmpty && b <= BFCodeI64 {
 		return vCode(b - BFCodeEmpty)
 	}
-	failS(E2002, "builtin ")
-	o := &ifailMsg
-	o.putStr(builtinName(b))
-	o.putStr(" is not available at compile time")
+	failf(E2002, formatTo(mbuf[:], "builtin %s is not available at compile time", builtinName(b)))
 	return z
 }

@@ -73,9 +73,9 @@ func scopeCheck() {
 	}
 }
 
-// scReport records the diagnostic in msgBuf at node n unless one with the
+// scReport records the diagnostic mbuf[:k] at node n unless one with the
 // same code was already reported at the same position.
-func scReport(code u32, n u32) {
+func scReport(code u32, n u32, k usize) {
 	if n == 0 {
 		return
 	}
@@ -88,7 +88,7 @@ func scReport(code u32, n u32) {
 			return
 		}
 	}
-	errAt(code, n)
+	errAt(code, n, k)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,28 +106,22 @@ func scOR(o u64) u32 {
 	return u32(o & 0xFFFF_FFFF)
 }
 
-// morigin writes origin.String().
-func morigin(o u64) {
-	d := scOD(o)
-	r := scOR(o)
+// Origin renders origin.String().
+type Origin u64
+
+func (o Origin) Format(dst []byte) usize {
+	d := scOD(u64(o))
+	r := scOR(u64(o))
 	if d == ScLevelGlobal {
-		ms("package-level storage")
-		return
+		return formatTo(dst, "package-level storage")
 	}
 	if r != 0 {
-		ms("the storage of parameter ")
-		mname(symName(r))
-		ms(" (depth ")
-		mu(u64(d - 1))
-		ms(")")
-		return
+		return formatTo(dst, "the storage of parameter %v (depth %d)", NameRef(symName(r)), d-1)
 	}
 	if d == ScLevelCaller {
-		ms("the caller's storage")
-		return
+		return formatTo(dst, "the caller's storage")
 	}
-	ms("storage at depth ")
-	mu(u64(d - 1))
+	return formatTo(dst, "storage at depth %d", d-1)
 }
 
 func scJoin(a u64, b u64) u64 {
@@ -627,11 +621,7 @@ func wDiscard(rhs u32, idx int, at u32) {
 		t = tl1(t, usize(idx))
 	}
 	if t != 0 && isLinear(t) {
-		mreset()
-		ms("Linear value of type ")
-		mtype(t)
-		ms(" cannot be discarded with _")
-		scReport(E3004, at)
+		scReport(E3004, at, formatTo(mbuf[:], "Linear value of type %v cannot be discarded with _", TypeRef(t)))
 	}
 }
 
@@ -691,11 +681,7 @@ func wStmt(s u32, dp usize) decreases(dp) {
 		if call != 0 && nkind(call) == NkCallExpr && !wCollect {
 			t := ntype[usize(call)]
 			if t != 0 && isLinear(t) {
-				mreset()
-				ms("result of type ")
-				mtype(t)
-				ms(" (Linear) is discarded")
-				scReport(E3004, s)
+				scReport(E3004, s, formatTo(mbuf[:], "result of type %v (Linear) is discarded", TypeRef(t)))
 			}
 		}
 	} else if k == NkIfStmt {
@@ -743,11 +729,7 @@ func wStmt(s u32, dp usize) decreases(dp) {
 			}
 			o := scOrigin(r, SemaDepth)
 			if scOD(o) >= wFnDepth {
-				mreset()
-				ms("scope escape: the returned value refers to ")
-				morigin(o)
-				ms(", which does not outlive the function")
-				scReport(E3002, r)
+				scReport(E3002, r, formatTo(mbuf[:], "scope escape: the returned value refers to %v, which does not outlive the function", Origin(o)))
 			}
 		}
 	}
@@ -795,13 +777,7 @@ func wAssign(s u32, dp usize) decreases(dp) {
 		o := scOrigin(rhs, SemaDepth)
 		st := scStorage(l, SemaDepth)
 		if !scFits(o, st) {
-			mreset()
-			ms("scope escape: a value referring to ")
-			morigin(o)
-			ms(" cannot be stored in ")
-			morigin(st)
-			ms(", which outlives it")
-			scReport(E3002, s)
+			scReport(E3002, s, formatTo(mbuf[:], "scope escape: a value referring to %v cannot be stored in %v, which outlives it", Origin(o), Origin(st)))
 		}
 	}
 }
@@ -822,11 +798,7 @@ func wMatch(s u32, dp usize) decreases(dp) {
 			wExpr(ae, dp-1)
 			t := ntype[usize(ae)]
 			if !wCollect && t != 0 && isLinear(t) {
-				mreset()
-				ms("result of type ")
-				mtype(t)
-				ms(" (Linear) is discarded")
-				scReport(E3004, ae)
+				scReport(E3004, ae, formatTo(mbuf[:], "result of type %v (Linear) is discarded", TypeRef(t)))
 			}
 		}
 		wBlock(nc(arm), dp-1)
@@ -962,11 +934,7 @@ func wCheckGo(e u32) {
 	if nkind(fn) != NkFuncLit {
 		o := scOrigin(fn, SemaDepth)
 		if !scFits(o, so) {
-			mreset()
-			ms("scope escape: task function refers to ")
-			morigin(o)
-			ms(", which does not outlive the scope")
-			scReport(E3002, fn)
+			scReport(E3002, fn, formatTo(mbuf[:], "scope escape: task function refers to %v, which does not outlive the scope", Origin(o)))
 		}
 		return
 	}
@@ -991,13 +959,7 @@ func wCheckGo(e u32) {
 			if id != 0 {
 				at = id
 			}
-			mreset()
-			ms("scope escape: task captures ")
-			mname(symName(s))
-			ms(", which refers to ")
-			morigin(o)
-			ms(" and does not outlive the scope")
-			scReport(E3002, at)
+			scReport(E3002, at, formatTo(mbuf[:], "scope escape: task captures %v, which refers to %v and does not outlive the scope", NameRef(symName(s)), Origin(o)))
 		}
 	}
 }

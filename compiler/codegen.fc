@@ -134,6 +134,11 @@ func cgWu(v u64) {
 	o.putUint(v)
 }
 
+// cgWf writes mbuf[:k] (formatted by the caller with formatTo).
+func cgWf(k usize) {
+	cgWb(mbuf[:k])
+}
+
 func cgWmark() usize {
 	return cgBuf.len
 }
@@ -265,15 +270,10 @@ func cgFail(n u32, msg string) {
 	o := &cgErrBuf
 	o.reset()
 	if n != 0 {
-		o.putStr(sources.files[nfile(n)].path)
-		o.putByte(':')
-		o.putUint(u64(nodes.items[usize(n)].sLine))
-		o.putByte(':')
-		o.putUint(u64(nodes.items[usize(n)].sCol))
-		o.putStr(": ")
+		putMsg(o, formatTo(mbuf[:], "%v: codegen: %s", PosRef(n), msg))
+	} else {
+		putMsg(o, formatTo(mbuf[:], "codegen: %s", msg))
 	}
-	o.putStr("codegen: ")
-	o.putStr(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,9 +1262,7 @@ func cgTypeLit(n u32, t u32, dp usize) decreases(dp) {
 			}
 			l = v
 		}
-		cgWc('[')
-		cgWu(l)
-		cgWc(']')
+		cgWf(formatTo(mbuf[:], "[%d]", l))
 		cgGoType(n, r.a, dp-1)
 	} else if k == TCSlice {
 		cgW("[]")

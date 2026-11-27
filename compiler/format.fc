@@ -135,31 +135,20 @@ func fmtNext(s []byte, i usize) FmtDir {
 	return d
 }
 
-// fmtErrMsg writes the message of a malformed directive into msgBuf.
-func fmtErrMsg(s []byte, d FmtDir) {
-	mreset()
-	ms("invalid format for formatTo: ")
-	dir := s[d.start:d.end]
+// fmtErrMsg formats the message of a malformed directive into mbuf and
+// returns its length.
+func fmtErrMsg(s []byte, d FmtDir) usize {
+	dir := Quoted(s[d.start:d.end])
 	if d.err == FeIncomplete {
-		ms("incomplete directive ")
-		mquote(dir)
-		ms(" at the end of the format")
+		return formatTo(mbuf[:], "invalid format for formatTo: incomplete directive %v at the end of the format", dir)
 	} else if d.err == FeUnknown {
-		ms("unknown verb in directive ")
-		mquote(dir)
+		return formatTo(mbuf[:], "invalid format for formatTo: unknown verb in directive %v", dir)
 	} else if d.err == FePercent {
-		ms("directive ")
-		mquote(dir)
-		ms(" cannot have flags or a width")
+		return formatTo(mbuf[:], "invalid format for formatTo: directive %v cannot have flags or a width", dir)
 	} else if d.err == FeWidth {
-		ms("width in directive ")
-		mquote(dir)
-		ms(" exceeds 64")
-	} else {
-		ms("flag 0 in directive ")
-		mquote(dir)
-		ms(" is only valid with %d and %x")
+		return formatTo(mbuf[:], "invalid format for formatTo: width in directive %v exceeds 64", dir)
 	}
+	return formatTo(mbuf[:], "invalid format for formatTo: flag 0 in directive %v is only valid with %%d and %%x", dir)
 }
 
 // fmtCount validates s and returns its number of directives; on a
@@ -174,8 +163,7 @@ func fmtCount(s []byte, at u32) (usize, bool) {
 			break
 		}
 		if d.kind == FdErr {
-			fmtErrMsg(s, d)
-			errAt(E2002, at)
+			errAt(E2002, at, fmtErrMsg(s, d))
 			return 0, false
 		}
 		if d.kind == FdVerb {
@@ -245,11 +233,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 	ctx := Ctx{kind: CtxArgBuiltin, a: u32(BFFormatTo), b: 0}
 	n := l1len(e)
 	if n < 2 {
-		mreset()
-		ms("not enough arguments in call to formatTo: have ")
-		mu(u64(n))
-		ms(", want at least 2")
-		errAt(E2003, e)
+		errAt(E2003, e, formatTo(mbuf[:], "not enough arguments in call to formatTo: have %d, want at least 2", n))
 		useArgs(e, 0, dp-1)
 		return invalidOp(e)
 	}
@@ -265,11 +249,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 		ok = false
 		fok = false
 	} else if fx.mode != KConst || fx.val.kind == VNone {
-		mreset()
-		ms("format argument ")
-		mexpr(a1)
-		ms(" to formatTo must be a constant string")
-		errAt(E2002, a1)
+		errAt(E2002, a1, formatTo(mbuf[:], "format argument %v to formatTo must be a constant string", Expr(a1)))
 		ok = false
 		fok = false
 	}
@@ -285,14 +265,7 @@ func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
 		if !good {
 			fok = false
 		} else if cnt != nargs {
-			mreset()
-			ms("wrong number of arguments for format ")
-			mquote(s)
-			ms(" in call to formatTo: have ")
-			mu(u64(nargs))
-			ms(", want ")
-			mu(u64(cnt))
-			errAt(E2003, a1)
+			errAt(E2003, a1, formatTo(mbuf[:], "wrong number of arguments for format %v in call to formatTo: have %d, want %d", Quoted(s), nargs, cnt))
 			fok = false
 		}
 	}
@@ -363,13 +336,7 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 		return FmtNone, 0
 	}
 	if classOfT(t) != ClassValue {
-		mreset()
-		ms("cannot format ")
-		mexpr(a)
-		ms(" (type ")
-		mtype(t)
-		ms("): formatTo arguments must be Value types")
-		errAt(E2002, a)
+		errAt(E2002, a, formatTo(mbuf[:], "cannot format %v (type %v): formatTo arguments must be Value types", Expr(a), TypeRef(t)))
 		return FmtNone, 0
 	}
 	op := u8(FmtNone)
@@ -395,15 +362,7 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 			m := lookupMethod(t, internStr("Format"), dp-1)
 			if m != 0 {
 				if !formatMethodOK(m) {
-					mreset()
-					ms("cannot use ")
-					mexpr(a)
-					ms(" (type ")
-					mtype(t)
-					ms(") as argument for %v in formatTo: method ")
-					mtype(t)
-					ms(".Format must be a total value-receiver method func(dst []byte) usize")
-					errAt(E2002, a)
+					errAt(E2002, a, formatTo(mbuf[:], "cannot use %v (type %v) as argument for %%v in formatTo: method %v.Format must be a total value-receiver method func(dst []byte) usize", Expr(a), TypeRef(t), TypeRef(t)))
 					return FmtNone, 0
 				}
 				return FmtFormat, m
@@ -420,15 +379,7 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 		}
 	}
 	if op == FmtNone {
-		mreset()
-		ms("cannot use ")
-		mexpr(a)
-		ms(" (type ")
-		mtype(t)
-		ms(") as argument for %")
-		mbyte(v)
-		ms(" in formatTo")
-		errAt(E2002, a)
+		errAt(E2002, a, formatTo(mbuf[:], "cannot use %v (type %v) as argument for %%%c in formatTo", Expr(a), TypeRef(t), v))
 		return FmtNone, 0
 	}
 	return op, 0
@@ -508,9 +459,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 	nargs := n - 2
 	cgW("func(_fc_d []byte")
 	for k := usize(0); k < nargs; k++ {
-		cgW(", _fc_a")
-		cgWu(u64(k))
-		cgWc(' ')
+		cgWf(formatTo(mbuf[:], ", _fc_a%d ", k))
 		op := fmtArgOp(c, k)
 		if op == FmtFormat {
 			a := l1at(e, 2+k)

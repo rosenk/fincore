@@ -577,51 +577,9 @@ type DiagList struct {
 
 var diags DiagList
 
-// msgBuf holds the message of the diagnostic being built.
-var msgBuf OutBuf
-
-func mreset() {
-	msgBuf.len = 0
-	msgBuf.full = false
-}
-
-func ms(s string) {
-	o := &msgBuf
-	o.putStr(s)
-}
-
-func mbytes(b []byte) {
-	o := &msgBuf
-	o.putBytes(b)
-}
-
-func mbyte(c byte) {
-	o := &msgBuf
-	o.putByte(c)
-}
-
-func mu(v u64) {
-	o := &msgBuf
-	o.putUint(v)
-}
-
-func mname(id u32) {
-	mbytes(nameBytes(id))
-}
-
-func mquote(b []byte) {
-	o := &msgBuf
-	putQuoted(o, b)
-}
-
-// mpos writes "file:line:col" of a node (diag.SourceSpan.String).
-func mpos(n u32) {
-	ms(sources.files[nfile(n)].path)
-	mbyte(':')
-	mu(u64(nodes.items[usize(n)].sLine))
-	mbyte(':')
-	mu(u64(nodes.items[usize(n)].sCol))
-}
+// mbuf holds the message of the diagnostic being built: callers format it
+// with formatTo(mbuf[:], ...) and pass the length to errAt (msg.fc).
+var mbuf [MaxOutputBytes]byte
 
 func diagPut(b []byte) bool {
 	n := len(b)
@@ -634,8 +592,8 @@ func diagPut(b []byte) bool {
 	return true
 }
 
-// addDiag records "file:line:col: error[E####]: <msgBuf>".
-func addDiag(file usize, line u32, col u32, code u32) {
+// addDiag records "file:line:col: error[E####]: <msg>".
+func addDiag(file usize, line u32, col u32, code u32, msg []byte) {
 	if diags.count >= MaxDiags {
 		setFull("diagnostics")
 		return
@@ -670,7 +628,7 @@ func addDiag(file usize, line u32, col u32, code u32) {
 		return
 	}
 	mo := diags.used
-	if !diagPut(msgBuf.data[:msgBuf.len]) {
+	if !diagPut(msg) {
 		return
 	}
 	i := diags.count
@@ -684,9 +642,9 @@ func addDiag(file usize, line u32, col u32, code u32) {
 	diags.code[i] = code
 }
 
-// errAt records the diagnostic in msgBuf at the start of node n.
-func errAt(code u32, n u32) {
-	addDiag(nfile(n), nodes.items[usize(n)].sLine, nodes.items[usize(n)].sCol, code)
+// errAt records the diagnostic mbuf[:k] at the start of node n.
+func errAt(code u32, n u32, k usize) {
+	addDiag(nfile(n), nodes.items[usize(n)].sLine, nodes.items[usize(n)].sCol, code, mbuf[:k])
 }
 
 // addParseDiag records a finished parser diagnostic line (with or without
@@ -729,9 +687,7 @@ func addParseDiag(file usize, b []byte) {
 	if i > n {
 		i = n
 	}
-	mreset()
-	mbytes(line[i:n])
-	addDiag(file, ln, col, code)
+	addDiag(file, ln, col, code, line[i:n])
 }
 
 // diagLess is the canonical order: file path, position, code, message.

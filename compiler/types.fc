@@ -1147,12 +1147,6 @@ func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
 	}
 }
 
-// mtype writes a type into the diagnostic message.
-func mtype(t u32) {
-	o := &msgBuf
-	putType(o, t, SemaDepth)
-}
-
 // ---------------------------------------------------------------------------
 // Methods (types.Method) and builtin method IDs
 
@@ -1642,18 +1636,18 @@ func funcOfSym(s u32) u32 {
 	return nfunc[usize(d)]
 }
 
-// mfuncName writes FuncInfo.Name(): "f", "T.m" or "func literal".
-func mfuncName(fi u32) {
+// FuncName renders FuncInfo.Name(): "f", "T.m" or "func literal".
+type FuncName u32
+
+func (fi FuncName) Format(dst []byte) usize {
 	s := funcs.items[usize(fi)].sym
 	if s == 0 {
-		ms("func literal")
-		return
+		return formatTo(dst, "func literal")
 	}
 	if syms.items[usize(s)].recvType != 0 {
-		mname(syms.items[usize(s)].recvType)
-		mbyte('.')
+		return formatTo(dst, "%v.%v", NameRef(syms.items[usize(s)].recvType), NameRef(syms.items[usize(s)].name))
 	}
-	mname(syms.items[usize(s)].name)
+	return formatTo(dst, "%v", NameRef(syms.items[usize(s)].name))
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,94 @@
+// msg.fc — diagnostic message construction with the v0.2 builtin formatTo.
+//
+// A diagnostic is one formatTo call into the message buffer mbuf (sema.fc);
+// the reporters (errAt, errAtOp, errAtEnd, scReport) take the length:
+//
+//	errAt(E2002, e, formatTo(mbuf[:], "mismatched types %v and %v", TypeRef(x.typ), TypeRef(y.typ)))
+//
+// The newtypes below render compiler entities through %v. Format methods
+// cannot recurse (totality, decision 68), so the recursive renderers
+// (putType, putVal, writeExpr) write into the scratch OutBuf fmtBuf and the
+// Format method copies the text into dst. Every Format method finishes with
+// fmtBuf before the next directive is written, so one scratch buffer is
+// enough. Other Format methods: Ctx and CallName (checker.fc), VarName
+// (checker.fc), FuncName (types.fc), Origin (scope.fc).
+package main
+
+var fmtBuf OutBuf
+
+// fmtOut copies the scratch text into dst.
+func fmtOut(dst []byte) usize {
+	return copy(dst, fmtBuf.data[:fmtBuf.len])
+}
+
+// TypeRef renders a type (types.TypeString).
+type TypeRef u32
+
+func (t TypeRef) Format(dst []byte) usize {
+	o := &fmtBuf
+	o.reset()
+	putType(o, u32(t), SemaDepth)
+	return fmtOut(dst)
+}
+
+// ValRef renders a compile-time value (types.Value.String).
+type ValRef Val
+
+func (v ValRef) Format(dst []byte) usize {
+	o := &fmtBuf
+	o.reset()
+	putVal(o, Val(v), SemaDepth)
+	return fmtOut(dst)
+}
+
+// Expr renders an expression like types.exprString: at most 60 bytes.
+type Expr u32
+
+func (e Expr) Format(dst []byte) usize {
+	o := &fmtBuf
+	o.reset()
+	writeExpr(o, u32(e), SemaDepth)
+	if fmtBuf.len > 60 {
+		return formatTo(dst, "%s...", fmtBuf.data[:57])
+	}
+	return fmtOut(dst)
+}
+
+// NameRef renders an interned name.
+type NameRef u32
+
+func (n NameRef) Format(dst []byte) usize {
+	return copy(dst, nameBytes(u32(n)))
+}
+
+// Quoted renders bytes quoted like Go's strconv.Quote (%q of finc0's
+// messages; formatTo's own %q escapes all non-ASCII bytes).
+type Quoted []byte
+
+func (q Quoted) Format(dst []byte) usize {
+	o := &fmtBuf
+	o.reset()
+	putQuoted(o, q)
+	return fmtOut(dst)
+}
+
+// PosRef renders "file:line:col" of a node (diag.SourceSpan.String).
+type PosRef u32
+
+func (n PosRef) Format(dst []byte) usize {
+	nd := nodes.items[usize(n)]
+	return formatTo(dst, "%s:%d:%d", sources.files[nfile(u32(n))].path, nd.sLine, nd.sCol)
+}
+
+// putMsg appends mbuf[:k] (formatted by the caller) to an output buffer.
+func putMsg(o *OutBuf, k usize) {
+	o.putBytes(mbuf[:k])
+}
+
+// tooMany is the quantifier of arity messages ("too many arguments ...").
+func tooMany(over bool) string {
+	if over {
+		return "too many"
+	}
+	return "not enough"
+}

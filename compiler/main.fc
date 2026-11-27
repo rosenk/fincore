@@ -140,6 +140,14 @@ driver func flushErr(io Stdio) error {
 	return err
 }
 
+// sayf writes mbuf[:k] (formatted by the caller) to stderr; like a reset
+// errBuf followed by flushErr, it leaves errBuf empty.
+driver func sayf(io Stdio, k usize) error {
+	eb := &errBuf
+	eb.reset()
+	return io.WriteStderr(mbuf[:k])
+}
+
 driver func say(io Stdio, toStderr bool, s string) error {
 	if toStderr {
 		return io.WriteStderr(strBytes(s))
@@ -168,21 +176,13 @@ driver func usage(io Stdio, toStderr bool) error {
 
 // ioFail reports "finc1: <what> <path>: <reason>" for an I/O error.
 driver func ioFail(io Stdio, what string, path string, err error) error {
-	eb := &errBuf
-	eb.reset()
-	eb.putStr("finc1: ")
-	eb.putStr(what)
-	eb.putStr(path)
-	eb.putStr(": ")
+	reason := "I/O error"
 	if err == ErrNotFound {
-		eb.putStr("no such file or directory")
+		reason = "no such file or directory"
 	} else if err == ErrArenaFull {
-		eb.putStr("compiler capacity exceeded")
-	} else {
-		eb.putStr("I/O error")
+		reason = "compiler capacity exceeded"
 	}
-	eb.putByte('\n')
-	if e := flushErr(io); e != nil {
+	if e := sayf(io, formatTo(mbuf[:], "finc1: %s%s: %s\n", what, path, reason)); e != nil {
 		return e
 	}
 	return err
@@ -190,14 +190,7 @@ driver func ioFail(io Stdio, what string, path string, err error) error {
 
 // capacityFail reports an exhausted compiler arena.
 driver func capacityFail(io Stdio, path string, what string) error {
-	eb := &errBuf
-	eb.reset()
-	eb.putStr("finc1: ")
-	eb.putStr(path)
-	eb.putStr(": compiler capacity exceeded (")
-	eb.putStr(what)
-	eb.putStr(")\n")
-	if e := flushErr(io); e != nil {
+	if e := sayf(io, formatTo(mbuf[:], "finc1: %s: compiler capacity exceeded (%s)\n", path, what)); e != nil {
 		return e
 	}
 	return ErrArenaFull
@@ -207,7 +200,6 @@ driver func capacityFail(io Stdio, path string, what string) error {
 // main
 
 driver func main(fs FS, env Env, io Stdio, exec Exec) error {
-	eb := &errBuf
 	if r, ok := env.GetEnv("FINCROOT"); ok {
 		fincRoot = r
 	}
@@ -237,11 +229,7 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	if strEq(cmd, "test") {
 		return runTest(fs, env, io, exec)
 	}
-	eb.reset()
-	eb.putStr("finc1: unknown command ")
-	putQuoted(eb, strBytes(cmd))
-	eb.putByte('\n')
-	if err := flushErr(io); err != nil {
+	if err := sayf(io, formatTo(mbuf[:], "finc1: unknown command %v\n", Quoted(strBytes(cmd)))); err != nil {
 		return err
 	}
 	if err := usage(io, true); err != nil {
@@ -260,7 +248,6 @@ driver func parseUsage(io Stdio) error {
 // runParse implements `parse [--dump-ast] <file.fc | dir>` (Go flag
 // syntax: -dump-ast / --dump-ast[=true|false] before the operand).
 driver func runParse(fs FS, env Env, io Stdio) error {
-	eb := &errBuf
 	argc := env.ArgsCount()
 	dump := false
 	operand := ""
@@ -278,11 +265,7 @@ driver func runParse(fs FS, env Env, io Stdio) error {
 			} else if strEq(a, "-dump-ast=false") || strEq(a, "--dump-ast=false") {
 				dump = false
 			} else {
-				eb.reset()
-				eb.putStr("flag provided but not defined: ")
-				eb.putStr(a)
-				eb.putByte('\n')
-				if err := flushErr(io); err != nil {
+				if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
 					return err
 				}
 				return parseUsage(io)
@@ -330,13 +313,8 @@ driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
 			nincluded++
 		}
 	}
-	ob.reset()
-	ob.putStr("Package ")
-	ob.putStr(pkgName)
-	ob.putStr(" (")
-	ob.putUint(u64(nincluded))
-	ob.putStr(" files)\n")
-	if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+	k := formatTo(mbuf[:], "Package %s (%d files)\n", pkgName, nincluded)
+	if err := io.WriteStdout(mbuf[:k]); err != nil {
 		return err
 	}
 	d := Dumper{na: np, sa: &sources, src: sources.bytes[:], out: ob, tmp: &tmpBuf}
@@ -374,11 +352,7 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 			return f0, f0, 0, ioFail(io, "open ", path, err)
 		}
 		if n == 0 {
-			eb.reset()
-			eb.putStr("finc1: ")
-			eb.putStr(path)
-			eb.putStr(": no .fc files in directory\n")
-			if e := flushErr(io); e != nil {
+			if e := sayf(io, formatTo(mbuf[:], "finc1: %s: no .fc files in directory\n", path)); e != nil {
 				return f0, f0, 0, e
 			}
 			return f0, f0, 0, ErrNotFound
@@ -476,13 +450,7 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 			firstIncluded = i
 		} else if !bytesEqual(pkgText, strBytes(pkgName)) {
 			diagHeader(eb, fpath, pk.sLine, pk.sCol, E1001)
-			eb.putStr("package ")
-			eb.putBytes(pkgText)
-			eb.putStr("; expected package ")
-			eb.putStr(pkgName)
-			eb.putStr(" (from ")
-			eb.putStr(sources.files[firstIncluded].path)
-			eb.putStr(")")
+			putMsg(eb, formatTo(mbuf[:], "package %s; expected package %s (from %s)", pkgText, pkgName, sources.files[firstIncluded].path))
 			diagEnd(eb)
 			ndiag++
 			if check {
@@ -573,11 +541,7 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 		}
 		if bytesEqual(name, strBytes("passes")) && eq < len(ab) {
 			if !parsePasses(ab[eq+1:]) {
-				eb.reset()
-				eb.putStr("finc1 check: invalid --passes value ")
-				putQuoted(eb, ab[eq+1:])
-				eb.putStr(" (want types, all or a list of passes)\n")
-				if err := flushErr(io); err != nil {
+				if err := sayf(io, formatTo(mbuf[:], "finc1 check: invalid --passes value %v (want types, all or a list of passes)\n", Quoted(ab[eq+1:]))); err != nil {
 					return err
 				}
 				return ErrParse
@@ -585,11 +549,7 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 			continue
 		}
 		if !bytesEqual(name, strBytes("comptime-fuel")) {
-			eb.reset()
-			eb.putStr("flag provided but not defined: -")
-			eb.putBytes(name)
-			eb.putByte('\n')
-			if err := flushErr(io); err != nil {
+			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: -%s\n", name)); err != nil {
 				return err
 			}
 			return checkUsage(io)
@@ -610,11 +570,7 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 		}
 		v, ok := parseU64(strBytes(val))
 		if !ok {
-			eb.reset()
-			eb.putStr("invalid value ")
-			putQuoted(eb, strBytes(val))
-			eb.putStr(" for flag -comptime-fuel: parse error\n")
-			if err := flushErr(io); err != nil {
+			if err := sayf(io, formatTo(mbuf[:], "invalid value %v for flag -comptime-fuel: parse error\n", Quoted(strBytes(val)))); err != nil {
 				return err
 			}
 			return checkUsage(io)
@@ -715,12 +671,7 @@ driver func checkPath(fs FS, io Stdio, path string) error {
 var semaStats bool
 
 func statLine(o *OutBuf, what string, used usize, capacity usize) {
-	o.putStr(what)
-	o.putStr(": ")
-	o.putUint(u64(used))
-	o.putStr(" / ")
-	o.putUint(u64(capacity))
-	o.putByte('\n')
+	putMsg(o, formatTo(mbuf[:], "%s: %d / %d\n", what, used, capacity))
 }
 
 // printStats writes the arena usage (hidden flag --stats; capacity
@@ -864,10 +815,7 @@ driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
 	ipb := importPathOf(spec)
 	ip := bytesToStr(ipb)
 	if !validImportPath(strBytes(ip)) {
-		mreset()
-		ms("invalid import path ")
-		mquote(strBytes(ip))
-		errAt(E2001, pathLit)
+		errAt(E2001, pathLit, formatTo(mbuf[:], "invalid import path %v", Quoted(strBytes(ip))))
 		return 0, nil
 	}
 	// std/... resolves against $FINCROOT when it is set (finc0:
@@ -886,35 +834,19 @@ driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
 	for p := usize(1); p < n; p++ {
 		if strEq(pkgs.items[p].key, dir) {
 			if pkgs.items[p].state == 1 {
-				mreset()
-				ms("import cycle not allowed: ")
-				mquote(strBytes(ip))
-				ms(" imports itself (directly or indirectly)")
-				errAt(E2006, pathLit)
+				errAt(E2006, pathLit, formatTo(mbuf[:], "import cycle not allowed: %v imports itself (directly or indirectly)", Quoted(strBytes(ip))))
 				return 0, nil
 			}
 			return u32(p), nil
 		}
 	}
 	if !fs.IsDir(dir) {
-		mreset()
-		ms("cannot find package ")
-		mquote(strBytes(ip))
-		ms(" (no directory ")
-		ms(dir)
-		ms(")")
-		errAt(E2001, pathLit)
+		errAt(E2001, pathLit, formatTo(mbuf[:], "cannot find package %v (no directory %s)", Quoted(strBytes(ip)), dir))
 		return 0, nil
 	}
 	cnt, lerr := fs.ListSourceFiles(dir, fileNames[:])
 	if lerr != nil || cnt == 0 {
-		mreset()
-		ms("cannot find package ")
-		mquote(strBytes(ip))
-		ms(" (no .fc files in ")
-		ms(dir)
-		ms(")")
-		errAt(E2001, pathLit)
+		errAt(E2001, pathLit, formatTo(mbuf[:], "cannot find package %v (no .fc files in %s)", Quoted(strBytes(ip)), dir))
 		return 0, nil
 	}
 	f0, f1, _, err := parseSources(fs, io, dir, true)

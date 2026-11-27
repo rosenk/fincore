@@ -54,25 +54,10 @@ func catStr(a string, b string) string {
 	return bytesToStr(bScratch[:n])
 }
 
-func cat3(a string, b string, c string) string {
-	n := copy(bScratch[:], strBytes(a))
-	n += copy(bScratch[n:], strBytes(b))
-	n += copy(bScratch[n:], strBytes(c))
-	return bytesToStr(bScratch[:n])
-}
-
 func uintStr(v u64) string {
 	var nb [24]byte
 	n, _ := formatUint(v, nb[:])
 	return bytesToStr(nb[:n])
-}
-
-// intStr formats an int (exit codes).
-func intStr(v int) string {
-	if v < 0 {
-		return catStr("-", uintStr(u64(0-v)))
-	}
-	return uintStr(u64(v))
 }
 
 func hasSuffixStr(s string, suf string) bool {
@@ -148,14 +133,6 @@ driver func emsg(io Stdio, s string) error {
 	return io.WriteStderr(strBytes(s))
 }
 
-driver func emsg3(io Stdio, a string, b string, c string) error {
-	eb := &errBuf
-	eb.reset()
-	eb.putStr(a)
-	eb.putStr(b)
-	eb.putStr(c)
-	return flushErr(io)
-}
 
 // ---------------------------------------------------------------------------
 // Flags (Go flag package syntax)
@@ -245,7 +222,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 		isStr := withOut && (cgBytesIs(fname, "o") || cgBytesIs(fname, "emit-go"))
 		isFuel := cgBytesIs(fname, "comptime-fuel")
 		if !isBool && !isStr && !isFuel {
-			if err := emsg3(io, "flag provided but not defined: -", bytesToStr(fname), "\n"); err != nil {
+			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: -%s\n", fname)); err != nil {
 				return 0, err
 			}
 			if err := buildUsage(io, name, withOut); err != nil {
@@ -258,7 +235,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 			if hasVal {
 				bv, ok := parseBoolStr(strBytes(val))
 				if !ok {
-					if err := emsg3(io, "invalid boolean value ", catStr(cat3("\"", val, "\""), cat3(" for -", bytesToStr(fname), ": parse error\n")), ""); err != nil {
+					if err := sayf(io, formatTo(mbuf[:], "invalid boolean value %v for -%s: parse error\n", Quoted(strBytes(val)), fname)); err != nil {
 						return 0, err
 					}
 					if err := buildUsage(io, name, withOut); err != nil {
@@ -277,7 +254,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 		}
 		if !hasVal {
 			if i >= to {
-				if err := emsg3(io, "flag needs an argument: -", bytesToStr(fname), "\n"); err != nil {
+				if err := sayf(io, formatTo(mbuf[:], "flag needs an argument: -%s\n", fname)); err != nil {
 					return 0, err
 				}
 				if err := buildUsage(io, name, withOut); err != nil {
@@ -298,7 +275,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 		}
 		v, ok := parseU64(strBytes(val))
 		if !ok {
-			if err := emsg3(io, "invalid value \"", val, "\" for flag -comptime-fuel: parse error\n"); err != nil {
+			if err := sayf(io, formatTo(mbuf[:], "invalid value %v for flag -comptime-fuel: parse error\n", Quoted(strBytes(val)))); err != nil {
 				return 0, err
 			}
 			if err := buildUsage(io, name, withOut); err != nil {
@@ -309,7 +286,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 		evalFuel = v
 	}
 	if evalFuel == 0 {
-		if err := emsg3(io, "finc1 ", name, ": --comptime-fuel must be positive\n"); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc1 %s: --comptime-fuel must be positive\n", name)); err != nil {
 			return 0, err
 		}
 		return 0, ErrParse
@@ -432,7 +409,7 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 		}
 		if !isRoot {
 			if !quiet {
-				_ = emsg3(io, "finc1: FINCORE_ROOT=", r, " does not contain the fincore go.mod\n")
+				_ = sayf(io, formatTo(mbuf[:], "finc1: FINCORE_ROOT=%s does not contain the fincore go.mod\n", r))
 			}
 			return ""
 		}
@@ -510,12 +487,7 @@ driver func compileGo(fs FS, io Stdio, src string) error {
 		if semaFull {
 			return capacityFail(io, src, semaFullWhat)
 		}
-		eb := &errBuf
-		eb.reset()
-		eb.putStr("finc1: ")
-		eb.putBytes(cgErrBuf.data[:cgErrBuf.len])
-		eb.putByte('\n')
-		if err := flushErr(io); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc1: %s\n", cgErrBuf.data[:cgErrBuf.len])); err != nil {
 			return err
 		}
 		return ErrParse
@@ -534,16 +506,11 @@ driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []strin
 	}
 	eb := &errBuf
 	eb.reset()
-	eb.putStr("finc1: ")
-	eb.putStr(what)
 	if err != nil {
-		eb.putStr(": cannot run ")
-		eb.putStr(bin)
+		putMsg(eb, formatTo(mbuf[:], "finc1: %s: cannot run %s\n", what, bin))
 	} else {
-		eb.putStr(": exit status ")
-		eb.putStr(intStr(st.Code))
+		putMsg(eb, formatTo(mbuf[:], "finc1: %s: exit status %d\n", what, st.Code))
 	}
-	eb.putByte('\n')
 	putStripped(eb, execErr[:n], strip)
 	eb.putByte('\n')
 	if e := flushErr(io); e != nil {
@@ -596,22 +563,16 @@ driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string,
 	}
 	absOut := absPath(env, out)
 	if len(strBytes(absOut)) == 0 {
-		_ = emsg3(io, "finc1: cannot make ", out, " absolute ($PWD is not set)\n")
+		_ = sayf(io, formatTo(mbuf[:], "finc1: cannot make %s absolute ($PWD is not set)\n", out))
 		return ErrNotFound
 	}
 	_, goVer := goModInfo(fs, root)
 	if len(strBytes(goVer)) == 0 {
 		goVer = "1.22"
 	}
-	mb := &tmpBuf
-	mb.reset()
-	mb.putStr("module fincprog\n\ngo ")
-	mb.putStr(goVer)
-	mb.putStr("\n\nrequire fincore v0.0.0\n\nreplace fincore => ")
-	mb.putStr(root)
-	mb.putStr("\n")
+	gm := formatTo(mbuf[:], "module fincprog\n\ngo %s\n\nrequire fincore v0.0.0\n\nreplace fincore => %s\n", goVer, root)
 	gomod := joinPath(dir, "go.mod")
-	if err := fs.WriteFile(gomod, tmpBuf.data[:tmpBuf.len]); err != nil {
+	if err := fs.WriteFile(gomod, mbuf[:gm]); err != nil {
 		return ioFail(io, "write ", gomod, err)
 	}
 	if bRace {
@@ -1076,14 +1037,11 @@ func addDiagLine(line []byte) {
 	}
 }
 
-func putDiagCode(o *OutBuf, code u64) {
-	o.putStr("E")
-	var cb [8]byte
-	n, _ := formatUint(code, cb[:])
-	for z := n; z < 4; z++ {
-		o.putByte('0')
-	}
-	o.putBytes(cb[:n])
+// DiagCode renders a diagnostic code as E####.
+type DiagCode u64
+
+func (c DiagCode) Format(dst []byte) usize {
+	return formatTo(dst, "E%04d", u64(c))
 }
 
 // runFailTest checks a fail test; the failure message (empty = pass) is
@@ -1106,9 +1064,7 @@ driver func runFailTest(exec Exec, self string, src string) {
 	defer cancel()
 	st, n, err := exec.Run(ctx, self, argv[:k], envs[:0], "", execErr[:])
 	if err != nil {
-		mb.putStr("cannot run ")
-		mb.putStr(self)
-		mb.putStr("\n")
+		putMsg(mb, formatTo(mbuf[:], "cannot run %s\n", self))
 		return
 	}
 	if st.Code == 0 {
@@ -1118,13 +1074,7 @@ driver func runFailTest(exec Exec, self string, src string) {
 			if i > 0 {
 				mb.putByte(' ')
 			}
-			mb.putByte('{')
-			mb.putStr(wantFile[i])
-			mb.putByte(' ')
-			mb.putUint(wantLine[i])
-			mb.putByte(' ')
-			putDiagCode(mb, wantCode[i])
-			mb.putByte('}')
+			putMsg(mb, formatTo(mbuf[:], "{%s %d %v}", wantFile[i], wantLine[i], DiagCode(wantCode[i])))
 		}
 		mb.putStr("]")
 		return
@@ -1141,24 +1091,12 @@ driver func runFailTest(exec Exec, self string, src string) {
 			}
 		}
 		if !found {
-			mb.putStr("missing diagnostic ")
-			mb.putStr(wantFile[i])
-			mb.putByte(':')
-			mb.putUint(wantLine[i])
-			mb.putStr(": error[")
-			putDiagCode(mb, wantCode[i])
-			mb.putStr("]\n")
+			putMsg(mb, formatTo(mbuf[:], "missing diagnostic %s:%d: error[%v]\n", wantFile[i], wantLine[i], DiagCode(wantCode[i])))
 		}
 	}
 	for q := usize(0); q < ng; q++ {
 		if gotLive[q] {
-			mb.putStr("unexpected diagnostic ")
-			mb.putStr(gotFile[q])
-			mb.putByte(':')
-			mb.putUint(gotLine[q])
-			mb.putStr(": error[")
-			putDiagCode(mb, gotCode[q])
-			mb.putStr("]\n")
+			putMsg(mb, formatTo(mbuf[:], "unexpected diagnostic %s:%d: error[%v]\n", gotFile[q], gotLine[q], DiagCode(gotCode[q])))
 		}
 	}
 	if tmpBuf.len > 0 {
@@ -1201,9 +1139,7 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 	}
 	wn, werr := fs.ReadFileInto(outPath, testBuf[:])
 	if werr != nil {
-		mb.putStr("missing expected output: open ")
-		mb.putStr(outPath)
-		mb.putStr(": no such file or directory")
+		putMsg(mb, formatTo(mbuf[:], "missing expected output: open %s: no such file or directory", outPath))
 		return
 	}
 	stdoutFile := joinPath(work, catStr(catStr("t", uintStr(u64(idx))), ".stdout"))
@@ -1214,14 +1150,12 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 	rctx := ctx.WithTimeout(30 * Second)
 	st2, n2, err2 := exec.Run(rctx, "/bin/sh", argv[:4], envs[:0], work, execErr[:])
 	if err2 != nil || st2.Code != 0 {
-		mb.putStr("run: ")
 		if err2 == ErrTimeout {
-			mb.putStr("signal: killed")
+			mb.putStr("run: signal: killed")
 		} else if err2 != nil {
-			mb.putStr("cannot run")
+			mb.putStr("run: cannot run")
 		} else {
-			mb.putStr("exit status ")
-			mb.putStr(intStr(st2.Code))
+			putMsg(mb, formatTo(mbuf[:], "run: exit status %d", st2.Code))
 		}
 		mb.putStr("\nstderr:\n")
 		mb.putBytes(execErr[:n2])
@@ -1257,7 +1191,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		if nops == 0 && (strEq(a, "-v") || strEq(a, "--v") || strEq(a, "-v=true") || strEq(a, "--v=true")) {
 			verbose = true
 		} else if nops == 0 && len(strBytes(a)) > 1 && strBytes(a)[0] == '-' {
-			if err := emsg3(io, "flag provided but not defined: ", a, "\n"); err != nil {
+			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
 				return err
 			}
 			return testUsage(io)
@@ -1270,7 +1204,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		return testUsage(io)
 	}
 	if !fs.IsDir(dir) {
-		if err := emsg3(io, "finc1 test: ", dir, " is not a directory\n"); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc1 test: %s is not a directory\n", dir)); err != nil {
 			return err
 		}
 		return ErrParse
@@ -1295,7 +1229,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		return ioFail(io, "open ", dir, err)
 	}
 	if nTests == 0 {
-		if err := emsg3(io, "finc1 test: no tests in ", dir, "\n"); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc1 test: no tests in %s\n", dir)); err != nil {
 			return err
 		}
 		return ErrNotFound
@@ -1340,15 +1274,11 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		if bad || verbose {
 			o := &outBuf
 			o.reset()
+			status := "ok"
 			if bad {
-				o.putStr("FAIL ")
-			} else {
-				o.putStr("ok   ")
+				status = "FAIL"
 			}
-			o.putStr(kind)
-			o.putByte(' ')
-			o.putStr(tName[i])
-			o.putByte('\n')
+			putMsg(o, formatTo(mbuf[:], "%-4s %s %s\n", status, kind, tName[i]))
 			if bad {
 				// indent the message lines
 				tl := tmpBuf.len
@@ -1376,15 +1306,8 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		}
 	}
 	_ = fs.RemoveAll(work)
-	o := &outBuf
-	o.reset()
-	o.putUint(u64(n))
-	o.putStr(" tests, ")
-	o.putUint(u64(n - failed))
-	o.putStr(" passed, ")
-	o.putUint(u64(failed))
-	o.putStr(" failed\n")
-	if err := io.WriteStdout(outBuf.data[:outBuf.len]); err != nil {
+	k := formatTo(mbuf[:], "%d tests, %d passed, %d failed\n", n, n-failed, failed)
+	if err := io.WriteStdout(mbuf[:k]); err != nil {
 		return err
 	}
 	if failed > 0 {
