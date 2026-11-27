@@ -2,6 +2,7 @@
 //
 //	finc parse [--dump-ast] <file.fc | dir>
 //	finc check | build | run | test   (build/run/test: build.fc)
+//	finc fmt [-w] [-l] [-d] [--check] <file.fc | dir>...   (fmt.fc)
 //	finc version                      (also --version)
 //
 // `parse` mirrors `finc0 parse`: all `.fc` files of a directory (sorted by
@@ -28,6 +29,7 @@ const (
 // (LangMajor.LangMinor). `finc version` prints it and `finc test` skips
 // tests whose `// SINCE: vX.Y` header names a newer version. finc0 is
 // frozen at v0.2; bump these when compiler/ starts a new language version.
+// Tooling (`fmt`, `--context`) is not language and does not bump it.
 const (
 	LangVersion = "0.2"
 	LangMajor   = 0
@@ -84,7 +86,7 @@ driver func usage(io Stdio, toStderr bool) error {
 	if err := say(io, toStderr, "  finc1 parse [--dump-ast] <file.fc | dir>\n      parse sources and optionally dump the AST\n"); err != nil {
 		return err
 	}
-	if err := say(io, toStderr, "  finc1 check [--comptime-fuel=N] <file.fc | dir>\n      type, scope and totality check\n"); err != nil {
+	if err := say(io, toStderr, "  finc1 check [--comptime-fuel=N] [--context] <file.fc | dir>\n      type, scope and totality check\n"); err != nil {
 		return err
 	}
 	if err := say(io, toStderr, "  finc1 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n      compile to a Go program and binary\n"); err != nil {
@@ -94,6 +96,9 @@ driver func usage(io Stdio, toStderr bool) error {
 		return err
 	}
 	if err := say(io, toStderr, "  finc1 test <dir>\n      run conformance tests in a directory\n"); err != nil {
+		return err
+	}
+	if err := say(io, toStderr, "  finc1 fmt [-w] [-l] [-d] [--check] <file.fc | dir>...\n      format sources (docs/fmt.md)\n"); err != nil {
 		return err
 	}
 	return say(io, toStderr, "  finc1 version\n      print the FinCore language version\n")
@@ -128,6 +133,9 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	if r, ok := env.GetEnv("FINCROOT"); ok {
 		fincRoot = r
 	}
+	if v, ok := env.GetEnv("FINC_DIAG"); ok && strEq(v, "context") {
+		diagContext = true
+	}
 	argc := env.ArgsCount()
 	if argc < 2 {
 		if err := usage(io, true); err != nil {
@@ -153,6 +161,9 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	}
 	if strEq(cmd, "test") {
 		return runTest(fs, env, io, exec)
+	}
+	if strEq(cmd, "fmt") {
+		return runFmt(fs, env, io, exec)
 	}
 	if strEq(cmd, "version") || strEq(cmd, "--version") {
 		if argc != 2 {
@@ -402,7 +413,7 @@ driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize
 // check
 
 driver func checkUsage(io Stdio) error {
-	if err := say(io, true, "usage: finc1 check [--comptime-fuel=N] <file.fc | dir>\n  -comptime-fuel uint\n    \tcomptime fuel budget per evaluation (default 1000000)\n"); err != nil {
+	if err := say(io, true, "usage: finc1 check [--comptime-fuel=N] [--context] <file.fc | dir>\n  -comptime-fuel uint\n    \tcomptime fuel budget per evaluation (default 1000000)\n  -context\n    \tshow the source line, a caret span and a hint after each diagnostic (also FINC_DIAG=context)\n"); err != nil {
 		return err
 	}
 	return ErrParse
@@ -447,6 +458,10 @@ driver func runCheck(fs FS, env Env, io Stdio) error {
 		name := ab[st:eq]
 		if bytesEqual(name, "stats") && eq == len(ab) {
 			semaStats = true
+			continue
+		}
+		if bytesEqual(name, "context") && eq == len(ab) {
+			diagContext = true
 			continue
 		}
 		if bytesEqual(name, "passes") && eq < len(ab) {
@@ -507,6 +522,9 @@ driver func printDiags(io Stdio) error {
 	for i := usize(0); i < n; i++ {
 		errBuf.WriteBytes(diagLine(usize(diags.order[i])))
 		errBuf.WriteByte('\n')
+		if diagContext {
+			putDiagContext(&errBuf, usize(diags.order[i]))
+		}
 		if errBuf.Len() > MaxOutputBytes/2 {
 			if err := flushErr(io); err != nil {
 				return err

@@ -1,0 +1,25 @@
+// SINCE: v0.3
+// context: E4002 for a loop (multi-line span: the first line is
+// underlined up to its trailing comment) and for a recursion, with hints.
+package main
+
+func spin(n u32) u32 {
+	x := n
+	for x > 0 { // the loop never shrinks x
+		x = x + 1
+	}
+	return x
+}
+
+func down(n u32) u32 {
+	if n == 0 {
+		return 0
+	}
+	return down(n - 1)
+}
+
+driver func main(io Stdio) error {
+	_ = spin(1)
+	_ = down(1)
+	return nil
+}

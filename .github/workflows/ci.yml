@@ -50,3 +50,5 @@ jobs:
         run: make diff-prev
       - name: integration
         run: make integration
+      - name: tooling (fmt idempotence + AST equivalence, --context golden tests)
+        run: make fmt-fc-check context-test

@@ -1,0 +1,4 @@
+testdata/context/leak.fc:14:2: error[E3005]: Linear resource conn (Conn) is not closed, released or moved on every path
+   14 |     conn, aerr := ln.Accept(ctx)
+      |     ^^^^
+      = help: close, release or move the resource on every path (for example `defer r.Close()` right after acquiring it)
