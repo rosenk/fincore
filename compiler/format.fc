@@ -1,0 +1,982 @@
+// format.fc — the v0.2 builtin formatTo(dst []byte, format string,
+// args...) usize (port of finc0's types/format.go, the formatTo parts of
+// codegen/golang/expr.go and comptime.go, and runtime/fincrt/fmt.go for the
+// comptime evaluator). See docs/semantics_decisions.md, "v0.2 additions".
+//
+// The format is a constant string. It is parsed lazily, one piece at a time
+// (fmtNext), by the checker, the code generator and the comptime evaluator;
+// finc0 parses it once into a piece list (types.ParseFormat) with the same
+// result. The checker records, per formatted argument, the write operation
+// and the Format method (Call.fmtS/fmtN: (op, method) pairs in ulists).
+package main
+
+// Write operations (types.FormatOp), aligned with finc0.
+const (
+	FmtNone       = 0
+	FmtInt        = 1
+	FmtUint       = 2
+	FmtHexInt     = 3
+	FmtHexUint    = 4
+	FmtStr        = 5
+	FmtBytes      = 6
+	FmtQuoteStr   = 7
+	FmtQuoteBytes = 8
+	FmtByte       = 9
+	FmtBool       = 10
+	FmtFormat     = 11
+
+	MaxFormatWidth = 64
+)
+
+// Piece kinds and format errors.
+const (
+	FdEnd  = 0
+	FdLit  = 1 // literal text [start, end), `%%` still escaped
+	FdVerb = 2 // directive [start, end)
+	FdErr  = 3 // malformed directive [start, end)
+
+	FeIncomplete = 1
+	FeUnknown    = 2
+	FePercent    = 3
+	FeWidth      = 4
+	FeZero       = 5
+)
+
+type FmtDir struct {
+	kind  u8
+	err   u8
+	verb  byte
+	left  bool
+	zero  bool
+	width u32
+	start usize
+	end   usize
+}
+
+// fmtNext parses the piece of s that starts at i. A literal piece is the
+// longest run of text and `%%` escapes (finc0 merges them into one piece).
+func fmtNext(s []byte, i usize) FmtDir {
+	var d FmtDir
+	n := len(s)
+	d.start = i
+	d.end = i
+	if i >= n {
+		return d
+	}
+	j := i
+	if s[i] != '%' || (i+1 < n && s[i+1] == '%') {
+		for g := usize(0); g < n; g++ {
+			if j >= n {
+				break
+			}
+			if s[j] != '%' {
+				j++
+				continue
+			}
+			if j+1 < n && s[j+1] == '%' {
+				j += 2
+				continue
+			}
+			break
+		}
+		d.kind = FdLit
+		d.end = j
+		return d
+	}
+	j = i + 1
+	for g := usize(0); g < n; g++ {
+		if j >= n || (s[j] != '-' && s[j] != '0') {
+			break
+		}
+		if s[j] == '-' {
+			d.left = true
+		} else {
+			d.zero = true
+		}
+		j++
+	}
+	hasWidth := false
+	for g := usize(0); g < n; g++ {
+		if j >= n || s[j] < '0' || s[j] > '9' {
+			break
+		}
+		hasWidth = true
+		if d.width <= MaxFormatWidth {
+			d.width = d.width*10 + u32(s[j]-'0')
+		}
+		j++
+	}
+	d.kind = FdErr
+	if j >= n {
+		d.err = FeIncomplete
+		d.end = n
+		return d
+	}
+	v := s[j]
+	d.end = j + 1
+	if v == '%' {
+		d.err = FePercent
+		return d
+	}
+	if v != 'd' && v != 'x' && v != 's' && v != 'c' && v != 'q' && v != 'v' {
+		d.err = FeUnknown
+		return d
+	}
+	if hasWidth && d.width > MaxFormatWidth {
+		d.err = FeWidth
+		return d
+	}
+	if d.zero && v != 'd' && v != 'x' {
+		d.err = FeZero
+		return d
+	}
+	d.kind = FdVerb
+	d.verb = v
+	return d
+}
+
+// fmtErrMsg writes the message of a malformed directive into msgBuf.
+func fmtErrMsg(s []byte, d FmtDir) {
+	mreset()
+	ms("invalid format for formatTo: ")
+	dir := s[d.start:d.end]
+	if d.err == FeIncomplete {
+		ms("incomplete directive ")
+		mquote(dir)
+		ms(" at the end of the format")
+	} else if d.err == FeUnknown {
+		ms("unknown verb in directive ")
+		mquote(dir)
+	} else if d.err == FePercent {
+		ms("directive ")
+		mquote(dir)
+		ms(" cannot have flags or a width")
+	} else if d.err == FeWidth {
+		ms("width in directive ")
+		mquote(dir)
+		ms(" exceeds 64")
+	} else {
+		ms("flag 0 in directive ")
+		mquote(dir)
+		ms(" is only valid with %d and %x")
+	}
+}
+
+// fmtCount validates s and returns its number of directives; on a
+// malformed directive it reports E2002 at node `at` and returns false.
+func fmtCount(s []byte, at u32) (usize, bool) {
+	n := len(s)
+	i := usize(0)
+	cnt := usize(0)
+	for g := usize(0); g < n+1; g++ {
+		d := fmtNext(s, i)
+		if d.kind == FdEnd {
+			break
+		}
+		if d.kind == FdErr {
+			fmtErrMsg(s, d)
+			errAt(E2002, at)
+			return 0, false
+		}
+		if d.kind == FdVerb {
+			cnt++
+		}
+		i = d.end
+	}
+	return cnt, true
+}
+
+// fmtFormatString returns the constant format of a checked formatTo call.
+func fmtFormatString(e u32) []byte {
+	s := nval[usize(l1at(e, 1))]
+	if s == 0 || vals.items[usize(s)].kind != VString {
+		return emptyBytes()
+	}
+	return strOf(slotGet(s))
+}
+
+func fmtArgOp(c u32, k usize) u8 {
+	return u8(uat(callTab.items[usize(c)].fmtS, 2*k))
+}
+
+func fmtArgMethod(c u32, k usize) u32 {
+	return uat(callTab.items[usize(c)].fmtS, 2*k+1)
+}
+
+// ---------------------------------------------------------------------------
+// Type checking (types/format.go)
+
+func fmtIntOp(t u32, hex bool) u8 {
+	if hex && isUnsigned(t) {
+		return FmtHexUint
+	}
+	if hex {
+		return FmtHexInt
+	}
+	if isUnsigned(t) {
+		return FmtUint
+	}
+	return FmtInt
+}
+
+// isByteSliceT: t's underlying type is []u8.
+func isByteSliceT(t u32) bool {
+	u := underlying(t)
+	return tk(u) == TCSlice && elemOf(u) == TyU8
+}
+
+// formatMethodOK: m is a value-receiver, total `Format(dst []byte) usize`.
+func formatMethodOK(m u32) bool {
+	r := meths.items[usize(m)]
+	if r.ptrRecv || r.builtin != 0 || r.sig == 0 {
+		return false
+	}
+	s := r.sig
+	return sigEffect(s) == EffTotal && !sigVariadic(s) && sigNParams(s) == 1 && sigNResults(s) == 1 &&
+		sigParam(s, 0) == mkSlice(TyU8) && sigResult(s, 0) == TyUsize
+}
+
+// formatCall checks a formatTo call (Checker.formatCall).
+func formatCall(e u32, ci u32, dp usize) Operand decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return invalidOp(e)
+	}
+	ctx := Ctx{kind: CtxArgBuiltin, a: u32(BFFormatTo), b: 0}
+	n := l1len(e)
+	if n < 2 {
+		mreset()
+		ms("not enough arguments in call to formatTo: have ")
+		mu(u64(n))
+		ms(", want at least 2")
+		errAt(E2003, e)
+		useArgs(e, 0, dp-1)
+		return invalidOp(e)
+	}
+	ok := true
+	d := exprValue(l1at(e, 0), dp-1)
+	if isInvalidOp(&d) || !assignment(&d, mkSlice(TyU8), ctx) {
+		ok = false
+	}
+	a1 := l1at(e, 1)
+	fx := exprValue(a1, dp-1)
+	fok := true
+	if isInvalidOp(&fx) || !assignment(&fx, TyString, ctx) {
+		ok = false
+		fok = false
+	} else if fx.mode != KConst || fx.val.kind == VNone {
+		mreset()
+		ms("format argument ")
+		mexpr(a1)
+		ms(" to formatTo must be a constant string")
+		errAt(E2002, a1)
+		ok = false
+		fok = false
+	}
+	mark := opStack.top
+	for i := usize(2); i < n; i++ {
+		opPush(exprValue(l1at(e, i), dp-1))
+	}
+	nargs := n - 2
+	s := emptyBytes()
+	if fok {
+		s = strOf(fx.val)
+		cnt, good := fmtCount(s, a1)
+		if !good {
+			fok = false
+		} else if cnt != nargs {
+			mreset()
+			ms("wrong number of arguments for format ")
+			mquote(s)
+			ms(" in call to formatTo: have ")
+			mu(u64(nargs))
+			ms(", want ")
+			mu(u64(cnt))
+			errAt(E2003, a1)
+			fok = false
+		}
+	}
+	if !fok {
+		for k := usize(0); k < nargs; k++ {
+			x := opStack.items[mark+k]
+			if !isInvalidOp(&x) {
+				_ = defaultTypeOp(&x, ctx)
+			}
+			opStack.items[mark+k] = x
+		}
+		opStack.top = mark
+		return opMode(KValue, TyUsize)
+	}
+	umark := ustack.count
+	ln := len(s)
+	i := usize(0)
+	k := usize(0)
+	for g := usize(0); g < ln+1; g++ {
+		p := fmtNext(s, i)
+		if p.kind == FdEnd {
+			break
+		}
+		i = p.end
+		if p.kind != FdVerb {
+			continue
+		}
+		x := opStack.items[mark+k]
+		arg := l1at(e, 2+k)
+		k++
+		op := u8(FmtNone)
+		m := u32(0)
+		if !isInvalidOp(&x) {
+			if isUntyped(x.typ) {
+				if p.verb == 'c' {
+					_ = convertUntyped(&x, TyU8)
+				} else {
+					_ = defaultTypeOp(&x, ctx)
+				}
+			}
+			if !isUntyped(x.typ) && !isInvalid(x.typ) {
+				op, m = formatArg(arg, x.typ, p.verb, dp-1)
+			}
+		}
+		if op == FmtNone {
+			ok = false
+		}
+		upush(u32(op))
+		upush(m)
+	}
+	opStack.top = mark
+	if !ok {
+		ustack.count = umark
+		return opMode(KValue, TyUsize)
+	}
+	fs, fn := ucommit(umark)
+	callTab.items[usize(ci)].fmtOK = true
+	callTab.items[usize(ci)].fmtS = fs
+	callTab.items[usize(ci)].fmtN = fn
+	return opMode(KValue, TyUsize)
+}
+
+// formatArg matches an argument of type t against verb v; it returns the
+// write operation (FmtNone after reporting an error) and the Format method.
+func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return FmtNone, 0
+	}
+	if classOfT(t) != ClassValue {
+		mreset()
+		ms("cannot format ")
+		mexpr(a)
+		ms(" (type ")
+		mtype(t)
+		ms("): formatTo arguments must be Value types")
+		errAt(E2002, a)
+		return FmtNone, 0
+	}
+	op := u8(FmtNone)
+	if v == 'd' || v == 'x' {
+		if isInteger(t) {
+			op = fmtIntOp(t, v == 'x')
+		}
+	} else if v == 's' || v == 'q' {
+		if isString(t) {
+			op = FmtStr
+		} else if isByteSliceT(t) {
+			op = FmtBytes
+		}
+		if v == 'q' && op != FmtNone {
+			op += FmtQuoteStr - FmtStr
+		}
+	} else if v == 'c' {
+		if basicKind(t) == BkU8 {
+			op = FmtByte
+		}
+	} else {
+		if tk(t) == TCNamed && builtinOf(t) == 0 {
+			m := lookupMethod(t, internStr("Format"), dp-1)
+			if m != 0 {
+				if !formatMethodOK(m) {
+					mreset()
+					ms("cannot use ")
+					mexpr(a)
+					ms(" (type ")
+					mtype(t)
+					ms(") as argument for %v in formatTo: method ")
+					mtype(t)
+					ms(".Format must be a total value-receiver method func(dst []byte) usize")
+					errAt(E2002, a)
+					return FmtNone, 0
+				}
+				return FmtFormat, m
+			}
+		}
+		if isBoolean(t) {
+			op = FmtBool
+		} else if isInteger(t) {
+			op = fmtIntOp(t, false)
+		} else if isString(t) {
+			op = FmtStr
+		} else if isByteSliceT(t) {
+			op = FmtBytes
+		}
+	}
+	if op == FmtNone {
+		mreset()
+		ms("cannot use ")
+		mexpr(a)
+		ms(" (type ")
+		mtype(t)
+		ms(") as argument for %")
+		mbyte(v)
+		ms(" in formatTo")
+		errAt(E2002, a)
+		return FmtNone, 0
+	}
+	return op, 0
+}
+
+// ---------------------------------------------------------------------------
+// Code generation (codegen/golang expr.go: formatTo)
+
+// cgFmtParamType is formatParamType: the Go parameter type (and
+// conversion) of a non-Format argument.
+func cgFmtParamType(op u8) string {
+	if op == FmtInt || op == FmtHexInt {
+		return "int64"
+	}
+	if op == FmtUint || op == FmtHexUint {
+		return "uint64"
+	}
+	if op == FmtStr || op == FmtQuoteStr {
+		return "string"
+	}
+	if op == FmtBytes || op == FmtQuoteBytes {
+		return "[]byte"
+	}
+	if op == FmtByte {
+		return "byte"
+	}
+	if op == FmtBool {
+		return "bool"
+	}
+	return "_"
+}
+
+// cgWFmtLit writes strconv.Quote of a literal piece with `%%` unescaped.
+func cgWFmtLit(raw []byte) {
+	o := &cgBuf
+	o.putByte('"')
+	n := len(raw)
+	st := usize(0)
+	j := usize(0)
+	for g := usize(0); g < n; g++ {
+		if j >= n {
+			break
+		}
+		if raw[j] == '%' {
+			putQuotedBody(o, raw[st:j])
+			o.putByte('%')
+			j += 2
+			st = j
+			continue
+		}
+		j++
+	}
+	if st < n {
+		putQuotedBody(o, raw[st:n])
+	}
+	o.putByte('"')
+}
+
+// cgWFmtWidth writes strconv.Itoa(FormatWidth()).
+func cgWFmtWidth(p FmtDir) {
+	if p.left && p.width > 0 {
+		cgWc('-')
+	}
+	cgWu(u64(p.width))
+}
+
+func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	n := l1len(e)
+	ci := callTab.items[usize(c)]
+	if !ci.fmtOK || n < 2 || usize(ci.fmtN) != 2*(n-2) {
+		cgFail(e, "formatTo without format information")
+		return
+	}
+	nargs := n - 2
+	cgW("func(_fc_d []byte")
+	for k := usize(0); k < nargs; k++ {
+		cgW(", _fc_a")
+		cgWu(u64(k))
+		cgWc(' ')
+		op := fmtArgOp(c, k)
+		if op == FmtFormat {
+			a := l1at(e, 2+k)
+			cgGoType(a, ntype[usize(a)], dp-1)
+		} else {
+			cgW(cgFmtParamType(op))
+		}
+	}
+	cgW(") uint { _fc_w := ")
+	cgRt("NewFmt")
+	cgW("(_fc_d); ")
+	s := fmtFormatString(e)
+	ln := len(s)
+	i := usize(0)
+	k := usize(0)
+	for g := usize(0); g < ln+1; g++ {
+		p := fmtNext(s, i)
+		if p.kind == FdEnd {
+			break
+		}
+		i = p.end
+		if p.kind == FdLit {
+			cgW("_fc_w.Lit(")
+			cgWFmtLit(s[p.start:p.end])
+			cgW("); ")
+			continue
+		}
+		if p.kind != FdVerb || k >= nargs {
+			cgFail(e, "formatTo without format information")
+			return
+		}
+		op := fmtArgOp(c, k)
+		cgW("_fc_w.")
+		if op == FmtInt {
+			cgW("Int(")
+		} else if op == FmtUint {
+			cgW("Uint(")
+		} else if op == FmtHexInt {
+			cgW("HexInt(")
+		} else if op == FmtHexUint {
+			cgW("Hex(")
+		} else if op == FmtStr {
+			cgW("Str(")
+		} else if op == FmtBytes {
+			cgW("Bytes(")
+		} else if op == FmtQuoteStr {
+			cgW("Quote(")
+		} else if op == FmtQuoteBytes {
+			cgW("QuoteBytes(")
+		} else if op == FmtByte {
+			cgW("Byte(")
+		} else if op == FmtBool {
+			cgW("Bool(")
+		} else if op == FmtFormat {
+			cgW("Advance(")
+		} else {
+			cgFail(e, "formatTo argument without a format operation")
+			return
+		}
+		cgW("_fc_a")
+		cgWu(u64(k))
+		if op == FmtFormat {
+			cgWc('.')
+			cgWSymName(meths.items[usize(fmtArgMethod(c, k))].sym)
+			cgW("(_fc_w.Dst(")
+			cgWFmtWidth(p)
+			cgW(")), ")
+			cgWFmtWidth(p)
+		} else {
+			cgW(", ")
+			cgWFmtWidth(p)
+			if op == FmtInt || op == FmtUint || op == FmtHexInt || op == FmtHexUint {
+				if p.zero {
+					cgW(", true")
+				} else {
+					cgW(", false")
+				}
+			}
+		}
+		cgW("); ")
+		k++
+	}
+	cgW("return _fc_w.N() }(")
+	cgExpr(l1at(e, 0), dp-1)
+	for k2 := usize(0); k2 < nargs; k2++ {
+		a := l1at(e, 2+k2)
+		op := fmtArgOp(c, k2)
+		cgW(", ")
+		if op == FmtFormat {
+			cgExpr(a, dp-1)
+		} else {
+			cgW(cgFmtParamType(op))
+			cgWc('(')
+			cgExpr(a, dp-1)
+			cgWc(')')
+		}
+	}
+	cgWc(')')
+}
+
+// ---------------------------------------------------------------------------
+// Comptime evaluation (comptime.go: formatTo, fincrt.Fmt)
+//
+// Like finc0, the writer works on a copy of dst (a heap array cfRef of
+// cfLen byte slots) that is copied back when the call ends; a %v Format
+// method gets a slice of that copy (or of the 64-byte scratch array cfScr
+// when right-justifying into less room than the width, fincrt.Fmt.Dst).
+
+var cfRef u32
+var cfLen usize
+var cfN usize
+var cfScr u32
+var cfInScr bool
+
+func cfPut(c byte) {
+	if cfN < cfLen {
+		slotSet(cfRef+u32(cfN), vIntU(u64(c)))
+		cfN++
+	}
+}
+
+func cfFill(c byte, k usize) {
+	for i := usize(0); i < k; i++ {
+		cfPut(c)
+	}
+}
+
+func cfPadLeft(l usize, width int) {
+	if width > 0 && usize(width) > l {
+		cfFill(' ', usize(width)-l)
+	}
+}
+
+func cfPadRight(l usize, width int) {
+	if width < 0 && usize(-width) > l {
+		cfFill(' ', usize(-width)-l)
+	}
+}
+
+func cfBytes(b []byte, width int) {
+	n := len(b)
+	cfPadLeft(n, width)
+	for i := usize(0); i < n; i++ {
+		cfPut(b[i])
+	}
+	cfPadRight(n, width)
+}
+
+func cfQuotedLen(c byte) usize {
+	if c == '\n' || c == '\r' || c == '\t' || c == '\\' || c == '"' {
+		return 2
+	}
+	if c < 0x20 || c >= 0x7f {
+		return 4
+	}
+	return 1
+}
+
+func cfHexDigit(v u64) byte {
+	if v < 10 {
+		return byte('0' + v)
+	}
+	return byte('a' + v - 10)
+}
+
+func cfPutQuoted(c byte) {
+	if c == '\n' {
+		cfPut('\\')
+		cfPut('n')
+	} else if c == '\r' {
+		cfPut('\\')
+		cfPut('r')
+	} else if c == '\t' {
+		cfPut('\\')
+		cfPut('t')
+	} else if c == '\\' || c == '"' {
+		cfPut('\\')
+		cfPut(c)
+	} else if c < 0x20 || c >= 0x7f {
+		cfPut('\\')
+		cfPut('x')
+		cfPut(cfHexDigit(u64(c >> 4)))
+		cfPut(cfHexDigit(u64(c & 15)))
+	} else {
+		cfPut(c)
+	}
+}
+
+func cfQuote(b []byte, width int) {
+	n := len(b)
+	l := usize(2)
+	for i := usize(0); i < n; i++ {
+		l += cfQuotedLen(b[i])
+	}
+	cfPadLeft(l, width)
+	cfPut('"')
+	for i := usize(0); i < n; i++ {
+		cfPutQuoted(b[i])
+	}
+	cfPut('"')
+	cfPadRight(l, width)
+}
+
+func cfNumber(neg bool, mag u64, base u64, width int, zero bool) {
+	var tmp [24]byte
+	i := usize(24)
+	m := mag
+	for g := usize(0); g < 24; g++ {
+		i--
+		tmp[i] = cfHexDigit(m % base)
+		m = m / base
+		if m == 0 {
+			break
+		}
+	}
+	l := 24 - i
+	if neg {
+		l++
+	}
+	if zero && width > 0 {
+		if neg {
+			cfPut('-')
+		}
+		if usize(width) > l {
+			cfFill('0', usize(width)-l)
+		}
+	} else {
+		cfPadLeft(l, width)
+		if neg {
+			cfPut('-')
+		}
+	}
+	for j := i; j < 24; j++ {
+		cfPut(tmp[j])
+	}
+	cfPadRight(l, width)
+}
+
+func cfSigned(v Val, base u64, width int, zero bool) {
+	if i64(v.lo) < 0 {
+		cfNumber(true, AllOnes-v.lo+1, base, width, zero)
+	} else {
+		cfNumber(false, v.lo, base, width, zero)
+	}
+}
+
+// cfDst is fincrt.Fmt.Dst: the slice a Format method writes into.
+func cfDst(width int) Val {
+	var sl Val
+	sl.kind = VSlice
+	sl.flag = 2
+	w := width
+	if w > MaxFormatWidth {
+		w = MaxFormatWidth
+	}
+	if w > 0 && usize(w) > cfLen-cfN {
+		if cfScr == 0 {
+			cfScr = valAlloc(MaxFormatWidth, true)
+			for i := usize(0); i < MaxFormatWidth; i++ {
+				slotSet(cfScr+u32(i), vIntU(0))
+			}
+		}
+		cfInScr = true
+		sl.ref = cfScr
+		sl.aux = 0
+		sl.aux2 = u32(w)
+	} else {
+		cfInScr = false
+		sl.ref = cfRef
+		sl.aux = u32(cfN)
+		sl.aux2 = u32(cfLen)
+	}
+	sl.lo = u64(sl.aux2)
+	return sl
+}
+
+// cfAdvance is fincrt.Fmt.Advance.
+func cfAdvance(n0 u64, width int) {
+	if cfInScr {
+		cfInScr = false
+		w := width
+		if w > MaxFormatWidth {
+			w = MaxFormatWidth
+		}
+		n := usize(0)
+		if w > 0 {
+			n = usize(w)
+		}
+		if n0 < u64(n) {
+			n = usize(n0)
+		}
+		cfPadLeft(n, width)
+		for i := usize(0); i < n; i++ {
+			cfPut(byte(slotGet(cfScr + u32(i)).lo))
+		}
+		cfPadRight(n, width)
+		return
+	}
+	l := cfLen - cfN
+	if n0 < u64(l) {
+		l = usize(n0)
+	}
+	if width > 0 && usize(width) > l {
+		pad := usize(width) - l
+		start := cfN
+		for q := usize(0); q < l; q++ {
+			i := l - 1 - q
+			j := start + pad + i
+			if j < cfLen {
+				slotSet(cfRef+u32(j), slotGet(cfRef+u32(start+i)))
+			}
+		}
+		cfFill(' ', pad)
+		cfN = start + pad + l
+		if cfN > cfLen {
+			cfN = cfLen
+		}
+		return
+	}
+	cfN += l
+	cfPadRight(l, width)
+}
+
+// iformatTo runs a formatTo call whose arguments are vstack[m:]: one unit
+// of fuel per formatted argument; a Format method is interpreted like any
+// other call.
+func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
+	var z Val
+	if dp == 0 {
+		tooDeep()
+		failSilent()
+		return z
+	}
+	c := ncall[usize(e)]
+	n := vtop - m
+	if c == 0 || !callTab.items[usize(c)].fmtOK || n < 2 || usize(callTab.items[usize(c)].fmtN) != 2*(n-2) {
+		failS(E2002, "formatTo without format information")
+		return z
+	}
+	d := vstack[m]
+	dlen := usize(0)
+	if d.kind == VSlice && d.flag&2 != 0 {
+		dlen = usize(d.aux2 - d.aux)
+	}
+	saveRef := cfRef
+	saveLen := cfLen
+	saveN := cfN
+	saveScr := cfScr
+	saveIn := cfInScr
+	cfRef = valAlloc(dlen, true)
+	cfLen = dlen
+	cfN = 0
+	cfScr = 0
+	cfInScr = false
+	for i := usize(0); i < dlen; i++ {
+		slotSet(cfRef+u32(i), slotGet(d.ref+d.aux+u32(i)))
+	}
+	s := strOf(vstack[m+1])
+	ln := len(s)
+	i := usize(0)
+	k := usize(0)
+	for g := usize(0); g < ln+1; g++ {
+		p := fmtNext(s, i)
+		if p.kind == FdEnd {
+			break
+		}
+		i = p.end
+		if p.kind == FdLit {
+			raw := s[p.start:p.end]
+			rn := len(raw)
+			j := usize(0)
+			for h := usize(0); h < rn; h++ {
+				if j >= rn {
+					break
+				}
+				cfPut(raw[j])
+				if raw[j] == '%' {
+					j++
+				}
+				j++
+			}
+			continue
+		}
+		if p.kind != FdVerb || 2+k >= n {
+			failS(E2002, "formatTo without format information")
+			break
+		}
+		tick()
+		if ifail {
+			break
+		}
+		v := vstack[m+2+k]
+		op := fmtArgOp(c, k)
+		meth := fmtArgMethod(c, k)
+		k++
+		width := int(p.width)
+		if p.left {
+			width = -width
+		}
+		if op == FmtInt {
+			cfSigned(v, 10, width, p.zero)
+		} else if op == FmtHexInt {
+			cfSigned(v, 16, width, p.zero)
+		} else if op == FmtUint {
+			cfNumber(false, v.lo, 10, width, p.zero)
+		} else if op == FmtHexUint {
+			cfNumber(false, v.lo, 16, width, p.zero)
+		} else if op == FmtStr {
+			if v.kind == VString {
+				cfBytes(strOf(v), width)
+			} else {
+				cfBytes(emptyBytes(), width)
+			}
+		} else if op == FmtQuoteStr {
+			if v.kind == VString {
+				cfQuote(strOf(v), width)
+			} else {
+				cfQuote(emptyBytes(), width)
+			}
+		} else if op == FmtBytes || op == FmtQuoteBytes {
+			if !bytesOfSlice(v) {
+				break
+			}
+			if op == FmtBytes {
+				cfBytes(tmpBuf.data[:tmpBuf.len], width)
+			} else {
+				cfQuote(tmpBuf.data[:tmpBuf.len], width)
+			}
+		} else if op == FmtByte {
+			cfPadLeft(1, width)
+			cfPut(byte(v.lo))
+			cfPadRight(1, width)
+		} else if op == FmtBool {
+			if v.lo != 0 {
+				cfBytes(strBytes("true"), width)
+			} else {
+				cfBytes(strBytes("false"), width)
+			}
+		} else if op == FmtFormat {
+			am := vtop
+			vpush(cfDst(width))
+			r := icall(meths.items[usize(meth)].sym, v, true, am, vtop, e, dp-1)
+			vtop = am
+			if ifail {
+				break
+			}
+			rn, _ := valUint64(r)
+			cfAdvance(rn, width)
+		} else {
+			failS(E2002, "formatTo argument without a format operation")
+			break
+		}
+	}
+	res := vIntU(u64(cfN))
+	if !ifail {
+		for j := usize(0); j < dlen; j++ {
+			slotSet(d.ref+d.aux+u32(j), slotGet(cfRef+u32(j)))
+		}
+	}
+	cfRef = saveRef
+	cfLen = saveLen
+	cfN = saveN
+	cfScr = saveScr
+	cfInScr = saveIn
+	if ifail {
+		return z
+	}
+	return res
+}

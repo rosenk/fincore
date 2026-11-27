@@ -25,8 +25,8 @@ import (
 // root) may also change through aliases, so it conflicts with:
 //   - any call that may write memory: calls of declared functions,
 //     methods, function values and capability methods; copy/formatUint
-//     into a slice whose element type contains one of the atom's struct
-//     types;
+//     (and formatTo without a %v Format method, v0.2) into a slice whose
+//     element type contains one of the atom's struct types;
 //   - a write to a field with the same name as a field of the path, or to
 //     a value whose type contains one of the structs on the path;
 //   - a write through a pointer (*p = ..) whose pointee type contains one
@@ -301,6 +301,20 @@ func (c *checker) callConflicts(call *ast.CallExpr, a atom) bool {
 		return false
 	case types.CallBuiltin:
 		switch cl.Builtin {
+		case resolve.FFormatTo:
+			// writes dst (Args[0]); a %v Format method is a user call
+			if cl.Format == nil || len(call.Args) == 0 {
+				return true
+			}
+			for _, fa := range cl.Format.Args {
+				if fa.Op == types.FmtFormat {
+					return true
+				}
+			}
+			if s, ok := under(c.info.TypeOf(call.Args[0])).(*types.Slice); ok {
+				return containsAny(s.Elem, a.structs)
+			}
+			return true
 		case resolve.FCopy, resolve.FFormatUint:
 			if len(call.Args) == 0 {
 				return true

@@ -12,6 +12,7 @@
 //	bytesToStr(b)             -> fincrt.BytesToStr(b)
 //	formatUint(v, dst)        -> fincrt.FormatUint(v, dst)
 //	parseUint(src)            -> fincrt.ParseUint(src)
+//	formatTo(dst, f, args...) -> immediately called func literal over fincrt.Fmt (fmt.go, v0.2)
 //	NewContext()              -> fincrt.NewContext()
 //	NewScope(n)               -> fincrt.NewScope(n)   (returns *fincrt.Scope)
 //	conns.AcquireSlot(ctx, &pool) -> fincrt.AcquireSlot(conns, ctx, pool[:])

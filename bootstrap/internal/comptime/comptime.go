@@ -38,6 +38,7 @@ import (
 	"fincore/bootstrap/internal/diag"
 	"fincore/bootstrap/internal/resolve"
 	"fincore/bootstrap/internal/types"
+	"fincore/runtime/fincrt"
 )
 
 // DefaultFuel is the default per-root fuel budget (spec 5.3).
@@ -855,6 +856,8 @@ func (in *interp) builtin(e *ast.CallExpr, ci *types.Call) types.Value {
 			return types.TupleVal{Elems: []types.Value{types.MakeInt(0), types.ErrorVal{Name: "ErrParse"}}}
 		}
 		return types.TupleVal{Elems: []types.Value{types.IntVal{V: new(big.Int).SetUint64(v)}, types.ErrorVal{}}}
+	case resolve.FFormatTo:
+		return in.formatTo(e, ci, args, bytesOf, byteSlice)
 	case resolve.FPanic:
 		in.fail(diag.E5001, "panic at compile time: %s", args[0])
 	case resolve.FCodeArray:
@@ -888,6 +891,76 @@ func (in *interp) builtin(e *ast.CallExpr, ci *types.Call) types.Value {
 	}
 	in.fail(diag.E2002, "builtin %s is not available at compile time", ci.Builtin)
 	return nil
+}
+
+// formatTo runs a formatTo call (v0.2) with the runtime's writer
+// (fincrt.Fmt), so the semantics are identical to generated code. Each
+// formatted argument costs one unit of fuel; a %v Format method is
+// interpreted like any other call (with its own fuel and depth).
+func (in *interp) formatTo(e *ast.CallExpr, ci *types.Call, args []types.Value, bytesOf func(types.Value) []byte, byteSlice func([]byte) types.SliceVal) types.Value {
+	fi := ci.Format
+	if fi == nil || len(args) != len(fi.Args)+2 {
+		in.fail(diag.E2002, "formatTo without format information")
+	}
+	d, _ := args[0].(types.SliceVal)
+	buf := bytesOf(d)
+	w := fincrt.NewFmt(buf)
+	k := 0
+	for _, p := range fi.Pieces {
+		if p.Verb == 0 {
+			w.Lit(p.Lit)
+			continue
+		}
+		in.tick()
+		v, fa := args[2+k], fi.Args[k]
+		k++
+		width := p.FormatWidth()
+		iv, ok := v.(types.IntVal)
+		if !ok || iv.V == nil {
+			iv = types.MakeUint(0)
+		}
+		switch fa.Op {
+		case types.FmtInt:
+			w.Int(iv.V.Int64(), width, p.Zero)
+		case types.FmtHexInt:
+			w.HexInt(iv.V.Int64(), width, p.Zero)
+		case types.FmtUint:
+			w.Uint(iv.V.Uint64(), width, p.Zero)
+		case types.FmtHexUint:
+			w.Hex(iv.V.Uint64(), width, p.Zero)
+		case types.FmtStr:
+			s, _ := v.(types.StringVal)
+			w.Str(string(s), width)
+		case types.FmtQuoteStr:
+			s, _ := v.(types.StringVal)
+			w.Quote(string(s), width)
+		case types.FmtBytes:
+			w.Bytes(bytesOf(v), width)
+		case types.FmtQuoteBytes:
+			w.QuoteBytes(bytesOf(v), width)
+		case types.FmtByte:
+			w.Byte(byte(iv.V.Uint64()), width)
+		case types.FmtBool:
+			b, _ := v.(types.BoolVal)
+			w.Bool(bool(b), width)
+		case types.FmtFormat:
+			dst := w.Dst(width)
+			tmp := byteSlice(dst)
+			r := in.call(fa.Method.Sym, v, []types.Value{tmp}, e)
+			for i := range dst {
+				u, _ := types.Uint64(tmp.Arr.Elems[i])
+				dst[i] = byte(u)
+			}
+			n, _ := types.Uint64(r)
+			w.Advance(uint(n), width)
+		default:
+			in.fail(diag.E2002, "formatTo argument without a format operation")
+		}
+	}
+	for i, b := range buf {
+		d.Arr.Elems[d.Lo+i] = types.MakeUint(uint64(b))
+	}
+	return types.MakeUint(uint64(w.N()))
 }
 
 func (in *interp) code(v types.Value) *types.CodeVal {

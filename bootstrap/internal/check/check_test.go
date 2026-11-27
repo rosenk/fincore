@@ -42,12 +42,13 @@ func passInputs(t *testing.T) []string {
 	return ins
 }
 
-// The 9 fail tests owned by the scope/totality checkers are otherwise
+// The fail tests owned by the scope/totality checkers are otherwise
 // valid programs: the type checker must accept them.
 var laterPassFail = map[string]bool{
 	"fail_conn_leak": true, "fail_driver_in_total": true, "fail_mutual_recursion_unbounded": true,
 	"fail_scope_escape_return": true, "fail_scope_escape_var": true, "fail_slot_leak": true,
 	"fail_total_infinite_for": true, "fail_total_missing_zero_check": true, "fail_use_after_move": true,
+	"fail_total_format_recursion": true, "fail_total_format_mutual": true,
 }
 
 func TestPassCorpusTypechecks(t *testing.T) {
@@ -175,6 +176,13 @@ func TestM1FailCorpus(t *testing.T) {
 		"fail_comptime_loop": {Fuel: 1000},
 		"fail_global_conn":   {},
 		"fail_nil_conn":      {},
+		// v0.2 formatTo
+		"fail_format_arity":      {},
+		"fail_format_verb":       {},
+		"fail_format_argtype":    {},
+		"fail_format_nonvalue":   {},
+		"fail_format_nonconst":   {},
+		"fail_format_method_sig": {},
 	}
 	names := make([]string, 0, len(cases))
 	for n := range cases {

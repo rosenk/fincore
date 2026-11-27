@@ -1554,6 +1554,11 @@ func ibuiltin(e u32, b u8, dp usize) Val decreases(dp) {
 		vtop = m
 		return z
 	}
+	if b == BFFormatTo {
+		rf := iformatTo(e, m, dp-1)
+		vtop = m
+		return rf
+	}
 	r := ibuiltin0(b, m)
 	vtop = m
 	return r

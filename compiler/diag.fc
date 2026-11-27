@@ -286,6 +286,13 @@ func isPrintRune(r u32) bool {
 // putQuoted writes s quoted like Go's strconv.Quote.
 func putQuoted(o *OutBuf, s []byte) {
 	o.putByte('"')
+	putQuotedBody(o, s)
+	o.putByte('"')
+}
+
+// putQuotedBody writes the inside of strconv.Quote(s), without the
+// delimiting quotes.
+func putQuotedBody(o *OutBuf, s []byte) {
 	n := len(s)
 	i := usize(0)
 	for g := usize(0); g < n; g++ {
@@ -316,7 +323,6 @@ func putQuoted(o *OutBuf, s []byte) {
 		putEscapedASCII(o, c, '"')
 		i++
 	}
-	o.putByte('"')
 }
 
 // putEscapedASCII writes one ASCII byte the way strconv quoting does inside

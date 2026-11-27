@@ -17,15 +17,18 @@ import (
 //     type through Call.Callee) to total functions;
 //   - calls through function values (CallValue) to every total function
 //     that escapes as a value: every function literal and every declared
-//     function referenced other than as the callee of a call.
+//     function referenced other than as the callee of a call;
+//   - formatTo calls (v0.2) to the Format method of every `%v` argument
+//     that resolves to one, in argument order.
 //
 // Calls to driver functions are E5001 and calls to comptime functions can
 // never lead back to total code, so neither yields edges.
 
 type edge struct {
-	to    int
-	call  *ast.CallExpr
-	value bool // through a function value
+	to     int
+	call   *ast.CallExpr
+	value  bool // through a function value
+	format bool // a formatTo %v directive calling a Format method
 }
 
 type graph struct {
@@ -61,6 +64,18 @@ func (c *checker) buildGraph() *graph {
 				}
 				for _, j := range escaped {
 					g.edges[i] = append(g.edges[i], edge{to: j, call: call, value: true})
+				}
+			case types.CallBuiltin:
+				if cl.Format == nil {
+					continue
+				}
+				for _, fa := range cl.Format.Args {
+					if fa.Op != types.FmtFormat || fa.Method == nil {
+						continue
+					}
+					if j, ok := g.index[c.info.FuncOfSym(fa.Method.Sym)]; ok {
+						g.edges[i] = append(g.edges[i], edge{to: j, call: call, format: true})
+					}
 				}
 			}
 		}
@@ -265,6 +280,10 @@ func (c *checker) checkSCC(g *graph, scc []int, inSCC map[int]bool) {
 			}
 			if es[0].value {
 				c.errorf(code, call, "call through a function value inside a recursive group cannot be proven to decrease a measure")
+				return
+			}
+			if es[0].format {
+				c.errorf(code, call, "formatTo call of %s inside a recursive group cannot be proven to decrease a measure", g.nodes[es[0].to].Name())
 				return
 			}
 			callee := g.nodes[es[0].to]

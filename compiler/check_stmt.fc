@@ -197,7 +197,7 @@ func exprStmt(e u32, what string, dp usize) decreases(dp) {
 	bad := k == CallConversion || k == CallVariant
 	if k == CallBuiltin {
 		b := callTab.items[usize(ci)].builtin
-		bad = b != BFPanic && b != BFCopy
+		bad = b != BFPanic && b != BFCopy && b != BFFormatTo
 	}
 	if bad {
 		mreset()

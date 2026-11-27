@@ -1,0 +1,39 @@
+-128 255 -9223372036854775808 18446744073709551615 -40 7
+ff -80 ffffffffffffffff beef
+42 -7 42 65 hi true z 122
+hello world, bytes! 100% world bytes
+"tab\there \"q\" back\\slash" "\x00\x1f\x7f\xff" "nl\ncr\r"
+[   42][42   ][00042][-0042][      ff][000000ff][ff      ]
+[    ab][ab    ][toolong][   x][y   ][    "q"][  true][false  ]
+false 18446744073709551615 str | (3, -4) | (3, -4)->(0, 0)
+red green #ff8000 pair#9
+[     (3, -4)][(3, -4)     ][(3, -4)]
+cut  0: 0 
+cut  1: 1 1
+cut  2: 2 12
+cut  3: 3 123
+cut  4: 4 1234
+cut  5: 5 12345
+cut  6: 6 12345=
+cut  7: 7 12345="
+cut  8: 8 12345="a
+cut  9: 9 12345="ab
+cut 10: 10 12345="ab"
+cut 11: 10 12345="ab"
+cut 12: 10 12345="ab"
+<   (3, 
+<   (3, -
+<   (3, -4
+<   (3, -4)
+<   (3, -4)>
+<   (3, -4)>
+<   (3, -4)>
+empty dst: 0
+comptime: 23 7
+
+  -42
+  -42|ff   |-0007|"t
+  -42|ff   |-0007|"t\"\\\n"|"a\x00\xfe"|Z|false| (
+  -42|ff   |-0007|"t\"\\\n"|"a\x00\xfe"|Z|false| (-3, 0)|(9, 1)  |(123
+  -42|ff   |-0007|"t\"\\\n"|"a\x00\xfe"|Z|false| (-3, 0)|(9, 1)  |(12345, 2)|100%|a
+xy

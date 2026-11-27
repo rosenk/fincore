@@ -4,8 +4,10 @@
 // embedded in finc0's resolver, type checker and comptime unit tests. With
 // -passes=scope (make diff-check-scope) the scope checker runs too, and the
 // snippets of finc0's scope unit tests are added. Snippets of the totality
-// unit tests are always included; any mode other than types also checks
-// mutated copies of compiler/ (make diff-check-totality).
+// unit tests and of the formatTo tests (bootstrap/internal/check/
+// format_test.go, formatSnippetCases) are always included; any mode other
+// than types also checks mutated copies of compiler/ (make
+// diff-check-totality).
 //
 //	go run ./scripts/diffcheck [-finc0 bin/finc0] [-finc1 bin/finc1] [-passes types|scope|totality|all] [-v] [-keep]
 //
@@ -90,6 +92,11 @@ func main() {
 		fatal(err)
 	}
 	cases = append(cases, fr...)
+	fsnips, err := formatSnippetCases(tmp)
+	if err != nil {
+		fatal(err)
+	}
+	cases = append(cases, fsnips...)
 	if *passes != "types" {
 		sc, err := scopeSnippetCases(tmp)
 		if err != nil {
@@ -433,6 +440,41 @@ func strLit(e ast.Expr) (string, bool) {
 	}
 	s, err := strconv.Unquote(bl.Value)
 	return s, err == nil
+}
+
+// formatSnippetCases extracts the sources of the formatTo (v0.2) unit
+// tests (bootstrap/internal/check/format_test.go): the second string of
+// every {name, src} case literal, a complete package whose `// FLAGS:`
+// header is honoured. They run in every -passes mode.
+func formatSnippetCases(tmp string) ([]tcase, error) {
+	f := "bootstrap/internal/check/format_test.go"
+	fset := token.NewFileSet()
+	af, err := parser.ParseFile(fset, f, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []tcase
+	n := 0
+	ast.Inspect(af, func(nd ast.Node) bool {
+		cl, ok := nd.(*ast.CompositeLit)
+		if !ok || len(cl.Elts) != 2 {
+			return true
+		}
+		_, ok0 := strLit(cl.Elts[0])
+		src, ok1 := strLit(cl.Elts[1])
+		if !ok0 || !ok1 || !strings.Contains(src, "package main") {
+			return true
+		}
+		n++
+		root := filepath.Join(tmp, fmt.Sprintf("f%03d", n))
+		_ = os.MkdirAll(root, 0o755)
+		path := filepath.Join(root, "t.fc")
+		_ = os.WriteFile(path, []byte(src), 0o644)
+		label := fmt.Sprintf("%s:%d", f, fset.Position(cl.Pos()).Line)
+		out = append(out, tcase{name: label, dir: root, path: "t.fc", flags: headerFlags(path)})
+		return true
+	})
+	return out, nil
 }
 
 // mutantCases writes n token-level mutants of every single-file corpus

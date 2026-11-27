@@ -1,0 +1,11 @@
+// fail_format_arity: the format has two directives but the call passes
+// three arguments (v0.2 formatTo). Count errors are E2003 and point at the
+// format argument.
+package main
+
+driver func main(io Stdio) error {
+	var b [32]byte
+	n := formatTo(b[:], "%d-%d", 1, 2, // ERROR E2003
+		3)
+	return io.WriteStdout(b[:n])
+}

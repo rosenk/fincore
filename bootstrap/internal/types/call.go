@@ -406,6 +406,8 @@ func (c *Checker) builtinCall(e *ast.CallExpr, sym *resolve.Symbol, ci *Call) op
 	case resolve.FNewScope:
 		ci.ResourceCtor = true
 		return fixed([]Type{Typ[Usize]}, c.univ.named[resolve.TScope])
+	case resolve.FFormatTo:
+		return c.formatCall(e, ci)
 	}
 	c.errorf(diag.E2002, e.Range, "unsupported builtin %s", name)
 	return invalidOp(e)

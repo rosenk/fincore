@@ -105,6 +105,19 @@ func buildGraph() {
 				if callTab.items[usize(ci)].effect != EffDriver {
 					gVal[v] = true
 				}
+			} else if k == CallBuiltin && callTab.items[usize(ci)].fmtOK {
+				// formatTo (v0.2): an edge to the Format method of every
+				// %v argument that resolves to one
+				nfa := usize(callTab.items[usize(ci)].fmtN) / 2
+				for a := usize(0); a < nfa; a++ {
+					if fmtArgOp(ci, a) != FmtFormat {
+						continue
+					}
+					j := gidx[usize(funcOfSym(meths.items[usize(fmtArgMethod(ci, a))].sym))]
+					if j != 0 {
+						pushEdge(j - 1)
+					}
+				}
 			}
 		}
 		if gVal[v] {
@@ -478,6 +491,24 @@ func recOnCall(call u32, st u32) {
 		mreset()
 		ms("call through a function value inside a recursive group cannot be proven to decrease a measure")
 		errAt(rcCode, call)
+		return
+	}
+	if k == CallBuiltin && callTab.items[usize(ci)].fmtOK {
+		nfa := usize(callTab.items[usize(ci)].fmtN) / 2
+		for a := usize(0); a < nfa; a++ {
+			if fmtArgOp(ci, a) != FmtFormat {
+				continue
+			}
+			j := gidx[usize(funcOfSym(meths.items[usize(fmtArgMethod(ci, a))].sym))]
+			if j != 0 && tjComp[usize(j-1)] == rcComp {
+				mreset()
+				ms("formatTo call of ")
+				mfuncName(gfi[usize(j-1)])
+				ms(" inside a recursive group cannot be proven to decrease a measure")
+				errAt(rcCode, call)
+				return
+			}
+		}
 		return
 	}
 	if k != CallFunc && k != CallMethod {

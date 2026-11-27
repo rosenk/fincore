@@ -74,24 +74,25 @@ const (
 	BFNewContext = 59
 	BFNewScope   = 60
 	BFPanic      = 61
-	BFCodeEmpty  = 62
-	BFCodeUnit   = 63
-	BFCodeBool   = 64
-	BFCodeU8     = 65
-	BFCodeU16    = 66
-	BFCodeU32    = 67
-	BFCodeU64    = 68
-	BFCodeI8     = 69
-	BFCodeI16    = 70
-	BFCodeI32    = 71
-	BFCodeI64    = 72
-	BFCodeArray  = 73
-	BFCodeSlice  = 74
-	BFCodeStruct = 75
-	BFCodeField  = 76
-	BFCodeUniv   = 77
+	BFFormatTo   = 62 // v0.2
+	BFCodeEmpty  = 63
+	BFCodeUnit   = 64
+	BFCodeBool   = 65
+	BFCodeU8     = 66
+	BFCodeU16    = 67
+	BFCodeU32    = 68
+	BFCodeU64    = 69
+	BFCodeI8     = 70
+	BFCodeI16    = 71
+	BFCodeI32    = 72
+	BFCodeI64    = 73
+	BFCodeArray  = 74
+	BFCodeSlice  = 75
+	BFCodeStruct = 76
+	BFCodeField  = 77
+	BFCodeUniv   = 78
 
-	NumBuiltins = 78
+	NumBuiltins = 79
 )
 
 func builtinName(b u8) string {
@@ -295,6 +296,9 @@ func builtinFuncName(b u8) string {
 	}
 	if b == BFPanic {
 		return "panic"
+	}
+	if b == BFFormatTo {
+		return "formatTo"
 	}
 	if b == BFCodeEmpty {
 		return "CodeEmpty"

@@ -118,7 +118,7 @@ func (c *Checker) condition(e ast.Expr, what string) {
 
 // exprStmt checks an expression statement, defer operand or match-arm
 // expression: it must be a call of a function, method, function value or
-// panic/copy (not a conversion, variant or pure builtin).
+// panic/copy/formatTo (not a conversion, variant or pure builtin).
 func (c *Checker) exprStmt(e ast.Expr, what string) {
 	call, ok := unparen(e).(*ast.CallExpr)
 	if !ok {
@@ -137,7 +137,7 @@ func (c *Checker) exprStmt(e ast.Expr, what string) {
 	case CallConversion, CallVariant:
 		c.errorf(diag.E2002, e.Span(), "%s is not used", exprString(e))
 	case CallBuiltin:
-		if ci.Builtin != resolve.FPanic && ci.Builtin != resolve.FCopy {
+		if ci.Builtin != resolve.FPanic && ci.Builtin != resolve.FCopy && ci.Builtin != resolve.FFormatTo {
 			c.errorf(diag.E2002, e.Span(), "%s is not used", exprString(e))
 		}
 	}
