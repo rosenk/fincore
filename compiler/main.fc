@@ -44,7 +44,11 @@ var tmpBuf OutBuf
 var fileNames [MaxFiles]string
 
 // fincRoot is $FINCROOT (read once by main): the directory std/... imports
-// resolve against; "" means the module root.
+// resolve against. When $FINCROOT is unset or empty, the working
+// directory has no std/ directory and the fincore module root
+// (findModuleRoot, e.g. found from the executable) is an installed release
+// (isRelease), main sets it to that root. "" means relative to the working
+// directory (the module root when finc runs there), as in finc0.
 var fincRoot string
 
 func strEq(a string, b string) bool {
@@ -125,8 +129,13 @@ driver func capacityFail(io Stdio, path string, what string) error {
 // main
 
 driver func main(fs FS, env Env, io Stdio, exec Exec) error {
-	if r, ok := env.GetEnv("FINCROOT"); ok {
+	if r, ok := env.GetEnv("FINCROOT"); ok && len(r) > 0 {
 		fincRoot = r
+	} else if !fs.IsDir("std") {
+		root := findModuleRoot(fs, env, io, true)
+		if len(root) > 0 && isRelease(fs, root) {
+			fincRoot = root
+		}
 	}
 	argc := env.ArgsCount()
 	if argc < 2 {

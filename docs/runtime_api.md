@@ -10,6 +10,7 @@ Key deviations from the spec:
 - Builtins exported as `fincrt.Copy`, `BytesEqual`, `StrBytes`, `BytesToStr`, `FormatUint`, `ParseUint`. `StrBytes` returns a fresh, writable copy (decision 90); it used to return a read-only zero-copy view, which made writes to it crash.
 - `Duration uint64`, `Signal uint8`, `ExitStatus{Code int}`; usize → `uint`.
 - `ListSourceFiles` returns base names (sorted); `Exec.Run` env entries extend the parent env.
+- `Env.GetEnv("FINCRT_EXECUTABLE")` (`fincrt.ExecutableKey`) is answered by the runtime, not the process environment: the absolute, symlink-resolved path of the running executable (`fincrt.Executable()`: `os.Executable` + `filepath.EvalSymlinks`), `ok` false if the OS cannot tell. It adds no language surface (seed-generated code keeps working) and lets the self-hosted compiler find its install directory (docs/release.md).
 - Zero-value Conn/Listener behave as closed; zero Context never cancelled.
 - `Clock` (no methods in v0.1) is `fincrt.Clock`; generated `main()` injects `fincrt.DefaultClock()`.
 - `finc0 build --race` adds a race-only init file (not part of `--emit-go` output) that re-executes the program once with `GORACE=atexit_sleep_ms=0`: the race runtime otherwise sleeps 1 s at exit because os/signal's loop goroutine never ends, which breaks the spec 13.3 shutdown deadlines.

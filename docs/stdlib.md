@@ -40,6 +40,17 @@ import (
    import (decisions 15, 41). The module root is the directory finc runs
    in, so in this repository `std/` simply resolves to the checked-in
    packages.
+3. compiler/ only (finc1/finc2, not the frozen finc0): when `FINCROOT`
+   is unset or empty and the working directory has no `std/` directory,
+   `<root>/std/<pkg>` where `<root>` is the fincore module root that
+   `build` uses for the runtime (`$FINCORE_ROOT`, else found above `$PWD`
+   or above the running executable), provided that root is an installed
+   release: it has a `VERSION` file, which release archives have and the
+   source tree does not. This is how an installed release
+   (`fincore/bin/finc`, docs/release.md) finds its `std/` from any
+   project directory; diagnostics then name the absolute path, as with
+   `FINCROOT`. In a source checkout nothing changes, so finc1 keeps
+   finc0's diagnostics (`make diff-prev`, `make diff-check`).
 
 finc0 and finc1 implement this identically (`resolve.StdDir` in
 bootstrap/internal/resolve/load.go, `loadImport` in compiler/main.fc).
@@ -47,8 +58,9 @@ Files of packages found through `FINCROOT` are named by the lexically
 cleaned path `$FINCROOT/std/<pkg>/<file>.fc` in diagnostics (they are
 never made relative to the working directory). A missing package is the
 usual E2001 `cannot find package "std/x" (no directory <dir>)` / `(no .fc
-files in <dir>)`. `FINCROOT` is unrelated to `FINCORE_ROOT`, which only
-tells `build` where the fincore Go module (the runtime) lives.
+files in <dir>)`. `FINCROOT` is unrelated to `FINCORE_ROOT`, which tells `build` where the
+fincore Go module (the runtime) lives; only the fallback of rule 3 uses
+the module root for std/.
 
 ## Conventions
 

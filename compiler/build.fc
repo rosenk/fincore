@@ -19,9 +19,11 @@
 // directory, so every go invocation runs with workdir = the fincore module
 // root and `go build -C <tmp>` switches to the temporary module. The root
 // is $FINCORE_ROOT, else the first directory at or above the working
-// directory ($PWD; FS has no Getwd) or above the finc1 executable (Arg(0),
-// when it is a path) whose go.mod declares `module fincore`. Relative -o
-// paths are made absolute with $PWD.
+// directory ($PWD; FS has no Getwd), above the running executable
+// (Env.GetEnv("FINCRT_EXECUTABLE"), which fincrt answers with the
+// symlink-resolved os.Executable(); an installed release keeps bin/finc
+// next to its go.mod), or above Arg(0) when it is a path, whose go.mod
+// declares `module fincore`. Relative -o paths are made absolute with $PWD.
 //
 // Exec forwards a child's stdout to finc1's stdout and captures stderr, so
 // `test` runs the compiled pass programs through `/bin/sh -c 'exec "$0"
@@ -386,6 +388,15 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 			return root
 		}
 	}
+	// The running executable (symlinks resolved; fincrt answers this key
+	// itself): an installed release has bin/finc next to go.mod.
+	self, oks := env.GetEnv("FINCRT_EXECUTABLE")
+	if oks && path.IsAbs(strBytes(self)) {
+		root := findRootFrom(fs, dirOf(cleanStr(self)))
+		if len(root) > 0 {
+			return root
+		}
+	}
 	exe := env.Arg(0)
 	if bytes.IndexByte(strBytes(exe), '/') >= 0 {
 		ae := absPath(env, exe)
@@ -400,6 +411,16 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 		_ = emsg(io, "finc1: cannot find the fincore module root (go.mod with `module fincore`); set FINCORE_ROOT\n")
 	}
 	return ""
+}
+
+// isRelease reports whether the module root dir is an installed release
+// (docs/release.md): its VERSION file exists. Only then does std/ fall
+// back to it (main), so a source checkout keeps finc0's std resolution
+// and diagnostics.
+driver func isRelease(fs FS, dir string) bool {
+	var vb [64]byte
+	_, err := fs.ReadFileInto(joinPath(dir, "VERSION"), vb[:])
+	return err == nil || err == ErrArenaFull
 }
 
 driver func goTool(env Env) string {

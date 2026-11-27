@@ -46,6 +46,9 @@ jobs:
         run: make diff-build
       - name: bootstrap fixed point (finc0 → finc-seed → finc1 → finc2 → finc3)
         run: make bootstrap
+      - name: release archive smoke test
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: make dist dist-test
       - name: current compiler vs previous release (seed) regression
         run: make diff-prev
       - name: examples and tutorial snippets
