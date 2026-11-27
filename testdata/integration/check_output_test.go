@@ -18,15 +18,9 @@ import (
 // diagLineRE is one spec 11 diagnostic line.
 var diagLineRE = regexp.MustCompile(`^\S+\.fc:\d+:\d+: error\[E\d{4}\]: \S`)
 
-// knownTrailer is the line the generated main of compiler/ adds after a
-// failure: compiler/ returns ErrParse from main because it may not use
-// ErrReported (decision 156) before the seed is v0.3.0. After the seed bump
-// main returns ErrReported; then drop knownTrailer and require
-// diagnostics only.
-const knownTrailer = "error: fincore: invalid number"
-
 // TestCheckFailureOutput: a failing `finc check` prints its diagnostics on
-// stderr, followed by at most knownTrailer and no other line, nothing on
+// stderr and no other line (compiler/ returns ErrReported, decision 156,
+// so its generated main adds no `error: ...` line), nothing on
 // stdout, and exits with status 1. It runs the compiler under test
 // ($FINC0, else finc0) and, when it has been built (make finc1), the
 // current compiler bin/finc1.
@@ -62,9 +56,6 @@ func TestCheckFailureOutput(t *testing.T) {
 				if stderr == "" || !strings.HasSuffix(stderr, "\n") {
 					t.Fatalf("stderr %q: want diagnostic lines", stderr)
 				}
-				if len(lines) > 1 && lines[len(lines)-1] == knownTrailer {
-					lines = lines[:len(lines)-1]
-				}
 				for _, l := range lines {
 					if !diagLineRE.MatchString(l) {
 						t.Errorf("stderr line %q is not a diagnostic; stderr:\n%s", l, stderr)
@@ -73,12 +64,11 @@ func TestCheckFailureOutput(t *testing.T) {
 			})
 		}
 	}
-	// The current compiler without arguments: the usage on stderr, at most
-	// knownTrailer after it, exit 1.
+	// The current compiler without arguments: the usage on stderr and
+	// nothing after it, exit 1.
 	if bin, ok := compilers["bin/finc1"]; ok {
 		_, stderr, code := runIn(t, root, bin)
-		usage := strings.TrimSuffix(stderr, knownTrailer+"\n")
-		if code != 1 || !strings.HasPrefix(stderr, "usage: finc <command>") || strings.Contains(usage, "error: ") {
+		if code != 1 || !strings.HasPrefix(stderr, "usage: finc <command>") || strings.Contains(stderr, "error: ") {
 			t.Errorf("finc1 without arguments: exit %d, stderr:\n%s", code, stderr)
 		}
 	}

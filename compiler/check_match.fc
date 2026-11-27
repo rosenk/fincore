@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // check_match.fc — the type checker, part 4 (v0.2 sum types and
 // patterns): match statements and expressions, tuple scrutinees, nested,
 // or-, tuple and rest patterns with bindings, guards, `is` expressions,
@@ -1845,10 +1846,7 @@ func checkCoverage(m u32, t u32, isExpr bool) bool {
 		ml := formatTo(mbuf[:], "non-exhaustive match on %v: missing ", TypeRef(t))
 		o := &fmtBuf
 		o.Reset()
-		lim := k
-		if lim > MaxWitnesses {
-			lim = MaxWitnesses
-		}
+		lim := min(k, MaxWitnesses)
 		for i := usize(0); i < lim; i++ {
 			if i > 0 {
 				o.WriteString(", ")

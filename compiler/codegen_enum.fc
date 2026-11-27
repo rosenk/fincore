@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // codegen_enum.fc — code generator part 4 (v0.2 sum types; finc0's
 // codegen/golang/enum.go): compact enum layout, match switches, match
 // expressions and returns of match expressions.
@@ -81,37 +82,19 @@ func cgLayKey(g usize) []byte {
 // cgBasicSlotKey returns the FinCore spelling of a Go basic type name
 // ("" if b is not one).
 func cgBasicSlotKey(b []byte) string {
-	if cgBytesIs(b, "uint8") {
-		return "u8"
+	return match b {
+		"uint8" -> "u8"
+		"uint16" -> "u16"
+		"uint32" -> "u32"
+		"uint64" -> "u64"
+		"int8" -> "i8"
+		"int16" -> "i16"
+		"int32" -> "i32"
+		"int64" -> "i64"
+		"uint" -> "usize"
+		"int" | "bool" | "string" | "error" -> "same"
+		_ -> ""
 	}
-	if cgBytesIs(b, "uint16") {
-		return "u16"
-	}
-	if cgBytesIs(b, "uint32") {
-		return "u32"
-	}
-	if cgBytesIs(b, "uint64") {
-		return "u64"
-	}
-	if cgBytesIs(b, "int8") {
-		return "i8"
-	}
-	if cgBytesIs(b, "int16") {
-		return "i16"
-	}
-	if cgBytesIs(b, "int32") {
-		return "i32"
-	}
-	if cgBytesIs(b, "int64") {
-		return "i64"
-	}
-	if cgBytesIs(b, "uint") {
-		return "usize"
-	}
-	if cgBytesIs(b, "int") || cgBytesIs(b, "bool") || cgBytesIs(b, "string") || cgBytesIs(b, "error") {
-		return "same"
-	}
-	return ""
 }
 
 func cgIsGoIdentBytes(b []byte) bool {
@@ -225,9 +208,7 @@ func cgComputeLayout(n u32, en u32, dp usize) CgLay decreases(dp) {
 			}
 			cgWtruncate(m)
 			cgLayGUsed[gi]++
-			if cgLayGUsed[gi] > cgLayGCnt[gi] {
-				cgLayGCnt[gi] = cgLayGUsed[gi]
-			}
+			cgLayGCnt[gi] = max(cgLayGCnt[gi], cgLayGUsed[gi])
 			if cgLayPTop >= CgMaxLayPay {
 				setFull("codegen enum layouts")
 				return l

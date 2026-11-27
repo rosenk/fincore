@@ -8,6 +8,18 @@ workflow publishes it; docs/release.md).
 - Bootstrap: the seed is `v0.3.0` (bootstrap/SEED); finc0 builds it
   directly. compiler/ may now use v0.3 features. The diff-prev allowlist
   is empty again.
+- The `finc` driver returns `ErrReported` for every failure it has already
+  reported, so a failed `finc check`/`build`/`fmt`/... no longer ends with
+  the misleading `error: fincore: invalid number` (or `arena full`,
+  `not found`, `exec failed`) line. Unreported errors (I/O errors writing
+  the output, the non-zero exit status of the program under `finc run`)
+  are still printed. `finc fmt` now goes on with the other files after a
+  file it cannot read, as it already did after a syntax error.
+- compiler/ uses v0.3 itself: `min`/`max` instead of hand-written
+  clamps, `match`/`is` on strings and `[]byte` for command and flag
+  dispatch and the Go keyword tables, multi-value `match` in the AST
+  layout helpers. The files that do are marked `// SINCE: v0.3`, so the
+  finc0 differentials (`make diff-*`) skip compiler/.
 
 ## v0.3.0
 

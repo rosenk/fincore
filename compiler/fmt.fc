@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // fmt.fc — `finc fmt`, the canonical FinCore source formatter.
 //
 //	finc fmt [-w] [-l] [-d] [--check] <file.fc | dir>...
@@ -268,18 +269,14 @@ func fmWalkBin(e u32, dp usize) (bool, bool, u8) decreases(dp) {
 		h4, h5, m := fmWalkBin(n.a, dp-1)
 		has4 = has4 || h4
 		has5 = has5 || h5
-		if m > mp {
-			mp = m
-		}
+		mp = max(mp, m)
 	}
 	r := nodes.items[usize(n.b)]
 	if r.kind == NkBinaryExpr && fmGoPrec(r.op) > pr {
 		h4, h5, m := fmWalkBin(n.b, dp-1)
 		has4 = has4 || h4
 		has5 = has5 || h5
-		if m > mp {
-			mp = m
-		}
+		mp = max(mp, m)
 	} else if r.kind == NkUnaryExpr {
 		if n.op == OpDiv && r.op == OpDeref || n.op == OpAnd && r.op == OpAddr {
 			mp = 5
@@ -330,10 +327,7 @@ func fmExpr(toks []Token, e u32, depth u32, dp usize) decreases(dp) {
 	n := nodes.items[usize(e)]
 	match n.kind {
 		NkBinaryExpr -> {
-			d := depth
-			if d < 1 {
-				d = 1
-			}
+			d := max(depth, 1)
 			pr := fmGoPrec(n.op)
 			if pr >= fmCutoff(e, d) {
 				fmMarkAny(toks, u32(n.ival>>32), u32(n.ival&0xFFFFFFFF), TcTight)
@@ -1021,10 +1015,7 @@ func fmWidths(n usize) {
 				if !fmHasCell(h, k) || fmLines[h].indent != ind {
 					break
 				}
-				cw := fmRunes(fmCellText(h, k))
-				if cw > w {
-					w = cw
-				}
+				w = max(w, fmRunes(fmCellText(h, k)))
 				j = h + 1
 			}
 			for h := i; h < j; h++ {
@@ -1133,7 +1124,7 @@ driver func fmtUsage(io Stdio) error {
 	if err := say(io, true, "usage: finc fmt [-w] [-l] [-d] [--check] <file.fc | dir>...\n  -check\n    \tlist files whose formatting differs and fail if there are any\n  -d\tdisplay diffs instead of rewriting files\n  -l\tlist files whose formatting differs\n  -w\twrite result to (source) file instead of stdout\n"); err != nil {
 		return err
 	}
-	return ErrParse
+	return ErrReported
 }
 
 // fmParse lexes and parses sources.files[i] (comments recorded when keep
@@ -1207,7 +1198,7 @@ driver func fmtFile(fs FS, io Stdio, path string) (bool, error) {
 		if e := flushErr(io); e != nil {
 			return false, e
 		}
-		return false, ErrParse
+		return false, ErrReported
 	}
 	toks := tokens.Slice()
 	fmClassify(toks, 1)
@@ -1246,7 +1237,7 @@ driver func fmtFile(fs FS, io Stdio, path string) (bool, error) {
 		if e := sayf(io, formatTo(mbuf[:], "finc fmt: internal error: the formatted %s does not parse; file left unchanged\n", path)); e != nil {
 			return false, e
 		}
-		return false, ErrParse
+		return false, ErrReported
 	}
 	fmDumpTo(&outBuf, root2)
 	if fmDump.Truncated() || outBuf.Truncated() {
@@ -1259,7 +1250,7 @@ driver func fmtFile(fs FS, io Stdio, path string) (bool, error) {
 		if e := sayf(io, formatTo(mbuf[:], "finc fmt: internal error: formatting %s changes its AST; file left unchanged\n", path)); e != nil {
 			return false, e
 		}
-		return false, ErrParse
+		return false, ErrReported
 	}
 	return !bytesEqual(sources.bytes[:n], fmOut.Bytes()), nil
 }
@@ -1330,7 +1321,7 @@ driver func fmDiff(fs FS, io Stdio, exec Exec, path string) error {
 		if e := sayf(io, formatTo(mbuf[:], "finc fmt: diff %s: %s\n", path, execErr[:n])); e != nil {
 			return e
 		}
-		return ErrExec
+		return ErrReported
 	}
 	return nil
 }
@@ -1350,21 +1341,18 @@ driver func runFmt(fs FS, env Env, io Stdio, exec Exec) error {
 		a := env.Arg(i)
 		ab := strBytes(a)
 		if !flagsDone && nops == 0 && len(ab) > 1 && ab[0] == '-' {
-			if strEq(a, "--") {
-				flagsDone = true
-			} else if strEq(a, "-w") || strEq(a, "--w") {
-				write = true
-			} else if strEq(a, "-l") || strEq(a, "--l") {
-				list = true
-			} else if strEq(a, "-d") || strEq(a, "--d") {
-				diff = true
-			} else if strEq(a, "-check") || strEq(a, "--check") {
-				check = true
-			} else {
-				if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
-					return err
+			match a {
+				"--" -> flagsDone = true
+				"-w" | "--w" -> write = true
+				"-l" | "--l" -> list = true
+				"-d" | "--d" -> diff = true
+				"-check" | "--check" -> check = true
+				_ -> {
+					if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
+						return err
+					}
+					return fmtUsage(io)
 				}
-				return fmtUsage(io)
 			}
 			continue
 		}
@@ -1390,7 +1378,7 @@ driver func runFmt(fs FS, env Env, io Stdio, exec Exec) error {
 		p := fmFiles[i]
 		changed, err := fmtFile(fs, io, p)
 		if err != nil {
-			if err == ErrParse || err == ErrArenaFull {
+			if err == ErrReported {
 				failed = true
 				continue
 			}
@@ -1423,10 +1411,10 @@ driver func runFmt(fs FS, env Env, io Stdio, exec Exec) error {
 		}
 	}
 	if failed {
-		return ErrParse
+		return ErrReported
 	}
 	if check && differ {
-		return ErrExec
+		return ErrReported
 	}
 	return nil
 }

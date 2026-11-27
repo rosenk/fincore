@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // types.fc — the typed model (port of finc0's bootstrap/internal/types:
 // type.go, universe.go, info.go and the instantiation half of typexpr.go).
 //
@@ -904,10 +905,7 @@ func maxClassOf(s u32, n u32, depth usize) u8 decreases(depth) {
 		return c
 	}
 	for i := u32(0); i < n; i++ {
-		x := classOf(tlist(s, usize(i)), depth-1)
-		if x > c {
-			c = x
-		}
+		c = max(c, classOf(tlist(s, usize(i)), depth-1))
 	}
 	return c
 }
@@ -937,10 +935,7 @@ func classOf(t u32, depth usize) u8 decreases(depth) {
 			c := u8(ClassValue)
 			nf := nfields(t)
 			for i := usize(0); i < nf; i++ {
-				x := classOf(fieldType(t, i), depth-1)
-				if x > c {
-					c = x
-				}
+				c = max(c, classOf(fieldType(t, i), depth-1))
 			}
 			return c
 		}
@@ -948,10 +943,7 @@ func classOf(t u32, depth usize) u8 decreases(depth) {
 			c := u8(ClassValue)
 			nv := nvariants(t)
 			for i := usize(0); i < nv; i++ {
-				x := maxClassOf(variantPayS(t, i), u32(variantPayN(t, i)), depth-1)
-				if x > c {
-					c = x
-				}
+				c = max(c, maxClassOf(variantPayS(t, i), u32(variantPayN(t, i)), depth-1))
 			}
 			return c
 		}
@@ -1827,10 +1819,7 @@ func completePending(origin u32) {
 
 // substLookup returns the binding of type parameter t (0 if unbound).
 func substLookup(t u32, tpS u32, tpN u32, argS u32, argN u32) u32 {
-	n := usize(tpN)
-	if usize(argN) < n {
-		n = usize(argN)
-	}
+	n := usize(min(tpN, argN))
 	for i := usize(0); i < n; i++ {
 		if tlist(tpS, i) == t {
 			return tlist(argS, i)

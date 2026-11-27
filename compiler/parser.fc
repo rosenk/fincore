@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // parser.fc — total recursive-descent parser for FinCore (spec section 3),
 // a faithful port of bootstrap/internal/parser/parser.go.
 //
@@ -102,11 +103,7 @@ func (p *Parser) next() {
 }
 
 func (p *Parser) peek(k usize) Token {
-	i := p.pos + k
-	if i >= p.ntok {
-		i = p.ntok - 1
-	}
-	return p.toks[i]
+	return p.toks[min(p.pos+k, p.ntok-1)]
 }
 
 func (p *Parser) tokText(t Token) []byte {

@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // scope.fc — the Layer-3 scope/depth escape checker (port of finc0's
 // bootstrap/internal/scope: doc.go and scope.go; the linearity analysis is
 // in linear.fc). It runs on a well-typed program (after checkProgram
@@ -726,9 +727,7 @@ func wStmt(s u32, dp usize) decreases(dp) {
 	} else if k == NkScopeStmt {
 		wExpr(nb(s), dp-1)
 		wDepth++
-		if wDepth > scMaxDepth {
-			scMaxDepth = wDepth
-		}
+		scMaxDepth = max(scMaxDepth, wDepth)
 		sym := scVarSym(na(s))
 		if sym != 0 && wCollect {
 			scSetDepth(sym, wDepth)
@@ -963,9 +962,7 @@ func wFuncLit(lit u32, dp usize) decreases(dp) {
 	saveD := wDepth
 	saveF := wFnDepth
 	wDepth++
-	if wDepth > scMaxDepth {
-		scMaxDepth = wDepth
-	}
+	scMaxDepth = max(scMaxDepth, wDepth)
 	wFnDepth = wDepth
 	fi := nfunc[usize(lit)]
 	if fi != 0 && wCollect {

@@ -55,7 +55,11 @@ func generate(t *testing.T, root, path string) []byte {
 
 // corpus lists the programs of the repository that must compile.
 func corpus(t *testing.T, root string) []string {
-	ins := []string{"examples/tcp_echo.fc", "compiler"}
+	ins := []string{"examples/tcp_echo.fc"}
+	// compiler/ uses v0.3 since the seed bump (its files say SINCE: v0.3).
+	if finc0Can(t, root, "compiler") {
+		ins = append(ins, "compiler")
+	}
 	ents, err := os.ReadDir(filepath.Join(root, "testdata", "pass"))
 	if err != nil {
 		t.Fatal(err)

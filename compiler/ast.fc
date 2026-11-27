@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // ast.fc — AST node kinds over the NodeArena, NodeID assignment, the
 // `--dump-ast` printer and the canonical source printer (finc0's
 // bootstrap/internal/ast: ast.go, walk.go, dump.go, print.go).
@@ -416,28 +417,26 @@ func layout(k u8, i usize) (u8, string) {
 }
 
 func layout1(i usize, s0 u8, n0 string) (u8, string) {
-	if i == 0 {
-		return s0, n0
+	return match i {
+		0 -> s0, n0
+		_ -> SlotNone, ""
 	}
-	return SlotNone, ""
 }
 
 func layout2(i usize, s0 u8, n0 string, s1 u8, n1 string) (u8, string) {
-	if i == 0 {
-		return s0, n0
+	return match i {
+		0 -> s0, n0
+		1 -> s1, n1
+		_ -> SlotNone, ""
 	}
-	if i == 1 {
-		return s1, n1
-	}
-	return SlotNone, ""
 }
 
 func layout3(i usize, s0 u8, n0 string, s1 u8, n1 string, s2 u8, n2 string) (u8, string) {
-	match i {
-		0 -> return s0, n0
-		1 -> return s1, n1
-		2 -> return s2, n2
-		_ -> return SlotNone, ""
+	return match i {
+		0 -> s0, n0
+		1 -> s1, n1
+		2 -> s2, n2
+		_ -> SlotNone, ""
 	}
 }
 

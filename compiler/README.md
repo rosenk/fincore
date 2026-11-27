@@ -400,15 +400,17 @@ function; overflow is reported as capacity exceeded.
 
 **The seed rule.** compiler/ is built by the seed compiler, not by finc0:
 finc0 (frozen at v0.2) builds compiler/ at the tag in `bootstrap/SEED`
-(`v0.2.0`), and that `finc-seed` builds the current compiler/ (`make seed`,
+(`v0.3.0`), and that `finc-seed` builds the current compiler/ (`make seed`,
 `make bootstrap`; bootstrap/README.md). New language features are
 implemented only here. compiler/ may use a feature once the seed tag has
 it: implement the feature, cut a release tag that contains it, then bump
 `bootstrap/SEED`. Until then the feature may appear in tests and examples
 but not in compiler/ itself (or the std/ packages it imports). The list
-below is the subset in use today, all of it v0.2.
+below is the subset in use today: v0.2, plus from v0.3 `min`/`max`,
+`match`/`is` on `[]byte` with string patterns, multi-value `match`
+expressions and `ErrReported`.
 
-Once compiler/ uses a v0.3 feature, mark the file that uses it with
+A file that uses a v0.3 feature is marked with
 `// SINCE: v0.3` in its leading comment block so that the finc0-vs-finc1
 differential (`make diff-*`, a regression check of the v0.2 subset)
 skips compiler/ and its mutants. (A marker in a std package compiler/
@@ -429,8 +431,9 @@ closure, testdata/README.md.)
   `any` and `decreases` are keywords and cannot name fields or variables.
 - No `iota`: every constant is spelled out. Token, node and operator kinds
   are untyped integer constants compared against `u8` fields.
-- No array literals and no lookup tables: name tables are `if` chains that
-  return string literals.
+- No array literals and no lookup tables: name tables are `match`
+  expressions (on token kinds, or on strings and `[]byte`) that return
+  string literals or kinds.
 - Every loop is T1: `for g := usize(0); g < lim; g++` where `lim` is a
   local (or a constant) that the body never assigns. Loops that consume
   input use a "fuel" counter bounded by the input length (source bytes for
@@ -440,7 +443,8 @@ closure, testdata/README.md.)
   on every call inside its SCC (T3). There are three SCCs: the parser
   (all recursive methods on `*Parser`; the number of methods with
   `decreases` and the SCC size are pinned by `TestCompilerSCCs` in
-  bootstrap/internal/totality/totality_test.go), the printer (4 methods on `*Printer`), and
+  bootstrap/internal/totality/totality_test.go, which runs on finc0 and
+  is skipped since compiler/ uses v0.3), the printer (4 methods on `*Printer`), and
   two directly recursive methods (`NodeArena.assignIDs`,
   `Dumper.dumpNode`). Parser entry points start the measure at
   `ParseDepth = 65_536`, far above the frames reachable within
@@ -487,10 +491,13 @@ closure, testdata/README.md.)
    `(u32, u32)`, and its guard is `return p.tooDeep(), 0`.
 9. **A loop counter of type `u8`** with a constant bound
    (`for k := u8(TkPackage); k < TkDecreases+1; k++`).
-10. **Error sentinels.** Syntax errors return `ErrParse` (the runtime
-    extension) and unimplemented subcommands return `ErrExec`. How a
-    returned error maps to the process exit status is up to the generated
-    `main` (finc0 uses 1 for errors and 2 for usage).
+10. **Error sentinels.** The driver reports every failure itself (on
+    stderr) and then returns `ErrReported` (v0.3, decision 156), so the
+    generated `main` exits 1 without adding a line; finc0 uses 1 for
+    errors and 2 for usage. Errors that were not reported (an I/O error
+    writing the output, a failed exec, a non-zero exit status of the
+    program under `finc run`) are returned as they are and printed as
+    `error: <err>`.
 
 ## Code generation and `finc1 build` (M7b)
 
@@ -537,13 +544,6 @@ exits. `test` runs pass programs through `/bin/sh -c 'exec "$0" >"$1"'`
 clock). Flag parsing covers the Go flag forms used in practice.
 
 ## Known gaps and differences from finc0
-
-- **Trailing `error: fincore: invalid number`.** The driver reports every
-  failure itself and then returns `ErrParse` from `main`, so the generated
-  main adds that line. v0.3 has `ErrReported` for exactly this (decision
-  156), but compiler/ may use it only once the seed is v0.3.0
-  (bootstrap/README.md). After the seed bump, `main` returns `ErrReported`
-  for already-reported failures (TODO in main.fc) and the line goes away.
 
 - **Capacity limits.** A single file whose dump exceeds 8 MiB fails with
   "capacity exceeded (output buffer)". For example, a 20,000-term `1+1+...`

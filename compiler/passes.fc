@@ -1,3 +1,4 @@
+// SINCE: v0.3
 // passes.fc — the semantic passes that run after the type checker (finc0's
 // check.Passes) and the hidden `check --passes=` selection flag.
 //
@@ -16,13 +17,11 @@ var passOnly u32       // 0 = all passes, else the selected pass bits
 
 // passBit returns the bit of a pass name (0 = unknown).
 func passBit(name []byte) u32 {
-	if bytesEqual(name, "scope") {
-		return PassScope
+	return match name {
+		"scope" -> PassScope
+		"totality" -> PassTotality
+		_ -> 0
 	}
-	if bytesEqual(name, "totality") {
-		return PassTotality
-	}
-	return 0
 }
 
 // parsePasses applies the value of --passes=types|all|<pass>[,<pass>].
