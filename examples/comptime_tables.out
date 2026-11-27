@@ -1,0 +1,6 @@
+comptime table == runtime table: 256/256 entries
+crc[1] = 77073096, crc[128] = edb88320, crc[255] = 2d02ef8d
+crc32("123456789") = cbf43926 (want cbf43926)
+whole 414fa339, in two parts 414fa339 (want 414fa339)
+classes: 10 digits, 12 letters, 4 blanks
+chunk buffer: 65536 bytes (El(ChunkCode(Pow2(16))))

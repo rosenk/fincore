@@ -1,0 +1,10 @@
+1 + 2 * 3                    => (1 + (2 * 3)) = 7
+(1 + 2) * 3                  => ((1 + 2) * 3) = 9
+x = 6 * 7                    => (6 * 7) = 42
+--x / 2 - -1                 => ((--x / 2) - -1) = 22
+y = x % 5 - 3                => ((x % 5) - 3) = -1
+x / (y + 1)                  => (x / (y + 1)) = arithmetic error: division by zero at column 3
+x * 1000000000 * 1000000000  => ((x * 1000000000) * 1000000000) = arithmetic error: overflow at column 16
+z + 1                        => (z + 1) = error: variable z is not set
+1 + (2 * 3                   error: expected ')' at column 11
+((((((((((((((((((((((((((((((((((1)))))))))))))))))))))))))))))))))) error: nested deeper than 80

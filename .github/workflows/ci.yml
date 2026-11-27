@@ -48,5 +48,7 @@ jobs:
         run: make bootstrap
       - name: current compiler vs previous release (seed) regression
         run: make diff-prev
+      - name: examples and tutorial snippets
+        run: make examples-test tutorial-check
       - name: integration
         run: make integration

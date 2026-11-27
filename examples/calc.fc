@@ -1,0 +1,309 @@
+// calc: an integer calculator with variables. Each line is parsed into an
+// AST, printed back fully parenthesized and evaluated with checked
+// arithmetic.
+//
+//	bin/finc1 run examples/calc.fc                   # the built-in script
+//	bin/finc1 run examples/calc.fc -- '(1 + 2) * 3'  # one expression
+//
+// Shows: sum types for the AST, errors and results; an arena where nodes
+// refer to each other by u32 IDs (no pointers, no allocation); mutual
+// recursion proven total with decreases(depth), so hostile input cannot
+// overflow the stack; tuple, nested and or-patterns, guards, `@`, `is`
+// with let-else; Format methods for %v.
+package main
+
+const (
+	MaxNodes = 256 // per line
+	MaxDepth = 80  // nesting limit of the parser and the evaluator
+	MaxI64   = i64(9223372036854775807)
+	MinI64   = -MaxI64 - 1
+)
+
+const Script = "1 + 2 * 3\n(1 + 2) * 3\nx = 6 * 7\n--x / 2 - -1\n" +
+	"y = x % 5 - 3\nx / (y + 1)\nx * 1000000000 * 1000000000\nz + 1\n" +
+	"1 + (2 * 3\n((((((((((((((((((((((((((((((((((1))))))))))))))))))))))))))))))))))\n"
+
+type NodeID u32
+
+type Op enum { Add; Sub; Mul; Div; Mod }
+
+func (o Op) Format(dst []byte) usize {
+	return formatTo(dst, "%c", match o { Add -> '+', Sub -> '-', Mul -> '*', Div -> '/', Mod -> '%' })
+}
+
+type Node enum {
+	Num(i64)
+	Var(u8) // 'a'..'z'
+	Neg(NodeID)
+	Bin(Op, NodeID, NodeID)
+}
+
+type CalcErr enum {
+	Syntax(u32, u8) // offset, expected byte (0: anything else)
+	DivZero(u32)    // offset of the operator
+	Overflow(u32)
+	Unbound(u8)
+	TooDeep
+	TooBig
+}
+
+func (e CalcErr) Format(dst []byte) usize {
+	return match e {
+		Syntax(at, 0) -> formatTo(dst, "syntax error at column %d", at+1)
+		Syntax(at, c) -> formatTo(dst, "expected '%c' at column %d", c, at+1)
+		DivZero(at) -> formatTo(dst, "division by zero at column %d", at+1)
+		Overflow(at) -> formatTo(dst, "overflow at column %d", at+1)
+		Unbound(v) -> formatTo(dst, "variable %c is not set", v)
+		TooDeep -> formatTo(dst, "nested deeper than %d", MaxDepth)
+		TooBig -> formatTo(dst, "more than %d nodes", MaxNodes)
+	}
+}
+
+type Result enum { Ok(i64); Err(CalcErr) }
+
+// The arena. Node 0 is never used, so NodeID 0 means "none".
+var nodes [MaxNodes]Node
+var nodeAt [MaxNodes]u32 // source offset of each node, for messages
+var nnodes usize = 1
+var vars [26]i64
+var isSet [26]bool
+
+func newNode(n Node, at u32) NodeID {
+	if nnodes >= MaxNodes {
+		return 0
+	}
+	nodes[nnodes] = n
+	nodeAt[nnodes] = at
+	nnodes++
+	return NodeID(nnodes - 1)
+}
+
+// ---- parser: binary, unary and primary form one recursive SCC ----
+
+type Parser struct {
+	src    []byte
+	pos    usize
+	err    CalcErr
+	failed bool
+}
+
+func (p *Parser) fail(e CalcErr) NodeID {
+	if !p.failed {
+		p.err, p.failed = e, true
+	}
+	return 0
+}
+
+func (p *Parser) node(n Node, at usize) NodeID {
+	if id := newNode(n, u32(at)); id != 0 {
+		return id
+	}
+	return p.fail(CalcErr.TooBig)
+}
+
+// peek skips blanks and returns the next byte (0 at the end).
+func (p *Parser) peek() u8 {
+	n := len(p.src)
+	for i := p.pos; i < n; i++ { // T1: i counts up to a local bound
+		if p.src[i] != ' ' {
+			return p.src[i]
+		}
+		p.pos = i + 1
+	}
+	return 0
+}
+
+func opOf(level u8, c u8) (Op, bool) {
+	match (level, c) {
+		(0, '+') -> return Op.Add, true
+		(0, '-') -> return Op.Sub, true
+		(1, '*') -> return Op.Mul, true
+		(1, '/') -> return Op.Div, true
+		(1, '%') -> return Op.Mod, true
+		_ -> return Op.Add, false
+	}
+}
+
+// binary parses level 0 (+ -) and 1 (* / %), left-associative; level 2
+// is a unary operand. Each round consumes an operator, so len(src) rounds
+// always suffice: a counting loop (T1) instead of an unbounded one.
+func (p *Parser) binary(level u8, depth usize) NodeID decreases(depth) {
+	if depth == 0 {
+		return p.fail(CalcErr.TooDeep)
+	}
+	if level == 2 {
+		return p.unary(depth - 1)
+	}
+	l := p.binary(level+1, depth-1)
+	lim := len(p.src)
+	for k := usize(0); k < lim; k++ {
+		op, ok := opOf(level, p.peek())
+		if p.failed || !ok {
+			break
+		}
+		at := p.pos
+		p.pos++
+		l = p.node(Node.Bin(op, l, p.binary(level+1, depth-1)), at)
+	}
+	return l
+}
+
+func (p *Parser) unary(depth usize) NodeID decreases(depth) {
+	if depth == 0 {
+		return p.fail(CalcErr.TooDeep)
+	}
+	at := p.pos
+	match p.peek() {
+		'-' -> {
+			p.pos++
+			return p.node(Node.Neg(p.unary(depth-1)), at)
+		}
+		'(' -> {
+			p.pos++
+			e := p.binary(0, depth-1)
+			if p.peek() != ')' {
+				return p.fail(CalcErr.Syntax(u32(p.pos), ')'))
+			}
+			p.pos++
+			return e
+		}
+		c if c >= 'a' && c <= 'z' -> { // a top-level binding with a guard
+			p.pos++
+			return p.node(Node.Var(c), at)
+		}
+	}
+	v := i64(0)
+	n := len(p.src)
+	start := p.pos
+	for i := start; i < n; i++ {
+		if p.src[i] < '0' || p.src[i] > '9' {
+			break
+		}
+		d := i64(p.src[i] - '0')
+		if v > (MaxI64-d)/10 {
+			return p.fail(CalcErr.Overflow(u32(start)))
+		}
+		v, p.pos = v*10+d, i+1
+	}
+	if p.pos == start {
+		return p.fail(CalcErr.Syntax(u32(start), 0))
+	}
+	return p.node(Node.Num(v), at)
+}
+
+// ---- checked arithmetic ----
+
+func apply(op Op, x i64, y i64, at u32) Result {
+	return match (op, y) {
+		(Div | Mod, 0) -> Result.Err(CalcErr.DivZero(at))
+		(Div | Mod, -1) if x == MinI64 -> Result.Err(CalcErr.Overflow(at))
+		(Add, _) if y > 0 && x > MaxI64-y || y < 0 && x < MinI64-y -> Result.Err(CalcErr.Overflow(at))
+		(Sub, _) if y < 0 && x > MaxI64+y || y > 0 && x < MinI64+y -> Result.Err(CalcErr.Overflow(at))
+		(Mul, _) if x != 0 && (x*y/x != y || x == -1 && y == MinI64) -> Result.Err(CalcErr.Overflow(at))
+		(Add, _) -> Result.Ok(x + y)
+		(Sub, _) -> Result.Ok(x - y)
+		(Mul, _) -> Result.Ok(x * y)
+		(Div, _) -> Result.Ok(x / y)
+		(Mod, _) -> Result.Ok(x % y)
+	}
+}
+
+func eval(id NodeID, depth usize) Result decreases(depth) {
+	if depth == 0 {
+		return Result.Err(CalcErr.TooDeep)
+	}
+	match nodes[id] {
+		Num(v) -> return Result.Ok(v)
+		Var(c) if isSet[c-'a'] -> return Result.Ok(vars[c-'a'])
+		Var(c) -> return Result.Err(CalcErr.Unbound(c))
+		Neg(x) -> {
+			r := eval(x, depth-1)
+			if !(r is Ok(v)) { // let-else: v is in scope after the if
+				return r
+			}
+			return apply(Op.Sub, 0, v, nodeAt[id])
+		}
+		Bin(op, l, r) -> {
+			a := eval(l, depth-1)
+			if !(a is Ok(x)) {
+				return a
+			}
+			b := eval(r, depth-1)
+			if !(b is Ok(y)) {
+				return b
+			}
+			return apply(op, x, y, nodeAt[id])
+		}
+	}
+}
+
+// show prints a tree fully parenthesized; formatTo truncates at len(dst).
+func show(dst []byte, id NodeID, depth usize) usize decreases(depth) {
+	if depth == 0 {
+		return 0
+	}
+	match nodes[id] {
+		Num(v) -> return formatTo(dst, "%d", v)
+		Var(c) -> return formatTo(dst, "%c", c)
+		Neg(x) -> {
+			k := formatTo(dst, "-")
+			return k + show(dst[k:], x, depth-1)
+		}
+		Bin(op, l, r) -> {
+			k := formatTo(dst, "(")
+			k += show(dst[k:], l, depth-1)
+			k += formatTo(dst[k:], " %v ", op)
+			k += show(dst[k:], r, depth-1)
+			return k + formatTo(dst[k:], ")")
+		}
+	}
+}
+
+// run handles one line, "[letter =] expr", and formats the answer.
+func run(line []byte, out []byte) usize {
+	nnodes = 1
+	p := Parser{src: line}
+	target := u8(0)
+	if len(line) > 2 && line[0] >= 'a' && line[0] <= 'z' && line[1] == ' ' && line[2] == '=' {
+		target, p.pos = line[0], 3
+	}
+	root := p.binary(0, MaxDepth)
+	if p.peek() != 0 {
+		p.fail(CalcErr.Syntax(u32(p.pos), 0))
+	}
+	k := formatTo(out, "%-28s ", line)
+	if p.failed {
+		return k + formatTo(out[k:], "error: %v\n", p.err)
+	}
+	k += formatTo(out[k:], "=> ")
+	k += show(out[k:], root, MaxDepth)
+	match eval(root, MaxDepth) {
+		Ok(v) -> {
+			if target != 0 {
+				vars[target-'a'], isSet[target-'a'] = v, true
+			}
+			k += formatTo(out[k:], " = %d\n", v)
+		}
+		Err(e @ (DivZero(_) | Overflow(_))) -> k += formatTo(out[k:], " = arithmetic error: %v\n", e)
+		Err(e) -> k += formatTo(out[k:], " = error: %v\n", e)
+	}
+	return k
+}
+
+driver func main(env Env, io Stdio) error {
+	var out [512]byte
+	if env.ArgsCount() > 1 {
+		return io.WriteStdout(out[:run(strBytes(env.Arg(1)), out[:])])
+	}
+	script := strBytes(Script)
+	start := usize(0)
+	for i := usize(0); i < len(script); i++ {
+		if script[i] == '\n' {
+			if err := io.WriteStdout(out[:run(script[start:i], out[:])]); err != nil {
+				return err
+			}
+			start = i + 1
+		}
+	}
+	return nil
+}

@@ -1,0 +1,17 @@
+C: MAIL FROM:<ann@example.org>    Connected    -> Connected    S: 503 say HELO first
+C: HELO client.example.org        Connected    -> Greeted      S: 250 hello
+C: MAIL FROM:<ann@example.org>    Greeted      -> Mail         S: 250 sender ok
+C: DATA                           Mail         -> Mail         S: 503 need RCPT TO
+C: RCPT TO:<bob@example.org>      Mail         -> Rcpt(1)      S: 250 recipient ok
+C: RCPT TO:<cy@example.org>       Rcpt(1)      -> Rcpt(2)      S: 250 recipient ok
+C: RCPT TO:<di@example.org>       Rcpt(2)      -> Rcpt(3)      S: 250 recipient ok
+C: RCPT TO:<ed@example.org>       Rcpt(3)      -> Rcpt(3)      S: 452 too many recipients
+C: DATA                           Rcpt(3)      -> Data(3, 0)   S: 354 end data with .
+C: Subject: lunch                 Data(3, 0)   -> Data(3, 1)
+C:                                Data(3, 1)   -> Data(3, 2)
+C: QUIT is not a command in here. Data(3, 2)   -> Data(3, 3)
+C: .                              Data(3, 3)   -> Greeted      S: 250 message queued
+C: MAIL FROM:<bob@example.org>    Greeted      -> Mail         S: 250 sender ok
+C: RSET                           Mail         -> Greeted      S: 250 reset
+C: QUIT                           Greeted      -> Closed       S: 221 bye
+C: NOOP                           Closed       -> Closed       S: 421 closing
