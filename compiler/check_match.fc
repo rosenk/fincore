@@ -1260,10 +1260,10 @@ func writePattern(o *OutBuf, p u32, dp usize) decreases(dp) {
 // column runs are built LIFO above their sources and popped after use.
 
 const (
-	MaxUStack       = 1_048_576
+	MaxUStack       = 65_536
 	MaxUCols        = 65536
 	MaxUSeen        = 262_144
-	MaxWCells       = 262_144
+	MaxWCells       = 32_768
 	MaxWRows        = 65536
 	MaxPatternDepth = 1000 // fuel: useful/witnesses give up (useful, exhaustive)
 	MaxWitnesses    = 32   // listed missing patterns (more: ", ...")

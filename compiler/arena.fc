@@ -14,13 +14,20 @@ import (
 	"std/vec"
 )
 
+// Capacities. Arenas are zeroed .bss, committed lazily page by page: a
+// capacity costs address space, and RSS only where written (with
+// transparent huge pages up to 2 MiB per touched region). They are sized
+// from measured high-water marks of compiling compiler/ and the test corpus;
+// compiler/README.md, "Capacities and memory", has the rules and headroom.
 const (
 	MaxFiles       = 128
 	MaxSourceBytes = 4 * 1024 * 1024
 	MaxTokens      = 262_144
 	MaxNodes       = 524_288
 	MaxListItems   = 1_048_576
+	MaxListStack   = MaxTokens // open node lists of one file (each item is >= 1 token)
 	MaxOutputBytes = 8 * 1024 * 1024
+	MaxMsgBytes    = MaxDiagBytes // one diagnostic message (sema.fc): mbuf and the message scratch buffers
 )
 
 // ---------------------------------------------------------------------------
@@ -106,7 +113,7 @@ type Node struct {
 // NodeLists holds the child lists of all nodes. Lists are built on its
 // scratch stack while they are parsed (they nest in LIFO order) and
 // committed into the store in one piece when complete.
-type NodeLists = vec.ListArena[MaxListItems, MaxListItems, u32]
+type NodeLists = vec.ListArena[MaxListItems, MaxListStack, u32]
 
 type NodeArena struct {
 	items  [MaxNodes]Node
@@ -149,3 +156,8 @@ func (na *NodeArena) listItem(start u32, i usize) u32 {
 // Writes that do not fit are dropped and set the sticky Truncated flag.
 
 type OutBuf = bytes.Builder[MaxOutputBytes]
+
+// MsgBuf: a bounded buffer for one message (value errors, comptime
+// failures, codegen errors). A message longer than MaxMsgBytes could not be
+// stored as a diagnostic anyway (MaxDiagBytes).
+type MsgBuf = bytes.Builder[MaxMsgBytes]

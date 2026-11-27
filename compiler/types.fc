@@ -20,18 +20,19 @@ import (
 )
 
 const (
-	MaxTypes     = 131_072
-	TypeBuckets  = 262_144
-	MaxTypeLists = 1 << 20
-	MaxListRecs  = 131_072
-	ListBuckets  = 262_144
-	MaxNamedRecs = 65_536
-	MaxMethods   = 16_384
-	MaxInsts     = 8192
-	MaxPending   = 8192
-	MaxFuncs     = 65_536
-	MaxCalls     = 262_144
-	MaxSels      = 262_144
+	MaxTypes         = 32_768
+	TypeBuckets      = 65_536
+	MaxTypeLists     = 1 << 18
+	MaxTypeListStack = 65_536 // type lists under construction
+	MaxListRecs      = 32_768
+	ListBuckets      = 65_536
+	MaxNamedRecs     = 8192
+	MaxMethods       = 16_384
+	MaxInsts         = 8192
+	MaxPending       = 8192
+	MaxFuncs         = 16_384
+	MaxCalls         = 131_072
+	MaxSels          = 65_536
 )
 
 // Basic kinds (types.BasicKind) and the TypeIDs of the basic types
@@ -137,7 +138,7 @@ type TypeArena struct {
 	items   [MaxTypes]TypeRec
 	count   usize
 	table   maps.Table[TypeBuckets]
-	lists   vec.ListArena[MaxTypeLists, MaxTypeLists, u32]
+	lists   vec.ListArena[MaxTypeLists, MaxTypeListStack, u32]
 	listTab maps.Table[ListBuckets]
 	listS   [MaxListRecs]u32 // interned list i: run (listS[i], listN[i])
 	listN   [MaxListRecs]u32

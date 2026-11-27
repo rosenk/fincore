@@ -25,11 +25,11 @@
 package main
 
 const (
-	TotMaxStates = 262_144
-	TotMaxLB     = 524_288
-	TotMaxBE     = 524_288
-	TotMaxBS     = 262_144
-	TotMaxAsg    = 65_536
+	TotMaxStates = 32_768
+	TotMaxLB     = 65_536
+	TotMaxBE     = 65_536
+	TotMaxBS     = 32_768
+	TotMaxAsg    = 16_384
 
 	TermVar   = 1 // value of a variable at iteration start
 	TermLen   = 2 // len of an invariant slice

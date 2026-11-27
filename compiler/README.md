@@ -51,8 +51,9 @@ frame. Capacities:
 | :--- | :--- |
 | `SourceArena` | `MaxFiles = 128` files, `MaxSourceBytes = 4 MiB` in total |
 | `TokenArena` | `MaxTokens = 262_144` tokens (reset per file) |
-| `NodeArena` | `MaxNodes = 524_288` nodes; `lists`: `MaxListItems = 1_048_576` list items (whole program) plus a scratch stack of `MaxListItems` for lists under construction |
-| `OutBuf` | `MaxOutputBytes = 8 MiB` (stdout dump per file, stderr diagnostics, string scratch) |
+| `NodeArena` | `MaxNodes = 524_288` nodes; `lists`: `MaxListItems = 1_048_576` list items (whole program) plus a scratch stack of `MaxListStack = MaxTokens` for the lists of one file under construction |
+| `OutBuf` | `MaxOutputBytes = 8 MiB` (stdout dump per file, stderr diagnostics, generated Go sections, string scratch) |
+| `MsgBuf`, `mbuf` | `MaxMsgBytes = MaxDiagBytes = 2 MiB`: one message (`mbuf`, `errTxt`, `ifailMsg`, `cgErrBuf`) |
 
 Overflow never panics: `alloc` and the std containers set a sticky flag
 (`full`, `Full()`, `Truncated()`; writes go to the reserved slot 0 or are
@@ -304,7 +305,8 @@ anything (finc0's `check.Passes`). The hidden flag
   frames and loop contexts live on shared stacks with per-flow bases. An
   abstract environment is an EnvID into `lnEnv` (dead flag + a range of
   state bytes and tied error symbols), a mutable handle like finc0's
-  `*env`; the arena is reset per declaration (1 Mi envs, 4 Mi slots).
+  `*env`; the arena is reset per declaration (`MaxLnEnvs = 65_536` envs,
+  `MaxLnSlots = 262_144` slots; the corpus needs fewer than 1k of each).
   Owned/borrowed lists and assignment operands are passed on the `lnTmp`
   scratch stack. Loop fixpoints keep finc0's 65-iteration cap.
 
@@ -317,27 +319,70 @@ diff-check corpus and snippets plus the 60 cases of finc0's
 
 ### Semantic capacities
 
-| Arena | Capacity | `compiler/` (18k lines) |
-| :--- | :--- | :--- |
-| `names` | `MaxNames = 65_536`, `MaxNameBytes = 1 MiB` | 1.9k |
-| `syms` | `MaxSyms = 131_072`, `SymBuckets = 524_288` | 4.9k |
-| `scopes` | `MaxScopes = 524_288` | 6.7k |
-| `ulists` (store + stack) | `MaxULists = 1_048_576` each | 3.3k |
-| `cells` | `MaxCells = 524_288` | 7.7k |
-| `typs` | `MaxTypes = 131_072`, `TypeBuckets = 262_144`, `MaxTypeLists = 1_048_576` (interned: `MaxListRecs = 131_072`, `ListBuckets = 262_144`), `MaxNamedRecs = 65_536` | 1.5k / 2.8k (with std/maps, std/vec) |
-| `meths`, `insts`, `funcs` | 16_384, 8_192, 65_536 | 164, 0, 644 |
-| `callTab`, `selTab` | 262_144 each | 7.7k, 5.1k |
-| `vals` | `VtabCap = 1 Mi` persistent + `HeapCap = 2 Mi` heap slots | 9.4k |
-| `strPool` | `MaxStrBytes = 4 MiB` | 16 KB |
-| `diags` | `MaxDiags = 8_192`, `MaxDiagBytes = 2 MiB` | 0 |
+The last column is the usage when compiling compiler/ itself (31k lines,
+v0.4; `finc1 check --stats ./compiler`); headroom is capacity / usage.
 
-`compiler/` itself uses 84k nodes (4.6 per line), so a 35k-line compiler
-needs about 165k of `MaxNodes = 524_288`; every other table has more than
-10x headroom. Deviations from the spec 9.4 table: MaxNodes 524_288 (spec
-131_072), MaxListItems 1_048_576 (262_144), MaxFiles 128 (64), MaxTypes
-131_072 (32_768), MaxSyms 131_072 (32_768) with 524_288 buckets (65_536);
-there is no separate MaxFields: fields are entries of `typs.lists`.
-`finc1 check compiler/` takes about 20 ms and 90 MB RSS.
+| Arena | Capacity | `compiler/` | Headroom |
+| :--- | :--- | :--- | :--- |
+| `names` | `MaxNames = 65_536`, `MaxNameBytes = 1 MiB` | 3.6k, 26 KB | 18x, 40x |
+| `syms` | `MaxSyms = 65_536`, `SymBuckets = 262_144` | 11.4k | 5.7x |
+| `scopes` | `MaxScopes = 131_072` | 14.3k | 9x |
+| `ulists` | store `MaxULists = 262_144`, stack `MaxUListStack = 65_536` | 8.3k, 2.6k | 31x, 25x |
+| `cells` | `MaxCells = 131_072` | 15.3k | 8.5x |
+| `typs` | `MaxTypes = 32_768`, `TypeBuckets = 65_536`, `MaxTypeLists = 262_144` (stack `MaxTypeListStack = 65_536`; interned: `MaxListRecs = 32_768`, `ListBuckets = 65_536`), `MaxNamedRecs = 8192` | 1.8k types, 3.3k list items, 1.6k interned, 301 named | 18x, 79x, 21x, 27x |
+| `meths`, `insts`, `funcs` | 16_384, 8_192, `MaxFuncs = 16_384` | 271, 154, 1.4k | 60x, 53x, 11x |
+| `callTab`, `selTab` | `MaxCalls = 131_072`, `MaxSels = 65_536` | 15.3k, 6.3k | 8.6x, 10x |
+| `opStack` | `MaxOperands = 16_384` operands (call arguments, assignment sides; nested calls stack) | < 20 | |
+| `vals` | `VtabCap = 1 Mi` persistent + `HeapCap = 2 Mi` heap slots | 17.6k | 60x |
+| `strPool` | `MaxStrBytes = 4 MiB` | 36 KB | 100x |
+| `diags` | `MaxDiags = 8_192`, `MaxDiagBytes = 2 MiB` | 0 | |
+
+`compiler/` itself uses 167k nodes (5.4 per line), 3.1x below `MaxNodes =
+524_288`. Deviations from the spec 9.6 table (v0.2 values): MaxSyms
+65_536 with 262_144 buckets, MaxScopes 131_072, MaxTypes 32_768,
+MaxTypeLists 1 << 18 (v0.4: right-sized, below); there is no separate
+MaxFields: fields are entries of `typs.lists`.
+
+### Capacities and memory
+
+Every arena is a zeroed package-level array, i.e. `.bss` of the finc
+binary, committed lazily by the kernel page by page: a capacity costs
+address space, and RSS only for the pages actually written. With
+transparent huge pages (`/sys/kernel/mm/transparent_hugepage/enabled` =
+`always`) the kernel backs each touched 2 MiB-aligned region with a huge
+page, so every arena that is touched at all costs up to 2 MiB, and large
+capacities do show up in RSS even for tiny programs.
+
+v0.4 right-sized the capacities from measured high-water marks: an
+instrumented finc1 (scanning every global array at exit for the last
+non-zero byte and, via /proc/self/pagemap, the last written page) ran the
+self-compile, `check`/`build`/`parse --dump-ast`/`fmt` on compiler/, std/,
+examples/, testdata/ and the inputs of `make diff-prev diff-check
+diff-build fmt-fc-check spec-check tutorial-check integration`. The rules:
+
+- Tables that grow with the program (syms, scopes, types, funcs, calls,
+  cells, ...) keep at least 5x headroom over compiler/ itself, the largest
+  program; most keep 8x or more. Per-node tables stay at `MaxNodes`.
+- Per-function or per-declaration scratch (totality states and bounds,
+  linearity environments, pattern matrices, codegen frames and match
+  arms, operand lists) keeps at least 30x headroom over the largest use in
+  the corpus.
+- User-visible limits stay: source size, tokens per file, nodes, output
+  size (`MaxOutputBytes`, which also bounds `finc fmt`'s AST dumps), the
+  comptime value slots and string pool.
+- One message (`mbuf` and the `MsgBuf` scratch buffers) is bounded by
+  `MaxMsgBytes = MaxDiagBytes`: a longer message could not be recorded as a
+  diagnostic anyway. Buffers passed to `*OutBuf` helpers stay `OutBuf`.
+
+| | `.bss` | RSS self-compile (finc1 only) | RSS `check examples/calc.fc` |
+| :--- | :--- | :--- | :--- |
+| v0.3 | 548 MB | 207 MB (THP) / 40 MB (no THP) | 147 MB / 6.6 MB |
+| v0.4 | 385 MB | 137 MB / 37 MB | 100 MB / 6.2 MB |
+
+The largest remaining arenas are `vals` (96 MB: 3 Mi value slots of 32
+bytes), `nodes` (49 MB), eleven `OutBuf`s (8 MiB each), `tokens` (12 MB) and
+about twenty `MaxNodes`-sized side tables (2 MiB each). Without THP the
+RSS is what the compiler actually writes.
 
 ### Validation
 
@@ -392,9 +437,12 @@ are documented in its doc.go); the differences are representation only:
   Tarjan is iterative with an explicit frame stack. Diagnostics are sorted
   afterwards, so the visiting order does not matter.
 
-Capacities: `TotMaxStates = 262_144` states, `TotMaxLB`/`TotMaxBE =
-524_288` fact entries, `TotMaxBS = 262_144` bounds, per analysed loop or
-function; overflow is reported as capacity exceeded.
+Capacities: `TotMaxStates = 32_768` states, `TotMaxLB`/`TotMaxBE =
+65_536` fact entries, `TotMaxBS = 32_768` bounds, `TotMaxAsg = 16_384`
+assignment targets, per analysed loop or function (largest use in the
+corpus: 245 states, 1.8k/426 fact entries); `TotMaxAtoms = 8192` and
+`TotMaxScratch = 32_768` per loop-invariance query; overflow is reported
+as capacity exceeded.
 
 ## Language subset used (conservative on purpose)
 
@@ -509,7 +557,9 @@ temporaries, labels and monomorphized-instance discovery happen in
 finc0's order. Labels for `break` out of a match are inserted in front of
 the loop after its body. Return values evaluated before scope waits and the
 match scrutinee are kept on the `cgStash` stack. Capacities: 8 MiB per
-section (compiler/ needs about 0.5 MB), 4096 instances, 65_536 frames.
+section (compiler/ needs about 0.7 MB), 4096 instances, 8192 frames,
+32_768 match arms under construction, 16_384 match subjects, enum
+layouts of 16_384 groups / 65_536 payloads.
 
 Formatting: the raw text is written to `<tmp>/main.go` and formatted with
 `go run cmd/gofmt -w` (or `$FINC_GOFMT`) through Exec; gofmt and go/format

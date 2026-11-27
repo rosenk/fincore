@@ -37,9 +37,9 @@ const (
 	CgMaxMonos    = 4096
 	CgMaxMonoVals = 32_768
 	CgMaxEnv      = 256
-	CgMaxFrames   = 65_536
+	CgMaxFrames   = 8192
 	CgMaxPend     = 65_536
-	CgMaxArms     = 262_144
+	CgMaxArms     = 32_768
 	CgMaxSeen     = 4096
 )
 
@@ -49,7 +49,7 @@ var genTypes OutBuf
 var genVars OutBuf
 var genFuncs OutBuf
 var cgStash OutBuf
-var cgErrBuf OutBuf
+var cgErrBuf MsgBuf
 
 var cgUsesRT bool
 var cgFailed bool
@@ -247,13 +247,12 @@ func cgFail(n u32, msg string) {
 		return
 	}
 	cgFailed = true
-	o := &cgErrBuf
-	o.Reset()
+	k := formatTo(mbuf[:], "codegen: %s", msg)
 	if n != 0 {
-		putMsg(o, formatTo(mbuf[:], "%v: codegen: %s", PosRef(n), msg))
-	} else {
-		putMsg(o, formatTo(mbuf[:], "codegen: %s", msg))
+		k = formatTo(mbuf[:], "%v: codegen: %s", PosRef(n), msg)
 	}
+	cgErrBuf.Reset()
+	cgErrBuf.WriteBytes(mbuf[:k])
 }
 
 // ---------------------------------------------------------------------------
