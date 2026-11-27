@@ -376,7 +376,7 @@ func (in *interp) cond(e ast.Expr) bool {
 }
 
 func (in *interp) match(s *ast.MatchStmt) ctl {
-	arm := in.selectArm(in.eval(s.X), s.Arms)
+	arm := in.selectArm(in.scrutinee(s.X), s.Arms)
 	if arm == nil {
 		return ctlNone
 	}
@@ -389,55 +389,39 @@ func (in *interp) match(s *ast.MatchStmt) ctl {
 
 // matchExpr evaluates a match expression (v0.2).
 func (in *interp) matchExpr(e *ast.MatchExpr) types.Value {
-	arm := in.selectArm(in.eval(e.X), e.Arms)
+	arm := in.selectArm(in.scrutinee(e.X), e.Arms)
 	if arm == nil {
 		in.fail(diag.E2002, "no match arm for the value")
 	}
 	return in.eval(arm.Expr)
 }
 
-// selectArm returns the first arm whose pattern (or one of whose
-// or-pattern alternatives) matches x, defining its payload bindings; nil
-// if none matches.
-func (in *interp) selectArm(x types.Value, arms []*ast.MatchArm) *ast.MatchArm {
-	for _, arm := range arms {
-		alts := []ast.Pattern{arm.Pattern}
-		if op, ok := arm.Pattern.(*ast.OrPattern); ok {
-			alts = op.Alts
+// scrutinee evaluates the scrutinee of a match (a tuple scrutinee to a
+// TupleVal, v0.2).
+func (in *interp) scrutinee(e ast.Expr) types.Value {
+	if te, ok := e.(*ast.TupleExpr); ok {
+		tv := types.TupleVal{}
+		for _, x := range te.Elems {
+			tv.Elems = append(tv.Elems, in.eval(x))
 		}
-		for _, alt := range alts {
-			if in.patternMatches(x, alt) {
-				return arm
-			}
-		}
+		return tv
 	}
-	return nil
+	return in.eval(e)
 }
 
-func (in *interp) patternMatches(x types.Value, p ast.Pattern) bool {
-	switch p := p.(type) {
-	case *ast.WildcardPattern:
-		return true
-	case *ast.LiteralPattern:
-		return in.equal(x, in.eval(p.Lit))
-	case *ast.CtorPattern:
-		if v := in.info.VariantOf(p); v != nil {
-			ev, isEnum := x.(*types.EnumVal)
-			if !isEnum || ev.Variant != v.Index {
-				return false
-			}
-			for i, b := range p.Bindings {
-				if sym := in.info.Prog.Defs[b.ID()]; sym != nil && i < len(ev.Payload) {
-					in.define(sym, ev.Payload[i])
-				}
-			}
-			return true
+// selectArm returns the first arm whose pattern matches x and whose guard
+// (evaluated after the bindings are defined) holds; nil if none.
+func (in *interp) selectArm(x types.Value, arms []*ast.MatchArm) *ast.MatchArm {
+	for _, arm := range arms {
+		if !types.MatchValue(in.info, arm.Pattern, x, in.define) {
+			continue
 		}
-		if cv := in.info.ValueOf(p.Name); cv != nil {
-			return in.equal(x, cv)
+		if arm.Guard != nil && !in.cond(arm.Guard) {
+			continue
 		}
+		return arm
 	}
-	return false
+	return nil
 }
 
 func (in *interp) equal(a, b types.Value) bool {
@@ -608,6 +592,8 @@ func (in *interp) eval(e ast.Expr) types.Value {
 		in.fail(diag.E2002, "function literals are not supported at compile time")
 	case *ast.MatchExpr:
 		return in.matchExpr(e)
+	case *ast.IsExpr:
+		return types.BoolVal(types.MatchValue(in.info, e.Pattern, in.eval(e.X), in.define))
 	}
 	in.fail(diag.E2002, "unsupported expression at compile time")
 	return nil

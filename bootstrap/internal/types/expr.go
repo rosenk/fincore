@@ -335,6 +335,11 @@ func (c *Checker) expr0(e ast.Expr) operand {
 		return c.structLit(e)
 	case *ast.MatchExpr:
 		return c.matchExpr(e)
+	case *ast.IsExpr:
+		return c.isExpr(e)
+	case *ast.TupleExpr:
+		c.errorf(diag.E2002, e.Range, "tuple %s can only be the scrutinee of a match", exprString(e))
+		return invalidOp(e)
 	case *ast.TypeExpr:
 		t := c.typExpr(e.Type)
 		if IsInvalid(t) {

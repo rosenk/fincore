@@ -334,9 +334,26 @@ func cgMatchStmt(s u32, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
+	if !cgFlatMatch(s) {
+		cgMatchChain(s, CgArmStmt, dp-1)
+		return
+	}
 	_ = cgPushFrame(CgFrSwitch, 0, 0)
 	cgMatchSwitch(s, CgArmStmt, dp-1)
 	cgPopFrame()
+}
+
+// cgMatchArmsEmit writes a match expression's switch (or v0.2 if chain)
+// whose arms return their values.
+func cgMatchArmsEmit(e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	if cgFlatMatch(e) {
+		cgMatchSwitch(e, CgArmReturn, dp-1)
+	} else {
+		cgMatchChain(e, CgArmReturn, dp-1)
+	}
 }
 
 // cgMatchExpr writes a match expression as an immediately invoked
@@ -351,7 +368,7 @@ func cgMatchExpr(e u32, dp usize) decreases(dp) {
 	cgW("func() ")
 	cgGoType(e, ntype[usize(e)], dp-1)
 	cgW(" {\n")
-	cgMatchSwitch(e, CgArmReturn, dp-1)
+	cgMatchArmsEmit(e, dp-1)
 	cgW("}()")
 	cgHeader = saveHeader
 }
@@ -366,7 +383,7 @@ func cgReturnValue(e u32, dp usize) decreases(dp) {
 	}
 	u := unparen(e)
 	if nkind(u) == NkMatchExpr && cgConstValueSlot(u) == 0 {
-		cgMatchSwitch(u, CgArmReturn, dp-1)
+		cgMatchArmsEmit(u, dp-1)
 		return
 	}
 	cgW("return ")
@@ -380,7 +397,8 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
-	mark, cnt, hasDef, en := cgMatchArms(s)
+	mark, cnt, hasDef0, en := cgMatchArms(s)
+	hasDef := hasDef0 || nexh[usize(s)]
 	x := na(s)
 	var lay CgLay
 	lay.g0 = cgLayGTop
@@ -396,7 +414,11 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 			}
 			nbd := l1len(pt)
 			for j := usize(0); j < nbd; j++ {
-				sym := defs[usize(l1at(pt, j))]
+				b := l1at(pt, j)
+				if nkind(b) != NkIdent {
+					continue
+				}
+				sym := defs[usize(b)]
 				if sym != 0 && cgSymUsed(sym) {
 					needBind = true
 				}
@@ -441,9 +463,14 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 		}
 		if nkind(pt) == NkCtorPattern && en != 0 && nvarEnum[usize(pt)] != 0 {
 			vi := usize(nvarIdx[usize(pt)])
+			npay := variantPayN(nvarEnum[usize(pt)], vi)
 			nbd := l1len(pt)
 			for j := usize(0); j < nbd; j++ {
-				sym := defs[usize(l1at(pt, j))]
+				b := l1at(pt, j)
+				if nkind(b) != NkIdent {
+					continue
+				}
+				sym := defs[usize(b)]
 				if sym == 0 || !cgSymUsed(sym) {
 					continue
 				}
@@ -455,24 +482,11 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 					cgStashEmit(smark, bEnd)
 				}
 				cgWc('.')
-				cgWSlot(lay, vi, j)
+				cgWSlot(lay, vi, payloadIndex(pt, j, npay))
 				cgWc('\n')
 			}
 		}
-		if mode == CgArmReturn {
-			cgReturnValue(nb(a), dp-1)
-		} else {
-			if nb(a) != 0 {
-				p := cgWmark()
-				cgExprStmt(nb(a), dp-1)
-				if cgWmark() > p {
-					cgWc('\n')
-				}
-			}
-			if nc(a) != 0 {
-				cgStmts(nc(a), dp-1)
-			}
-		}
+		cgArmBody(a, mode, dp-1)
 	}
 	cgW("}\n")
 	cgArmTop = mark
@@ -526,4 +540,701 @@ func cgCaseLabel(x u32, a u32, pt u32, dp usize) decreases(dp) {
 		}
 	}
 	cgFail(a, "unsupported match pattern")
+}
+
+// cgArmBody writes the body of a match arm after its bindings: the arm's
+// statement(s), or `return <arm>` (match expression).
+func cgArmBody(a u32, mode u8, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	if mode == CgArmReturn {
+		cgReturnValue(nb(a), dp-1)
+		return
+	}
+	if nb(a) != 0 {
+		p := cgWmark()
+		cgExprStmt(nb(a), dp-1)
+		if cgWmark() > p {
+			cgWc('\n')
+		}
+	}
+	if nc(a) != 0 {
+		cgStmts(nc(a), dp-1)
+	}
+}
+
+// cgFlatMatch reports whether match m is lowered to a Go switch (finc0's
+// flatMatch): no tuple scrutinee, no guards, and every alternative is '_',
+// a literal, a constant or a variant whose payload patterns are bindings,
+// '_' or '..' (bindings only outside or-patterns). Other matches (v0.2)
+// are lowered to if chains (cgMatchChain).
+func cgFlatMatch(m u32) bool {
+	if nkind(na(m)) == NkTupleExpr {
+		return false
+	}
+	narms := l1len(m)
+	for i := usize(0); i < narms; i++ {
+		a := l1at(m, i)
+		if nd(a) != 0 {
+			return false
+		}
+		pt := na(a)
+		isOr := nkind(pt) == NkOrPattern
+		nalt := patAltN(pt)
+		for k := usize(0); k < nalt; k++ {
+			alt := patAlt(pt, k)
+			ak := nkind(alt)
+			if ak == NkWildcardPattern || ak == NkLiteralPattern {
+				continue
+			}
+			if ak != NkCtorPattern {
+				return false
+			}
+			nargs := l1len(alt)
+			for j := usize(0); j < nargs; j++ {
+				b := l1at(alt, j)
+				bk := nkind(b)
+				if bk == NkRestPattern {
+					continue
+				}
+				if bk != NkIdent {
+					return false
+				}
+				if nvarEnum[usize(b)] != 0 || (isOr && !isBlank(b)) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// v0.2 patterns: if chains and `is` expressions
+//
+// A subject (finc0's subject) is the value a pattern is matched against:
+// entries [s, s+sn) of the subject stack, one per element of a tuple
+// scrutinee, each a Go expression (path, a span of cgStash) and a type.
+// Pattern conditions are written to gw (nothing written: always matches);
+// the bindings of a pattern are collected on the binding stack.
+
+const CgMaxSub = 65_536
+
+var cgSubA [CgMaxSub]u32 // path: span in cgStash
+var cgSubB [CgMaxSub]u32
+var cgSubT [CgMaxSub]u32 // type
+var cgSubTop usize
+var cgBindSym [CgMaxSub]u32 // patBindings: symbol and type
+var cgBindT [CgMaxSub]u32
+var cgBindTop usize
+var cgChainTmp [CgMaxSub]u64 // scrutinee temporaries of the if chains being written
+var cgChainTmpTop usize
+
+func cgSubPush(a usize, b usize, t u32) usize {
+	if cgSubTop >= CgMaxSub {
+		setFull("codegen match subjects")
+		return CgMaxSub - 1
+	}
+	i := cgSubTop
+	cgSubA[i] = u32(a)
+	cgSubB[i] = u32(b)
+	cgSubT[i] = t
+	cgSubTop++
+	return i
+}
+
+// cgSubCut makes everything written since mark the path of a new subject
+// entry of type t.
+func cgSubCut(mark usize, t u32) usize {
+	a := (&cgStash).Len()
+	cgStashCut(mark)
+	return cgSubPush(a, (&cgStash).Len(), t)
+}
+
+// cgSubPop drops the subject entries from mark on (and their paths).
+func cgSubPop(mark usize) {
+	if mark < cgSubTop {
+		(&cgStash).Truncate(usize(cgSubA[mark]))
+		cgSubTop = mark
+	}
+}
+
+func cgWPath(s usize) {
+	cgStashEmit(usize(cgSubA[s]), usize(cgSubB[s]))
+}
+
+// cgSubPay pushes the subject `<path of s>.<slot>` of payload j of variant
+// vi of enum en (layout lay).
+func cgSubPay(s usize, lay CgLay, en u32, vi usize, j usize) usize {
+	m := cgWmark()
+	cgWPath(s)
+	cgWc('.')
+	cgWSlot(lay, vi, j)
+	return cgSubCut(m, variantPay(en, vi, j))
+}
+
+func cgBindPush(sym u32, t u32) {
+	if cgBindTop >= CgMaxSub {
+		setFull("codegen match bindings")
+		return
+	}
+	cgBindSym[cgBindTop] = sym
+	cgBindT[cgBindTop] = t
+	cgBindTop++
+}
+
+// cgWprefix moves s in front of everything written since mark.
+func cgWprefix(mark usize, s string) {
+	q := cgWmark()
+	cgW(s)
+	cgWrotate(mark, q)
+}
+
+// cgPatTest writes the Go condition under which subject s (sn entries)
+// matches p (nothing if it always does; finc0's patTest). It reports
+// whether the condition is a conjunction of several tests; disjunctions
+// are parenthesized.
+func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
+	if dp == 0 || p == 0 {
+		return false
+	}
+	k := nkind(p)
+	if k == NkTuplePattern {
+		n := l1len(p)
+		parts := usize(0)
+		for i := usize(0); i < n; i++ {
+			m := cgWmark()
+			if parts > 0 {
+				cgW(" && ")
+			}
+			m2 := cgWmark()
+			_ = cgPatTest(l1at(p, i), s+i, 1, dp-1)
+			if cgWmark() == m2 {
+				cgWtruncate(m)
+			} else {
+				parts++
+			}
+		}
+		return parts > 1
+	}
+	if k == NkOrPattern {
+		m0 := cgWmark()
+		cgWc('(')
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			if i > 0 {
+				cgW(" || ")
+			}
+			m := cgWmark()
+			comp := cgPatTest(l1at(p, i), s, sn, dp-1)
+			if cgWmark() == m {
+				cgWtruncate(m0)
+				return false
+			}
+			if comp {
+				cgWwrap(m)
+			}
+		}
+		cgWc(')')
+		return false
+	}
+	if k == NkIdent {
+		if nvarEnum[usize(p)] != 0 {
+			cgWPath(s)
+			cgW("._tag == ")
+			cgWu(u64(nvarIdx[usize(p)]))
+		}
+		return false
+	}
+	if k == NkCtorPattern {
+		t := cgSubT[s]
+		en := nvarEnum[usize(p)]
+		if en == 0 {
+			cgWPath(s)
+			cgW(" == ")
+			v := nval[usize(nb(p))]
+			if v == 0 {
+				cgFail(p, "unsupported match pattern")
+				return false
+			}
+			cgValue(p, slotGet(v), t, dp-1)
+			return false
+		}
+		vi := usize(nvarIdx[usize(p)])
+		cgWPath(s)
+		cgW("._tag == ")
+		cgWu(u64(vi))
+		parts := usize(1)
+		lay := cgLayout(p, t, dp-1)
+		npay := variantPayN(en, vi)
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			a := l1at(p, i)
+			if nkind(a) == NkRestPattern {
+				continue
+			}
+			m := cgWmark()
+			cgW(" && ")
+			m2 := cgWmark()
+			ps := cgSubPay(s, lay, en, vi, payloadIndex(p, i, npay))
+			_ = cgPatTest(a, ps, 1, dp-1)
+			cgSubPop(ps)
+			if cgWmark() == m2 {
+				cgWtruncate(m)
+			} else {
+				parts++
+			}
+		}
+		cgLayRelease(lay)
+		return parts > 1
+	}
+	if k == NkLiteralPattern {
+		cgWPath(s)
+		cgW(" == ")
+		v := nval[usize(na(p))]
+		if v == 0 {
+			cgFail(p, "unsupported match pattern")
+			return false
+		}
+		cgValue(p, slotGet(v), cgSubT[s], dp-1)
+	}
+	return false
+}
+
+// cgBindUsed reports whether a binding is read in region (anywhere if
+// region is 0: the bindings of an `is` expression).
+func cgBindUsed(sym u32, region u32) bool {
+	if region == 0 {
+		return cgSymUsed(sym)
+	}
+	return cgUsedIn(region, sym)
+}
+
+// cgPatBindings pushes the bindings of p that are read in region onto the
+// binding stack, in source order (for or-patterns those of the first
+// alternative; finc0's patBindings). t is the type matched; for a tuple
+// scrutinee (sn > 1) the element types are those of subject s.
+func cgPatBindings(p u32, t u32, s usize, sn usize, region u32, dp usize) decreases(dp) {
+	if dp == 0 || p == 0 {
+		return
+	}
+	k := nkind(p)
+	if k == NkTuplePattern {
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			et := u32(0)
+			if sn > 1 {
+				et = cgSubT[s+i]
+			} else {
+				et = tupleAt(t, i)
+			}
+			cgPatBindings(l1at(p, i), et, 0, 1, region, dp-1)
+		}
+	} else if k == NkOrPattern {
+		if l1len(p) > 0 {
+			cgPatBindings(l1at(p, 0), t, s, sn, region, dp-1)
+		}
+	} else if k == NkIdent {
+		sym := defs[usize(p)]
+		if sym != 0 && cgBindUsed(sym, region) {
+			cgBindPush(sym, t)
+		}
+	} else if k == NkCtorPattern {
+		en := nvarEnum[usize(p)]
+		if en == 0 {
+			return
+		}
+		vi := usize(nvarIdx[usize(p)])
+		npay := variantPayN(en, vi)
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			a := l1at(p, i)
+			if nkind(a) == NkRestPattern {
+				continue
+			}
+			cgPatBindings(a, variantPay(en, vi, payloadIndex(p, i, npay)), 0, 1, region, dp-1)
+		}
+	}
+}
+
+// cgSubType is the type of subject s for cgPatBindings (the scrutinee's
+// type for a tuple; its element types come from the subject).
+func cgSubType(s usize, sn usize, x u32) u32 {
+	if sn > 1 {
+		return ntype[usize(x)]
+	}
+	return cgSubT[s]
+}
+
+// cgEmitBinds writes the bindings of p that are read in region: `x :=
+// path`, or `x = path` if assign. An or-pattern with bindings declares
+// them (`var x T`, unless assign) and assigns them in an if chain over its
+// alternatives (finc0's emitBinds). x is the scrutinee (for tuple types).
+func cgEmitBinds(p u32, s usize, sn usize, x u32, region u32, assign bool, dp usize) decreases(dp) {
+	if dp == 0 || p == 0 {
+		return
+	}
+	k := nkind(p)
+	if k == NkTuplePattern {
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			cgEmitBinds(l1at(p, i), s+i, 1, x, region, assign, dp-1)
+		}
+	} else if k == NkOrPattern {
+		bmark := cgBindTop
+		cgPatBindings(p, cgSubType(s, sn, x), s, sn, region, dp-1)
+		btop := cgBindTop
+		if btop == bmark {
+			return
+		}
+		if !assign {
+			for i := bmark; i < btop; i++ {
+				cgW("var ")
+				cgWSymName(cgBindSym[i])
+				cgWc(' ')
+				cgGoType(p, cgBindT[i], dp-1)
+				cgWc('\n')
+			}
+		}
+		cgBindTop = bmark
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			alt := l1at(p, i)
+			m := cgWmark()
+			_ = cgPatTest(alt, s, sn, dp-1)
+			empty := cgWmark() == m
+			last := i == n-1 || empty
+			if i == 0 && last {
+				cgWtruncate(m)
+				cgW("{\n")
+			} else if i == 0 {
+				cgWprefix(m, "if ")
+				cgW(" {\n")
+			} else if last {
+				cgWtruncate(m)
+				cgW("} else {\n")
+			} else {
+				cgWprefix(m, "} else if ")
+				cgW(" {\n")
+			}
+			cgEmitBinds(alt, s, sn, x, region, true, dp-1)
+			if last {
+				break
+			}
+		}
+		cgW("}\n")
+	} else if k == NkIdent {
+		sym := defs[usize(p)]
+		if sym != 0 && cgBindUsed(sym, region) {
+			cgWSymName(sym)
+			if assign {
+				cgW(" = ")
+			} else {
+				cgW(" := ")
+			}
+			cgWPath(s)
+			cgWc('\n')
+		}
+	} else if k == NkCtorPattern {
+		en := nvarEnum[usize(p)]
+		if en == 0 {
+			return
+		}
+		vi := usize(nvarIdx[usize(p)])
+		lay := cgLayout(p, cgSubT[s], dp-1)
+		npay := variantPayN(en, vi)
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			a := l1at(p, i)
+			if nkind(a) == NkRestPattern {
+				continue
+			}
+			ps := cgSubPay(s, lay, en, vi, payloadIndex(p, i, npay))
+			cgEmitBinds(a, ps, 1, x, region, assign, dp-1)
+			cgSubPop(ps)
+		}
+		cgLayRelease(lay)
+	}
+}
+
+// cgScrutineeSubject writes the evaluation of the scrutinee of a general
+// match m (v0.2) into temporaries (`_fc_tN := x`, one per tuple element,
+// recorded on cgChainTmp) unless every element is a local variable and no
+// arm has a guard. It returns the subject.
+func cgScrutineeSubject(m u32, dp usize) (usize, usize) decreases(dp) {
+	if dp == 0 {
+		return cgSubTop, 0
+	}
+	x := na(m)
+	direct := true
+	narms := l1len(m)
+	for i := usize(0); i < narms; i++ {
+		if nd(l1at(m, i)) != 0 {
+			direct = false
+		}
+	}
+	tuple := nkind(x) == NkTupleExpr
+	n := usize(1)
+	if tuple {
+		n = l1len(x)
+	}
+	for i := usize(0); i < n; i++ {
+		el := x
+		if tuple {
+			el = l1at(x, i)
+		}
+		if !cgIsPlainVar(el) {
+			direct = false
+		}
+	}
+	s := cgSubTop
+	for i := usize(0); i < n; i++ {
+		el := x
+		if tuple {
+			el = l1at(x, i)
+		}
+		t := ntype[usize(el)]
+		if direct {
+			p := cgWmark()
+			cgPrimary(el, dp-1)
+			_ = cgSubCut(p, t)
+			continue
+		}
+		tn := cgNewTemp()
+		cgWtemp(tn)
+		cgW(" := ")
+		cgExpr(el, dp-1)
+		cgWc('\n')
+		if cgChainTmpTop < CgMaxSub {
+			cgChainTmp[cgChainTmpTop] = tn
+			cgChainTmpTop++
+		} else {
+			setFull("codegen match temporaries")
+		}
+		p := cgWmark()
+		cgWtemp(tn)
+		_ = cgSubCut(p, t)
+	}
+	return s, n
+}
+
+// cgMatchChain writes a general match m (v0.2: nested, tuple and
+// or-patterns with bindings, guards) as an if chain (finc0's matchChain);
+// the last arm of an exhaustive match is the final else. Bindings read by
+// a guard are bound in a function literal evaluated in the condition;
+// those read by the body are bound at the start of the arm. Scrutinee
+// temporaries the chain does not mention get `_ = t`.
+func cgMatchChain(m u32, mode u8, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	exhaustive := nexh[usize(m)]
+	x := na(m)
+	smark := (&cgStash).Len()
+	submark := cgSubTop
+	tmark := cgChainTmpTop
+	s, sn := cgScrutineeSubject(m, dp-1)
+	start := cgWmark()
+	narms := l1len(m)
+	for i := usize(0); i < narms; i++ {
+		a := l1at(m, i)
+		g := nd(a)
+		isElse := i == narms-1 && exhaustive && g == 0
+		m0 := cgWmark()
+		_ = cgPatTest(na(a), s, sn, dp-1)
+		if g != 0 {
+			if cgWmark() > m0 {
+				cgW(" && ")
+			}
+			cgGuardCond(a, s, sn, x, dp-1)
+		}
+		if isElse {
+			cgWtruncate(m0)
+			if i == 0 {
+				cgW("{\n")
+			} else {
+				cgW("} else {\n")
+			}
+		} else {
+			if cgWmark() == m0 {
+				cgW("true")
+			}
+			if i == 0 {
+				cgWprefix(m0, "if ")
+			} else {
+				cgWprefix(m0, "} else if ")
+			}
+			cgW(" {\n")
+		}
+		region := nc(a)
+		if nb(a) != 0 {
+			region = nb(a)
+		}
+		cgEmitBinds(na(a), s, sn, x, region, false, dp-1)
+		cgArmBody(a, mode, dp-1)
+	}
+	if narms > 0 {
+		cgW("}\n")
+	}
+	q := cgWmark()
+	ttop := cgChainTmpTop
+	for i := tmark; i < ttop; i++ {
+		tn := cgChainTmp[i]
+		k := formatTo(mbuf[:], "_fc_t%d", tn)
+		if !cgWcontains(start, q, mbuf[:k]) {
+			cgW("_ = ")
+			cgWtemp(tn)
+			cgWc('\n')
+		}
+	}
+	cgWrotate(start, q)
+	cgChainTmpTop = tmark
+	cgSubTop = submark
+	(&cgStash).Truncate(smark)
+}
+
+// cgGuardCond writes the guard of arm a; the bindings it reads are bound
+// in a function literal: `func() bool { x := path; return guard }()`.
+func cgGuardCond(a u32, s usize, sn usize, x u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	g := nd(a)
+	bmark := cgBindTop
+	cgPatBindings(na(a), cgSubType(s, sn, x), s, sn, g, dp-1)
+	has := cgBindTop > bmark
+	cgBindTop = bmark
+	if !has {
+		cgHeader++
+		cgWc('(')
+		cgExpr(g, dp-1)
+		cgWc(')')
+		cgHeader--
+		return
+	}
+	saveHeader := cgHeader
+	cgHeader = 0
+	cgW("func() bool {\n")
+	cgEmitBinds(na(a), s, sn, x, g, false, dp-1)
+	cgW("return ")
+	cgExpr(g, dp-1)
+	cgW("\n}()")
+	cgHeader = saveHeader
+}
+
+// cgIsExpr writes `X is P` (v0.2). Its bindings (only in if conditions)
+// are declared before the if statement (cgIsDecls) and assigned here.
+func cgIsExpr(e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	x := na(e)
+	p := nb(e)
+	t := ntype[usize(x)]
+	bmark := cgBindTop
+	cgPatBindings(p, t, 0, 1, 0, dp-1)
+	has := cgBindTop > bmark
+	cgBindTop = bmark
+	submark := cgSubTop
+	smark := (&cgStash).Len()
+	if !has && (cgIsPlainVar(x) || cgSingleTest(p)) {
+		pm := cgWmark()
+		cgPrimary(x, dp-1)
+		s := cgSubCut(pm, t)
+		m0 := cgWmark()
+		_ = cgPatTest(p, s, 1, dp-1)
+		if cgWmark() == m0 {
+			cgW("true")
+		} else {
+			cgWwrap(m0)
+		}
+		cgSubTop = submark
+		(&cgStash).Truncate(smark)
+		return
+	}
+	saveHeader := cgHeader
+	cgHeader = 0
+	cgW("func() bool {\n")
+	tn := cgNewTemp()
+	cgWtemp(tn)
+	cgW(" := ")
+	cgExpr(x, dp-1)
+	cgWc('\n')
+	pm := cgWmark()
+	cgWtemp(tn)
+	s := cgSubCut(pm, t)
+	m0 := cgWmark()
+	_ = cgPatTest(p, s, 1, dp-1)
+	empty := cgWmark() == m0
+	if !has && empty {
+		cgW("_ = ")
+		cgWtemp(tn)
+		cgW("\nreturn true\n")
+	} else if !has {
+		cgWprefix(m0, "return ")
+		cgWc('\n')
+	} else if empty {
+		cgEmitBinds(p, s, 1, x, 0, true, dp-1)
+		cgW("return true\n")
+	} else {
+		cgWprefix(m0, "if ")
+		cgW(" {\n")
+		cgEmitBinds(p, s, 1, x, 0, true, dp-1)
+		cgW("return true\n}\nreturn false\n")
+	}
+	cgW("}()")
+	cgHeader = saveHeader
+	cgSubTop = submark
+	(&cgStash).Truncate(smark)
+}
+
+// cgSingleTest reports whether the test of p reads the subject once: a
+// literal, a constant or a variant whose payload patterns are bindings,
+// '_' or '..'.
+func cgSingleTest(p u32) bool {
+	k := nkind(p)
+	if k == NkLiteralPattern {
+		return true
+	}
+	if k != NkCtorPattern {
+		return false
+	}
+	n := l1len(p)
+	for i := usize(0); i < n; i++ {
+		b := l1at(p, i)
+		bk := nkind(b)
+		if bk == NkRestPattern {
+			continue
+		}
+		if bk != NkIdent || nvarEnum[usize(b)] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// cgIsDecls writes the declarations `var x T` of the variables bound by
+// the `is` expressions of an if condition (v0.2) that are read.
+func cgIsDecls(cond u32, dp usize) decreases(dp) {
+	if dp == 0 || cond == 0 {
+		return
+	}
+	k := nkind(cond)
+	if k == NkIsExpr {
+		bmark := cgBindTop
+		cgPatBindings(nb(cond), ntype[usize(na(cond))], 0, 1, 0, dp-1)
+		btop := cgBindTop
+		for i := bmark; i < btop; i++ {
+			cgW("var ")
+			cgWSymName(cgBindSym[i])
+			cgWc(' ')
+			cgGoType(cond, cgBindT[i], dp-1)
+			cgWc('\n')
+		}
+		cgBindTop = bmark
+	} else if k == NkBinaryExpr && nop(cond) == OpLAnd {
+		cgIsDecls(na(cond), dp-1)
+		cgIsDecls(nb(cond), dp-1)
+	}
 }

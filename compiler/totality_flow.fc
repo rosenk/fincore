@@ -755,7 +755,7 @@ func addLess(x u32, y u32, strict bool, st u32, dp usize) decreases(dp) {
 // The walker
 
 func isExprKind(k u8) bool {
-	return k >= NkIdent && k <= NkStructLit || k == NkTypeExpr || k == NkMatchExpr
+	return k >= NkIdent && k <= NkStructLit || k == NkTypeExpr || k == NkMatchExpr || k == NkTupleExpr || k == NkIsExpr
 }
 
 func asgPush(n u32) {
@@ -886,7 +886,8 @@ func twStmt(s u32, st0 u32, dp usize) u32 decreases(dp) {
 		for i := usize(0); i < n; i++ {
 			arm := l1at(s, i)
 			a := cloneState(st)
-			killPattern(na(arm), a)
+			killPattern(na(arm), a, SemaDepth)
+			twExpr(nd(arm), a, dp-1)
 			if nb(arm) != 0 {
 				twExpr(nb(arm), a, dp-1)
 				if isPanicCall(nb(arm)) {
@@ -941,28 +942,27 @@ func twStmt(s u32, st0 u32, dp usize) u32 decreases(dp) {
 	return st
 }
 
-func killPattern(p u32, st u32) {
-	if p == 0 || nkind(p) != NkCtorPattern {
+// killPattern forgets the facts about the bindings of a pattern (v0.2:
+// nested, or- and tuple patterns; `is` expressions).
+func killPattern(p u32, st u32, depth usize) decreases(depth) {
+	if depth == 0 || p == 0 {
 		return
 	}
-	n := l1len(p)
-	for i := usize(0); i < n; i++ {
-		kill(symbolOf(l1at(p, i)), st)
+	k := nkind(p)
+	if k == NkIdent {
+		kill(symbolOf(p), st)
+	} else if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			killPattern(l1at(p, i), st, depth-1)
+		}
 	}
 }
 
-// matchExhaustive reports whether a match statement covers all cases: it
-// has a wildcard arm, or it matches an enum (v0.2: the type checker
-// rejects non-exhaustive enum matches with E2012).
+// matchExhaustive reports whether a match statement covers all cases
+// (v0.2: recorded by the type checker, nexh).
 func matchExhaustive(m u32) bool {
-	n := l1len(m)
-	for i := usize(0); i < n; i++ {
-		p := na(l1at(m, i))
-		if p != 0 && nkind(p) == NkWildcardPattern {
-			return true
-		}
-	}
-	return isEnumT(underlying(ntype[usize(na(m))]))
+	return nexh[usize(m)]
 }
 
 // wNestedLoop analyses a loop inside the analysed body: facts about the
@@ -1067,9 +1067,15 @@ func twExpr(e u32, st u32, dp usize) decreases(dp) {
 		for i := usize(0); i < n; i++ {
 			arm := l1at(e, i)
 			a := cloneState(st)
-			killPattern(na(arm), a)
+			killPattern(na(arm), a, SemaDepth)
+			twExpr(nd(arm), a, dp-1)
 			twExpr(nb(arm), a, dp-1)
 		}
+		return
+	}
+	if k == NkIsExpr {
+		twExpr(na(e), st, dp-1)
+		killPattern(nb(e), st, SemaDepth)
 		return
 	}
 	if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) {

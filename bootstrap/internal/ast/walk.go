@@ -194,18 +194,26 @@ func Children(n Node) []Node {
 		if n.Pattern != nil {
 			add(n.Pattern)
 		}
+		addE(n.Guard)
 		addE(n.Expr)
 		add(n.Block)
 	case *WildcardPattern:
 	case *CtorPattern:
 		add(n.Qual, n.Name)
-		idents(n.Bindings)
+		for _, a := range n.Args {
+			add(a)
+		}
 	case *LiteralPattern:
 		addE(n.Lit)
 	case *OrPattern:
 		for _, a := range n.Alts {
 			add(a)
 		}
+	case *TuplePattern:
+		for _, a := range n.Elems {
+			add(a)
+		}
+	case *RestPattern:
 	case *ForStmt:
 		addS(n.Init)
 		addE(n.Cond)
@@ -259,6 +267,11 @@ func Children(n Node) []Node {
 		for _, a := range n.Arms {
 			add(a)
 		}
+	case *TupleExpr:
+		exprs(n.Elems)
+	case *IsExpr:
+		addE(n.X)
+		add(n.Pattern)
 	}
 	return out
 }

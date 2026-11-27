@@ -431,145 +431,6 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 	}
 }
 
-func bindInvalid(p u32) {
-	n := l1len(p)
-	for i := usize(0); i < n; i++ {
-		setSymType(defs[usize(l1at(p, i))], TyInvalid)
-	}
-}
-
-// pattern checks a single (non-or) pattern against the scrutinee type t
-// and reports whether it is valid.
-func pattern(p u32, t u32, dp usize) bool decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		return false
-	}
-	en := underlying(t)
-	isEnum := isEnumT(en)
-	k := nkind(p)
-	if k == NkLiteralPattern {
-		x := exprValue(na(p), dp-1)
-		if !isInvalidOp(&x) {
-			if !assignment(&x, t, mkCtx(CtxPattern)) {
-				return false
-			}
-			if !comparable(t, SemaDepth) {
-				errAt(E2002, p, formatTo(mbuf[:], "cannot match values of type %v against literals", TypeRef(t)))
-				return false
-			}
-			return true
-		}
-		return false
-	}
-	if k != NkCtorPattern {
-		return true
-	}
-	name := nb(p)
-	sym := uses[usize(name)]
-	// A constant pattern (pkg.Const or Const). An unqualified name that is
-	// a variant of the scrutinee's enum is that variant (v0.2).
-	isVariant := false
-	if na(p) == 0 && isEnum {
-		_, isVariant = variantByName(en, idName(name))
-	}
-	if sym != 0 && symKind(sym) == SymConst && !isVariant {
-		if nflag(p) {
-			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot have bindings", NameRef(symName(sym))))
-			bindInvalid(p)
-			return false
-		}
-		if isEnum {
-			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot be a pattern for enum type %v", NameRef(symName(sym)), TypeRef(t)))
-			return false
-		}
-		x := symOperand(sym, name, dp-1)
-		x.expr = name
-		record(&x)
-		return !isInvalidOp(&x) && assignment(&x, t, mkCtx(CtxPattern))
-	}
-	nm := idName(name)
-	venum := u32(0)
-	vi := usize(0)
-	q := na(p)
-	if q != 0 {
-		qs := uses[usize(q)]
-		if qs == 0 {
-			bindInvalid(p)
-			return false
-		}
-		if symKind(qs) != SymType {
-			errAt(E2002, q, formatTo(mbuf[:], "%v is not an enum type", NameRef(idName(q))))
-			bindInvalid(p)
-			return false
-		}
-		qt := typeSym(qs, q, dp-1)
-		ntype[usize(q)] = qt
-		nmode[usize(q)] = KType
-		if isInvalid(qt) {
-			bindInvalid(p)
-			return false
-		}
-		qe := underlying(qt)
-		if !isEnumT(qe) {
-			errAt(E2002, q, formatTo(mbuf[:], "%v is not an enum type", TypeRef(qt)))
-			bindInvalid(p)
-			return false
-		}
-		// v0.2: a generic enum qualifies patterns on its instances
-		// (Option.Some(x) on an Option[u32]); the variant comes from the
-		// instance.
-		if isNamedT(t) && namedOrigin(t) != 0 && namedOrigin(t) == qt && isEnum {
-			qe = en
-		} else if qt != t {
-			errAt(E2002, p, formatTo(mbuf[:], "pattern of type %v does not match scrutinee of type %v", TypeRef(qt), TypeRef(t)))
-			bindInvalid(p)
-			return false
-		}
-		v, found := variantByName(qe, nm)
-		if !found {
-			errAt(E2001, name, formatTo(mbuf[:], "enum %v has no variant %v", TypeRef(qt), NameRef(nm)))
-			bindInvalid(p)
-			return false
-		}
-		venum = qe
-		vi = v
-	} else if isEnum {
-		v, found := variantByName(en, nm)
-		if !found {
-			errAt(E2001, name, formatTo(mbuf[:], "undefined: %v (no constant or variant of %v)", NameRef(nm), TypeRef(t)))
-			bindInvalid(p)
-			return false
-		}
-		venum = en
-		vi = v
-	} else {
-		errAt(E2001, name, formatTo(mbuf[:], "undefined: %v", NameRef(nm)))
-		bindInvalid(p)
-		return false
-	}
-	nvarEnum[usize(p)] = venum
-	nvarIdx[usize(p)] = u32(vi)
-	ntype[usize(p)] = t
-	nbind := l1len(p)
-	npay := variantPayN(venum, vi)
-	if nbind != npay || (nflag(p) && npay == 0) {
-		errAt(E2003, p, formatTo(mbuf[:], "variant %v has %d payload values, pattern binds %d", NameRef(nm), npay, nbind))
-		bindInvalid(p)
-		return false
-	}
-	for i := usize(0); i < nbind; i++ {
-		b := l1at(p, i)
-		bs := defs[usize(b)]
-		if bs != 0 {
-			setSymType(bs, variantPay(venum, vi, i))
-		} else {
-			ntype[usize(b)] = variantPay(venum, vi, i)
-		}
-	}
-	return true
-}
-
 // ---------------------------------------------------------------------------
 // Terminating statements (Go spec rules, adapted)
 
@@ -605,16 +466,11 @@ func isTerminating(s u32, dp usize) bool decreases(dp) {
 		return isTerminatingList(nc(s), dp-1)
 	}
 	if k == NkMatchStmt {
-		// v0.2: a match on an enum is exhaustive (E2012 otherwise), so it
-		// terminates if all arms do; other matches need a '_' arm.
-		exhaustive := false
+		// v0.2: a match is a terminating statement if it is exhaustive
+		// (nexh) and all its arms terminate.
 		n := l1len(s)
 		for i := usize(0); i < n; i++ {
 			arm := l1at(s, i)
-			pat := na(arm)
-			if nkind(pat) == NkWildcardPattern {
-				exhaustive = true
-			}
 			if nb(arm) != 0 && !isPanicCall(nb(arm)) {
 				return false
 			}
@@ -622,13 +478,7 @@ func isTerminating(s u32, dp usize) bool decreases(dp) {
 				return false
 			}
 		}
-		if !exhaustive && n > 0 {
-			t := ntype[usize(na(s))]
-			if t != 0 && isEnumT(underlying(t)) {
-				exhaustive = true
-			}
-		}
-		return exhaustive
+		return n > 0 && nexh[usize(s)]
 	}
 	return false
 }

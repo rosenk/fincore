@@ -705,7 +705,7 @@ func imatch(s u32, dp usize) u8 decreases(dp) {
 		failSilent()
 		return CtlReturn
 	}
-	x := ieval(na(s), dp-1)
+	x := iscrutinee(na(s), dp-1)
 	if ifail {
 		return CtlReturn
 	}
@@ -732,7 +732,7 @@ func imatchExpr(e u32, dp usize) Val decreases(dp) {
 		failSilent()
 		return z
 	}
-	x := ieval(na(e), dp-1)
+	x := iscrutinee(na(e), dp-1)
 	if ifail {
 		return z
 	}
@@ -747,9 +747,39 @@ func imatchExpr(e u32, dp usize) Val decreases(dp) {
 	return ieval(nb(l1at(e, i)), dp-1)
 }
 
+// iscrutinee evaluates the scrutinee of a match (a tuple scrutinee to a
+// Tuple value, v0.2).
+func iscrutinee(e u32, dp usize) Val decreases(dp) {
+	var z Val
+	if dp == 0 {
+		tooDeep()
+		failSilent()
+		return z
+	}
+	if nkind(e) != NkTupleExpr {
+		return ieval(e, dp-1)
+	}
+	n := l1len(e)
+	m := vtop
+	for i := usize(0); i < n; i++ {
+		v := ieval(l1at(e, i), dp-1)
+		if ifail {
+			vtop = m
+			return z
+		}
+		vpush(v)
+	}
+	st := valAlloc(n, true)
+	for i := usize(0); i < n; i++ {
+		slotSet(st+u32(i), vstack[m+i])
+	}
+	vtop = m
+	return Val.Tuple(st, u32(n))
+}
+
 // iselectArm returns the index of the first arm of match m whose pattern
-// (or one of whose or-pattern alternatives) matches x, defining its
-// payload bindings; the arm count if none matches.
+// matches x and whose guard (evaluated after the bindings are defined)
+// holds; the arm count if none.
 func iselectArm(x Val, m u32, dp usize) usize decreases(dp) {
 	n := l1len(m)
 	if dp == 0 {
@@ -758,62 +788,90 @@ func iselectArm(x Val, m u32, dp usize) usize decreases(dp) {
 		return n
 	}
 	for i := usize(0); i < n; i++ {
-		p := na(l1at(m, i))
-		nalt := patAltN(p)
-		for j := usize(0); j < nalt; j++ {
-			ok := ipatternMatches(x, patAlt(p, j), dp-1)
-			if ifail {
-				return n
-			}
-			if ok {
-				return i
-			}
+		arm := l1at(m, i)
+		if !imatchPat(na(arm), x, SemaDepth) {
+			continue
+		}
+		g := nd(arm)
+		if g == 0 {
+			return i
+		}
+		b := icond(g, dp-1)
+		if ifail {
+			return n
+		}
+		if b {
+			return i
 		}
 	}
 	return n
 }
 
-func ipatternMatches(x Val, p u32, dp usize) bool decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
+// imatchPat reports whether x matches the checked pattern p, defining the
+// bindings of the matching pattern (finc0's types.MatchValue).
+func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
+	if depth == 0 || p == 0 {
 		return false
 	}
-	pk := nkind(p)
-	if pk == NkWildcardPattern {
+	k := nkind(p)
+	if k == NkWildcardPattern || k == NkRestPattern {
 		return true
 	}
-	if pk == NkLiteralPattern {
-		v := ieval(na(p), dp-1)
-		if ifail {
+	if k == NkIdent {
+		if nvarEnum[usize(p)] != 0 {
+			return isVariant(x, nvarIdx[usize(p)])
+		}
+		if !isBlank(p) && defs[usize(p)] != 0 {
+			define(defs[usize(p)], x)
+		}
+		return true
+	}
+	if k == NkCtorPattern {
+		if nvarEnum[usize(p)] == 0 {
+			s := nval[usize(nb(p))]
+			return s != 0 && valsEqual(x, slotGet(s))
+		}
+		if !isVariant(x, nvarIdx[usize(p)]) {
 			return false
 		}
-		return iequal(x, v)
-	}
-	if pk == NkCtorPattern {
-		if nvarEnum[usize(p)] != 0 {
-			match x {
-				Enum(vi, ref, np) -> {
-					if vi != nvarIdx[usize(p)] {
-						return false
-					}
-					nb2 := l1len(p)
-					for j := usize(0); j < nb2; j++ {
-						bs := defs[usize(l1at(p, j))]
-						if bs != 0 && j < usize(np) {
-							define(bs, slotGet(ref+u32(j)))
-						}
-					}
-					return true
-				}
-				_ -> {
-					return false
-				}
+		np := variantPayN(nvarEnum[usize(p)], usize(nvarIdx[usize(p)]))
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			a := l1at(p, i)
+			if nkind(a) == NkRestPattern {
+				continue
+			}
+			if !imatchPat(a, slotGet(enumPaySlot(x, payloadIndex(p, i, np))), depth-1) {
+				return false
 			}
 		}
-		if nval[usize(nb(p))] != 0 {
-			return iequal(x, slotGet(nval[usize(nb(p))]))
+		return true
+	}
+	if k == NkLiteralPattern {
+		s := nval[usize(na(p))]
+		return s != 0 && valsEqual(x, slotGet(s))
+	}
+	if k == NkOrPattern {
+		c := l1len(p)
+		for i := usize(0); i < c; i++ {
+			if imatchPat(l1at(p, i), x, depth-1) {
+				return true
+			}
 		}
+		return false
+	}
+	if k == NkTuplePattern {
+		ref, tn := tupleOf(x)
+		c := l1len(p)
+		if usize(tn) != c {
+			return false
+		}
+		for i := usize(0); i < c; i++ {
+			if !imatchPat(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
@@ -1122,6 +1180,13 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 	}
 	if k == NkMatchExpr {
 		return imatchExpr(e, dp-1)
+	}
+	if k == NkIsExpr {
+		x := ieval(na(e), dp-1)
+		if ifail {
+			return z
+		}
+		return Val.Bool(imatchPat(nb(e), x, SemaDepth))
 	}
 	failS(E2002, "unsupported expression at compile time")
 	return z

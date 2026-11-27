@@ -1806,7 +1806,8 @@ var ncall [MaxNodes]u32    // CallOf
 var nsel [MaxNodes]u32     // SelectionOf
 var ninst [MaxNodes]u32    // InstanceOf
 var nvarEnum [MaxNodes]u32 // VariantOf (CtorPattern): underlying Enum TypeID
-var nvarIdx [MaxNodes]u32  //   and variant index
+var nvarIdx [MaxNodes]u32  //   and variant index (also v0.2 payload Idents)
+var nexh [MaxNodes]bool    // Exhaustive (v0.2): match counts as exhaustive
 var nfunc [MaxNodes]u32    // FuncDecl/FuncLit -> FuncInfo
 var nbytes [MaxNodes]bool  // ImplicitBytes: a constant string used as []byte (v0.2)
 

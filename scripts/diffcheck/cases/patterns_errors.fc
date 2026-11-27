@@ -1,0 +1,140 @@
+// patterns_errors (v0.2): type-checker diagnostics of patterns: or-pattern
+// binding sets and types, duplicate bindings, '_' alternatives, two '..',
+// arity with '..', tuple arity and element types, `is` bindings outside
+// if conditions, guards, literal and constant patterns in payloads,
+// unreachable arms and non-exhaustive matches with witnesses.
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+type Opt[T any] enum {
+	Some(T)
+	None
+}
+
+type Val enum {
+	Int(u32, u32)
+	Bool(bool)
+	Str(string)
+	Wrap(Shape)
+}
+
+const K = 3
+
+func orSets(s Shape) u32 {
+	return match s {
+		Circle(x) | Rect(x, y) -> x + y
+		Empty -> 0
+	}
+}
+
+func orTypes(v Val) u32 {
+	match v {
+		Int(_, x) | Bool(x) -> return 1
+		_ -> return 0
+	}
+}
+
+func dup(v Val) u32 {
+	return match v {
+		Int(a, a) -> a
+		_ -> 0
+	}
+}
+
+func wildAlt(o Opt[u32]) u32 {
+	return match o {
+		Some(1 | _) -> 1
+		_ -> 0
+	}
+}
+
+func rests(s Shape) u32 {
+	return match s {
+		Rect(.., ..) -> 1
+		Circle(a, b, ..) -> a + b
+		_ -> 0
+	}
+}
+
+func tuples(a u32, b Shape) u32 {
+	return match (a, b) {
+		(1, Circle(r)) -> r
+		(2, 3) -> 1
+		(_, _, _) -> 2
+		_ -> 0
+	}
+}
+
+func isOutside(v Val) bool {
+	b := v is Int(h, _)
+	return b
+}
+
+func guards(s Shape) u32 {
+	return match s {
+		Circle(r) if r -> r
+		Rect(w, _) if w > 1 -> w
+		_ -> 0
+	}
+}
+
+func payloads(o Opt[u32], v Val) u32 {
+	match o {
+		Some(K) -> return 1
+		Some("x") -> return 2
+		_ -> return 0
+	}
+}
+
+func variantPayload(v Val) u32 {
+	return match v {
+		Wrap(Circle) -> 1
+		Wrap(Rect(1, _)) -> 2
+		Wrap(Triangle) -> 3
+		_ -> 0
+	}
+}
+
+func unreachable(o Opt[Opt[u32]], v Val) u32 {
+	match v {
+		Int(..) -> return 1
+		Int(1, 2) -> return 2
+		Bool(true) | Bool(false) -> return 3
+		Bool(_) -> return 4
+		_ -> return 5
+	}
+	return match o {
+		Some(Some(_)) -> 1
+		Some(None) | None -> 2
+		Some(_) -> 3
+	}
+}
+
+func missing(o Opt[Val], a Shape, b Shape) u32 {
+	x := match o {
+		Some(Int(0, _)) -> 1
+		Some(Bool(true)) -> 2
+		Some(Wrap(Rect(..))) -> 3
+		None -> 4
+	}
+	y := match (a, b) {
+		(Circle(_), Circle(_)) -> 1
+		(Rect(..), _) -> 2
+	}
+	match (a, b) {
+		(Empty, Empty) -> x = 1
+	}
+	return x + y
+}
+
+func boolTuple(p bool, q bool) u32 {
+	return match (p, q, p) {
+		(true, true, _) -> 1
+		(false, _, false) -> 2
+	}
+}

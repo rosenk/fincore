@@ -176,7 +176,11 @@ func (f *flow) collectVars(body *ast.BlockStmt) {
 		case *ast.VarDecl:
 			ids = []*ast.Ident{n.Name}
 		case *ast.CtorPattern:
-			ids = n.Bindings
+			for _, a := range n.Args {
+				if id, ok := a.(*ast.Ident); ok {
+					ids = append(ids, id)
+				}
+			}
 		}
 		for _, id := range ids {
 			if s := c.varSym(id); s != nil && isDef(c.info, id, s) && types.IsLinear(c.info.SymType(s)) {
@@ -446,6 +450,7 @@ func (f *flow) stmt(s ast.Stmt, e *env) *env {
 			a := e.clone()
 			f.frames = append(f.frames, nil)
 			f.borrowBindings(arm.Pattern, a)
+			f.expr(arm.Guard, a)
 			if arm.Expr != nil {
 				f.expr(arm.Expr, a)
 				if call, ok := unparen(arm.Expr).(*ast.CallExpr); ok {
@@ -561,31 +566,33 @@ func (f *flow) nilTest(cond ast.Expr) (*resolve.Symbol, bool, bool) {
 	return s, b.Op == ast.OpNe, true
 }
 
-// exhaustive reports whether a match statement covers all cases: it has a
-// '_' arm, or it matches an enum (v0.2: the type checker rejects
-// non-exhaustive enum matches with E2012).
+// exhaustive reports whether a match statement covers all cases (v0.2:
+// recorded by the type checker, see types.Info.Exhaustive).
 func (f *flow) exhaustive(s *ast.MatchStmt) bool {
-	for _, arm := range s.Arms {
-		if _, ok := arm.Pattern.(*ast.WildcardPattern); ok {
-			return true
-		}
-	}
-	_, ok := under(f.c.info.TypeOf(s.X)).(*types.Enum)
-	return ok && len(s.Arms) > 0
+	return f.c.info.IsExhaustive(s)
 }
 
-// borrowBindings marks the Linear payload bindings of a match-arm pattern
-// as Borrowed (decision 46).
+// borrowBindings marks the Linear payload bindings of a pattern (match arm
+// or `is` expression) as Borrowed (decision 46).
 func (f *flow) borrowBindings(p ast.Pattern, a *env) {
-	cp, ok := p.(*ast.CtorPattern)
-	if !ok {
-		return
-	}
-	for _, b := range cp.Bindings {
-		if sym := f.c.varSym(b); sym != nil {
+	switch p := p.(type) {
+	case *ast.Ident:
+		if sym := f.c.varSym(p); sym != nil {
 			if i, ok := f.idx[sym]; ok {
 				a.st[i], a.tie[i] = stBorrowed, nil
 			}
+		}
+	case *ast.CtorPattern:
+		for _, x := range p.Args {
+			f.borrowBindings(x, a)
+		}
+	case *ast.OrPattern:
+		for _, x := range p.Alts {
+			f.borrowBindings(x, a)
+		}
+	case *ast.TuplePattern:
+		for _, x := range p.Elems {
+			f.borrowBindings(x, a)
 		}
 	}
 }
@@ -600,6 +607,7 @@ func (f *flow) matchExpr(x *ast.MatchExpr, e *env) {
 	for _, arm := range x.Arms {
 		a := e.clone()
 		f.borrowBindings(arm.Pattern, a)
+		f.expr(arm.Guard, a)
 		if i := f.linVar(arm.Expr); i >= 0 && types.IsLinear(c.info.TypeOf(arm.Expr)) {
 			f.consume(a, i, rootIdent(arm.Expr), kMove)
 		} else {
@@ -709,6 +717,13 @@ func (f *flow) expr(x ast.Expr, e *env) {
 		f.lit(x, e, false)
 	case *ast.MatchExpr:
 		f.matchExpr(x, e)
+	case *ast.TupleExpr:
+		for _, y := range x.Elems {
+			f.expr(y, e)
+		}
+	case *ast.IsExpr:
+		f.expr(x.X, e)
+		f.borrowBindings(x.Pattern, e)
 	}
 }
 

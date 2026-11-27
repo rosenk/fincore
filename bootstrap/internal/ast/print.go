@@ -356,6 +356,10 @@ func (p *printer) node(n Node) {
 		p.w("}")
 	case *MatchArm:
 		p.node(n.Pattern)
+		if n.Guard != nil {
+			p.w(" if ")
+			p.node(n.Guard)
+		}
 		p.w(" -> ")
 		if n.Block != nil {
 			p.node(n.Block)
@@ -371,7 +375,12 @@ func (p *printer) node(n Node) {
 		p.w(n.Name.Name)
 		if n.HasParens {
 			p.w("(")
-			p.idents(n.Bindings)
+			for i, a := range n.Args {
+				if i > 0 {
+					p.w(", ")
+				}
+				p.node(a)
+			}
 			p.w(")")
 		}
 	case *LiteralPattern:
@@ -382,6 +391,36 @@ func (p *printer) node(n Node) {
 				p.w(" | ")
 			}
 			p.node(a)
+		}
+	case *TuplePattern:
+		p.w("(")
+		for i, a := range n.Elems {
+			if i > 0 {
+				p.w(", ")
+			}
+			p.node(a)
+		}
+		p.w(")")
+	case *RestPattern:
+		p.w("..")
+	case *TupleExpr:
+		p.w("(")
+		for i, a := range n.Elems {
+			if i > 0 {
+				p.w(", ")
+			}
+			p.node(a)
+		}
+		p.w(")")
+	case *IsExpr:
+		if p.opts.FullParens {
+			p.w("(")
+		}
+		p.node(n.X)
+		p.w(" is ")
+		p.node(n.Pattern)
+		if p.opts.FullParens {
+			p.w(")")
 		}
 	case *MatchExpr:
 		// one line, so that diagnostics embedding it stay single-line

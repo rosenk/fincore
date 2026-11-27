@@ -660,8 +660,8 @@ driver func visitPackage(fs FS, io Stdio, f0 usize, f1 usize, importPath string,
 	for q := usize(0); q < nimps; q++ {
 		upush(imps[q])
 	}
-	is, in := ucommit(mark)
-	pkgs.items[usize(pid)].impS = is
+	ls, in := ucommit(mark)
+	pkgs.items[usize(pid)].impS = ls
 	pkgs.items[usize(pid)].impN = in
 	pkgs.items[usize(pid)].state = 2
 	pkgs.order[pkgs.norder] = pid

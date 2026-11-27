@@ -1,0 +1,119 @@
+// patterns_flow (v0.2): patterns in the scope and totality passes:
+// nested, or- and tuple bindings carry the scrutinee's origin and are
+// borrowed; `is` bindings in if conditions; guards are expressions of
+// their arm's branch (calls in guards are call-graph edges); simple-
+// statement arm bodies (break, continue, return, assignments) in loops.
+package main
+
+type Opt[T any] enum {
+	Some(T)
+	None
+}
+
+type Res enum {
+	Got(Conn, u32)
+	Two(Conn, Conn)
+	Nothing
+}
+
+type Holder struct {
+	p *u32
+}
+
+type PtrOpt enum {
+	PSome(*u32)
+	PNone
+}
+
+type HolderOpt enum {
+	HSome(Holder)
+	HNone
+}
+
+type ResOpt enum {
+	RSome(Res)
+	RNone
+}
+
+var global u32
+
+func pick(o PtrOpt, q PtrOpt) *u32 {
+	var local u32
+	match (o, q) {
+		(PSome(a), _) | (PNone, PSome(a)) -> return a
+		(PNone, PNone) -> return &local
+	}
+}
+
+func viaIs(o HolderOpt) *u32 {
+	var local u32
+	if o is HSome(h) && global > 0 {
+		return h.p
+	}
+	return &local
+}
+
+func closeNested(r ResOpt) {
+	match r {
+		RSome(Got(c, _)) | RSome(Two(c, _)) -> {
+			_ = c.Close()
+		}
+		_ -> {}
+	}
+}
+
+func closeIs(r Res) {
+	if r is Got(c, n) && n > 0 {
+		_ = c.Close()
+	}
+}
+
+func count(xs []Opt[u32], limit u32) u32 {
+	var n u32 = 0
+	for i := usize(0); i < len(xs); i++ {
+		match xs[i] {
+			Some(x) if x > limit -> break
+			Some(0) -> continue
+			Some(_) -> n++
+			None -> n += 2
+		}
+	}
+	return n
+}
+
+func even(n u32) bool {
+	return match n {
+		0 -> true
+		_ if odd(n - 1) -> true
+		_ -> false
+	}
+}
+
+func odd(n u32) bool {
+	if n == 0 {
+		return false
+	}
+	return even(n - 1)
+}
+
+func shrink(n usize) usize decreases(n) {
+	return match (n, n > 10) {
+		(0, _) -> 0
+		(_, true) -> shrink(n - 10)
+		_ -> shrink(n - 1)
+	}
+}
+
+driver func main(io Stdio) error {
+	var x u32 = 1
+	_ = pick(PtrOpt.PSome(&x), PtrOpt.PNone)
+	_ = viaIs(HolderOpt.HNone)
+	closeNested(ResOpt.RNone)
+	closeIs(Res.Nothing)
+	var xs [3]Opt[u32]
+	_ = count(xs[:], 4)
+	_ = even(4)
+	_ = shrink(25)
+	global = x
+	return nil
+}

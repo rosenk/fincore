@@ -460,6 +460,13 @@ func (b *binder) bindExpr(e ast.Expr) {
 		for _, arm := range e.Arms {
 			b.matchArm(arm)
 		}
+	case *ast.TupleExpr:
+		for _, x := range e.Elems {
+			b.bindExpr(x)
+		}
+	case *ast.IsExpr:
+		b.bindExpr(e.X)
+		b.patternNames(e.Pattern, false)
 	}
 }
 
@@ -558,8 +565,17 @@ func (b *binder) stmt(s ast.Stmt) {
 	case *ast.IfStmt:
 		defer b.openScope(s)()
 		b.stmt(s.Init)
-		b.bindExpr(s.Cond)
-		b.block(s.Then)
+		if condWithBindings(s.Cond) {
+			// v0.2: `is` bindings are visible in later conjuncts and the
+			// then block, not in the else branch.
+			closeCond := b.openScope(s.Cond)
+			b.bindCond(s.Cond)
+			b.block(s.Then)
+			closeCond()
+		} else {
+			b.bindExpr(s.Cond)
+			b.block(s.Then)
+		}
 		b.stmt(s.Else)
 	case *ast.ForStmt:
 		defer b.openScope(s)()
@@ -586,25 +602,85 @@ func (b *binder) stmt(s ast.Stmt) {
 
 func (b *binder) matchArm(arm *ast.MatchArm) {
 	defer b.openScope(arm)()
-	switch p := arm.Pattern.(type) {
-	case *ast.CtorPattern:
-		b.ctorPattern(p)
-		for _, id := range p.Bindings {
-			b.declare(SymVar, VarBinding, id, p)
-		}
-	case *ast.OrPattern:
-		// Alternatives bind nothing (bindings are rejected by the type
-		// checker and are not declared).
-		for _, a := range p.Alts {
-			if cp, ok := a.(*ast.CtorPattern); ok {
-				b.ctorPattern(cp)
-			}
-		}
-	}
+	b.patternNames(arm.Pattern, true)
+	b.bindExpr(arm.Guard)
 	if arm.Expr != nil {
 		b.bindExpr(arm.Expr)
 	}
 	if arm.Block != nil {
 		b.stmts(arm.Block.Stmts)
 	}
+}
+
+// patternNames resolves the names of a pattern (qualifiers and constants
+// of variant patterns) and, if declare is set, declares its payload
+// bindings (v0.2) in the current scope. A name bound in several places of
+// one pattern (or-pattern alternatives) is one symbol; the type checker
+// checks that the alternatives agree and that no alternative binds a name
+// twice. Bindings of an undeclared pattern keep no symbol (E2002 in the
+// type checker unless the name is a variant).
+func (b *binder) patternNames(p ast.Pattern, declare bool) {
+	var seen []*Symbol
+	var walk func(p ast.Pattern, payload bool)
+	walk = func(p ast.Pattern, payload bool) {
+		switch p := p.(type) {
+		case *ast.Ident:
+			if !declare || p.Name == "_" {
+				return
+			}
+			for _, sym := range seen {
+				if sym.Name == p.Name {
+					b.prog.Defs[p.ID()] = sym
+					return
+				}
+			}
+			seen = append(seen, b.declare(SymVar, VarBinding, p, p))
+		case *ast.CtorPattern:
+			b.ctorPattern(p)
+			for _, a := range p.Args {
+				walk(a, true)
+			}
+		case *ast.OrPattern:
+			for _, a := range p.Alts {
+				walk(a, payload)
+			}
+		case *ast.TuplePattern:
+			for _, a := range p.Elems {
+				walk(a, payload)
+			}
+		}
+	}
+	walk(p, false)
+}
+
+// condWithBindings reports whether an if condition has an `is` expression
+// in a binding position (the condition itself or a conjunct of its
+// top-level && chain).
+func condWithBindings(e ast.Expr) bool {
+	switch e := e.(type) {
+	case *ast.IsExpr:
+		return true
+	case *ast.BinaryExpr:
+		return e.Op == ast.OpLAnd && (condWithBindings(e.X) || condWithBindings(e.Y))
+	}
+	return false
+}
+
+// bindCond binds an if condition; `is` expressions in binding positions
+// declare their bindings in the current scope, visible to later conjuncts
+// and the then block (v0.2).
+func (b *binder) bindCond(e ast.Expr) {
+	switch e := e.(type) {
+	case *ast.IsExpr:
+		b.bindExpr(e.X)
+		b.patternNames(e.Pattern, true)
+		return
+	case *ast.BinaryExpr:
+		if e.Op == ast.OpLAnd {
+			b.bindCond(e.X)
+			b.bindCond(e.Y)
+			return
+		}
+	}
+	b.bindExpr(e)
 }

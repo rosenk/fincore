@@ -1,0 +1,30 @@
+size struct: 12
+size array: 30
+size slice: 9
+size sig: 8
+size ptr: 8
+depth 0: 100
+depth 42: 42
+depth some none: 1
+depth none: 0
+codes: 1246645678
+eq int: true
+eq int ne: false
+eq str: true
+eq code: true
+eq mixed: false
+both: 21
+boolStmt: 12
+classify: 1234656
+low int: 77
+low int high: 0
+low pair: 7
+low str: 1000
+ints: 3
+walk: 126004
+pairs gt: 5
+pairs le: 105
+pairs one: 1009
+pairs none: 7
+comptime: 1033024119
+const is: true

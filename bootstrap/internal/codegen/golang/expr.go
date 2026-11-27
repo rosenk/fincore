@@ -138,6 +138,8 @@ func (f *fnCtx) expr(e ast.Expr) string {
 		return f.structLit(e)
 	case *ast.MatchExpr:
 		return f.matchExpr(e)
+	case *ast.IsExpr:
+		return f.isExpr(e)
 	case *ast.BasicLit, *ast.BoolLit, *ast.NilLit:
 		f.g.fail(e, "literal without a recorded value")
 	}

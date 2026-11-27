@@ -585,7 +585,9 @@ func lnCollectVars(fl u32, n u32, dp usize) decreases(dp) {
 	} else if k == NkCtorPattern {
 		m := l1len(n)
 		for i := usize(0); i < m; i++ {
-			lnCollectId(fl, l1at(n, i))
+			if nkind(l1at(n, i)) == NkIdent {
+				lnCollectId(fl, l1at(n, i))
+			}
 		}
 	}
 	for i := usize(0); i < MaxSlots; i++ {
@@ -836,7 +838,8 @@ func lnMatch(fl u32, s u32, e u32, dp usize) u32 decreases(dp) {
 		arm := l1at(s, i)
 		a := lnClone(e)
 		lnPushFrame()
-		lnBorrowBindings(fl, na(arm), a)
+		lnBorrowBindings(fl, na(arm), a, SemaDepth)
+		lnExpr(fl, nd(arm), a, dp-1)
 		ae := nb(arm)
 		if ae != 0 {
 			lnExpr(fl, ae, a, dp-1)
@@ -933,38 +936,31 @@ func lnNilTest(cond u32) (u32, bool, bool) {
 	return s, nop(b) == OpNe, true
 }
 
-// lnExhaustive reports whether a match statement covers all cases: it has
-// a '_' arm, or it matches an enum (v0.2: the type checker rejects
-// non-exhaustive enum matches with E2012).
+// lnExhaustive reports whether a match statement covers all cases (v0.2:
+// recorded by the type checker, nexh).
 func lnExhaustive(s u32) bool {
-	n := l1len(s)
-	for i := usize(0); i < n; i++ {
-		p := na(l1at(s, i))
-		if p != 0 && nkind(p) == NkWildcardPattern {
-			return true
-		}
-	}
-	t := ntype[usize(na(s))]
-	if t == 0 {
-		return false
-	}
-	return isEnumT(underlying(t)) && n > 0
+	return nexh[usize(s)]
 }
 
-// lnBorrowBindings marks the Linear payload bindings of a match-arm
-// pattern as Borrowed (decision 46).
-func lnBorrowBindings(fl u32, p u32, a u32) {
-	if p == 0 || nkind(p) != NkCtorPattern {
+// lnBorrowBindings marks the Linear payload bindings of a pattern (match
+// arm or `is` expression) as Borrowed (decision 46).
+func lnBorrowBindings(fl u32, p u32, a u32, depth usize) decreases(depth) {
+	if depth == 0 || p == 0 {
 		return
 	}
-	nbind := l1len(p)
-	for j := usize(0); j < nbind; j++ {
-		sym := scVarSym(l1at(p, j))
+	k := nkind(p)
+	if k == NkIdent {
+		sym := scVarSym(p)
 		if sym != 0 {
 			vi := lnIdx(fl, sym)
 			if vi != LnNoVar {
 				lnSet(a, vi, StBorrowed, 0)
 			}
+		}
+	} else if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+		n := l1len(p)
+		for i := usize(0); i < n; i++ {
+			lnBorrowBindings(fl, l1at(p, i), a, depth-1)
 		}
 	}
 }
@@ -992,7 +988,8 @@ func lnMatchExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
 	for i := usize(0); i < n; i++ {
 		arm := l1at(x, i)
 		a := lnClone(e)
-		lnBorrowBindings(fl, na(arm), a)
+		lnBorrowBindings(fl, na(arm), a, SemaDepth)
+		lnExpr(fl, nd(arm), a, dp-1)
 		ae := nb(arm)
 		vi := lnLinArg(fl, ae)
 		if vi != LnNoVar {
@@ -1120,6 +1117,14 @@ func lnExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
 		lnLit(fl, x, e, false, dp-1)
 	} else if k == NkMatchExpr {
 		lnMatchExpr(fl, x, e, dp-1)
+	} else if k == NkTupleExpr {
+		n := l1len(x)
+		for i := usize(0); i < n; i++ {
+			lnExpr(fl, l1at(x, i), e, dp-1)
+		}
+	} else if k == NkIsExpr {
+		lnExpr(fl, na(x), e, dp-1)
+		lnBorrowBindings(fl, nb(x), e, SemaDepth)
 	}
 }
 

@@ -1,0 +1,26 @@
+// fail_pattern_nested_non_exhaustive (v0.2): nested patterns are checked
+// for exhaustiveness; the message lists the missing patterns
+// (`non-exhaustive match on Option[Shape]: missing Some(Rect(_, _))`).
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+}
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+func area(o Option[Shape]) u32 {
+	return match o { // ERROR E2012
+		Some(Circle(r)) -> r * 3
+		None -> 0
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = area(Option[Shape].None)
+	return nil
+}

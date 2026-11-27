@@ -555,6 +555,7 @@ func (w *walker) stmt(s ast.Stmt) {
 		w.expr(s.X)
 		for _, arm := range s.Arms {
 			w.patternBindings(arm.Pattern, s.X)
+			w.expr(arm.Guard)
 			if arm.Expr != nil {
 				w.expr(arm.Expr)
 				if t := c.info.TypeOf(arm.Expr); !w.collect && t != nil && types.IsLinear(t) {
@@ -692,20 +693,42 @@ func (w *walker) expr(e ast.Expr) {
 		w.expr(e.X)
 		for _, arm := range e.Arms {
 			w.patternBindings(arm.Pattern, e.X)
+			w.expr(arm.Guard)
 			w.expr(arm.Expr)
 		}
+	case *ast.TupleExpr:
+		for _, x := range e.Elems {
+			w.expr(x)
+		}
+	case *ast.IsExpr:
+		w.expr(e.X)
+		w.patternBindings(e.Pattern, e.X)
 	}
 }
 
-// patternBindings defines the payload bindings of a match-arm pattern;
-// their values flow from the scrutinee x.
+// patternBindings defines the payload bindings of a pattern (match arm or
+// `is` expression); their values flow from the scrutinee x (v0.2: from
+// the matching element of a tuple scrutinee).
 func (w *walker) patternBindings(p ast.Pattern, x ast.Expr) {
-	if cp, ok := p.(*ast.CtorPattern); ok {
-		for _, b := range cp.Bindings {
-			if b.Name == "_" {
-				continue
+	switch p := p.(type) {
+	case *ast.Ident:
+		if p.Name != "_" {
+			w.flow(w.define(p), x)
+		}
+	case *ast.CtorPattern:
+		for _, a := range p.Args {
+			w.patternBindings(a, x)
+		}
+	case *ast.OrPattern:
+		for _, a := range p.Alts {
+			w.patternBindings(a, x)
+		}
+	case *ast.TuplePattern:
+		te, ok := x.(*ast.TupleExpr)
+		for i, a := range p.Elems {
+			if ok && i < len(te.Elems) {
+				w.patternBindings(a, te.Elems[i])
 			}
-			w.flow(w.define(b), x)
 		}
 	}
 }
