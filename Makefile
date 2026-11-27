@@ -42,8 +42,10 @@ lint: fmt-check vet ## fmt-check + vet
 
 parse-corpus: finc0 ## finc0 parse on examples, testdata, std/ and compiler/ (v0.2 inputs: no newer // SINCE:)
 	@set -e; fs=$$($(GO) run ./scripts/sincefilter examples/*.fc testdata/pass/*.fc testdata/fail/*.fc std/*/ compiler/); \
-	for f in $$fs; do $(FINC0) parse $$f >/dev/null; done
-	@echo "parse-corpus: ok"
+	for f in $$fs; do \
+	  if grep -q '// ERROR E1' $$f 2>/dev/null; then continue; fi; \
+	  $(FINC0) parse $$f >/dev/null; done
+	@echo "parse-corpus: ok (fail tests that expect a syntax error, // ERROR E1xxx, are skipped)"
 
 check-corpus: finc0 ## finc0 check on examples, pass tests, std/ and compiler/ (v0.2 inputs: no newer // SINCE:)
 	@set -e; fs=$$($(GO) run ./scripts/sincefilter examples/*.fc testdata/pass/*.fc std/*/ compiler/); \
