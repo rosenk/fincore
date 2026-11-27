@@ -22,7 +22,9 @@
 //
 //   - parse --dump-ast;
 //   - check --passes=types, scope, totality and all (mutants: types, all);
-//   - build --emit-go: the emitted Go is compared byte for byte; when both
+//   - build --emit-go: the emitted Go is compared byte for byte (an old
+//     release's Go main is first rewritten to the v0.3 MainExit form,
+//     scripts/gomain); when both
 //     compilers build the case, `go vet` runs on the emitted Go (-govet)
 //     and, when the case has a .out file and no `// BUILD-ONLY`, both
 //     binaries are run and their stdout and exit status compared, also
@@ -53,8 +55,9 @@
 // allowlisted without naming the case.
 //
 // A failing compiler's final `error: fincore: ...` line (the generated
-// main's report, which the current runtime leaves out after diagnostics,
-// decision 156) is removed from stderr before comparing.
+// main's report of the error returned by compiler/'s main, which goes away
+// when compiler/ returns ErrReported after the seed bump, decision 156) is
+// removed from stderr before comparing.
 package main
 
 import (
@@ -80,6 +83,7 @@ import (
 	"time"
 
 	"fincore/scripts/diagallow"
+	"fincore/scripts/gomain"
 	"fincore/scripts/langver"
 )
 
@@ -771,6 +775,8 @@ func runCase(c tcase, out string) result {
 		r.add("build", regression, fmt.Sprintf("missing emitted Go: %v %v", errA, errB), "")
 		return r
 	}
+	// A pre-v0.3 previous release emits the old Go main (decision 156).
+	a = gomain.ToV03(a)
 	if !bytes.Equal(a, b) {
 		r.add("build --emit-go", regression, "accepted by both, emitted Go differs", firstDiff(a, b))
 	}

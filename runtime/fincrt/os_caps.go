@@ -161,16 +161,7 @@ func Executable() string {
 }
 
 func (Stdio) WriteStdout(data []byte) error { return writeAllTo(os.Stdout, data) }
-
-// WriteStderr writes data to stderr. A non-empty write means the program
-// reports its own failures: a failing main then exits 1 without the
-// `error: <err>` line (sentinel.Error in errors.go).
-func (Stdio) WriteStderr(data []byte) error {
-	if len(data) > 0 {
-		stderrUsed.Store(true)
-	}
-	return writeAllTo(os.Stderr, data)
-}
+func (Stdio) WriteStderr(data []byte) error { return writeAllTo(os.Stderr, data) }
 
 func writeAllTo(f *os.File, data []byte) error {
 	if _, err := f.Write(data); err != nil {

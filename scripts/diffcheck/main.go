@@ -28,10 +28,9 @@
 // with the default fuel and with --comptime-fuel=1000.
 //
 // A case matches when stdout, stderr and the exit status are identical.
-// finc1 always exits 1 on error, so exit statuses are compared as 0 /
-// non-zero; a final "error: fincore: ..." line of finc1's generated main
-// (printed only when finc1 failed without writing to stderr, decision 156)
-// is removed before comparing.
+// finc1's generated main prints "error: <err>" after a failing driver and
+// always exits 1 on error, so its final "error: fincore: ..." line is
+// removed before comparing and exit statuses are compared as 0 / non-zero.
 //
 // Allowlist (-allow, default scripts/diffcheck/allow.txt): deliberate
 // rewordings of finc1's diagnostics (compiler/ is ahead of the frozen

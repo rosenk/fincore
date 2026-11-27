@@ -1,0 +1,20 @@
+// pass_err_reported_shadow: a program that declares its own ErrReported
+// keeps working when the language predeclares it (v0.3, decision 156): a
+// package-level declaration shadows the universe like any predeclared
+// name. Valid in every language version, so it has no SINCE.
+package main
+
+const ErrReported = 7
+
+func code(ok bool) u32 {
+	if ok {
+		return 0
+	}
+	return ErrReported
+}
+
+driver func main(io Stdio) error {
+	var b [16]byte
+	n := formatTo(b[:], "%d %d\n", code(true), code(false))
+	return io.WriteStdout(b[:n])
+}

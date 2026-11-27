@@ -1021,8 +1021,20 @@ func arguments(e u32, params []u32, variadic bool, c Ctx, dp usize) bool decreas
 	mark := opStack.top
 	nargs := l1len(e)
 	for i := usize(0); i < nargs; i++ {
+		ctx := nargs == 1 && !variadic && len(params) > 1 && nkind(unparen(l1at(e, i))) == NkMatchExpr
+		if ctx {
+			// v0.3: a multi-value match as the sole argument takes the
+			// parameter types as the types of its value positions, like
+			// assignment targets (decision 149). Variadic callees give
+			// no context (untyped values take their default types).
+			setMatchWant(l1at(e, i), mkTuple(params))
+		}
 		x := rawExpr(l1at(e, i), dp-1)
+		mwWant = 0
 		opPush(x)
+		if ctx && isInvalidOp(&x) && hasValueListArm(unparen(l1at(e, i))) {
+			return false // reported in the match; no argument count error
+		}
 	}
 	if nargs == 1 && opStack.items[mark].mode == KValue && trec(opStack.items[mark].typ) is Tuple(ts, tn) {
 		first := opStack.items[mark]
@@ -1064,6 +1076,18 @@ func arguments(e u32, params []u32, variadic bool, c Ctx, dp usize) bool decreas
 		}
 	}
 	return ok
+}
+
+// hasValueListArm reports whether the match expression e has an arm whose
+// value is a value list `-> a, b` (v0.3 syntax).
+func hasValueListArm(e u32) bool {
+	n := l1len(e)
+	for i := usize(0); i < n; i++ {
+		if nkind(nb(l1at(e, i))) == NkTupleExpr {
+			return true
+		}
+	}
+	return false
 }
 
 func foldComptime(e u32, fn u32, sig u32, mark usize, ci u32, dp usize) Operand decreases(dp) {

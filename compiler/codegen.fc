@@ -1827,11 +1827,13 @@ func cgEmitMethods(pid u32, sym u32, mi int) {
 	}
 }
 
-// entryPoint writes Go's main.
+// entryPoint writes Go's main (v0.3, decision 156):
+// `fincrt.MainExit(_fc_main(caps...))`. MainExit returns for nil, exits 1
+// silently for ErrReported and prints `error: <err>` and exits 1 otherwise.
 func cgEntryPoint() {
 	m := funcs.main
 	cgW("func main() {\n")
-	cgW("if err := ")
+	cgRt("MainExit(")
 	cgWSymName(funcs.items[usize(m)].sym)
 	cgWc('(')
 	s := funcs.items[usize(m)].sig
@@ -1860,9 +1862,7 @@ func cgEntryPoint() {
 		}
 		cgW("()")
 	}
-	cgW("); err != nil {\n")
-	cgW("_, _ = os.Stderr.WriteString(\"error: \" + err.Error() + \"\\n\")\n")
-	cgW("os.Exit(1)\n}\n}\n")
+	cgW("))\n}\n")
 	cgFlushTo(3)
 }
 
@@ -1974,7 +1974,6 @@ func cgAssembleGo() bool {
 	if cgUsesRT {
 		outBuf.WriteString("\"fincore/runtime/fincrt\"\n")
 	}
-	outBuf.WriteString("\"os\"\n")
 	outBuf.WriteString(")\n\n")
 	outBuf.WriteBytes(genTypes.Bytes())
 	outBuf.WriteBytes(genVars.Bytes())

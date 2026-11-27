@@ -133,6 +133,10 @@ driver func capacityFail(io Stdio, path string, what string) error {
 // ---------------------------------------------------------------------------
 // main
 
+// TODO(seed v0.3.0): failures are reported on stderr and then returned as
+// ErrParse, so the generated main prints a misleading
+// `error: fincore: invalid number`. Once bootstrap/SEED is v0.3.0, return
+// ErrReported (decision 156) for already-reported failures instead.
 driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	if r, ok := env.GetEnv("FINCROOT"); ok && len(r) > 0 {
 		fincRoot = r

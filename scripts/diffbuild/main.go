@@ -15,7 +15,10 @@
 //
 // A case matches when both compilers succeed and the emitted Go files are
 // identical, or when both fail (most unit-test snippets are error cases;
-// their diagnostics are compared by diff-check). A case where a compiler
+// their diagnostics are compared by diff-check). finc0's Go main (inline
+// `error: <err>` and os.Exit) is first rewritten to the v0.3 form
+// `fincrt.MainExit(...)` that finc1 emits (scripts/gomain, decision 156);
+// nothing else is normalized. A case where a compiler
 // accepted the program but `go build` rejected the emitted Go ("go build
 // failed") is always a mismatch: the type checker is unsound there. With
 // -govet, `go vet` additionally runs on the emitted Go of every case both
@@ -42,6 +45,7 @@ import (
 	"strings"
 	"sync"
 
+	"fincore/scripts/gomain"
 	"fincore/scripts/langver"
 )
 
@@ -158,11 +162,12 @@ func runCase(finc0, finc1, tmp string, i int, c tcase) result {
 	if err0 != nil || err1 != nil {
 		return result{msg: fmt.Sprintf("  missing output: %v %v\n", err0, err1)}
 	}
+	a = gomain.ToV03(a)
 	if !bytes.Equal(a, b) {
 		return result{msg: firstDiff(a, b)}
 	}
 	if govet {
-		if msg, ok := vet(out, a); !ok {
+		if msg, ok := vet(out, b); !ok {
 			return result{msg: indent("  go vet: ", msg)}
 		}
 	}

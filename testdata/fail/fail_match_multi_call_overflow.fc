@@ -1,0 +1,18 @@
+// SINCE: v0.3
+// fail_match_multi_call_overflow (v0.3, decision 149): as the only
+// argument of a call a multi-value match takes the parameter types as
+// the context of its values, so an untyped constant that does not fit
+// the parameter is an error at the value (and no argument count error).
+package main
+
+func take(a u8, b u8) u8 {
+	return a + b
+}
+
+func f(n u32) u8 {
+	return take(match n { 0 -> 300, 1; _ -> 2, 3 }) // ERROR E2002
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

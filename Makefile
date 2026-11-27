@@ -102,7 +102,7 @@ clean: ## remove build outputs
 diff-parse: finc1 ## [v0.2 regression] finc0 vs finc1: byte-identical `parse --dump-ast` on the corpus
 	@set -e; ts=$$($(GO) run ./scripts/sincefilter examples/tcp_echo.fc compiler/ std/*/ testdata/pass/*.fc testdata/fail/*.fc); \
 	for t in $$ts; do \
-	  cmp -s <($(FINC0) parse --dump-ast $$t 2>&1) <($(BIN)/finc1 parse --dump-ast $$t 2>&1) || { echo "DIFF: $$t"; exit 1; }; \
+	  cmp -s <($(FINC0) parse --dump-ast $$t 2>&1) <($(BIN)/finc1 parse --dump-ast $$t 2>&1 | grep -v '^error: fincore:') || { echo "DIFF: $$t"; exit 1; }; \
 	done; echo "diff-parse: ok"
 
 diff-check: finc1 ## [v0.2 regression] finc0 vs finc1 check --passes=types: identical diagnostics (corpus + snippets)
@@ -158,9 +158,9 @@ fmt-fc-check: finc1 ## finc fmt on every .fc file of the repo: idempotent and AS
 
 context-test: finc1 ## golden `check --context` output of testdata/context (UPDATE=1 rewrites the .out files)
 	@set -e; for f in testdata/context/*.fc; do o=$${f%.fc}.out; \
-	  got=$$($(BIN)/finc1 check --context $$f 2>&1 || true); \
+	  got=$$($(BIN)/finc1 check --context $$f 2>&1 | grep -v '^error: fincore:' || true); \
 	  if [ -n "$(UPDATE)" ]; then printf '%s\n' "$$got" >$$o; fi; \
 	  diff -u $$o <(printf '%s\n' "$$got") || { echo "context-test: $$f differs from $$o"; exit 1; }; \
 	  cmp -s <(FINC_DIAG=context $(BIN)/finc1 check $$f 2>&1) <($(BIN)/finc1 check --context $$f 2>&1) || { echo "context-test: FINC_DIAG=context differs from --context on $$f"; exit 1; }; \
-	  cmp -s <($(BIN)/finc1 check $$f 2>&1) <(grep -E '^[^ ]+\.fc:[0-9]+:[0-9]+: error\[' $$o) || { echo "context-test: default output of $$f is not the plain diagnostics"; exit 1; }; \
+	  cmp -s <($(BIN)/finc1 check $$f 2>&1 | grep -v '^error: fincore:') <(grep -E '^[^ ]+\.fc:[0-9]+:[0-9]+: error\[' $$o) || { echo "context-test: default output of $$f is not the plain diagnostics"; exit 1; }; \
 	done; echo "context-test: ok ($$(ls testdata/context/*.fc | wc -l) files)"

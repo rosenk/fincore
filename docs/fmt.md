@@ -182,9 +182,8 @@ The default output is unchanged, byte for byte: the spec 11 line only.
 (against the seed) run without the flag and stay identical.
 
 `make context-test` runs `check --context` on `testdata/context/*.fc` and
-compares stderr (only the diagnostics: since v0.3 a failing finc prints no
-`error: fincore:` line, decision 156) with the `.out` file next to each
-(`UPDATE=1` rewrites them). It also
+compares stderr (without the generated `main`'s final `error: fincore:`
+line) with the `.out` file next to each (`UPDATE=1` rewrites them). It also
 checks that `FINC_DIAG=context` gives the same output and that the output
 without the flag is exactly the diagnostic lines of the `.out` file. The
 files are marked `// SINCE: v0.3`: they test behaviour that finc0 and the

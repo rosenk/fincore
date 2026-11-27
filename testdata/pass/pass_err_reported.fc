@@ -1,0 +1,33 @@
+// SINCE: v0.3
+// pass_err_reported: the predeclared sentinel ErrReported (decision 156)
+// is an error value distinct from the other sentinels, compared with ==,
+// usable in constants, at compile time and as a return value. (A main that
+// returns it exits 1 silently: testdata/integration, TestErrReportedExit.)
+package main
+
+const Reported error = ErrReported
+
+func fail(reported bool) error {
+	if reported {
+		return ErrReported
+	}
+	return ErrParse
+}
+
+comptime func isReported(e error) bool {
+	return e == ErrReported
+}
+
+const CT = isReported(Reported)
+
+driver func main(io Stdio) error {
+	var b [64]byte
+	n := formatTo(b[:], "%v %v %v %v\n", fail(true) == ErrReported, fail(false) == ErrReported, Reported == ErrReported, CT)
+	if err := io.WriteStdout(b[:n]); err != nil {
+		return err
+	}
+	if ErrReported == ErrParse || ErrReported == ErrIO {
+		return ErrIO
+	}
+	return nil
+}

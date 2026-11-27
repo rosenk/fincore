@@ -1,0 +1,12 @@
+// SINCE: v0.3
+// fail_match_multi_call_min (v0.3, decision 149): min and max have no
+// spread form, so a multi-value match is a single argument to them.
+package main
+
+func f(n u32) u32 {
+	return min(match n { 0 -> 1, 2; _ -> 3, 4 }) // ERROR E2003
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

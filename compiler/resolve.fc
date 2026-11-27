@@ -94,14 +94,16 @@ const (
 	BFMin        = 79 // v0.3
 	BFMax        = 80 // v0.3
 
-	NumBuiltins = 81
+	BCErrReported = 81 // v0.3: the failure has been reported (exit 1 silently)
+
+	NumBuiltins = 82
 )
 
 func builtinName(b u8) string {
 	if b <= BTFieldCode {
 		return builtinTypeName(b)
 	}
-	if b <= BCErrParse {
+	if b <= BCErrParse || b == BCErrReported {
 		return builtinConstName(b)
 	}
 	return builtinFuncName(b)
@@ -165,6 +167,7 @@ func builtinConstName(b u8) string {
 		BCErrArenaFull -> "ErrArenaFull"
 		BCErrExec -> "ErrExec"
 		BCErrParse -> "ErrParse"
+		BCErrReported -> "ErrReported"
 		_ -> "?"
 	}
 }
@@ -210,11 +213,11 @@ func builtinIsType(b u8) bool {
 }
 
 func builtinIsConst(b u8) bool {
-	return b >= BCNanosecond && b <= BCErrParse
+	return b >= BCNanosecond && b <= BCErrParse || b == BCErrReported
 }
 
 func builtinIsErrorSentinel(b u8) bool {
-	return b >= BCErrEOF && b <= BCErrParse
+	return b >= BCErrEOF && b <= BCErrParse || b == BCErrReported
 }
 
 func builtinIsFunc(b u8) bool {

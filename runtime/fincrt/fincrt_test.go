@@ -29,7 +29,7 @@ func checkLeaks(t *testing.T) {
 }
 
 func TestErrorsDistinct(t *testing.T) {
-	all := []error{ErrEOF, ErrTimeout, ErrCancelled, ErrZeroWrite, ErrClosed, ErrIO, ErrNotFound, ErrMaxDepth, ErrArenaFull, ErrExec, ErrParse}
+	all := []error{ErrEOF, ErrTimeout, ErrCancelled, ErrZeroWrite, ErrClosed, ErrIO, ErrNotFound, ErrMaxDepth, ErrArenaFull, ErrExec, ErrParse, ErrReported}
 	for i := range all {
 		for j := range all {
 			if (i == j) != (all[i] == all[j]) {
