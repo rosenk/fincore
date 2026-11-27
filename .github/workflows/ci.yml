@@ -49,6 +49,8 @@ jobs:
       - name: release archive smoke test
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: make dist dist-test
+      - name: spec examples (finc1 check on the programs of the v0.2 spec)
+        run: make spec-check
       - name: current compiler vs previous release (seed) regression
         run: make diff-prev
       - name: examples and tutorial snippets

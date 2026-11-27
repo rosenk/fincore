@@ -1,6 +1,6 @@
 # FinCore conformance corpus (`testdata/`)
 
-Conformance tests from spec section 13. Every compiler must pass every test
+Conformance tests from spec section 13 ([fincore_language_specification_v0_2.md](../fincore_language_specification_v0_2.md)). Every compiler must pass every test
 of its language version: `finc0` (frozen at v0.2) and the self-hosted
 `finc1`/`finc2` (the version in `compiler/main.fc`, `LangVersion`). Tests of
 newer versions are marked `// SINCE: vX.Y` and skipped by older compilers.

@@ -1,5 +1,7 @@
 # FinCore v0.1 — resolved spec ambiguities (binding for finc0 and compiler/)
 
+All decisions below (1–139) are folded into the consolidated specification [fincore_language_specification_v0_2.md](../fincore_language_specification_v0_2.md), the main reference. New decisions are added here and then to the specification.
+
 The test corpus in testdata/ is written against these decisions. Conventions for tests: testdata/README.md.
 
 1. **Linear parameters.** A Linear param of a `driver func` is OWNED by the callee (must be consumed on all paths; the caller's argument is moved). A Linear param of a total `func` is BORROWED (caller keeps ownership; callee must not consume it).
