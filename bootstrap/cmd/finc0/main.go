@@ -6,7 +6,8 @@
 //	finc0 check [--comptime-fuel=N] <file.fc | dir>
 //	finc0 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>
 //	finc0 run   [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]
-//	finc0 test  <dir>
+//	finc0 test  [-v] <dir>
+//	finc0 version
 //
 // Exit codes: 0 success, 1 compile errors (diagnostics on stderr) or I/O
 // failure, 2 usage errors / unimplemented commands.
@@ -20,6 +21,12 @@ import (
 	"io"
 	"os"
 )
+
+// LangVersion is the FinCore language version finc0 implements. finc0 is
+// frozen at v0.2 (the bootstrap seed, tag v0.2.0); newer versions exist
+// only in compiler/. `finc0 test` skips tests whose `// SINCE: vX.Y`
+// header names a newer version.
+const LangVersion = "0.2"
 
 // Exit codes.
 const (
@@ -49,6 +56,7 @@ var commands = []*Command{
 	{Name: "build", Usage: "build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>", Summary: "compile to a Go program and binary", Run: runBuild},
 	{Name: "run", Usage: "run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]", Summary: "build and run", Run: runRun},
 	{Name: "test", Usage: "test <dir>", Summary: "run conformance tests in a directory", Run: runTest},
+	{Name: "version", Usage: "version", Summary: "print the FinCore language version", Run: runVersion},
 }
 
 func main() {
@@ -66,6 +74,8 @@ func Main(env *Env, args []string) int {
 	case "-h", "--help", "help":
 		usage(env.Stdout)
 		return ExitOK
+	case "--version":
+		return runVersion(env, args[1:])
 	}
 	for _, c := range commands {
 		if c.Name == args[0] {
@@ -90,4 +100,14 @@ func notImplemented(name string) func(env *Env, args []string) int {
 		fmt.Fprintf(env.Stderr, "finc0 %s: not implemented\n", name)
 		return ExitUsage
 	}
+}
+
+// runVersion prints "finc0 language vX.Y".
+func runVersion(env *Env, args []string) int {
+	if len(args) != 0 {
+		fmt.Fprintln(env.Stderr, "usage: finc0 version")
+		return ExitUsage
+	}
+	fmt.Fprintf(env.Stdout, "finc0 language v%s\n", LangVersion)
+	return ExitOK
 }

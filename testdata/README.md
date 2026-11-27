@@ -1,9 +1,14 @@
 # FinCore conformance corpus (`testdata/`)
 
-Conformance tests from spec section 13. `finc0` and the self-hosted
-`finc1`/`finc2` must both pass all of them. A future `finc test <dir>` must
-implement the conventions below exactly. `testdata/integration/corpus_test.go`
-is the reference implementation.
+Conformance tests from spec section 13. Every compiler must pass every test
+of its language version: `finc0` (frozen at v0.2) and the self-hosted
+`finc1`/`finc2` (the version in `compiler/main.fc`, `LangVersion`). Tests of
+newer versions are marked `// SINCE: vX.Y` and skipped by older compilers.
+Three runners implement the conventions below:
+`testdata/integration/corpus_test.go` (the reference implementation),
+`finc0 test` (`bootstrap/cmd/finc0/test.go`) and `finc1 test`
+(`compiler/build.fc`). See [docs/testing.md](../docs/testing.md) for the
+testing strategy as a whole.
 
 ```
 testdata/
@@ -33,8 +38,13 @@ Environment variables:
 | unset | Both, as `static` and `race` subtests. |
 
 The tests skip rather than fail when:
-- `./bootstrap/cmd/finc0` does not build, or
-- `finc0` exits non-zero and its output contains `not implemented`.
+- `./bootstrap/cmd/finc0` does not build,
+- `finc0` exits non-zero and its output contains `not implemented`, or
+- the test's `// SINCE: vX.Y` is newer than the compiler's language version.
+
+`FINC0` may name any FinCore compiler: `scripts/bootstrap_verify.go` runs the
+suite with `finc2`; `FINC0=$PWD/bin/finc1` tests the current compiler/,
+including the tests of language versions finc0 does not implement.
 
 Run one group with `-run`, for example `-run TestCorpusFail`, `-run TestCorpusPass`
 or `-run TestEcho`.
@@ -74,6 +84,40 @@ The program is compiled with `finc build` but never run, and it has no `.out`
 file. `pass_tcp_echo.fc` uses this: it listens on `0.0.0.0:8080` and runs until
 it gets a signal.
 
+### `// SINCE: vX.Y` (versioned tests)
+
+```go
+// SINCE: v0.3
+// pass_foo: what the test covers.
+package main
+```
+
+The test needs language version `vX.Y` (exactly this spelling: `v`, major,
+`.`, minor). Every test of a feature added after v0.2 must carry it.
+
+- Each compiler knows the version it implements: `finc0` is frozen at v0.2
+  (`LangVersion` in `bootstrap/cmd/finc0/main.go`); `compiler/` declares
+  `LangVersion`/`LangMajor`/`LangMinor` in `compiler/main.fc`. Both print it
+  with `finc version` (or `--version`): `finc1 language v0.2`.
+- A runner **skips** a test whose version is newer than the compiler's and
+  counts it: `finc0 test` and `finc1 test` end with
+  `N tests, P passed, F failed, S skipped (needs vX.Y)` (the newest version
+  needed; `-v` lists each skipped test); the Go runner marks the subtest
+  SKIP and logs `S skipped (needs vX.Y)`. It asks the compiler under test
+  (`$FINC0 version`) and assumes v0.2 for a compiler without the command.
+- A malformed value (`// SINCE: 0.3`) fails the test.
+- Directory tests: put the directive in the first `.fc` file (sorted). The
+  Go runner and the diff tools (`scripts/langver`) take the highest version
+  of all files of the directory.
+- `make diff-parse`/`diff-check*`/`diff-build*` (finc0 vs finc1) skip inputs
+  newer than v0.2; `make diff-prev` classifies them against the previous
+  release (see below).
+
+Unit tests of the runners use a dummy `// SINCE: v9.9` test in a temporary
+directory (`TestTestSince` in `bootstrap/cmd/finc0`, `TestSinceSkip` here,
+which also runs the compiler's own `test` command); the corpus has no such
+test.
+
 ### `.out` files (pass tests)
 
 - Single-file test `pass/<name>.fc` → expected stdout in `pass/<name>.out`.
@@ -91,6 +135,32 @@ it gets a signal.
   repository's `std/`; see docs/stdlib.md).
 - Pass programs write output only through `io.WriteStdout(...)` of a
   `driver func main(io Stdio) error`. Numbers are printed with `formatUint`.
+
+## Testing a new language feature
+
+finc0 is frozen, so a feature of v0.3 or later has no second
+implementation to be compared with. It is tested by
+([docs/testing.md](../docs/testing.md)):
+
+1. **Conformance tests** with `// SINCE: vX.Y`: pass tests for every form of
+   the feature (with `.out`) and fail tests for every diagnostic it adds
+   (one `// ERROR` marker each). `finc1 test testdata` and
+   `make integration` (with `FINC0=bin/finc1`) run them.
+2. **`make diff-prev`** (`scripts/diffprev`): the current compiler against
+   the previous release (`.stage/finc-seed`, `make seed`) on the whole
+   corpus, the unit-test snippets and mutants: parse dumps, check
+   diagnostics in all pass modes, emitted Go, `go vet`, and run output for
+   cases with a `.out`. Old programs must behave identically (REGRESSION
+   and DIAG-CHANGED fail); the new tests show up as EXPECTED. Intentional
+   changes go into `scripts/diffprev/allow.txt` with a reason.
+   `make diff-prev-fuzz` adds random mutants (`FUZZ_SEED=n`).
+3. **Go compile and vet of the emitted Go**: every pass test is built (a
+   program finc accepts but `go build` rejects is a type checker bug), and
+   diff-prev vets every program both compilers build (`make diff-build-vet`
+   does the same for the v0.2 subset).
+4. **The fixed point** (`make bootstrap`): compiler/ built by the seed
+   builds itself twice to identical Go, and finc2 passes `testdata` and the
+   integration suite.
 
 ## Integration (`integration/`)
 

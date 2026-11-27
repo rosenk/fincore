@@ -788,6 +788,39 @@ var hFlags [MaxExecArgs]string
 var nhFlags usize
 var hBuildOnly bool
 
+// `// SINCE: vX.Y` of the current test: hSince is set when present,
+// hSinceBad when the value is not vX.Y.
+var hSince bool
+var hSinceBad bool
+var hSinceMaj u64
+var hSinceMin u64
+
+// parseSince parses the value of a `// SINCE:` directive (vX.Y).
+func parseSince(v []byte) {
+	hSince = true
+	n := len(v)
+	hSinceBad = true
+	if n < 4 || v[0] != 'v' {
+		return
+	}
+	x, e1 := parseDigits(v, 1, 5)
+	if e1 == 1 || e1 >= n || v[e1] != '.' {
+		return
+	}
+	y, e2 := parseDigits(v, e1+1, 5)
+	if e2 == e1+1 || e2 != n {
+		return
+	}
+	hSinceMaj = x
+	hSinceMin = y
+	hSinceBad = false
+}
+
+// sinceNewer reports whether version maj.min is newer than LangVersion.
+func sinceNewer(maj u64, min u64) bool {
+	return maj > LangMajor || maj == LangMajor && min > LangMinor
+}
+
 func parseDigits(b []byte, i usize, max usize) (u64, usize) {
 	v := u64(0)
 	n := len(b)
@@ -854,6 +887,8 @@ func scanMarkers(base string, lineNo u64, line []byte) {
 driver func readHeader(fs FS, nfiles usize) error {
 	nhFlags = 0
 	hBuildOnly = false
+	hSince = false
+	hSinceBad = false
 	nWant = 0
 	for f := usize(0); f < nfiles; f++ {
 		path := fileNames[f]
@@ -904,6 +939,8 @@ driver func readHeader(fs FS, nfiles usize) error {
 					}
 				} else if cgBytesIs(tl, "// BUILD-ONLY") {
 					hBuildOnly = true
+				} else if cgBytesHasPrefix(tl, "// SINCE:") {
+					parseSince(bytes.TrimSpace(tl[9:]))
 				}
 			}
 			scanMarkers(base, lineNo, line)
@@ -1184,6 +1221,9 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 	}
 	self := env.Arg(0)
 	failed := usize(0)
+	skipped := usize(0)
+	needMaj := u64(0)
+	needMin := u64(0)
 	n := nTests
 	for i := usize(0); i < n; i++ {
 		nf := testFiles(fs, i)
@@ -1196,6 +1236,24 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 			kind = "?"
 			tmpBuf.Reset()
 			tmpBuf.WriteString("cannot read test sources")
+		} else if hSince && hSinceBad {
+			kind = "?"
+			tmpBuf.Reset()
+			tmpBuf.WriteString("bad // SINCE: directive (want vX.Y)")
+		} else if hSince && sinceNewer(hSinceMaj, hSinceMin) {
+			skipped++
+			if hSinceMaj > needMaj || hSinceMaj == needMaj && hSinceMin > needMin {
+				needMaj = hSinceMaj
+				needMin = hSinceMin
+			}
+			if verbose {
+				k := formatTo(mbuf[:], "skip %s (needs v%d.%d)\n", tName[i], hSinceMaj, hSinceMin)
+				if err := io.WriteStdout(mbuf[:k]); err != nil {
+					_ = fs.RemoveAll(work)
+					return err
+				}
+			}
+			continue
 		} else if nWant > 0 {
 			kind = "fail"
 			runFailTest(exec, self, tName[i])
@@ -1249,7 +1307,11 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		}
 	}
 	_ = fs.RemoveAll(work)
-	k := formatTo(mbuf[:], "%d tests, %d passed, %d failed\n", n, n-failed, failed)
+	k := formatTo(mbuf[:], "%d tests, %d passed, %d failed", n, n-failed-skipped, failed)
+	if skipped > 0 {
+		k += formatTo(mbuf[k:], ", %d skipped (needs v%d.%d)", skipped, needMaj, needMin)
+	}
+	k += formatTo(mbuf[k:], "\n")
 	if err := io.WriteStdout(mbuf[:k]); err != nil {
 		return err
 	}

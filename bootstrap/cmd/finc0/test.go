@@ -25,7 +25,10 @@ import (
 //     must fail and report exactly the marked (file, line, code) triples;
 //   - other tests are pass tests: `build [FLAGS]` must succeed; unless
 //     the header says `// BUILD-ONLY`, the program is run with no
-//     arguments, must exit 0 and its stdout must equal <name>.out.
+//     arguments, must exit 0 and its stdout must equal <name>.out;
+//   - a test whose header says `// SINCE: vX.Y` with X.Y newer than
+//     LangVersion is skipped and counted in the summary
+//     ("N skipped (needs vX.Y)", the newest version needed).
 
 var (
 	testErrorMarkerRE = regexp.MustCompile(`//\s*ERROR\s+(E\d{4})\b`)
@@ -43,6 +46,45 @@ type testCase struct {
 type testHeader struct {
 	flags     []string
 	buildOnly bool
+	since     string // `// SINCE:` value ("v0.3"), "" if absent
+}
+
+// langVersion is a FinCore language version X.Y.
+type langVersion struct{ major, minor int }
+
+func (v langVersion) less(w langVersion) bool {
+	return v.major < w.major || v.major == w.major && v.minor < w.minor
+}
+
+func (v langVersion) String() string { return fmt.Sprintf("v%d.%d", v.major, v.minor) }
+
+// parseLangVersion parses "X.Y" (with an optional leading "v").
+func parseLangVersion(s string) (langVersion, bool) {
+	s = strings.TrimPrefix(s, "v")
+	a, b, ok := strings.Cut(s, ".")
+	if !ok {
+		return langVersion{}, false
+	}
+	x, err1 := strconv.ParseUint(a, 10, 16)
+	y, err2 := strconv.ParseUint(b, 10, 16)
+	if err1 != nil || err2 != nil {
+		return langVersion{}, false
+	}
+	return langVersion{int(x), int(y)}, true
+}
+
+// sinceSkip reports whether a test with header h needs a newer language
+// version than finc0's; bad is set for a malformed `// SINCE:` value.
+func sinceSkip(h testHeader) (need langVersion, skip bool, bad bool) {
+	if h.since == "" {
+		return langVersion{}, false, false
+	}
+	need, ok := parseLangVersion(h.since)
+	if !ok || !strings.HasPrefix(h.since, "v") {
+		return langVersion{}, false, true
+	}
+	cur, _ := parseLangVersion(LangVersion)
+	return need, cur.less(need), false
 }
 
 func runTest(env *Env, args []string) int {
@@ -76,10 +118,21 @@ func runTest(env *Env, args []string) int {
 		return ExitError
 	}
 	defer os.RemoveAll(work)
-	failed := 0
+	failed, skipped := 0, 0
+	var newest langVersion
 	for i, tc := range cases {
 		start := time.Now()
-		kind, msg := runTestCase(tc, work, i)
+		kind, msg, need := runTestCase(tc, work, i)
+		if kind == "skip" {
+			skipped++
+			if newest.less(need) {
+				newest = need
+			}
+			if *verbose {
+				fmt.Fprintf(env.Stdout, "skip %s (needs %s)\n", tc.name, need)
+			}
+			continue
+		}
 		status := "ok  "
 		if msg != "" {
 			status = "FAIL"
@@ -94,7 +147,11 @@ func runTest(env *Env, args []string) int {
 			}
 		}
 	}
-	fmt.Fprintf(env.Stdout, "%d tests, %d passed, %d failed\n", len(cases), len(cases)-failed, failed)
+	fmt.Fprintf(env.Stdout, "%d tests, %d passed, %d failed", len(cases), len(cases)-failed-skipped, failed)
+	if skipped > 0 {
+		fmt.Fprintf(env.Stdout, ", %d skipped (needs %s)", skipped, newest)
+	}
+	fmt.Fprintln(env.Stdout)
 	if failed > 0 {
 		return ExitError
 	}
@@ -160,6 +217,9 @@ func readTestHeader(path string) (testHeader, error) {
 		if line == "// BUILD-ONLY" {
 			h.buildOnly = true
 		}
+		if rest, ok := strings.CutPrefix(line, "// SINCE:"); ok {
+			h.since = strings.TrimSpace(rest)
+		}
 	}
 	return h, sc.Err()
 }
@@ -186,20 +246,28 @@ func expectedDiags(files []string) ([]diagKey, error) {
 	return out, nil
 }
 
-// runTestCase returns the test kind and a failure message ("" = pass).
-func runTestCase(tc *testCase, work string, idx int) (kind, msg string) {
+// runTestCase returns the test kind ("pass", "fail", "skip" or "?") and
+// a failure message ("" = pass); need is the version a skipped test needs.
+func runTestCase(tc *testCase, work string, idx int) (kind, msg string, need langVersion) {
 	h, err := readTestHeader(tc.header)
 	if err != nil {
-		return "?", err.Error()
+		return "?", err.Error(), need
+	}
+	need, skip, bad := sinceSkip(h)
+	if bad {
+		return "?", fmt.Sprintf("bad // SINCE: %q (want vX.Y)", h.since), need
+	}
+	if skip {
+		return "skip", "", need
 	}
 	want, err := expectedDiags(tc.files)
 	if err != nil {
-		return "?", err.Error()
+		return "?", err.Error(), need
 	}
 	if len(want) > 0 {
-		return "fail", runFailTest(tc, h, want)
+		return "fail", runFailTest(tc, h, want), need
 	}
-	return "pass", runPassTest(tc, h, work, idx)
+	return "pass", runPassTest(tc, h, work, idx), need
 }
 
 func runFailTest(tc *testCase, h testHeader, want []diagKey) string {

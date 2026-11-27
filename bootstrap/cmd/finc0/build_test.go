@@ -94,3 +94,44 @@ func TestTestCommand(t *testing.T) {
 		t.Fatalf("failing test: %d %q", code, out)
 	}
 }
+
+// TestTestSince checks that `// SINCE: vX.Y` tests newer than LangVersion
+// are skipped (they would fail: no .out file, invalid code) and reported.
+func TestTestSince(t *testing.T) {
+	if testing.Short() {
+		t.Skip("invokes go build")
+	}
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "pass", "hello.fc"), "// SINCE: v0.2\npackage main\n\ndriver func main(io Stdio) error {\n\treturn io.WriteStdout(strBytes(\"hi\\n\"))\n}\n")
+	writeFile(t, filepath.Join(dir, "pass", "hello.out"), "hi\n")
+	writeFile(t, filepath.Join(dir, "pass", "future.fc"), "// A test of a future language version.\n// SINCE: v9.9\npackage main\n\nnot v0.2 syntax\n")
+	writeFile(t, filepath.Join(dir, "pass", "future2", "a.fc"), "// SINCE: v1.0\npackage main\n\nnot v0.2 syntax\n")
+	writeFile(t, filepath.Join(dir, "fail", "future.fc"), "// SINCE: v0.3\npackage main\n\nvar g u32 // ERROR E9999\n")
+	code, out, errs := run("test", "-v", dir)
+	if code != ExitOK || !strings.Contains(out, "4 tests, 1 passed, 0 failed, 3 skipped (needs v9.9)") ||
+		!strings.Contains(out, "future.fc (needs v9.9)") {
+		t.Fatalf("test: %d %q %q", code, out, errs)
+	}
+	// A malformed directive fails the test.
+	writeFile(t, filepath.Join(dir, "pass", "future.fc"), "// SINCE: 9.9\npackage main\n")
+	code, out, _ = run("test", dir)
+	if code != ExitError || !strings.Contains(out, `bad // SINCE: "9.9"`) {
+		t.Fatalf("bad since: %d %q", code, out)
+	}
+	if v, ok := parseLangVersion("v9.9"); !ok || !(langVersion{0, 2}).less(v) || v.String() != "v9.9" {
+		t.Fatal(v, ok)
+	}
+	for _, bad := range []string{"", "v", "v1", "v1.", "v.1", "v1.x", "v1.2.3", "v-1.2"} {
+		if _, ok := parseLangVersion(bad); ok {
+			t.Errorf("parseLangVersion(%q) ok", bad)
+		}
+	}
+}
+
+func TestVersion(t *testing.T) {
+	for _, a := range []string{"version", "--version"} {
+		if code, out, _ := run(a); code != ExitOK || out != "finc0 language v"+LangVersion+"\n" {
+			t.Fatalf("%s: %d %q", a, code, out)
+		}
+	}
+}

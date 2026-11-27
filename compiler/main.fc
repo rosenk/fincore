@@ -2,6 +2,7 @@
 //
 //	finc parse [--dump-ast] <file.fc | dir>
 //	finc check | build | run | test   (build/run/test: build.fc)
+//	finc version                      (also --version)
 //
 // `parse` mirrors `finc0 parse`: all `.fc` files of a directory (sorted by
 // name) are parsed as one package; syntax errors are printed to stderr in
@@ -21,6 +22,16 @@ import (
 
 const (
 	MaxPathBytes = 4096
+)
+
+// LangVersion is the FinCore language version this compiler implements
+// (LangMajor.LangMinor). `finc version` prints it and `finc test` skips
+// tests whose `// SINCE: vX.Y` header names a newer version. finc0 is
+// frozen at v0.2; bump these when compiler/ starts a new language version.
+const (
+	LangVersion = "0.2"
+	LangMajor   = 0
+	LangMinor   = 2
 )
 
 // Package-level arenas (Value types only, rule S1).
@@ -82,7 +93,10 @@ driver func usage(io Stdio, toStderr bool) error {
 	if err := say(io, toStderr, "  finc1 run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n      build and run\n"); err != nil {
 		return err
 	}
-	return say(io, toStderr, "  finc1 test <dir>\n      run conformance tests in a directory\n")
+	if err := say(io, toStderr, "  finc1 test <dir>\n      run conformance tests in a directory\n"); err != nil {
+		return err
+	}
+	return say(io, toStderr, "  finc1 version\n      print the FinCore language version\n")
 }
 
 // ioFail reports "finc1: <what> <path>: <reason>" for an I/O error.
@@ -139,6 +153,15 @@ driver func main(fs FS, env Env, io Stdio, exec Exec) error {
 	}
 	if strEq(cmd, "test") {
 		return runTest(fs, env, io, exec)
+	}
+	if strEq(cmd, "version") || strEq(cmd, "--version") {
+		if argc != 2 {
+			if err := say(io, true, "usage: finc1 version\n"); err != nil {
+				return err
+			}
+			return ErrParse
+		}
+		return say(io, false, catStr(catStr("finc1 language v", LangVersion), "\n"))
 	}
 	if err := sayf(io, formatTo(mbuf[:], "finc1: unknown command %v\n", Quoted(strBytes(cmd)))); err != nil {
 		return err

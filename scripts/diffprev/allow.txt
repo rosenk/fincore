@@ -1,0 +1,6 @@
+# diff-prev allowlist (scripts/diffprev, make diff-prev): intentional output
+# changes of the current compiler against the previous release.
+#
+# One entry per line: <case name> # <reason>
+# The case name is the one diff-prev prints (also with -v). Remove entries
+# when the seed moves past the change.

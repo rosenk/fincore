@@ -103,6 +103,17 @@ diff-build-vet: finc1 ## [v0.2 regression] diff-build plus `go vet` on the emitt
 	$(GO) run ./scripts/diffbuild -govet
 # --- end finc0 vs finc1 differential
 
+# --- diff-prev: current compiler/ (bin/finc1) vs the previous release
+# (.stage/finc-seed), the oracle for new language versions. docs/testing.md.
+.PHONY: diff-prev diff-prev-fuzz
+FUZZ_SEED ?= 1
+diff-prev: finc1 seed ## current compiler vs previous release (seed): parse/check/emitted Go/vet/run; REGRESSION + DIAG-CHANGED fail
+	$(GO) run ./scripts/diffprev
+
+diff-prev-fuzz: finc1 seed ## diff-prev plus 20 random mutants per corpus file and snippet (FUZZ_SEED=n)
+	$(GO) run ./scripts/diffprev -mutate 20 -seed $(FUZZ_SEED)
+# --- end diff-prev
+
 finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3.go
 	@mkdir -p $(STAGE)
 	$(BIN)/finc1 build --emit-go=$(STAGE)/stage2.go -o $(BIN)/finc2 ./compiler
