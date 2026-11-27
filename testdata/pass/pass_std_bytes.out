@@ -47,3 +47,8 @@ extremes: [-9223372036854775808 18446744073709551615]
 repeat/hex: [		BEEF 001fffffffffffffffff]
 repeat/hex truncated: true
 len after dropped writes: 27
+spare len: 62
+extend: [abcd]
+extend truncated: false
+extend too far truncated: true
+len after extend: 4

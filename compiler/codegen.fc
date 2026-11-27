@@ -31,6 +31,8 @@
 // (build.fc), which makes it byte-identical to finc0's go/format output.
 package main
 
+import "std/bytes"
+
 const (
 	CgMaxMonos    = 4096
 	CgMaxMonoVals = 32_768
@@ -116,33 +118,31 @@ const (
 
 func cgW(s string) {
 	o := &cgBuf
-	o.putStr(s)
+	o.WriteString(s)
 }
 
 func cgWb(b []byte) {
 	o := &cgBuf
-	o.putBytes(b)
+	o.WriteBytes(b)
 }
 
 func cgWc(c byte) {
 	o := &cgBuf
-	o.putByte(c)
+	o.WriteByte(c)
 }
 
 func cgWu(v u64) {
 	o := &cgBuf
-	o.putUint(v)
+	o.WriteUint(v)
 }
 
 func cgWmark() usize {
-	return cgBuf.len
+	return (&cgBuf).Len()
 }
 
 // wtruncate drops everything written after mark.
 func cgWtruncate(mark usize) {
-	if mark <= cgBuf.len {
-		cgBuf.len = mark
-	}
+	(&cgBuf).Truncate(mark)
 }
 
 // wreverse reverses gw.data[a:b].
@@ -150,17 +150,18 @@ func cgWreverse(a usize, b usize) {
 	if b <= a {
 		return
 	}
+	w := (&cgBuf).Bytes()
 	n := (b - a) / 2
 	for i := usize(0); i < n; i++ {
-		x := cgBuf.data[a+i]
-		cgBuf.data[a+i] = cgBuf.data[b-1-i]
-		cgBuf.data[b-1-i] = x
+		x := w[a+i]
+		w[a+i] = w[b-1-i]
+		w[b-1-i] = x
 	}
 }
 
 // wrotate moves gw.data[q:len] in front of gw.data[p:q].
 func cgWrotate(p usize, q usize) {
-	e := cgBuf.len
+	e := (&cgBuf).Len()
 	if p >= q || q >= e {
 		return
 	}
@@ -172,34 +173,27 @@ func cgWrotate(p usize, q usize) {
 // wwrap wraps everything written since mark in parentheses.
 func cgWwrap(mark usize) {
 	cgWc('(')
-	cgWrotate(mark, cgBuf.len-1)
+	cgWrotate(mark, (&cgBuf).Len()-1)
 	cgWc(')')
 }
 
 // wbyteAt returns gw.data[i] (0 past the end).
 func cgWbyteAt(i usize) byte {
-	if i >= cgBuf.len {
+	w := (&cgBuf).Bytes()
+	if i >= len(w) {
 		return 0
 	}
-	return cgBuf.data[i]
+	return w[i]
 }
 
 func cgWendsWith(mark usize, c byte) bool {
-	return cgBuf.len > mark && cgBuf.data[cgBuf.len-1] == c
+	w := (&cgBuf).Bytes()
+	return len(w) > mark && w[len(w)-1] == c
 }
 
 func cgWhasPrefix(mark usize, s string) bool {
-	b := strBytes(s)
-	n := len(b)
-	if cgBuf.len < mark+n {
-		return false
-	}
-	for i := usize(0); i < n; i++ {
-		if cgBuf.data[mark+i] != b[i] {
-			return false
-		}
-	}
-	return true
+	w := (&cgBuf).Bytes()
+	return mark <= len(w) && bytes.HasPrefix(w[mark:], strBytes(s))
 }
 
 // wtemp writes the name of temporary n.
@@ -217,35 +211,38 @@ func cgNewTemp() u64 {
 
 // stashCut moves gw.data[mark:len] onto cgStash.
 func cgStashCut(mark usize) {
-	if mark > cgBuf.len {
+	w := &cgBuf
+	if mark > w.Len() {
 		return
 	}
 	o := &cgStash
-	o.putBytes(cgBuf.data[mark:cgBuf.len])
-	cgBuf.len = mark
+	o.WriteBytes(w.Bytes()[mark:])
+	w.Truncate(mark)
 }
 
 // stashEmit writes cgStash.data[a:b] to gw.
 func cgStashEmit(a usize, b usize) {
-	if a >= b || b > cgStash.len {
+	st := (&cgStash).Bytes()
+	if a >= b || b > len(st) {
 		return
 	}
-	cgWb(cgStash.data[a:b])
+	cgWb(st[a:b])
 }
 
 // flushTo appends gw to a section and resets gw.
 func cgFlushTo(sec u8) {
+	w := &cgBuf
 	if sec == 1 {
 		o := &genTypes
-		o.putBytes(cgBuf.data[:cgBuf.len])
+		o.WriteBytes(w.Bytes())
 	} else if sec == 2 {
 		o := &genVars
-		o.putBytes(cgBuf.data[:cgBuf.len])
+		o.WriteBytes(w.Bytes())
 	} else {
 		o := &genFuncs
-		o.putBytes(cgBuf.data[:cgBuf.len])
+		o.WriteBytes(w.Bytes())
 	}
-	cgBuf.len = 0
+	w.Truncate(0)
 }
 
 // rt writes a reference to the runtime package.
@@ -263,17 +260,17 @@ func cgFail(n u32, msg string) {
 	}
 	cgFailed = true
 	o := &cgErrBuf
-	o.reset()
+	o.Reset()
 	if n != 0 {
-		o.putStr(sources.files[nfile(n)].path)
-		o.putByte(':')
-		o.putUint(u64(nodes.items[usize(n)].sLine))
-		o.putByte(':')
-		o.putUint(u64(nodes.items[usize(n)].sCol))
-		o.putStr(": ")
+		o.WriteString(sources.files[nfile(n)].path)
+		o.WriteByte(':')
+		o.WriteUint(u64(nodes.items[usize(n)].sLine))
+		o.WriteByte(':')
+		o.WriteUint(u64(nodes.items[usize(n)].sCol))
+		o.WriteString(": ")
 	}
-	o.putStr("codegen: ")
-	o.putStr(msg)
+	o.WriteString("codegen: ")
+	o.WriteString(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -284,12 +281,7 @@ func cgBytesIs(b []byte, s string) bool {
 }
 
 func cgBytesHasPrefix(b []byte, s string) bool {
-	p := strBytes(s)
-	n := len(p)
-	if len(b) < n {
-		return false
-	}
-	return bytesEqual(b[:n], p)
+	return bytes.HasPrefix(b, strBytes(s))
 }
 
 func cgIsGoKeyword(b []byte) bool {
@@ -482,7 +474,7 @@ func cgWalkMarkExpr(n u32, dp usize) decreases(dp) {
 			st, cnt := slotList(node, slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				cgWalkMarkExpr(nodes.lists[usize(st)+j], dp-1)
+				cgWalkMarkExpr(listAt(st, j), dp-1)
 			}
 		} else {
 			cgWalkMarkExpr(slotChild(node, slot), dp-1)
@@ -598,7 +590,7 @@ func cgNumberScopes(n u32, fi u32, dp usize) decreases(dp) {
 			st, cnt := slotList(node, slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				cgNumberScopes(nodes.lists[usize(st)+j], fi, dp-1)
+				cgNumberScopes(listAt(st, j), fi, dp-1)
 			}
 		} else {
 			cgNumberScopes(slotChild(node, slot), fi, dp-1)
@@ -1828,7 +1820,7 @@ func cgCtxReset(fi u32) {
 	cgPendBase = 0
 	cgArmTop = 0
 	cgSeenTop = 0
-	cgStash.len = 0
+	(&cgStash).Truncate(0)
 }
 
 // funcDecl writes a function or method. mi >= 0 is the monomorphized
@@ -1942,14 +1934,10 @@ func cgGenerateGo() bool {
 	cgNMonos = 0
 	cgNMonoVals = 0
 	cgValTop = 0
-	cgBuf.len = 0
-	cgBuf.full = false
-	genTypes.len = 0
-	genTypes.full = false
-	genVars.len = 0
-	genVars.full = false
-	genFuncs.len = 0
-	genFuncs.full = false
+	(&cgBuf).Reset()
+	(&genTypes).Reset()
+	(&genVars).Reset()
+	(&genFuncs).Reset()
 	m := funcs.main
 	if m == 0 || funcs.items[usize(m)].sym == 0 || syms.items[usize(funcs.items[usize(m)].sym)].pkg != pkgs.root {
 		cgFail(0, "the root package has no main function")
@@ -2039,18 +2027,18 @@ func cgGenerateGo() bool {
 // assembleGo joins the header, the imports and the sections into outBuf.
 func cgAssembleGo() bool {
 	o := &outBuf
-	o.reset()
-	o.putStr("// Code generated by finc0 from FinCore sources. DO NOT EDIT.\n\npackage main\n\n")
-	o.putStr("import (\n")
+	o.Reset()
+	o.WriteString("// Code generated by finc0 from FinCore sources. DO NOT EDIT.\n\npackage main\n\n")
+	o.WriteString("import (\n")
 	if cgUsesRT {
-		o.putStr("\"fincore/runtime/fincrt\"\n")
+		o.WriteString("\"fincore/runtime/fincrt\"\n")
 	}
-	o.putStr("\"os\"\n")
-	o.putStr(")\n\n")
-	o.putBytes(genTypes.data[:genTypes.len])
-	o.putBytes(genVars.data[:genVars.len])
-	o.putBytes(genFuncs.data[:genFuncs.len])
-	if outBuf.full || cgBuf.full || genTypes.full || genVars.full || genFuncs.full || cgStash.full {
+	o.WriteString("\"os\"\n")
+	o.WriteString(")\n\n")
+	o.WriteBytes((&genTypes).Bytes())
+	o.WriteBytes((&genVars).Bytes())
+	o.WriteBytes((&genFuncs).Bytes())
+	if o.Truncated() || (&cgBuf).Truncated() || (&genTypes).Truncated() || (&genVars).Truncated() || (&genFuncs).Truncated() || (&cgStash).Truncated() {
 		setFull("generated Go output")
 		return false
 	}

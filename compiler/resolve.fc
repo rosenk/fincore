@@ -469,7 +469,7 @@ func declarePackage(pkg u32) {
 	pkgs.items[usize(pkg)].scp = sc
 	f0 := pkgs.items[usize(pkg)].f0
 	f1 := pkgs.items[usize(pkg)].f1
-	mark := ustack.count
+	mark := umark()
 	for fi := f0; fi < f1; fi++ {
 		if !sources.files[fi].ok {
 			continue
@@ -509,16 +509,16 @@ func declarePackage(pkg u32) {
 	pkgs.items[usize(pkg)].declS = ds
 	pkgs.items[usize(pkg)].declN = dn
 	// Methods (redeclared ones are reported and left out).
-	mark2 := ustack.count
+	mark2 := umark()
 	for i := usize(0); i < usize(dn); i++ {
 		s := uat(ds, i)
 		if syms.items[usize(s)].recvType == 0 {
 			continue
 		}
 		old := u32(0)
-		top := ustack.count
-		for j := mark2; j < top; j++ {
-			m := ustack.items[j]
+		prev := (&ulists).Pending(mark2)
+		for j := usize(0); j < len(prev); j++ {
+			m := prev[j]
 			if syms.items[usize(m)].recvType == syms.items[usize(s)].recvType && syms.items[usize(m)].name == syms.items[usize(s)].name {
 				old = m
 				break
@@ -554,9 +554,9 @@ func declarePackage(pkg u32) {
 // returns it.
 func importPathOf(spec u32) []byte {
 	t := &tmpBuf
-	t.reset()
+	t.Reset()
 	decodeStringLit(t, ntext(nb(spec)))
-	return tmpBuf.data[:tmpBuf.len]
+	return t.Bytes()
 }
 
 func bindPackage(pkg u32, depth usize) decreases(depth) {

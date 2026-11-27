@@ -282,6 +282,25 @@ func (b *Builder[N]) WriteHex(v u64, width usize, upper bool) {
 	b.WriteBytes(tmp[:width])
 }
 
+// Spare returns the unused capacity (the N - Len() bytes after the
+// contents) as a slice aliasing the buffer, for a caller that fills it in
+// place (e.g. a driver reading a file); Extend then appends what was
+// written. O(1).
+func (b *Builder[N]) Spare() []byte {
+	return b.data[b.n:]
+}
+
+// Extend appends the first k bytes of Spare() (written there by the
+// caller). Like every write it is all-or-nothing: when k > N - Len() the
+// contents are unchanged and Truncated is set. O(1).
+func (b *Builder[N]) Extend(k usize) {
+	if k > N-b.n {
+		b.trunc = true
+		return
+	}
+	b.n += k
+}
+
 // Bytes returns the contents, aliasing the buffer (valid until the next
 // write or Reset). O(1).
 func (b *Builder[N]) Bytes() []byte {

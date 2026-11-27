@@ -112,19 +112,19 @@ func codeName(code u32) string {
 // diagHeader writes "path:line:col: error[E####]: ". The caller appends the
 // message and finishes the line with diagEnd.
 func diagHeader(o *OutBuf, path string, line u32, col u32, code u32) {
-	o.putStr(path)
-	o.putByte(':')
-	o.putUint(u64(line))
-	o.putByte(':')
-	o.putUint(u64(col))
-	o.putStr(": error[E")
+	o.WriteString(path)
+	o.WriteByte(':')
+	o.WriteUint(u64(line))
+	o.WriteByte(':')
+	o.WriteUint(u64(col))
+	o.WriteString(": error[E")
 	putDecMin(o, u64(code), 4)
-	o.putStr("]: ")
+	o.WriteString("]: ")
 }
 
 // diagEnd terminates a diagnostic line.
 func diagEnd(o *OutBuf) {
-	o.putByte('\n')
+	o.WriteByte('\n')
 }
 
 // putDecMin writes v in decimal, zero-padded to at least `width` digits.
@@ -139,9 +139,9 @@ func putDecMin(o *OutBuf, v u64, width usize) {
 		digits++
 	}
 	for i := digits; i < width; i++ {
-		o.putByte('0')
+		o.WriteByte('0')
 	}
-	o.putUint(v)
+	o.WriteUint(v)
 }
 
 // putHexMin writes v in upper-case hex with at least `width` digits (%0*X).
@@ -158,7 +158,7 @@ func putHexMin(o *OutBuf, v u64, width usize) {
 	if digits < width {
 		digits = width
 	}
-	o.putHex(v, digits, true)
+	o.WriteHex(v, digits, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -229,24 +229,24 @@ func decodeRune(b []byte, i usize) (u32, usize) {
 // putRune writes the UTF-8 encoding of r.
 func putRune(o *OutBuf, r u32) {
 	if r < 0x80 {
-		o.putByte(byte(r))
+		o.WriteByte(byte(r))
 		return
 	}
 	if r < 0x800 {
-		o.putByte(byte(0xC0 | (r >> 6)))
-		o.putByte(byte(0x80 | (r & 0x3F)))
+		o.WriteByte(byte(0xC0 | (r >> 6)))
+		o.WriteByte(byte(0x80 | (r & 0x3F)))
 		return
 	}
 	if r < 0x10000 {
-		o.putByte(byte(0xE0 | (r >> 12)))
-		o.putByte(byte(0x80 | ((r >> 6) & 0x3F)))
-		o.putByte(byte(0x80 | (r & 0x3F)))
+		o.WriteByte(byte(0xE0 | (r >> 12)))
+		o.WriteByte(byte(0x80 | ((r >> 6) & 0x3F)))
+		o.WriteByte(byte(0x80 | (r & 0x3F)))
 		return
 	}
-	o.putByte(byte(0xF0 | (r >> 18)))
-	o.putByte(byte(0x80 | ((r >> 12) & 0x3F)))
-	o.putByte(byte(0x80 | ((r >> 6) & 0x3F)))
-	o.putByte(byte(0x80 | (r & 0x3F)))
+	o.WriteByte(byte(0xF0 | (r >> 18)))
+	o.WriteByte(byte(0x80 | ((r >> 12) & 0x3F)))
+	o.WriteByte(byte(0x80 | ((r >> 6) & 0x3F)))
+	o.WriteByte(byte(0x80 | (r & 0x3F)))
 }
 
 // isPrintRune approximates Go's strconv.IsPrint for non-ASCII runes: Go
@@ -289,9 +289,9 @@ func isPrintRune(r u32) bool {
 
 // putQuoted writes s quoted like Go's strconv.Quote.
 func putQuoted(o *OutBuf, s []byte) {
-	o.putByte('"')
+	o.WriteByte('"')
 	putQuotedBody(o, s)
-	o.putByte('"')
+	o.WriteByte('"')
 }
 
 // putQuotedBody writes the inside of strconv.Quote(s), without the
@@ -307,19 +307,19 @@ func putQuotedBody(o *OutBuf, s []byte) {
 		if c >= 0x80 {
 			r, w := decodeRune(s, i)
 			if w <= 1 {
-				o.putStr("\\x")
-				o.putHex(u64(c), 2, false)
+				o.WriteString("\\x")
+				o.WriteHex(u64(c), 2, false)
 				i++
 				continue
 			}
 			if isPrintRune(r) {
-				o.putBytes(s[i : i+w])
+				o.WriteBytes(s[i : i+w])
 			} else if r < 0x10000 {
-				o.putStr("\\u")
-				o.putHex(u64(r), 4, false)
+				o.WriteString("\\u")
+				o.WriteHex(u64(r), 4, false)
 			} else {
-				o.putStr("\\U")
-				o.putHex(u64(r), 8, false)
+				o.WriteString("\\U")
+				o.WriteHex(u64(r), 8, false)
 			}
 			i += w
 			continue
@@ -333,58 +333,58 @@ func putQuotedBody(o *OutBuf, s []byte) {
 // a literal delimited by `quote`.
 func putEscapedASCII(o *OutBuf, c byte, quote byte) {
 	if c == quote || c == '\\' {
-		o.putByte('\\')
-		o.putByte(c)
+		o.WriteByte('\\')
+		o.WriteByte(c)
 		return
 	}
 	if c >= 0x20 && c < 0x7F {
-		o.putByte(c)
+		o.WriteByte(c)
 		return
 	}
 	if c == 7 {
-		o.putStr("\\a")
+		o.WriteString("\\a")
 		return
 	}
 	if c == 8 {
-		o.putStr("\\b")
+		o.WriteString("\\b")
 		return
 	}
 	if c == 12 {
-		o.putStr("\\f")
+		o.WriteString("\\f")
 		return
 	}
 	if c == '\n' {
-		o.putStr("\\n")
+		o.WriteString("\\n")
 		return
 	}
 	if c == '\r' {
-		o.putStr("\\r")
+		o.WriteString("\\r")
 		return
 	}
 	if c == '\t' {
-		o.putStr("\\t")
+		o.WriteString("\\t")
 		return
 	}
 	if c == 11 {
-		o.putStr("\\v")
+		o.WriteString("\\v")
 		return
 	}
-	o.putStr("\\x")
-	o.putHex(u64(c), 2, false)
+	o.WriteString("\\x")
+	o.WriteHex(u64(c), 2, false)
 }
 
 // putQuotedByte writes c as Go's %q verb formats a byte value ('a').
 func putQuotedByte(o *OutBuf, c byte) {
-	o.putByte('\'')
+	o.WriteByte('\'')
 	if c < 0x80 {
 		putEscapedASCII(o, c, '\'')
 	} else if isPrintRune(u32(c)) {
 		putRune(o, u32(c))
 	} else {
-		o.putStr("\\u00")
-		o.putHex(u64(c), 2, false)
+		o.WriteString("\\u00")
+		o.WriteHex(u64(c), 2, false)
 	}
-	o.putByte('\'')
+	o.WriteByte('\'')
 }
 
 // putCharVerb writes c as Go's %c verb formats a byte (the rune U+00cc).
