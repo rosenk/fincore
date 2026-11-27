@@ -324,7 +324,7 @@ Verb            = "d" | "x" | "s" | "c" | "q" | "v" .
 * **Кортежи** съществуват само като scrutinee на `match`: `(` с `,` на най-горно ниво преди съответната `)`. Навсякъде другаде `(a, b)` е синтактична грешка, а кортеж, попаднал в по-голям израз (`match (a, b) + 1 {`), е `E2002` (`tuple (a, b) can only be the scrutinee of a match`).
 * **`@` в or-шаблон:** операндът на `@` е една алтернатива, затова `x @ A | B` би било `(x @ A) | B`; като капан това е `E1001` (`ambiguous '@' pattern in an or-pattern: write x @ (P | Q) or (x @ P) | Q`). Пише се `x @ (A | B)` или `(x @ A) | (x @ B)`. Вериги `a @ b @ P` и вложени `@` са позволени.
 * **Голо име в шаблон** (без `.`/`(`) е вариант, константа или свързване според правилото от 4.8.2; в позиция на полезни данни `Q.N` може да е квалифициран вариант (`Type.V`) или импортирана константа (`pkg.C`). `pkg.Type.Variant` не е шаблон.
-* **`..`** е позволен само непосредствено в списъка на полезните данни на вариант (не в скоби вътре в него) и най-много веднъж (второто `..` е `E2002`).
+* **`..`** е позволен само непосредствено в списъка на полезните данни на вариант (не в скоби вътре в него: `A((.., x))` и `A((..))` са синтактична грешка `E1001`) и най-много веднъж (второто `..` е `E2002`).
 * **Литералът `nil`:** валиден е единствено за `error` и срезове `[]T` (4.5).
 * **Типови преобразувания:** `u32(x)`, `usize(n)`, `Name(x)`, `[]byte(s)` се парсират като извикване и се разпознават от Type Checker-а.
 * **Типови аргументи** на генерични функции се дават явно с `Index`: `id[u64](42)`, `sort.Sort[u32](xs, less)` (реш. 11).
@@ -930,6 +930,31 @@ CodeUniv(n usize)                        : Code (n + 1)
 * `CodeUniv(n)` има строго тип `Code (n + 1)`; `n` трябва да е константа (типът зависи от него).
 * `El(CodeUniv(n))` се редуцира до типа `Code n`.
 * Подаване на `Code (n+1)` там, където се очаква `Code n`, е `E2010: UNIVERSE_LEVEL_MISMATCH` (`universe level mismatch: cannot use CodeUniv(0) (Code 1) as Code 0 in return statement`). Голо `Code` без ниво също е `E2010` (`Code requires a level (Code n)`), както и неконстантно ниво.
+* Аргументът на `El(...)` трябва да е константа при компилация (иначе `E2002` `El argument e is not a compile-time constant`). `CodeStruct(fields)` **никога не е константа**: аргументът му е срез, а срезовете не са константи, затова извикването е стойност дори когато всички полета са константни (реш. 30). `CodeStruct` и всеки `Code` израз, който го съдържа (`CodeArray(2, CodeStruct(...))`), могат да се използват само в тялото на `comptime` функция; `El` се прилага към извикването на тази функция:
+
+```go
+package main
+
+comptime func Fields() []FieldCode {
+	var fs [2]FieldCode
+	fs[0] = CodeField("a", CodeU8())
+	fs[1] = CodeField("b", CodeU32())
+	return fs[:]
+}
+
+comptime func Pair() Code 0 {
+	return CodeStruct(Fields())
+}
+
+type P = El(Pair())               // struct{ a uint8; b uint32 }
+type Q = El(CodeStruct(Fields())) // ERROR E2002
+
+var p P
+
+func get() u32 {
+	return p.b
+}
+```
 
 > **Промяна спрямо v0.1:** добавени са `CodeU16`, `CodeI16` и др. (пълният набор от цели типове), `CodeField`/`FieldCode`; конструкторите са полиморфни по ниво.
 
@@ -1386,7 +1411,7 @@ fincore/
 
 Всички капацитети се проверяват при вмъкване; при запълване се вдига „лепкав“ флаг, а драйверът докладва `compiler capacity exceeded (...)` и връща `ErrArenaFull` — никакъв паничен OOM или тихо препълване. Скритият флаг `finc1 check --stats <path>` отпечатва използването на всяка арена.
 
-**Тоталност на самия компилатор:** парсерът е една SCC от 40 метода с `decreases(depth)` и охрана `if depth == 0`; входът е с `ParseDepth = 65_536`, а влагането е ограничено отделно (`MaxNesting = 1000`, `E1001`). Проверките (резолюция, типове, comptime, обхвати, тоталност, кодогенерация) са големи SCC с мярка `dp usize` и вход `SemaDepth`.
+**Тоталност на самия компилатор:** всички рекурсивни методи на парсера носят `decreases(depth)` и охрана `if depth == 0` и образуват една SCC (броят им се фиксира от `TestCompilerSCCs` в bootstrap/internal/totality/totality_test.go); входът е с `ParseDepth = 65_536`, а влагането е ограничено отделно (`MaxNesting = 1000`, `E1001`). Проверките (резолюция, типове, comptime, обхвати, тоталност, кодогенерация) са големи SCC с мярка `dp usize` и вход `SemaDepth`.
 
 ### 9.7. Ключови правила при генериране на Go код
 
@@ -1851,7 +1876,7 @@ driver func main(net Net, sig Signals) error {
 | Присвояемост | `fail_named_assign.fc` (няколко маркера) | `E2002` |
 | `formatTo` | `fail_format_argtype`, `_arity`, `_method_sig`, `_nonconst`, `_nonvalue`, `_verb`; `fail_total_format_recursion` (`E4002`), `fail_total_format_mutual` (`E4004`) | `E2002`/`E2003`/`E4002`/`E4004` |
 | Sum types | `fail_match_arm_type` (`E2002`), `fail_match_expr_non_exhaustive`, `fail_match_int_no_wildcard`, `fail_match_non_exhaustive`, `fail_match_unreachable` (`E2012`), `fail_enum_recursive` (`E2002`) | |
-| Шаблони | `fail_pattern_nested_non_exhaustive`, `fail_pattern_tuple_non_exhaustive`, `fail_pattern_unreachable_nested` (`E2012`), `fail_pattern_or_binding`, `fail_pattern_two_rest` (`E2002`) | |
+| Шаблони | `fail_pattern_nested_non_exhaustive`, `fail_pattern_tuple_non_exhaustive`, `fail_pattern_unreachable_nested` (`E2012`), `fail_pattern_or_binding`, `fail_pattern_two_rest` (`E2002`), `fail_pattern_rest_paren` (`E1001`) | |
 | Константни шаблони | `fail_const_pattern_type` (`E2002`), `fail_const_pattern_unreachable`, `fail_const_pattern_non_exhaustive` (`E2012`) | |
 | `@` | `fail_at_pattern_const`, `_duplicate`, `_or_binding`, `_tuple` (`E2002`), `fail_at_pattern_unreachable` (`E2012`) | |
 | `is` потоци | `fail_is_flow_duplicate`, `fail_is_flow_intersect_dup` (`E2001`), `fail_is_flow_else`, `fail_is_flow_or_true`, `fail_is_flow_intersect_one_side` (`E2001`), `fail_is_flow_fallthrough`, `fail_is_flow_letelse_toplevel`, `fail_is_flow_intersect_type` (`E2002`) | |

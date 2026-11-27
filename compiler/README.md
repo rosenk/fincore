@@ -25,7 +25,7 @@ files (spec 9.5.6); there are no local imports.
 | `totality.fc` | Totality checker part 1 (finc0's `totality`: totality.go, invariant.go, loops.go): pre-order program index, E5001 effects, root facts, loop invariance, T1, T2 setup |
 | `totality_flow.fc` | Totality checker part 2 (flow.go, T2/T3 walks): abstract states, bounds, the path-sensitive walker |
 | `totality_rec.fc` | Totality checker part 3 (recursion.go): call graph, iterative Tarjan, measures, E4002/E4004 |
-| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`, `check [--comptime-fuel=N] <file.fc \| dir>` (hidden flags `--stats`, `--passes=types\|all\|totality`; the loader for local imports lives here); dispatches build/run/test to build.fc |
+| `main.fc` | `driver func main(fs FS, env Env, io Stdio, exec Exec) error`: `parse [--dump-ast] <file.fc \| dir>`, `check [--comptime-fuel=N] <file.fc \| dir>` (hidden flags `--stats`, `--passes=types\|all\|<pass>[,<pass>]` with the passes `scope` and `totality`; the loader for local imports lives here); dispatches build/run/test to build.fc |
 | `codegen.fc` | Code generator part 1 (finc0's `ir` + `codegen/golang` gen.go, types.go, values.go): emission buffers, Go names, usage/scope/dead-code analyses, match arm lowering, monomorphization, types, constant values, declarations, entry point |
 | `codegen_expr.fc` | Code generator part 2 (expr.go): expressions and calls |
 | `codegen_stmt.fc` | Code generator part 3 (stmt.go): bodies, statements, scope barriers, labeled breaks, returns through scopes |
@@ -151,7 +151,9 @@ is still available as `Node.id`).
    order and the first pass with diagnostics stops the pipeline
    (finc0's `check.Passes`): the scope pass, then `totalityProgram`
    (totality*.fc). The hidden flag `--passes=types|all|<pass>[,<pass>]`
-   selects them like finc0's oracle flag.
+   (`types`: stop after the type checker; `all`, the default: every pass;
+   otherwise a comma-separated list of `scope` and `totality`, e.g.
+   `--passes=scope,totality`) selects them like finc0's oracle flag.
 
 The later passes (scope, totality) must run only when `diags.count == 0`
 after step 3, and may then assume a well-typed program: every expression
@@ -286,7 +288,7 @@ Port of finc0's `scope` package (S2-S5: E3002-E3005; rules in
 enabled passes in order and stops after the first one that reports
 anything (finc0's `check.Passes`). The hidden flag
 `check --passes=types|all|<pass>[,<pass>]` mirrors finc0's oracle flag
-(known passes: `scope`).
+(known passes: `scope`, `totality`; `passBit` in passes.fc).
 
 - `scope.fc` (finc0 scope.go): `scopeCheck` checks every declaration with a
   body in `funcs.order`. Origins (depth, region) are packed into a u64
@@ -436,9 +438,9 @@ closure, testdata/README.md.)
 - Every recursive function carries `decreases(depth)`, opens with
   `if depth == 0 { return ... }` and passes `depth - 1` (or `depth-1`)
   on every call inside its SCC (T3). There are three SCCs: the parser
-  (40 methods on `*Parser` since v0.2's `matchExpr`, `patternAlt` and the
-  pattern methods `scrutinee`, `guard`, `patterns`, `payloadListPush`,
-  `patternAltBody`; the SCC has 38 members), the printer (4 methods on `*Printer`), and
+  (all recursive methods on `*Parser`; the number of methods with
+  `decreases` and the SCC size are pinned by `TestCompilerSCCs` in
+  bootstrap/internal/totality/totality_test.go), the printer (4 methods on `*Printer`), and
   two directly recursive methods (`NodeArena.assignIDs`,
   `Dumper.dumpNode`). Parser entry points start the measure at
   `ParseDepth = 65_536`, far above the frames reachable within

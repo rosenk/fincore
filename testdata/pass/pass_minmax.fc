@@ -1,15 +1,18 @@
 // SINCE: v0.3
 // pass_minmax (v0.3): the predeclared min and max. Two or more operands
 // of one ordered type (integers of every width, named integer types,
-// strings), typed like comparison operands: untyped constants take the
-// type of the typed operands; all-constant calls are folded to constants
-// (untyped if every operand is untyped, typed otherwise) and usable in
-// const declarations and array lengths; untyped int and char operands mix
-// to untyped char. min and max are shadowable like len: locals,
+// strings, named string types), typed like comparison operands: untyped
+// constants take the type of the typed operands; all-constant calls are
+// folded to constants (untyped if every operand is untyped, typed
+// otherwise) and usable in const declarations and array lengths; untyped
+// int and char operands mix to untyped char (default type u8). min and
+// max are shadowable like len: locals,
 // parameters and struct fields named min/max. Comptime evaluation.
 package main
 
 type Size u16
+
+type Label string
 
 const Lo = min(7, 3, 5)               // untyped 3
 const Hi = max(7, 3, 5)               // untyped 7
@@ -141,6 +144,16 @@ driver func main(io Stdio) error {
 		return err
 	}
 	if err := line(io, "comptime", u64(CtA)*100+u64(CtB)*10+u64(CtC)); err != nil {
+		return err
+	}
+	// A named string type; an untyped char result defaults to u8.
+	lb := max(Label("b"), "a", Label("ab"))
+	ch := max('a', 66)
+	var cb u8 = ch
+	if err := sline(io, "label", string(lb)); err != nil {
+		return err
+	}
+	if err := line(io, "char", u64(cb)); err != nil {
 		return err
 	}
 	return sline(io, "ctstring", CtS)

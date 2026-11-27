@@ -1,0 +1,18 @@
+// SINCE: v0.3
+// fail_match_multi_call_untyped (v0.3): as a call argument a multi-value
+// match gets no expected types from the parameters: a position that is
+// an untyped constant in every arm takes its default type (int), which is
+// not a u32. Give one arm a typed value (`u32(1), 2`).
+package main
+
+func add(a u32, b u32) u32 {
+	return a + b
+}
+
+func f(n u32) u32 {
+	return add(match n { 0 -> 1, 2; _ -> 3, 4 }) // ERROR E2002
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

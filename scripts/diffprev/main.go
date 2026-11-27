@@ -580,6 +580,7 @@ func treeMutantCases(tmp, prefix string, muts []mutation) []tcase {
 			fmt.Printf("warning: mutation %d (%s %q) does not apply\n", i, m.file, m.old)
 			continue
 		}
+		linkStd(root, pkg)
 		out = append(out, tcase{name: fmt.Sprintf("%s mutant %d: %s %q -> %q", pkg, i, m.file, m.old, m.new),
 			dir: root, path: pkg, passes: allPasses, mutant: true})
 	}

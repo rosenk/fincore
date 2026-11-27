@@ -4,7 +4,8 @@
 // types) match a string scrutinee by ==, and a []byte value (also a named
 // byte slice type) by its bytes, in every pattern position: top level
 // (flat switch), or-patterns, guards, bindings, tuple elements, enum
-// payloads and `is` (with let-else). A string or []byte match expression
+// payloads, `@` operands and `is` (with let-else and in `&&` chains); a
+// nil slice matches "". A string or []byte match expression
 // needs '_' or a binding; statement matches need not be exhaustive.
 // Comptime evaluation of all forms.
 package main
@@ -92,6 +93,19 @@ func wordLen(t Tok) u32 {
 	return u32(len(w))
 }
 
+// An `@` operand binds the matched slice.
+func atVerb(b []byte) u32 {
+	return match b {
+		w @ ("GET" | "HEAD") -> 10 + u32(len(w))
+		_ -> 0
+	}
+}
+
+// `is` tests in an `&&` chain.
+func pair(a []byte, b []byte) bool {
+	return a is "x" && b is "y" | ""
+}
+
 // A statement match on []byte without '_': no arm runs for other values.
 func count(b []byte) u32 {
 	n := u32(0)
@@ -169,6 +183,26 @@ driver func main(io Stdio) error {
 		return err
 	}
 	if err := line(io, "count", u64(count("a"))*100+u64(count("b"))*10+u64(count("c"))); err != nil {
+		return err
+	}
+	if err := line(io, "atVerb", u64(atVerb("HEAD"))*100+u64(atVerb("GET!"))); err != nil {
+		return err
+	}
+	var nb []byte
+	pr := u64(0)
+	if pair("x", nb) {
+		pr += 100
+	}
+	if pair("x", "y") {
+		pr += 10
+	}
+	if !pair("y", "y") {
+		pr += 1
+	}
+	if err := line(io, "pair", pr); err != nil {
+		return err
+	}
+	if err := line(io, "nil", u64(method(nb))); err != nil {
 		return err
 	}
 	return line(io, "comptime", u64(CtGet)*10000+u64(CtIf))

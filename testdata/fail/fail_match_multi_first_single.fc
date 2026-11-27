@@ -1,0 +1,15 @@
+// SINCE: v0.3
+// fail_match_multi_first_single (v0.3): the count N is that of the first
+// arm with several values; an earlier single-value arm is reported too.
+package main
+
+func f(n u32) (u32, u32) {
+	return match n {
+		0 -> n // ERROR E2003
+		_ -> 1, 2
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

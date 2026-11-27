@@ -14,4 +14,6 @@ runtime: 100250
 u64: 1099511627770
 named: 75
 comptime: 1002
+label: b
+char: 97
 ctstring: c

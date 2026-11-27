@@ -27,7 +27,9 @@ in [docs/v0_3.md](docs/v0_3.md), decisions 140–157 in
   of values (a value list, a multi-result call or a nested multi-value
   match); untyped values take the result/variable types. A `,` after an
   arm value continues the value list unless the rest of the arm is another
-  arm, so multi-value arms are separated by `;` or newlines.
+  arm, so multi-value arms are separated by `;` or newlines. As the only
+  argument of a call a multi-value match supplies one argument per value,
+  like a multi-result call (untyped values take their default types).
 
 ### Compiler and tooling
 
@@ -37,6 +39,11 @@ in [docs/v0_3.md](docs/v0_3.md), decisions 140–157 in
 - `make diff-prev` now `go vet`s the emitted Go of programs only the
   current compiler builds and runs those with a `.out` file. Mutants in
   `make diff-prev-fuzz` inherit their source's `// SINCE:` version.
+- `make diff-check-totality`/`diff-check-all` and `make diff-prev`: the
+  compiler/ and std/ mutants now see the std/ packages (symlinked into
+  their temporary trees). Before, every compiler/ mutant stopped at E2001
+  `cannot find package "std/..."` in both compilers and never reached the
+  totality checker.
 - Fixed: a string constant pattern on a `[]byte` scrutinee was accepted
   by the v0.2 checker but produced Go that did not compile.
 - A failing `finc` prints only its diagnostics and exits 1: the trailing
