@@ -1,0 +1,248 @@
+// Package strconv converts integers to and from text and quotes byte
+// strings as FinCore string literals. All functions are total and write
+// into caller-provided buffers; nothing allocates.
+//
+// Formatting functions return the number of bytes written to dst, or 0
+// when dst is too small or an argument is invalid (dst is then left in an
+// unspecified state). Every successful result is at least one byte long,
+// so 0 always means failure.
+package strconv
+
+// MaxUintLen is the longest FormatUint result (u64 in base 2).
+const MaxUintLen = 64
+
+// MaxIntLen is the longest FormatInt result (i64 in base 2 with '-').
+const MaxIntLen = 65
+
+const digitChars = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+// FormatUint writes v in the given base (2..36, lower-case digits) to dst
+// and returns the length. O(digits).
+func FormatUint(dst []byte, v u64, base u32) usize {
+	if base < 2 || base > 36 {
+		return 0
+	}
+	var tmp [MaxUintLen]byte
+	digits := strBytes(digitChars)
+	b := u64(base)
+	i := usize(MaxUintLen)
+	x := v
+	for g := usize(0); g < MaxUintLen; g++ {
+		i--
+		tmp[i] = digits[usize(x%b)]
+		x = x / b
+		if x == 0 {
+			break
+		}
+	}
+	n := MaxUintLen - i
+	if n > len(dst) {
+		return 0
+	}
+	return copy(dst, tmp[i:])
+}
+
+// FormatInt writes v in the given base (2..36) to dst with a leading '-'
+// when negative and returns the length. O(digits).
+func FormatInt(dst []byte, v i64, base u32) usize {
+	if v >= 0 {
+		return FormatUint(dst, u64(v), base)
+	}
+	if len(dst) < 2 {
+		return 0
+	}
+	// |v| as u64 without overflowing on the minimum i64.
+	u := u64(-(v + 1)) + 1
+	k := FormatUint(dst[1:], u, base)
+	if k == 0 {
+		return 0
+	}
+	dst[0] = '-'
+	return k + 1
+}
+
+// AppendUint is FormatUint in base 10 at dst[at:]; it returns the new end
+// (at + length), or at itself when the digits do not fit.
+func AppendUint(dst []byte, at usize, v u64) usize {
+	if at > len(dst) {
+		return at
+	}
+	return at + FormatUint(dst[at:], v, 10)
+}
+
+// digitVal returns the value of the digit c (36 for a non-digit).
+func digitVal(c byte) u64 {
+	if c >= '0' && c <= '9' {
+		return u64(c - '0')
+	}
+	if c >= 'a' && c <= 'z' {
+		return u64(c-'a') + 10
+	}
+	if c >= 'A' && c <= 'Z' {
+		return u64(c-'A') + 10
+	}
+	return 36
+}
+
+// ParseUint parses s as an unsigned integer in the given base and reports
+// whether s was valid and in range.
+//
+// base is 2..36, or 0: then a prefix selects the base ("0x"/"0X" 16,
+// "0b"/"0B" 2, "0o"/"0O" 8, otherwise 10, leading zeros allowed) and
+// underscores are allowed between digits and after a prefix, as in Go
+// integer literals. No sign is accepted. O(len(s)).
+func ParseUint(s []byte, base u32) (u64, bool) {
+	n := len(s)
+	if n == 0 || base == 1 || base > 36 {
+		return 0, false
+	}
+	b := u64(base)
+	i := usize(0)
+	under := false
+	if base == 0 {
+		under = true
+		b = 10
+		if n >= 2 && s[0] == '0' {
+			c := s[1]
+			if c == 'x' || c == 'X' {
+				b = 16
+				i = 2
+			} else if c == 'b' || c == 'B' {
+				b = 2
+				i = 2
+			} else if c == 'o' || c == 'O' {
+				b = 8
+				i = 2
+			}
+		}
+	}
+	if i >= n {
+		return 0, false
+	}
+	const maxU64 = u64(0xFFFF_FFFF_FFFF_FFFF)
+	v := u64(0)
+	// last: 0 nothing yet, 1 base prefix, 2 digit, 3 underscore
+	last := u8(0)
+	if i > 0 {
+		last = 1
+	}
+	for g := i; g < n; g++ {
+		c := s[g]
+		if c == '_' && under {
+			if last != 1 && last != 2 {
+				return 0, false
+			}
+			last = 3
+			continue
+		}
+		d := digitVal(c)
+		if d >= b {
+			return 0, false
+		}
+		if v > (maxU64-d)/b {
+			return 0, false
+		}
+		v = v*b + d
+		last = 2
+	}
+	if last != 2 {
+		return 0, false
+	}
+	return v, true
+}
+
+// ParseInt parses s as a signed integer (optional leading '+' or '-') in
+// the given base (see ParseUint) and reports whether it was valid and
+// within i64. O(len(s)).
+func ParseInt(s []byte, base u32) (i64, bool) {
+	n := len(s)
+	if n == 0 {
+		return 0, false
+	}
+	neg := false
+	body := s
+	if s[0] == '-' || s[0] == '+' {
+		neg = s[0] == '-'
+		body = s[1:]
+	}
+	u, ok := ParseUint(body, base)
+	if !ok {
+		return 0, false
+	}
+	const lim = u64(1) << 63
+	if neg {
+		if u > lim {
+			return 0, false
+		}
+		if u == lim {
+			return -9_223_372_036_854_775_807 - 1, true
+		}
+		return -i64(u), true
+	}
+	if u >= lim {
+		return 0, false
+	}
+	return i64(u), true
+}
+
+// QuotedLen returns the length of Quote's output for s. O(len(s)).
+func QuotedLen(s []byte) usize {
+	n := len(s)
+	k := usize(2)
+	for i := usize(0); i < n; i++ {
+		c := s[i]
+		if c == '\n' || c == '\r' || c == '\t' || c == '\\' || c == '"' {
+			k += 2
+		} else if c < 0x20 || c >= 0x7f {
+			k += 4
+		} else {
+			k++
+		}
+	}
+	return k
+}
+
+// Quote writes s as a double-quoted FinCore string literal to dst and
+// returns the length (0 when dst is shorter than QuotedLen(s)). The
+// escapes are \n \r \t \\ \" and \xHH (lower-case hex) for every other
+// byte below 0x20, 0x7f and every byte >= 0x80; all other bytes are
+// copied. The result is valid FinCore source that denotes exactly s.
+// O(len(s)).
+func Quote(dst []byte, s []byte) usize {
+	need := QuotedLen(s)
+	if need > len(dst) {
+		return 0
+	}
+	digits := strBytes(digitChars)
+	n := len(s)
+	w := usize(0)
+	dst[w] = '"'
+	w++
+	for i := usize(0); i < n; i++ {
+		c := s[i]
+		if c == '\n' || c == '\r' || c == '\t' || c == '\\' || c == '"' {
+			dst[w] = '\\'
+			e := c
+			if c == '\n' {
+				e = 'n'
+			} else if c == '\r' {
+				e = 'r'
+			} else if c == '\t' {
+				e = 't'
+			}
+			dst[w+1] = e
+			w += 2
+		} else if c < 0x20 || c >= 0x7f {
+			dst[w] = '\\'
+			dst[w+1] = 'x'
+			dst[w+2] = digits[usize(c>>4)]
+			dst[w+3] = digits[usize(c&15)]
+			w += 4
+		} else {
+			dst[w] = c
+			w++
+		}
+	}
+	dst[w] = '"'
+	return w + 1
+}

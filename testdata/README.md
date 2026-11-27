@@ -86,7 +86,9 @@ it gets a signal.
   byte, including the final newline. stderr is ignored.
 - `finc` is always invoked with the **module root** as the working directory,
   and paths are relative to it (for example `testdata/pass/multifile`). Local
-  import paths are resolved against this root (see `pass_extra_import`).
+  import paths are resolved against this root (see `pass_extra_import`), and
+  so are `std/...` imports unless `FINCROOT` is set (`pass_std_*` use the
+  repository's `std/`; see docs/stdlib.md).
 - Pass programs write output only through `io.WriteStdout(...)` of a
   `driver func main(io Stdio) error`. Numbers are printed with `formatUint`.
 

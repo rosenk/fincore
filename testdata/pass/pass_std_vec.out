@@ -1,0 +1,23 @@
+pushed: 3
+len/cap/full: 331
+at 1: 1020
+at 3 (oob): 0
+set 2 / set 5: 10
+last: 7
+slice sum: 37
+pop: 1007
+after truncate(1): 1
+pop empty ok: 0
+last empty ok: 0
+pair: 105
+big len/last: 8049
+inner run: 12
+outer run: 33
+outer sum: 5
+inner sum via outer[1]: 15
+empty run: 0
+pending: 1
+depth/used: 6
+overflow run/full: 1
+stack overflow depth/full: 41
+after reset store: 12

@@ -1,0 +1,191 @@
+// Package path manipulates slash-separated paths lexically, with the
+// semantics of Go's path package. Functions that build a new path write it
+// into a caller-provided dst and return its length (0 when dst is too
+// small: every valid result is at least one byte long, except Join of two
+// empty paths). Functions that select a part of a path return a subslice.
+package path
+
+// Clean writes the shortest path equivalent to src to dst, by purely
+// lexical processing (Go path.Clean):
+//
+//  1. multiple slashes become one;
+//  2. "." elements are removed;
+//  3. ".." elements remove the preceding non-".." element;
+//  4. ".." elements at the start of a rooted path are removed.
+//
+// The result has no trailing slash unless it is "/", and "" becomes ".".
+// It returns the length, or 0 when len(dst) < max(len(src), 1) (the result
+// is never longer than that). dst may be src itself (in-place cleaning):
+// the write position never passes the read position. O(len(src)).
+func Clean(dst []byte, src []byte) usize {
+	n := len(src)
+	room := len(dst)
+	if n == 0 {
+		if room == 0 {
+			return 0
+		}
+		dst[0] = '.'
+		return 1
+	}
+	if room < n {
+		return 0
+	}
+	rooted := src[0] == '/'
+	w := usize(0)
+	r := usize(0)
+	dotdot := usize(0)
+	if rooted {
+		dst[0] = '/'
+		w = 1
+		r = 1
+		dotdot = 1
+	}
+	for g := usize(0); g < n; g++ {
+		if r >= n {
+			break
+		}
+		if src[r] == '/' {
+			r++
+		} else if src[r] == '.' && (r+1 == n || src[r+1] == '/') {
+			r++
+		} else if src[r] == '.' && src[r+1] == '.' && (r+2 == n || src[r+2] == '/') {
+			r += 2
+			if w > dotdot {
+				w--
+				for h := usize(0); h < n; h++ {
+					if w <= dotdot || dst[w] == '/' {
+						break
+					}
+					w--
+				}
+			} else if !rooted {
+				if w > 0 {
+					dst[w] = '/'
+					w++
+				}
+				dst[w] = '.'
+				dst[w+1] = '.'
+				w += 2
+				dotdot = w
+			}
+		} else {
+			if rooted && w != 1 || !rooted && w != 0 {
+				dst[w] = '/'
+				w++
+			}
+			for h := usize(0); h < n; h++ {
+				if r >= n || src[r] == '/' {
+					break
+				}
+				dst[w] = src[r]
+				w++
+				r++
+			}
+		}
+	}
+	if w == 0 {
+		dst[0] = '.'
+		return 1
+	}
+	return w
+}
+
+// Join writes Clean(a + "/" + b) to dst, ignoring empty elements (Go
+// path.Join of two elements): Join("", "") is "" (length 0), Join(a, "")
+// is Clean(a), Join("", b) is Clean(b). It needs
+// len(dst) >= len(a) + 1 + len(b) (it joins in dst, then cleans in
+// place) and returns 0 otherwise. dst must not overlap a or b.
+// O(len(a) + len(b)).
+func Join(dst []byte, a []byte, b []byte) usize {
+	na := len(a)
+	nb := len(b)
+	if na == 0 && nb == 0 {
+		return 0
+	}
+	if na == 0 {
+		return Clean(dst, b)
+	}
+	if nb == 0 {
+		return Clean(dst, a)
+	}
+	if len(dst) < na+1+nb {
+		return 0
+	}
+	k := copy(dst, a)
+	dst[k] = '/'
+	k++
+	k += copy(dst[k:], b)
+	return Clean(dst, dst[:k])
+}
+
+// Base returns the last element of p: trailing slashes are removed first;
+// Base("") is "." and a path of only slashes gives "/". The result is a
+// subslice of p, or a constant for those two cases. O(len(p)).
+func Base(p []byte) []byte {
+	n := len(p)
+	if n == 0 {
+		return strBytes(".")
+	}
+	m := n
+	for g := usize(0); g < n; g++ {
+		if m == 0 || p[m-1] != '/' {
+			break
+		}
+		m--
+	}
+	if m == 0 {
+		return strBytes("/")
+	}
+	q := p[:m]
+	for i := m; i > 0; i-- {
+		if q[i-1] == '/' {
+			return q[i:]
+		}
+	}
+	return q
+}
+
+// Ext returns the file name extension of p: the suffix starting at the
+// final '.' of the last element, or an empty slice. O(len(p)).
+func Ext(p []byte) []byte {
+	n := len(p)
+	for i := n; i > 0; i-- {
+		c := p[i-1]
+		if c == '/' {
+			break
+		}
+		if c == '.' {
+			return p[i-1:]
+		}
+	}
+	return p[n:]
+}
+
+// Split splits p after its final slash into (dir, file); dir keeps the
+// slash, either part may be empty, and dir + file == p. O(len(p)).
+func Split(p []byte) ([]byte, []byte) {
+	n := len(p)
+	for i := n; i > 0; i-- {
+		if p[i-1] == '/' {
+			return p[:i], p[i:]
+		}
+	}
+	return p[:0], p
+}
+
+// Dir writes all but the last element of p, cleaned, to dst (Go
+// path.Dir): Dir("a/b") is "a", Dir("a") and Dir("") are ".", Dir("/a")
+// is "/". It returns the length (0 when len(dst) < max(len(p), 1)).
+// O(len(p)).
+func Dir(dst []byte, p []byte) usize {
+	d, _ := Split(p)
+	if len(dst) < len(p) {
+		return 0
+	}
+	return Clean(dst, d)
+}
+
+// IsAbs reports whether p starts with a slash. O(1).
+func IsAbs(p []byte) bool {
+	return len(p) > 0 && p[0] == '/'
+}

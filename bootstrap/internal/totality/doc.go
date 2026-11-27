@@ -35,7 +35,8 @@
 //     must be a constant with B + c - 1 <= max (B - c + 1 >= min), or, for
 //     a 64-bit unsigned counter counting up, a len/cap expression;
 //   - the body writes no storage rooted at i (i = .., i++, ...);
-//   - B is loop-invariant: built from constants, arithmetic, identity
+//   - B is loop-invariant: built from constants (including const type
+//     parameters such as N of Vec[N usize, T any]), arithmetic, identity
 //     conversions, len/cap and access paths x.f.g, and no write in the body
 //     or post statement may change it (see invariant.go): a local atom
 //     (non-addressed local/param, no pointer on the path) only conflicts

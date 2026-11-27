@@ -85,9 +85,11 @@ bootstrap/        Stage 0 compiler in Go (finc0): diag, lexer, ast, parser, reso
                   comptime, types, check, scope, totality, ir, codegen/golang
 compiler/         Self-hosting compiler written in FinCore (data-oriented, fixed arenas)
 runtime/fincrt/   Go runtime used by generated code
+std/              Finitist standard library in FinCore: vec, maps, bytes, strconv, path,
+                  sort (total, bounded, allocation-free; see docs/stdlib.md)
 examples/         tcp_echo.fc — the reference program
 testdata/         pass/ fail/ integration/ conformance suite (see testdata/README.md)
-docs/             Resolved spec ambiguities, runtime API, self-hosting requirements
+docs/             Resolved spec ambiguities, runtime API, stdlib reference, self-hosting requirements
 ```
 
 ## Build and test
@@ -110,4 +112,5 @@ bin/finc0 check examples/tcp_echo.fc
 
 - [`docs/semantics_decisions.md`](docs/semantics_decisions.md) lists every place where the spec was ambiguous and how it was resolved. The compilers and tests follow it.
 - [`docs/runtime_api.md`](docs/runtime_api.md) describes the `fincrt` API that generated code targets.
+- [`docs/stdlib.md`](docs/stdlib.md) is the reference for the `std/` packages (`import "std/maps"`; resolved against `$FINCROOT` when set, else the module root).
 - [`docs/compiler_requirements.md`](docs/compiler_requirements.md) lists the language features the self-hosted compiler relies on.

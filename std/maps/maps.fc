@@ -1,0 +1,506 @@
+// Package maps provides bounded open-addressing hash tables.
+//
+// All tables keep their entries densely in insertion order (entry i is the
+// i-th distinct key inserted) and the bucket array only holds entry
+// numbers, so iteration (for i := 0; i < m.Len(); i++) is deterministic
+// and independent of the hash function, the bucket count and the order of
+// lookups. Entries cannot be deleted; Reset empties a table.
+//
+// Capacities are type parameters: NB buckets and at most N entries (plus
+// NBYTES key bytes for byte-string keys). NB should be at least N (a load
+// factor of 1/2 or less, NB >= 2*N, keeps probes short); any NB >= 1
+// works, as probing wraps around and is bounded by NB steps. Nothing
+// allocates and no operation panics: an insertion that does not fit
+// returns ok = false and sets the sticky Full flag.
+//
+// Type parameters admit no operators (decision 31), so hashing and
+// equality need concrete key types: U64Map (u64 keys), StrMap and
+// Interner (byte-string keys). Table is the bare bucket array for tables
+// whose keys live elsewhere (records hashed and compared by the caller).
+package maps
+
+// ---------------------------------------------------------------------------
+// Hashing
+
+// FNV-1a parameters (64 bit).
+const (
+	fnvOffset = u64(14695981039346656037)
+	fnvPrime  = u64(1099511628211)
+)
+
+// HashBytes returns the 64-bit FNV-1a hash of b. O(len(b)).
+func HashBytes(b []byte) u64 {
+	h := fnvOffset
+	n := len(b)
+	for i := usize(0); i < n; i++ {
+		h = h ^ u64(b[i])
+		h = h * fnvPrime
+	}
+	return h
+}
+
+// HashU64 returns a well-mixed hash of x (the splitmix64 finalizer, a
+// bijection on u64). O(1).
+func HashU64(x u64) u64 {
+	z := x + 0x9E3779B97F4A7C15
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+// Mix folds x into the running hash h (for hashing composite keys:
+// h := Mix(Mix(seed, a), b)). O(1).
+func Mix(h u64, x u64) u64 {
+	return HashU64(h ^ x)
+}
+
+// ---------------------------------------------------------------------------
+// Table: a bare bucket array
+
+// Table is an open-addressing bucket array of NB slots holding non-zero
+// u32 entry IDs (0 = empty slot) for keys stored by the caller. The
+// caller hashes and compares keys itself and drives the bounded probe
+// loop:
+//
+//	s := t.Start(h)
+//	for g := usize(0); g < t.Cap(); g++ {
+//		id := t.At(s)
+//		if id == 0 { // absent: insert here
+//			t.Set(s, newID)
+//			break
+//		}
+//		if sameKey(id) { // found
+//			break
+//		}
+//		s = t.Next(s)
+//	}
+//
+// After Cap() steps every slot was visited (the table is full).
+type Table[NB usize] struct {
+	slots [NB]u32
+	n     usize
+}
+
+// Start returns the first slot to probe for hash h. O(1).
+func (t *Table[NB]) Start(h u64) usize {
+	if NB == 0 {
+		return 0
+	}
+	return usize(h % u64(NB))
+}
+
+// Next returns the slot after s (wrapping around). O(1).
+func (t *Table[NB]) Next(s usize) usize {
+	if s+1 >= NB {
+		return 0
+	}
+	return s + 1
+}
+
+// At returns the entry ID in slot s (0 = empty or out of range). O(1).
+func (t *Table[NB]) At(s usize) u32 {
+	if s >= NB {
+		return 0
+	}
+	return t.slots[s]
+}
+
+// Set stores id in slot s and counts it when the slot was empty. O(1).
+func (t *Table[NB]) Set(s usize, id u32) {
+	if s >= NB {
+		return
+	}
+	if t.slots[s] == 0 && id != 0 {
+		t.n++
+	}
+	t.slots[s] = id
+}
+
+// Len returns the number of occupied slots. O(1).
+func (t *Table[NB]) Len() usize {
+	return t.n
+}
+
+// Cap returns NB (the bound of every probe loop). O(1).
+func (t *Table[NB]) Cap() usize {
+	return NB
+}
+
+// Reset empties every slot. O(NB).
+func (t *Table[NB]) Reset() {
+	for i := usize(0); i < NB; i++ {
+		t.slots[i] = 0
+	}
+	t.n = 0
+}
+
+// ---------------------------------------------------------------------------
+// U64Map
+
+// U64Map maps u64 keys to values of type V: NB buckets, at most N
+// entries, iteration in insertion order (Key(i), Value(i)).
+type U64Map[NB usize, N usize, V any] struct {
+	tab  Table[NB]
+	keys [N]u64
+	vals [N]V
+	n    usize
+	full bool
+}
+
+// find returns the slot holding k, or the empty slot where k would go,
+// and whether k is present; ok is false when the probe ran through every
+// bucket without finding k or an empty slot.
+func (m *U64Map[NB, N, V]) find(k u64) (usize, bool, bool) {
+	tp := &m.tab
+	s := tp.Start(HashU64(k))
+	for g := usize(0); g < NB; g++ {
+		id := tp.At(s)
+		if id == 0 {
+			return s, false, true
+		}
+		if m.keys[usize(id)-1] == k {
+			return s, true, true
+		}
+		s = tp.Next(s)
+	}
+	return 0, false, false
+}
+
+// Index returns the entry number of k (0-based insertion order) and
+// whether k is present. O(1) expected.
+func (m *U64Map[NB, N, V]) Index(k u64) (usize, bool) {
+	s, found, _ := m.find(k)
+	if !found {
+		return 0, false
+	}
+	tp := &m.tab
+	return usize(tp.At(s)) - 1, true
+}
+
+// Has reports whether k is present. O(1) expected.
+func (m *U64Map[NB, N, V]) Has(k u64) bool {
+	_, found, _ := m.find(k)
+	return found
+}
+
+// Get returns the value of k; ok is false (zero V) when k is absent.
+// O(1) expected.
+func (m *U64Map[NB, N, V]) Get(k u64) (V, bool) {
+	var z V
+	i, ok := m.Index(k)
+	if !ok {
+		return z, false
+	}
+	return m.vals[i], true
+}
+
+// Insert adds k with the zero value unless present and returns its entry
+// number and whether it was added; ok is false (and Full is set) when k is
+// new and the map is full. O(1) expected.
+func (m *U64Map[NB, N, V]) Insert(k u64) (usize, bool, bool) {
+	s, found, probed := m.find(k)
+	tp := &m.tab
+	if found {
+		return usize(tp.At(s)) - 1, false, true
+	}
+	if !probed || m.n >= N {
+		m.full = true
+		return 0, false, false
+	}
+	i := m.n
+	var z V
+	m.keys[i] = k
+	m.vals[i] = z
+	m.n++
+	tp.Set(s, u32(i+1))
+	return i, true, true
+}
+
+// Put sets the value of k (inserting k when absent). It returns false
+// (and sets Full) when k is new and the map is full. O(1) expected.
+func (m *U64Map[NB, N, V]) Put(k u64, v V) bool {
+	i, _, ok := m.Insert(k)
+	if !ok {
+		return false
+	}
+	m.vals[i] = v
+	return true
+}
+
+// Len returns the number of entries. O(1).
+func (m *U64Map[NB, N, V]) Len() usize {
+	return m.n
+}
+
+// Cap returns the entry capacity N. O(1).
+func (m *U64Map[NB, N, V]) Cap() usize {
+	return N
+}
+
+// Full reports whether an insertion failed for lack of capacity since the
+// last Reset (sticky). O(1).
+func (m *U64Map[NB, N, V]) Full() bool {
+	return m.full
+}
+
+// Key returns the key of entry i (0 when out of range). O(1).
+func (m *U64Map[NB, N, V]) Key(i usize) u64 {
+	if i >= m.n {
+		return 0
+	}
+	return m.keys[i]
+}
+
+// Value returns the value of entry i (zero V when out of range). O(1).
+func (m *U64Map[NB, N, V]) Value(i usize) V {
+	var z V
+	if i >= m.n {
+		return z
+	}
+	return m.vals[i]
+}
+
+// SetValue replaces the value of entry i; false when out of range. O(1).
+func (m *U64Map[NB, N, V]) SetValue(i usize, v V) bool {
+	if i >= m.n {
+		return false
+	}
+	m.vals[i] = v
+	return true
+}
+
+// Keys returns the keys in insertion order (aliases the map). O(1).
+func (m *U64Map[NB, N, V]) Keys() []u64 {
+	return m.keys[:m.n]
+}
+
+// Values returns the values in insertion order (aliases the map). O(1).
+func (m *U64Map[NB, N, V]) Values() []V {
+	return m.vals[:m.n]
+}
+
+// Reset removes every entry and clears Full. O(NB).
+func (m *U64Map[NB, N, V]) Reset() {
+	tp := &m.tab
+	tp.Reset()
+	m.n = 0
+	m.full = false
+}
+
+// ---------------------------------------------------------------------------
+// Interner
+
+// Interner maps byte strings to dense u32 IDs 1, 2, 3, ... in insertion
+// order (0 means "none"). It copies the bytes of every new string into an
+// internal arena of NBYTES bytes; NB buckets, at most N strings.
+type Interner[NB usize, NBYTES usize, N usize] struct {
+	tab   Table[NB]
+	bytes [NBYTES]byte
+	used  usize
+	off   [N]u32
+	ln    [N]u32
+	n     usize
+	full  bool
+}
+
+// find returns the slot holding b (or the empty slot where it would go),
+// whether it is present and whether the probe found either.
+func (in *Interner[NB, NBYTES, N]) find(b []byte) (usize, bool, bool) {
+	tp := &in.tab
+	s := tp.Start(HashBytes(b))
+	for g := usize(0); g < NB; g++ {
+		id := tp.At(s)
+		if id == 0 {
+			return s, false, true
+		}
+		if bytesEqual(in.Bytes(id), b) {
+			return s, true, true
+		}
+		s = tp.Next(s)
+	}
+	return 0, false, false
+}
+
+// Lookup returns the ID of b, or 0 when b was never interned.
+// O(len(b)) expected.
+func (in *Interner[NB, NBYTES, N]) Lookup(b []byte) u32 {
+	s, found, _ := in.find(b)
+	if !found {
+		return 0
+	}
+	tp := &in.tab
+	return tp.At(s)
+}
+
+// LookupStr is Lookup(strBytes(s)).
+func (in *Interner[NB, NBYTES, N]) LookupStr(s string) u32 {
+	return in.Lookup(strBytes(s))
+}
+
+// Intern returns the ID of b, adding (a copy of) b when it is new. ok is
+// false, the ID 0 and Full set when b is new and the table, the entry
+// count or the byte arena is exhausted. O(len(b)) expected.
+func (in *Interner[NB, NBYTES, N]) Intern(b []byte) (u32, bool) {
+	s, found, probed := in.find(b)
+	tp := &in.tab
+	if found {
+		return tp.At(s), true
+	}
+	k := len(b)
+	if !probed || in.n >= N || k > NBYTES-in.used {
+		in.full = true
+		return 0, false
+	}
+	st := in.used
+	in.used = st + copy(in.bytes[st:st+k], b)
+	i := in.n
+	in.off[i] = u32(st)
+	in.ln[i] = u32(k)
+	in.n++
+	id := u32(i + 1)
+	tp.Set(s, id)
+	return id, true
+}
+
+// InternStr is Intern(strBytes(s)).
+func (in *Interner[NB, NBYTES, N]) InternStr(s string) (u32, bool) {
+	return in.Intern(strBytes(s))
+}
+
+// Bytes returns the bytes of id (aliasing the arena; empty for 0 or an
+// unknown ID). O(1).
+func (in *Interner[NB, NBYTES, N]) Bytes(id u32) []byte {
+	if id == 0 || usize(id) > in.n {
+		return in.bytes[0:0]
+	}
+	i := usize(id) - 1
+	s := usize(in.off[i])
+	return in.bytes[s : s+usize(in.ln[i])]
+}
+
+// Len returns the number of interned strings (the largest ID). O(1).
+func (in *Interner[NB, NBYTES, N]) Len() usize {
+	return in.n
+}
+
+// Used returns the number of arena bytes in use. O(1).
+func (in *Interner[NB, NBYTES, N]) Used() usize {
+	return in.used
+}
+
+// Full reports whether an Intern failed for lack of capacity since the
+// last Reset (sticky). O(1).
+func (in *Interner[NB, NBYTES, N]) Full() bool {
+	return in.full
+}
+
+// Reset forgets every string and clears Full. O(NB).
+func (in *Interner[NB, NBYTES, N]) Reset() {
+	tp := &in.tab
+	tp.Reset()
+	in.used = 0
+	in.n = 0
+	in.full = false
+}
+
+// ---------------------------------------------------------------------------
+// StrMap
+
+// StrMap maps byte-string keys to values of type V. Keys are copied into
+// an Interner (NB buckets, NBYTES key bytes, at most N keys); lookups take
+// a []byte (or a string through the *Str variants) and never allocate.
+// Entry IDs are the Interner's: 1, 2, ... in insertion order.
+type StrMap[NB usize, NBYTES usize, N usize, V any] struct {
+	keys Interner[NB, NBYTES, N]
+	vals [N]V
+}
+
+// ID returns the entry ID of k (0 when absent). O(len(k)) expected.
+func (m *StrMap[NB, NBYTES, N, V]) ID(k []byte) u32 {
+	kp := &m.keys
+	return kp.Lookup(k)
+}
+
+// Has reports whether k is present. O(len(k)) expected.
+func (m *StrMap[NB, NBYTES, N, V]) Has(k []byte) bool {
+	return m.ID(k) != 0
+}
+
+// Get returns the value of k; ok is false (zero V) when k is absent.
+// O(len(k)) expected.
+func (m *StrMap[NB, NBYTES, N, V]) Get(k []byte) (V, bool) {
+	var z V
+	id := m.ID(k)
+	if id == 0 {
+		return z, false
+	}
+	return m.vals[usize(id)-1], true
+}
+
+// GetStr is Get(strBytes(k)).
+func (m *StrMap[NB, NBYTES, N, V]) GetStr(k string) (V, bool) {
+	return m.Get(strBytes(k))
+}
+
+// Put sets the value of k (inserting a copy of k when absent). It returns
+// false (and sets Full) when k is new and does not fit. O(len(k))
+// expected.
+func (m *StrMap[NB, NBYTES, N, V]) Put(k []byte, v V) bool {
+	kp := &m.keys
+	id, ok := kp.Intern(k)
+	if !ok {
+		return false
+	}
+	m.vals[usize(id)-1] = v
+	return true
+}
+
+// PutStr is Put(strBytes(k), v).
+func (m *StrMap[NB, NBYTES, N, V]) PutStr(k string, v V) bool {
+	return m.Put(strBytes(k), v)
+}
+
+// Key returns the key bytes of entry id (aliasing the map). O(1).
+func (m *StrMap[NB, NBYTES, N, V]) Key(id u32) []byte {
+	kp := &m.keys
+	return kp.Bytes(id)
+}
+
+// Value returns the value of entry id (zero V for an unknown ID). O(1).
+func (m *StrMap[NB, NBYTES, N, V]) Value(id u32) V {
+	var z V
+	kp := &m.keys
+	if id == 0 || usize(id) > kp.Len() {
+		return z
+	}
+	return m.vals[usize(id)-1]
+}
+
+// SetValue replaces the value of entry id; false for an unknown ID. O(1).
+func (m *StrMap[NB, NBYTES, N, V]) SetValue(id u32, v V) bool {
+	kp := &m.keys
+	if id == 0 || usize(id) > kp.Len() {
+		return false
+	}
+	m.vals[usize(id)-1] = v
+	return true
+}
+
+// Len returns the number of entries (the largest entry ID). O(1).
+func (m *StrMap[NB, NBYTES, N, V]) Len() usize {
+	kp := &m.keys
+	return kp.Len()
+}
+
+// Full reports whether a Put failed for lack of capacity since the last
+// Reset (sticky). O(1).
+func (m *StrMap[NB, NBYTES, N, V]) Full() bool {
+	kp := &m.keys
+	return kp.Full()
+}
+
+// Reset removes every entry and clears Full. O(NB).
+func (m *StrMap[NB, NBYTES, N, V]) Reset() {
+	kp := &m.keys
+	kp.Reset()
+}

@@ -1,0 +1,49 @@
+HasPrefix: true
+HasPrefix longer: false
+HasPrefix empty: true
+HasSuffix: true
+HasSuffix no: false
+Index: 4
+Index absent: -1
+Index empty sep: 0
+Index sep longer: -1
+Index at end: 1
+IndexByte: 2
+IndexByte absent: -1
+LastIndexByte: 4
+LastIndexByte absent: -1
+Equal: true
+Equal no: false
+Compare a<b: -1
+Compare prefix: -1
+Compare equal: 0
+Compare greater: 1
+Compare empty: 0
+TrimSpace: [hello world]
+TrimSpace all: []
+TrimSpace none: [x]
+TrimPrefix: [maps]
+TrimSuffix: [a]
+TrimSuffix no: [a.fc]
+Count: 3
+Count overlap: 2
+Count empty sep: 5
+Count none: 0
+Contains: true
+builder: [abc42!]
+builder truncated: false
+builder after drop: [abc42!]
+builder truncated: true
+builder full: [abc42!xy]
+builder len/cap: 88
+builder still: [abc42!xy]
+builder truncate(2): [ab]
+builder truncated kept: true
+builder reset truncated: false
+min int truncated: true
+WriteInt: [-1234567]
+zeros: [00]
+extremes: [-9223372036854775808 18446744073709551615]
+repeat/hex: [		BEEF 001fffffffffffffffff]
+repeat/hex truncated: true
+len after dropped writes: 27

@@ -1,0 +1,136 @@
+// Package sort sorts slices in place without allocating.
+//
+// Sort is an unstable heapsort (O(n log n) comparisons, worst case
+// included); Stable is an insertion sort (O(n^2) worst case, O(n) on
+// sorted input; use it for short or nearly sorted slices or when equal
+// elements must keep their order). The comparison is a total function
+// value `less(a, b)` that must be a strict weak order; it is called a
+// bounded number of times even when it is not.
+//
+// Type parameters admit no operators (decision 31), so the generic
+// versions take `less`; SortU32, SortU64 and SortBytes are specialised
+// versions for the common key types.
+package sort
+
+// siftDown restores the max-heap property of xs[:n] below the root i.
+func siftDown[T any](xs []T, i usize, n usize, less func(a T, b T) bool) {
+	root := i
+	for g := usize(0); g < n; g++ {
+		child := 2*root + 1
+		if child >= n {
+			return
+		}
+		if child+1 < n && less(xs[child], xs[child+1]) {
+			child++
+		}
+		if !less(xs[root], xs[child]) {
+			return
+		}
+		t := xs[root]
+		xs[root] = xs[child]
+		xs[child] = t
+		root = child
+	}
+}
+
+// Sort sorts xs in ascending order of less (heapsort, not stable).
+// O(n log n) time, O(1) space.
+func Sort[T any](xs []T, less func(a T, b T) bool) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	for i := n / 2; i > 0; i-- {
+		siftDown[T](xs, i-1, n, less)
+	}
+	for end := n - 1; end > 0; end-- {
+		t := xs[0]
+		xs[0] = xs[end]
+		xs[end] = t
+		siftDown[T](xs, 0, end, less)
+	}
+}
+
+// Stable sorts xs in ascending order of less, keeping equal elements in
+// their original order (insertion sort). O(n^2) time worst case, O(n) for
+// sorted input; O(1) space.
+func Stable[T any](xs []T, less func(a T, b T) bool) {
+	n := len(xs)
+	for i := usize(1); i < n; i++ {
+		for j := i; j > 0; j-- {
+			if !less(xs[j], xs[j-1]) {
+				break
+			}
+			t := xs[j]
+			xs[j] = xs[j-1]
+			xs[j-1] = t
+		}
+	}
+}
+
+// IsSorted reports whether xs is in ascending order of less. O(n).
+func IsSorted[T any](xs []T, less func(a T, b T) bool) bool {
+	n := len(xs)
+	for i := usize(1); i < n; i++ {
+		if less(xs[i], xs[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lessU32(a u32, b u32) bool {
+	return a < b
+}
+
+func lessU64(a u64, b u64) bool {
+	return a < b
+}
+
+// lessBytes orders byte strings lexicographically (a proper prefix first).
+func lessBytes(a []byte, b []byte) bool {
+	na := len(a)
+	nb := len(b)
+	n := na
+	if nb < n {
+		n = nb
+	}
+	for i := usize(0); i < n; i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return na < nb
+}
+
+// SortU32 sorts xs in ascending order. O(n log n).
+func SortU32(xs []u32) {
+	Sort[u32](xs, lessU32)
+}
+
+// SortU64 sorts xs in ascending order. O(n log n).
+func SortU64(xs []u64) {
+	Sort[u64](xs, lessU64)
+}
+
+// SortBytes sorts byte strings in lexicographic order (the slices are
+// reordered; their contents are not touched). O(n log n) comparisons.
+func SortBytes(xs [][]byte) {
+	Sort[[]byte](xs, lessBytes)
+}
+
+// SearchU32 returns the index of the first element >= x in the ascending
+// slice xs (len(xs) when there is none). O(log n).
+func SearchU32(xs []u32, x u32) usize {
+	lo := usize(0)
+	hi := len(xs)
+	for lo < hi decreases(hi - lo) {
+		mid := lo + (hi-lo)/2
+		if xs[mid] < x {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}

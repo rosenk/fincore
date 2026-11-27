@@ -121,7 +121,10 @@ is still available as `Node.id`).
    `visitPackage` / `loadImport` load local imports depth-first relative to
    the current directory (module root), exactly like `resolve/load.go`:
    E2001 invalid/missing/empty packages, E2006 import cycles, files of
-   imported packages are named `importpath/file.fc`. `pkgs.order` is the
+   imported packages are named `importpath/file.fc`. `std/...` imports
+   resolve against `$FINCROOT` when it is set (read once by `main` into
+   `fincRoot`; files are then named `<cleaned $FINCROOT/importpath>/file.fc`),
+   like finc0's `resolve.StdDir` (decision 58). `pkgs.order` is the
    dependency order (root last), `pkgs.root` the root package.
 2. If any diagnostic exists, print them (sorted) and stop. Otherwise
    `resolveProgram` (resolve.fc): universe, `declarePackage` for all

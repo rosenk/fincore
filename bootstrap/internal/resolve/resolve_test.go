@@ -107,6 +107,87 @@ func TestErrors(t *testing.T) {
 	}
 }
 
+func TestStdDir(t *testing.T) {
+	cases := []struct{ ip, root, want string }{
+		{"std/vec", "", ""},
+		{"std/vec", "/opt/fincore", "/opt/fincore/std/vec"},
+		{"std", "/opt/fincore/", "/opt/fincore/std"},
+		{"std/maps", "../fr/", "../fr/std/maps"},
+		{"std/maps", ".", "std/maps"},
+		{"stdx/vec", "/opt/fincore", ""},
+		{"lib/std/vec", "/opt/fincore", ""},
+	}
+	for _, c := range cases {
+		if got := resolve.StdDir(c.ip, c.root); got != filepath.FromSlash(c.want) {
+			t.Errorf("StdDir(%q, %q) = %q, want %q", c.ip, c.root, got, c.want)
+		}
+	}
+}
+
+// TestStdImportFincRoot: std/... resolves against $FINCROOT when it is
+// set, else against the module root; files of FINCROOT packages are named
+// by the cleaned FINCROOT path.
+func TestStdImportFincRoot(t *testing.T) {
+	files := map[string]string{
+		"mod/a.fc":                  "package main\nimport \"std/hello\"\nimport \"lib\"\nfunc f() u32 { return hello.Which + lib.X }\n",
+		"mod/lib/lib.fc":            "package lib\nconst X = 0\n",
+		"mod/std/hello/hello.fc":    "package hello\nconst Which = 1\n",
+		"root/std/hello/hello.fc":   "package hello\nimport \"std/inner\"\nconst Which = inner.Two\n",
+		"root/std/inner/inner.fc":   "package inner\nconst Two = 2\n",
+		"broken/std/hello/hello.fc": "package hello\nconst Which = missing\n",
+	}
+	tmp := t.TempDir()
+	write(t, tmp, files)
+	t.Chdir(filepath.Join(tmp, "mod"))
+	which := func(prog *resolve.Program) (string, string) {
+		for _, p := range prog.Packages {
+			if p.Path == "std/hello" {
+				return p.AST.Files[0].Path, p.Key
+			}
+		}
+		return "", ""
+	}
+
+	t.Setenv("FINCROOT", "")
+	prog, d, err := resolve.Load("a.fc", resolve.Options{})
+	if err != nil || len(d) > 0 {
+		t.Fatal(err, d)
+	}
+	if f, _ := which(prog); f != filepath.Join("std", "hello", "hello.fc") {
+		t.Errorf("empty FINCROOT: std/hello from %q", f)
+	}
+
+	for _, root := range []string{filepath.Join(tmp, "root"), "../root", "../root/"} {
+		t.Setenv("FINCROOT", root)
+		prog, d, err = resolve.Load("a.fc", resolve.Options{})
+		if err != nil || len(d) > 0 {
+			t.Fatal(root, err, d)
+		}
+		f, key := which(prog)
+		if want := filepath.Join(filepath.Clean(root), "std", "hello", "hello.fc"); f != want {
+			t.Errorf("FINCROOT=%s: std/hello file %q, want %q", root, f, want)
+		}
+		if key != filepath.Join(tmp, "root", "std", "hello") {
+			t.Errorf("FINCROOT=%s: key %q", root, key)
+		}
+		if len(prog.Packages) != 4 {
+			t.Errorf("FINCROOT=%s: %d packages (std/inner must load from FINCROOT too)", root, len(prog.Packages))
+		}
+	}
+
+	t.Setenv("FINCROOT", "../broken")
+	_, d, err = resolve.Load("a.fc", resolve.Options{})
+	if err != nil || codesOf(d) != "E2001" || d[0].Span.File != filepath.Join("..", "broken", "std", "hello", "hello.fc") {
+		t.Errorf("broken FINCROOT package: %v %v", err, d)
+	}
+
+	t.Setenv("FINCROOT", filepath.Join(tmp, "nowhere"))
+	_, d, err = resolve.Load("a.fc", resolve.Options{})
+	if err != nil || codesOf(d) != "E2001" || !strings.Contains(d[0].Message, "no directory "+filepath.Join(tmp, "nowhere", "std", "hello")) {
+		t.Errorf("missing FINCROOT package: %v %v", err, d)
+	}
+}
+
 func TestScopesAndCaptures(t *testing.T) {
 	prog, d := load(t, map[string]string{"a.fc": `package main
 const x = 1

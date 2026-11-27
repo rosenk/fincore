@@ -11,8 +11,11 @@
 //
 // Corpus cases (run from the module root): examples/*.fc, testdata/pass
 // (files and package directories), testdata/fail/*.fc,
-// testdata/integration/*.fc, the parser fixtures and compiler/. `// FLAGS:`
-// header directives are honoured.
+// testdata/integration/*.fc, the parser fixtures, the std/ packages and
+// compiler/. `// FLAGS:` header directives are honoured. FINCROOT cases
+// (fincRootCases) run both compilers with FINCROOT set to absolute and
+// relative std trees. Modes other than types also check std/ packages with
+// one loop/measure/type broken each (stdMutations).
 //
 // Snippet cases are extracted from bootstrap/internal/{resolve,types,
 // comptime}/*_test.go with go/parser: every string literal that starts with
@@ -49,6 +52,7 @@ type tcase struct {
 	dir   string // working directory
 	path  string // argument to check
 	flags []string
+	env   []string // extra environment (FINCROOT cases)
 }
 
 func main() {
@@ -81,6 +85,11 @@ func main() {
 		fatal(err)
 	}
 	cases = append(cases, tsnips...)
+	fr, err := fincRootCases(tmp)
+	if err != nil {
+		fatal(err)
+	}
+	cases = append(cases, fr...)
 	if *passes != "types" {
 		sc, err := scopeSnippetCases(tmp)
 		if err != nil {
@@ -88,6 +97,7 @@ func main() {
 		}
 		cases = append(cases, sc...)
 		cases = append(cases, mutantCompilerCases(tmp)...)
+		cases = append(cases, mutantStdCases(tmp)...)
 	}
 	if *mutants > 0 {
 		cases = append(cases, mutantCases(tmp, *mutants, *seed, *passes != "types")...)
@@ -97,8 +107,8 @@ func main() {
 	var failed []string
 	for _, c := range cases {
 		pf := "--passes=" + *passes
-		o0, e0, x0 := run(abs0, c.dir, append(append([]string{"check", pf}, c.flags...), c.path))
-		o1, e1, x1 := run(abs1, c.dir, append(append([]string{"check", pf}, c.flags...), c.path))
+		o0, e0, x0 := run(abs0, c.dir, c.env, append(append([]string{"check", pf}, c.flags...), c.path))
+		o1, e1, x1 := run(abs1, c.dir, c.env, append(append([]string{"check", pf}, c.flags...), c.path))
 		e1 = stripRuntimeError(e1)
 		ok := o0 == o1 && e0 == e1 && (x0 == 0) == (x1 == 0)
 		if ok {
@@ -156,9 +166,12 @@ func stripRuntimeError(s string) string {
 	return s
 }
 
-func run(bin, dir string, args []string) (string, string, int) {
+func run(bin, dir string, env []string, args []string) (string, string, int) {
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -219,9 +232,59 @@ func corpusCases() []tcase {
 			add(d, fl)
 		}
 	}
+	stdDirs, _ := filepath.Glob("std/*")
+	sort.Strings(stdDirs)
+	for _, d := range stdDirs {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			add(d, nil)
+		}
+	}
 	add("compiler/", nil)
 	add("compiler", nil)
 	return out
+}
+
+// fincRootCases check std imports resolved through $FINCROOT: a module
+// root (cwd) and a separate FINCROOT tree with good, broken and missing
+// std packages, absolute and relative FINCROOT values, an empty FINCROOT
+// (module root fallback) and a FINCROOT without the package next to a
+// module root that has it (then it must not be found).
+func fincRootCases(tmp string) ([]tcase, error) {
+	files := map[string]string{
+		"fr/std/hello/hello.fc":   "package hello\n\nimport \"std/inner\"\n\nfunc Twice(x u32) u32 {\n\treturn inner.Add(x, x)\n}\n",
+		"fr/std/inner/inner.fc":   "package inner\n\nfunc Add(a u32, b u32) u32 {\n\treturn a + b\n}\n",
+		"fr/std/broken/broken.fc": "package broken\n\nfunc Bad() u32 {\n\treturn \"x\"\n}\n",
+		"fr/std/loop/loop.fc":     "package loop\n\nfunc Spin(n usize) usize {\n\tfor n > 0 {\n\t\tn--\n\t}\n\treturn n\n}\n",
+		"fr/std/empty/README":     "no sources\n",
+		"mod/std/hello/hello.fc":  "package hello\n\nfunc Twice(x u32) u32 {\n\treturn x\n}\n",
+		"mod/ok.fc":               "package main\n\nimport \"std/hello\"\n\ndriver func main() error {\n\tif hello.Twice(2) != 4 {\n\t\treturn ErrIO\n\t}\n\treturn nil\n}\n",
+		"mod/broken.fc":           "package main\n\nimport \"std/broken\"\n\ndriver func main() error {\n\t_ = broken.Bad()\n\treturn nil\n}\n",
+		"mod/loop.fc":             "package main\n\nimport \"std/loop\"\n\ndriver func main() error {\n\t_ = loop.Spin(3)\n\treturn nil\n}\n",
+		"mod/missing.fc":          "package main\n\nimport (\n\t\"std/nope\"\n\t\"std/empty\"\n)\n\ndriver func main() error {\n\treturn nil\n}\n",
+		"mod/local.fc":            "package main\n\nimport \"std/hello\"\n\ndriver func main() error {\n\t_ = hello.Twice(1)\n\treturn nil\n}\n",
+	}
+	base := filepath.Join(tmp, "fincroot")
+	for name, src := range files {
+		p := filepath.Join(base, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+			return nil, err
+		}
+	}
+	mod := filepath.Join(base, "mod")
+	var out []tcase
+	for _, f := range []string{"ok.fc", "broken.fc", "loop.fc", "missing.fc"} {
+		for _, fr := range []string{filepath.Join(base, "fr"), "../fr", "../fr/"} {
+			out = append(out, tcase{name: "fincroot " + f + " FINCROOT=" + fr, dir: mod, path: f, env: []string{"FINCROOT=" + fr}})
+		}
+	}
+	// FINCROOT empty: std/hello resolves against the module root.
+	out = append(out, tcase{name: "fincroot local.fc (empty FINCROOT)", dir: mod, path: "local.fc", env: []string{"FINCROOT="}})
+	// FINCROOT without std/hello: not found, although mod/std/hello exists.
+	out = append(out, tcase{name: "fincroot local.fc (FINCROOT without std)", dir: mod, path: "local.fc", env: []string{"FINCROOT=" + filepath.Join(base, "none")}})
+	return out, nil
 }
 
 func flagSuffix(flags []string) string {
@@ -381,7 +444,7 @@ func mutantCases(tmp string, n int, seed int64, tot bool) []tcase {
 	rng := rand.New(rand.NewSource(seed))
 	var srcs []string
 	for _, pat := range []string{"examples/*.fc", "testdata/pass/*.fc", "testdata/fail/*.fc",
-		"testdata/pass/*/*.fc", "testdata/pass/*/*/*.fc", "scripts/diffcheck/cases/*.fc", "compiler/*.fc"} {
+		"testdata/pass/*/*.fc", "testdata/pass/*/*/*.fc", "scripts/diffcheck/cases/*.fc", "std/*/*.fc", "compiler/*.fc"} {
 		files, _ := filepath.Glob(pat)
 		sort.Strings(files)
 		srcs = append(srcs, files...)
@@ -600,6 +663,51 @@ var compilerMutations = []struct{ file, old, new string }{
 	{"compiler/types.fc", "if depth == 0 {", "if depth == 1 {"},
 	{"compiler/main.fc", "driver func checkUsage(io Stdio) error {", "func spin(n usize) usize {\n\tfor n > 0 {\n\t\tn--\n\t}\n\treturn n\n}\n\ndriver func checkUsage(io Stdio) error {"},
 	{"compiler/main.fc", "func strEq(a string, b string) bool {", "func shrink(b []byte) {\n\tfor len(b) > 0 {\n\t\tb = b[1:]\n\t}\n\trem := b\n\tfor len(rem) > 0 {\n\t\tn := len(rem) - 1\n\t\trem = rem[n:]\n\t}\n}\n\nfunc strEq(a string, b string) bool {"},
+}
+
+// stdMutations are textual edits of std/ that break one loop, measure or
+// type each (totality and type errors in generic library code).
+var stdMutations = []struct{ file, old, new string }{
+	{"std/vec/vec.fc", "for i := n; i < top; i++ {", "for i := n; i < top; i += 0 {"},
+	{"std/maps/maps.fc", "for g := usize(0); g < NB; g++ {", "for g := usize(0); g <= NB; g++ {"},
+	{"std/maps/maps.fc", "for i := usize(0); i < NB; i++ {", "for i := usize(0); i < NB+t.n; i++ {\n\t\tt.n = 0"},
+	{"std/sort/sort.fc", "for lo < hi decreases(hi - lo) {", "for lo < hi {"},
+	{"std/sort/sort.fc", "hi = mid", "hi = mid + 1"},
+	{"std/strconv/strconv.fc", "for g := i; g < n; g++ {", "for g := i; g < n; g-- {"},
+	{"std/path/path.fc", "if m == 0 || p[m-1] != '/' {", "if m == 0 || p[m-1] != '/' || g > m {\n\t\t\tn++"},
+	{"std/bytes/bytes.fc", "if a[i] < b[i] {", "if a[i] < b {"},
+	{"std/vec/vec.fc", "var z T", "var z N"},
+}
+
+// mutantStdCases writes copies of one std package with one mutation each.
+func mutantStdCases(tmp string) []tcase {
+	var out []tcase
+	for i, m := range stdMutations {
+		pkg := filepath.Dir(m.file)
+		files, _ := filepath.Glob(filepath.Join(pkg, "*.fc"))
+		root := filepath.Join(tmp, fmt.Sprintf("m%02d", i))
+		dir := filepath.Join(root, pkg)
+		_ = os.MkdirAll(dir, 0o755)
+		changed := false
+		for _, f := range files {
+			src, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			s := string(src)
+			if f == m.file && strings.Contains(s, m.old) {
+				s = strings.Replace(s, m.old, m.new, 1)
+				changed = true
+			}
+			_ = os.WriteFile(filepath.Join(dir, filepath.Base(f)), []byte(s), 0o644)
+		}
+		if !changed {
+			fmt.Printf("warning: std mutation %d (%s) does not apply\n", i, m.file)
+			continue
+		}
+		out = append(out, tcase{name: fmt.Sprintf("std mutant %d: %s %q -> %q", i, m.file, m.old, m.new), dir: root, path: pkg})
+	}
+	return out
 }
 
 // mutantCompilerCases writes copies of compiler/ with one mutation each.

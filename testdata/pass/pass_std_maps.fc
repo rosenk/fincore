@@ -1,0 +1,240 @@
+// pass_std_maps: std/maps — U64Map (insertion-order iteration, overwrite,
+// full map, tiny bucket arrays with collisions), Interner (dense IDs from
+// 1, byte-arena and count exhaustion), StrMap (lookups by []byte and
+// string), Table (caller-driven probing over external records) and the
+// hash functions.
+package main
+
+import (
+	"std/bytes"
+	"std/maps"
+)
+
+var out bytes.Builder[4096]
+
+// A package-level interner, the way compiler/ keeps its name table.
+var names maps.Interner[64, 256, 16]
+
+func say(s string) {
+	o := &out
+	o.WriteString(s)
+}
+
+func num(label string, v u64) {
+	o := &out
+	o.WriteString(label)
+	o.WriteString(": ")
+	o.WriteUint(v)
+	o.WriteByte('\n')
+}
+
+func b2u(b bool) u64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func u64Maps() {
+	// 3 buckets for 4 entries: every probe sequence wraps and collides.
+	var m maps.U64Map[3, 4, u32]
+	mp := &m
+	ok1 := mp.Put(100, 1)
+	ok2 := mp.Put(7, 2)
+	ok3 := mp.Put(1_000_000_007, 3)
+	ok4 := mp.Put(7, 20) // overwrite, no new entry
+	num("puts", b2u(ok1)+b2u(ok2)+b2u(ok3)+b2u(ok4))
+	num("len", u64(mp.Len()))
+	ok5 := mp.Put(55, 5) // the 3 buckets are all taken: full
+	num("put into full buckets", b2u(ok5))
+	num("full", b2u(mp.Full()))
+	v, ok := mp.Get(7)
+	num("get 7", u64(v)+b2u(ok)*1000)
+	v, ok = mp.Get(55)
+	num("get 55 (absent)", u64(v)+b2u(ok)*1000)
+	num("has 100", b2u(mp.Has(100)))
+	idx, ok := mp.Index(1_000_000_007)
+	num("index of 1e9+7", u64(idx)+b2u(ok)*1000)
+	o := &out
+	o.WriteString("keys in insertion order:")
+	keys := mp.Keys()
+	vals := mp.Values()
+	for i := usize(0); i < len(keys); i++ {
+		o.WriteByte(' ')
+		o.WriteUint(keys[i])
+		o.WriteByte('=')
+		o.WriteUint(u64(vals[i]))
+	}
+	o.WriteByte('\n')
+	num("key(1)/value(1)", mp.Key(1)*100+u64(mp.Value(1)))
+	num("key(9)/value(9) out of range", mp.Key(9)+u64(mp.Value(9)))
+	num("setvalue 0 / 9", b2u(mp.SetValue(0, 11))*10+b2u(mp.SetValue(9, 11)))
+	mp.Reset()
+	num("after reset len/full/has", u64(mp.Len())*100+b2u(mp.Full())*10+b2u(mp.Has(100)))
+
+	// entry capacity (N) reached before the buckets
+	var e maps.U64Map[16, 2, bool]
+	ep := &e
+	_ = ep.Put(1, true)
+	_ = ep.Put(2, true)
+	num("third put into N=2", b2u(ep.Put(3, true)))
+	i, isNew, ok := ep.Insert(2)
+	num("insert existing", u64(i)*100+b2u(isNew)*10+b2u(ok))
+
+	// many keys
+	var big maps.U64Map[1024, 512, u64]
+	bp := &big
+	for k := u64(0); k < 600; k++ {
+		_ = bp.Put(k*k*2654435761, k)
+	}
+	sum := u64(0)
+	for k := u64(0); k < 600; k++ {
+		x, found := bp.Get(k * k * 2654435761)
+		if found {
+			sum += x
+		}
+	}
+	num("big len/full", u64(bp.Len())*10+b2u(bp.Full()))
+	num("big sum of found", sum)
+}
+
+func interner() {
+	np := &names
+	a, _ := np.InternStr("alpha")
+	b, _ := np.InternStr("beta")
+	a2, _ := np.Intern(strBytes("alpha"))
+	e, _ := np.InternStr("")
+	num("ids alpha/beta/alpha/empty", u64(a)*1000+u64(b)*100+u64(a2)*10+u64(e))
+	num("lookup beta / gamma", u64(np.LookupStr("beta"))*10+u64(np.Lookup(strBytes("gamma"))))
+	o := &out
+	o.WriteString("bytes(2) = ")
+	o.WriteBytes(np.Bytes(2))
+	o.WriteString(", bytes(0) len ")
+	o.WriteUint(u64(len(np.Bytes(0))))
+	o.WriteString(", bytes(99) len ")
+	o.WriteUint(u64(len(np.Bytes(99))))
+	o.WriteByte('\n')
+	num("len/used", u64(np.Len())*100+u64(np.Used()))
+	// fill the 16 IDs
+	var nb [8]byte
+	for i := u64(0); i < 20; i++ {
+		nb[0] = 'n'
+		nb[1] = byte('a' + i)
+		_, _ = np.Intern(nb[:2])
+	}
+	num("after filling len/full", u64(np.Len())*10+b2u(np.Full()))
+	id, ok := np.InternStr("alpha") // existing names still resolve
+	num("existing when full", u64(id)*10+b2u(ok))
+	id, ok = np.InternStr("delta")
+	num("new when full", u64(id)*10+b2u(ok))
+	np.Reset()
+	num("after reset len/full/lookup", u64(np.Len())*100+b2u(np.Full())*10+u64(np.LookupStr("alpha")))
+
+	// byte arena exhaustion: 8 bytes, plenty of IDs
+	var tiny maps.Interner[8, 8, 8]
+	tp := &tiny
+	x, ok1 := tp.InternStr("abcde")
+	y, ok2 := tp.InternStr("fgh")
+	z, ok3 := tp.InternStr("i")
+	num("tiny ids", u64(x)*100+u64(y)*10+u64(z))
+	num("tiny oks/full", b2u(ok1)*1000+b2u(ok2)*100+b2u(ok3)*10+b2u(tp.Full()))
+}
+
+type Sym struct {
+	name  u32
+	scp u32
+	kind  u8
+}
+
+var symRecs [32]Sym
+var nsym usize
+var symTab maps.Table[64]
+
+// bind looks up (scope, name) and inserts a new record when absent, the
+// way compiler/ keeps its (scope, name) symbol table.
+func bind(scp u32, name u32, kind u8) (u32, bool) {
+	tp := &symTab
+	s := tp.Start(maps.Mix(maps.HashU64(u64(scp)), u64(name)))
+	lim := tp.Cap()
+	for g := usize(0); g < lim; g++ {
+		id := tp.At(s)
+		if id == 0 {
+			if nsym >= len(symRecs) {
+				return 0, false
+			}
+			symRecs[nsym] = Sym{name: name, scp: scp, kind: kind}
+			nsym++
+			tp.Set(s, u32(nsym))
+			return u32(nsym), true
+		}
+		r := symRecs[usize(id)-1]
+		if r.scp == scp && r.name == name {
+			return id, false
+		}
+		s = tp.Next(s)
+	}
+	return 0, false
+}
+
+func table() {
+	a, n1 := bind(1, 10, 1)
+	b, n2 := bind(2, 10, 2)
+	c, n3 := bind(1, 10, 3)
+	num("table ids", u64(a)*100+u64(b)*10+u64(c))
+	num("table new flags", b2u(n1)*100+b2u(n2)*10+b2u(n3))
+	tp := &symTab
+	num("table len/cap", u64(tp.Len())*100+u64(tp.Cap()))
+	num("kind of (1,10)", u64(symRecs[usize(c)-1].kind))
+}
+
+func strMap() {
+	var m maps.StrMap[32, 64, 8, u64]
+	mp := &m
+	_ = mp.PutStr("func", 1)
+	_ = mp.PutStr("for", 2)
+	_ = mp.Put(strBytes("func"), 10)
+	src := strBytes("x := for")
+	v, ok := mp.Get(src[5:8])
+	num("get for (by subslice)", v+b2u(ok)*1000)
+	v, ok = mp.GetStr("func")
+	num("get func", v+b2u(ok)*1000)
+	v, ok = mp.GetStr("fun")
+	num("get fun (absent)", v+b2u(ok)*1000)
+	num("len/id(for)/has(if)", u64(mp.Len())*100+u64(mp.ID(strBytes("for")))*10+b2u(mp.Has(strBytes("if"))))
+	o := &out
+	o.WriteString("entries:")
+	n := mp.Len()
+	for id := u32(1); id < u32(n)+1; id++ {
+		o.WriteByte(' ')
+		o.WriteBytes(mp.Key(id))
+		o.WriteByte('=')
+		o.WriteUint(mp.Value(id))
+	}
+	o.WriteByte('\n')
+	num("setvalue 2 / 0", b2u(mp.SetValue(2, 7))*10+b2u(mp.SetValue(0, 7)))
+	num("value 2 / 9", mp.Value(2)*10+mp.Value(9))
+	mp.Reset()
+	num("after reset len/full", u64(mp.Len())*10+b2u(mp.Full()))
+}
+
+func hashes() {
+	// FNV-1a test vectors
+	num("fnv(\"\")", maps.HashBytes(strBytes("")))
+	num("fnv(\"a\")", maps.HashBytes(strBytes("a")))
+	num("fnv(\"foobar\")", maps.HashBytes(strBytes("foobar")))
+	num("hashU64(0) != hashU64(1)", b2u(maps.HashU64(0) != maps.HashU64(1)))
+	num("mix order matters", b2u(maps.Mix(maps.Mix(0, 1), 2) != maps.Mix(maps.Mix(0, 2), 1)))
+}
+
+driver func main(io Stdio) error {
+	u64Maps()
+	interner()
+	table()
+	strMap()
+	hashes()
+	op := &out
+	if op.Truncated() {
+		return ErrArenaFull
+	}
+	return io.WriteStdout(op.Bytes())
+}

@@ -367,6 +367,36 @@ func f(n usize) usize {
 	}
 	return s
 }`},
+		{"const type parameter bound", `
+type Ring[N usize, T any] struct {
+	data [N]T
+	n    usize
+}
+
+func (r *Ring[N, T]) Clear() {
+	var z T
+	for i := usize(0); i < N; i++ {
+		r.data[i] = z
+		r.Clear2()
+	}
+	for i := N; i > 0; i-- {
+		r.n = i
+	}
+	for i := usize(0); i < N*2+r.n; i++ { // ERROR E4002
+		r.n++
+	}
+}
+
+func (r *Ring[N, T]) Clear2() {
+}
+
+func count[N usize](v *Ring[N, u8]) usize {
+	k := usize(0)
+	for i := usize(1); i < N-1; i++ {
+		k++
+	}
+	return k
+}`},
 	})
 }
 

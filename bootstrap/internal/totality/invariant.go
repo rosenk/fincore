@@ -80,6 +80,13 @@ func (c *checker) atomsOf(e ast.Expr, fi *types.FuncInfo, rf *rootFacts) (out []
 			}
 			return false
 		case *ast.Ident, *ast.SelectorExpr:
+			if id, isID := e.(*ast.Ident); isID {
+				// A const type parameter (`N` of `Vec[N usize, T any]`)
+				// is a constant of every instance.
+				if s := c.info.SymbolOf(id); s != nil && s.Kind == resolve.SymTypeParam {
+					return true
+				}
+			}
 			a, ok := c.pathAtom(e, fi, rf)
 			if ok {
 				out = append(out, a)

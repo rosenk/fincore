@@ -122,6 +122,22 @@ func assertComplete(t *testing.T, info *types.Info) {
 					}
 				case *ast.ScopeStmt:
 					skip[n.Name] = true
+				case *ast.NamedType:
+					// package qualifier of an imported type (`vec.Vec[4, u8]`)
+					if n.Pkg != nil {
+						skip[n.Pkg] = true
+					}
+				case *ast.FuncType:
+					// parameter names of a function type declare nothing
+					for _, p := range n.Sig.Params {
+						for _, id := range p.Names {
+							skip[id] = true
+						}
+					}
+				case *ast.TypeExpr:
+					// a type argument such as `[]byte` in `Sort[[]byte]`:
+					// the type is recorded on the wrapped type node
+					skip[n] = true
 				case *ast.ImportSpec:
 					skip[n.Path] = true
 					if n.Name != nil {

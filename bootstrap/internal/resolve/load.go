@@ -181,7 +181,20 @@ func (l *loader) importSpec(spec *ast.ImportSpec) *Package {
 		return nil
 	}
 	dir := filepath.Join(l.prog.ModuleRoot, filepath.FromSlash(ip))
+	// std/... resolves against $FINCROOT when it is set (and non-empty).
+	// Such packages are named by the lexically cleaned path
+	// $FINCROOT/<ip> in diagnostics (never made relative), so that finc1,
+	// which cannot query the working directory, prints the same names.
+	stdDir := StdDir(ip, os.Getenv("FINCROOT"))
+	display := func(p string) string { return rel(l.prog.ModuleRoot, p) }
+	if stdDir != "" {
+		dir = stdDir
+		display = func(p string) string { return p }
+	}
 	key := filepath.Clean(dir)
+	if abs, err := filepath.Abs(key); err == nil {
+		key = abs
+	}
 	switch l.state[key] {
 	case 1:
 		l.diags.Addf(diag.E2006, spec.Path.Range, "import cycle not allowed: %q imports itself (directly or indirectly)", ip)
@@ -191,19 +204,19 @@ func (l *loader) importSpec(spec *ast.ImportSpec) *Package {
 	}
 	st, err := os.Stat(dir)
 	if err != nil || !st.IsDir() {
-		l.diags.Addf(diag.E2001, spec.Path.Range, "cannot find package %q (no directory %s)", ip, rel(l.prog.ModuleRoot, dir))
+		l.diags.Addf(diag.E2001, spec.Path.Range, "cannot find package %q (no directory %s)", ip, display(dir))
 		return nil
 	}
 	files, err := parser.ListSourceFiles(dir)
 	if err != nil || len(files) == 0 {
-		l.diags.Addf(diag.E2001, spec.Path.Range, "cannot find package %q (no %s files in %s)", ip, parser.SourceExt, rel(l.prog.ModuleRoot, dir))
+		l.diags.Addf(diag.E2001, spec.Path.Range, "cannot find package %q (no %s files in %s)", ip, parser.SourceExt, display(dir))
 		return nil
 	}
 	// Report positions relative to the module root, like the root package.
 	for i, f := range files {
-		files[i] = rel(l.prog.ModuleRoot, f)
+		files[i] = display(f)
 	}
-	a, d, err := parser.ParseFiles(rel(l.prog.ModuleRoot, dir), files, l.prog.IDs)
+	a, d, err := parser.ParseFiles(display(dir), files, l.prog.IDs)
 	if err != nil {
 		l.diags.Addf(diag.E2001, spec.Path.Range, "cannot load package %q: %v", ip, err)
 		return nil
@@ -213,6 +226,17 @@ func (l *loader) importSpec(spec *ast.ImportSpec) *Package {
 		return nil
 	}
 	return l.visit(a, ip, key)
+}
+
+// StdDir returns the directory of the standard-library import path ip
+// ("std" or "std/...") under fincRoot (the value of $FINCROOT), lexically
+// cleaned, or "" when ip is not a std path or fincRoot is empty (then ip
+// resolves against the module root like every local import).
+func StdDir(ip, fincRoot string) string {
+	if fincRoot == "" || (ip != "std" && !strings.HasPrefix(ip, "std/")) {
+		return ""
+	}
+	return filepath.Join(fincRoot, filepath.FromSlash(ip))
 }
 
 // rel returns path relative to the current directory if that is a clean

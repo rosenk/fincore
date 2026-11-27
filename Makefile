@@ -40,13 +40,13 @@ fmt-check: ## fail if any Go file is not gofmt-ed
 
 lint: fmt-check vet ## fmt-check + vet
 
-parse-corpus: finc0 ## finc0 parse on examples, testdata and compiler/
-	@set -e; for f in examples/*.fc testdata/pass/*.fc testdata/fail/*.fc; do $(FINC0) parse $$f >/dev/null; done
+parse-corpus: finc0 ## finc0 parse on examples, testdata, std/ and compiler/
+	@set -e; for f in examples/*.fc testdata/pass/*.fc testdata/fail/*.fc std/*/; do $(FINC0) parse $$f >/dev/null; done
 	$(FINC0) parse compiler/ >/dev/null
 	@echo "parse-corpus: ok"
 
-check-corpus: finc0 ## finc0 check on examples, pass tests and compiler/
-	@set -e; for f in examples/*.fc testdata/pass/*.fc; do $(FINC0) check --comptime-fuel=$(FUEL) $$f; done
+check-corpus: finc0 ## finc0 check on examples, pass tests, std/ and compiler/
+	@set -e; for f in examples/*.fc testdata/pass/*.fc std/*/; do $(FINC0) check --comptime-fuel=$(FUEL) $$f; done
 	$(FINC0) check compiler/
 	@echo "check-corpus: ok"
 
@@ -66,7 +66,7 @@ clean: ## remove build outputs
 	rm -rf $(BIN) $(STAGE)
 
 diff-parse: finc1 ## finc0 vs finc1: byte-identical `parse --dump-ast` on the corpus
-	@set -e; for t in examples/tcp_echo.fc compiler/ testdata/pass/*.fc testdata/fail/*.fc; do \
+	@set -e; for t in examples/tcp_echo.fc compiler/ std/*/ testdata/pass/*.fc testdata/fail/*.fc; do \
 	  cmp -s <($(FINC0) parse --dump-ast $$t 2>&1) <($(BIN)/finc1 parse --dump-ast $$t 2>&1) || { echo "DIFF: $$t"; exit 1; }; \
 	done; echo "diff-parse: ok"
 

@@ -1,0 +1,175 @@
+// pass_std_vec: std/vec — Vec[N, T] (push until full, pop, at/set, last,
+// slice, truncate, reset) and ListArena (nested runs, commit, discard,
+// overflow), used through package-level and local instances.
+package main
+
+import "std/vec"
+
+type Pair struct {
+	a u32
+	b bool
+}
+
+var big vec.Vec[8, u64]
+var lists vec.ListArena[8, 4, u32]
+
+driver func put(io Stdio, label string, v u64) error {
+	var nb [20]byte
+	n, err := formatUint(v, nb[:])
+	if err != nil {
+		return err
+	}
+	if err := io.WriteStdout(strBytes(label)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(nb[:n]); err != nil {
+		return err
+	}
+	return io.WriteStdout(strBytes("\n"))
+}
+
+func b2u(b bool) u64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func sum(xs []u32) u64 {
+	s := u64(0)
+	for i := usize(0); i < len(xs); i++ {
+		s += u64(xs[i])
+	}
+	return s
+}
+
+driver func main(io Stdio) error {
+	var v vec.Vec[3, u32]
+	vp := &v
+	pushed := u64(0)
+	for i := u32(1); i < 6; i++ {
+		if vp.Push(i * 10) {
+			pushed++
+		}
+	}
+	if err := put(io, "pushed: ", pushed); err != nil {
+		return err
+	}
+	if err := put(io, "len/cap/full: ", u64(vp.Len())*100+u64(vp.Cap())*10+b2u(vp.Full())); err != nil {
+		return err
+	}
+	x, ok := vp.At(1)
+	if err := put(io, "at 1: ", u64(x)+b2u(ok)*1000); err != nil {
+		return err
+	}
+	x, ok = vp.At(3)
+	if err := put(io, "at 3 (oob): ", u64(x)+b2u(ok)*1000); err != nil {
+		return err
+	}
+	if err := put(io, "set 2 / set 5: ", b2u(vp.Set(2, 7))*10+b2u(vp.Set(5, 7))); err != nil {
+		return err
+	}
+	last, _ := vp.Last()
+	if err := put(io, "last: ", u64(last)); err != nil {
+		return err
+	}
+	if err := put(io, "slice sum: ", sum(vp.Slice())); err != nil {
+		return err
+	}
+	p, ok := vp.Pop()
+	if err := put(io, "pop: ", u64(p)+b2u(ok)*1000); err != nil {
+		return err
+	}
+	vp.Truncate(1)
+	if err := put(io, "after truncate(1): ", u64(vp.Len())); err != nil {
+		return err
+	}
+	vp.Reset()
+	_, ok = vp.Pop()
+	if err := put(io, "pop empty ok: ", b2u(ok)); err != nil {
+		return err
+	}
+	_, ok = vp.Last()
+	if err := put(io, "last empty ok: ", b2u(ok)); err != nil {
+		return err
+	}
+
+	// struct elements, package-level vector
+	var pv vec.Vec[2, Pair]
+	pp := &pv
+	_ = pp.Push(Pair{a: 5, b: true})
+	q, _ := pp.At(0)
+	if err := put(io, "pair: ", u64(q.a)+b2u(q.b)*100); err != nil {
+		return err
+	}
+	bp := &big
+	for i := u64(0); i < 20; i++ {
+		if !bp.Push(i * i) {
+			break
+		}
+	}
+	bl, _ := bp.Last()
+	if err := put(io, "big len/last: ", u64(bp.Len())*1000+bl); err != nil {
+		return err
+	}
+
+	// ListArena: an outer run [1, <inner>, 3] with a nested inner run [7, 8]
+	la := &lists
+	outer := la.Mark()
+	la.Push(1)
+	inner := la.Mark()
+	la.Push(7)
+	la.Push(8)
+	is, in := la.Commit(inner)
+	la.Push(is)
+	la.Push(3)
+	os, on := la.Commit(outer)
+	if err := put(io, "inner run: ", u64(is)*10+u64(in)); err != nil {
+		return err
+	}
+	if err := put(io, "outer run: ", u64(os)*10+u64(on)); err != nil {
+		return err
+	}
+	if err := put(io, "outer sum: ", sum(la.Run(os, on))); err != nil {
+		return err
+	}
+	if err := put(io, "inner sum via outer[1]: ", sum(la.Run(la.At(usize(os)+1), 2))); err != nil {
+		return err
+	}
+	es, en := la.Commit(la.Mark())
+	if err := put(io, "empty run: ", u64(es)*10+u64(en)); err != nil {
+		return err
+	}
+	m := la.Mark()
+	la.Push(99)
+	if err := put(io, "pending: ", u64(len(la.Pending(m)))); err != nil {
+		return err
+	}
+	la.Discard(m)
+	if err := put(io, "depth/used: ", u64(la.Depth())*100+u64(la.Used())); err != nil {
+		return err
+	}
+	// overflow: the store has 8 slots (slot 0 reserved, 6 used)
+	m = la.Mark()
+	la.Push(1)
+	la.Push(2)
+	la.Push(3)
+	fs, fn := la.Commit(m)
+	if err := put(io, "overflow run/full: ", u64(fs)*100+u64(fn)*10+b2u(la.Full())); err != nil {
+		return err
+	}
+	for i := u32(0); i < 6; i++ {
+		la.Push(i)
+	}
+	if err := put(io, "stack overflow depth/full: ", u64(la.Depth())*10+b2u(la.Full())); err != nil {
+		return err
+	}
+	la.Reset()
+	_ = vp.Push(4)
+	_ = vp.Push(5)
+	rs, rn := la.Store(vp.Slice())
+	if err := put(io, "after reset store: ", u64(rs)*10+u64(rn)+b2u(la.Full())*100); err != nil {
+		return err
+	}
+	return nil
+}
