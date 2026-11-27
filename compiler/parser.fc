@@ -289,7 +289,7 @@ func (p *Parser) expectSemi(context string) {
 	k := p.tok.kind
 	if k == TkSemicolon {
 		p.next()
-	} else if k != TkRParen && k != TkRBrace {
+	} else if !(k is TkRParen | TkRBrace) {
 		p.errorAfter(context)
 	}
 }
@@ -897,7 +897,7 @@ func (p *Parser) typeBody(depth usize) u32 decreases(depth) {
 	if k == TkEnum {
 		return p.enumType(depth - 1)
 	}
-	if k == TkFunc || k == TkDriver {
+	if k is TkFunc | TkDriver {
 		return p.funcType(depth - 1)
 	}
 	if k == TkAny {
@@ -1232,7 +1232,7 @@ func (p *Parser) simpleStmtOrExpr(depth usize) (u32, u32) decreases(depth) {
 		}
 		return p.finish(a), 0
 	}
-	if k == TkInc || k == TkDec {
+	if k is TkInc | TkDec {
 		if ln != 1 {
 			p.errorUnexpected(" after expression list")
 		}
@@ -1569,7 +1569,7 @@ func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
 		p.setB(a, p.expr(depth-1))
 		p.ls.Push(p.finish(a))
 		k := p.tok.kind
-		if k == TkSemicolon || k == TkComma {
+		if k is TkSemicolon | TkComma {
 			p.next()
 		} else if k != TkRBrace {
 			p.errorAfterArm()
@@ -1610,7 +1610,7 @@ func (p *Parser) patternAltBody(payload bool, depth usize) u32 decreases(depth) 
 	if k == TkIdent {
 		if payload {
 			k1 := p.peek(1).kind
-			if k1 != TkPeriod && k1 != TkLParen {
+			if !(k1 is TkPeriod | TkLParen) {
 				return p.ident()
 			}
 		}
@@ -2004,7 +2004,7 @@ func (p *Parser) operand(depth usize) u32 decreases(depth) {
 	if k is TkInt | TkString | TkChar {
 		return p.basicLit()
 	}
-	if k == TkTrue || k == TkFalse {
+	if k is TkTrue | TkFalse {
 		p.next()
 		b := p.mk(NkBoolLit, s)
 		if k == TkTrue {
@@ -2052,7 +2052,7 @@ func (p *Parser) operand(depth usize) u32 decreases(depth) {
 		p.setA(pe, x)
 		return p.finish(pe)
 	}
-	if k == TkFunc || k == TkDriver {
+	if k is TkFunc | TkDriver {
 		if k == TkDriver && p.peek(1).kind != TkFunc {
 			p.errorTok("unexpected keyword driver; expected 'driver func' or 'driver for'")
 		}

@@ -64,7 +64,7 @@ func markPatUnbound(p u32, dp usize) decreases(dp) {
 		if sym := defs[usize(p)]; sym != 0 {
 			chkUnbound[usize(sym)] = true
 		}
-	} else if k == NkCtorPattern || k == NkOrPattern || k == NkTuplePattern {
+	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
 			markPatUnbound(l1at(p, i), dp-1)
@@ -214,9 +214,9 @@ func exprStmt(e u32, what string, dp usize) decreases(dp) {
 	if isInvalidOp(&x) {
 		return
 	}
-	bad := match callTab.items[usize(ncall[usize(call)])].kind {
-		Conversion(_) | Variant(..) -> true
-		Builtin(b, ..) -> b != BFPanic && b != BFCopy && b != BFFormatTo
+	bad := match callKind(call) {
+		Builtin(BFPanic | BFCopy | BFFormatTo, ..) -> false
+		Conversion(_) | Variant(..) | Builtin(..) -> true
 		Invalid | Func(..) | Method(..) | BuiltinMeth(..) | Value -> false
 	}
 	if bad {
@@ -241,7 +241,7 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 		if isInvalidOp(&x) {
 			return false
 		}
-		if !isTupleT(x.typ) || x.mode != KValue {
+		if !(trec(x.typ) is Tuple(ts, tn)) || x.mode != KValue {
 			singleValue(&x)
 			if isInvalidOp(&x) {
 				return false
@@ -249,7 +249,7 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 			errAt(E2003, r0, formatTo(mbuf[:], "assignment mismatch: %d variables but %v returns 1 value", nl, Expr(r0)))
 			return false
 		}
-		nt := tupleN(x.typ)
+		nt := usize(tn)
 		if nt != nl {
 			errAt(E2003, r0, formatTo(mbuf[:], "assignment mismatch: %d variables but %v returns %d values", nl, Expr(r0), nt))
 			return false
@@ -259,7 +259,7 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 			tv = ref
 		}
 		for i := usize(0); i < nt; i++ {
-			op := opMode(KValue, tupleAt(x.typ, i))
+			op := opMode(KValue, tlist(ts, i))
 			op.expr = r0
 			if tv != 0 {
 				op.mode = KConst
@@ -447,20 +447,20 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		if isInvalidOp(&x) {
 			return
 		}
-		if !isTupleT(x.typ) {
+		if !(trec(x.typ) is Tuple(ts, tn)) {
 			singleValue(&x)
 			if !isInvalidOp(&x) {
 				errAt(E2003, r0, formatTo(mbuf[:], "not enough return values: have 1, want %d", want))
 			}
 			return
 		}
-		nt := tupleN(x.typ)
+		nt := usize(tn)
 		if nt != want {
 			errAt(E2003, r0, formatTo(mbuf[:], "wrong number of return values: have %d, want %d", nt, want))
 			return
 		}
 		for i := usize(0); i < nt; i++ {
-			t := tupleAt(x.typ, i)
+			t := tlist(ts, i)
 			w := sigResult(sig, i)
 			if !assignable(t, w) && !isInvalid(w) {
 				errAt(E2002, r0, formatTo(mbuf[:], "cannot use result %d of type %v as type %v in return statement", i + 1, TypeRef(t), TypeRef(w)))
@@ -535,7 +535,7 @@ func isPanicCall(e u32) bool {
 	if nkind(call) != NkCallExpr {
 		return false
 	}
-	return callBuiltin(call) == BFPanic
+	return callKind(call) is Builtin(BFPanic, ..)
 }
 
 // hasBreak reports whether a block contains a break that targets the

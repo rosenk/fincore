@@ -680,7 +680,7 @@ func lbFact(v u32, op u8, c u32, st u32) {
 			return
 		}
 		lb = k + 1
-	} else if op == OpGe || op == OpEq {
+	} else if op is OpGe | OpEq {
 		lb = k
 	} else if op == OpNe {
 		if k == 0 && isUnsigned(symTyp(s)) {
@@ -1008,7 +1008,7 @@ func killWrites(n u32, st u32) {
 	for p := s; p < e; p++ {
 		x := tord[p]
 		k := nkind(x)
-		if k == NkAssignStmt || k == NkShortVarDecl {
+		if k is NkAssignStmt | NkShortVarDecl {
 			m := l1len(x)
 			for i := usize(0); i < m; i++ {
 				kill(storageRoot(l1at(x, i)), st)
@@ -1034,7 +1034,7 @@ func decWrites(n u32, st u32, dp usize) decreases(dp) {
 	for p := s; p < e; p++ {
 		x := tord[p]
 		k := nkind(x)
-		if k == NkAssignStmt || k == NkShortVarDecl {
+		if k is NkAssignStmt | NkShortVarDecl {
 			m := l1len(x)
 			for i := usize(0); i < m; i++ {
 				onAssign(l1at(x, i), 0, st, st, dp-1)

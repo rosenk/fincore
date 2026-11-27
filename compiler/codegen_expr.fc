@@ -57,7 +57,7 @@ func cgConstExpr(e u32, v Val, typed bool, dp usize) decreases(dp) {
 	if k == NkCallExpr && l1len(e) == 1 {
 		a0 := cgUnparenNode(l1at(e, 0))
 		rs := cgConstRefSym(a0)
-		if callTab.items[usize(ncall[usize(e)])].kind is Conversion(t) && rs != 0 {
+		if callKind(e) is Conversion(t) && rs != 0 {
 			cgConvType(e, t, dp-1)
 			cgWc('(')
 			cgWConstRef(a0, rs, false, dp-1)
@@ -146,7 +146,7 @@ func cgExpr(e u32, dp usize) decreases(dp) {
 		cgMatchExpr(e, dp-1)
 	} else if k == NkIsExpr {
 		cgIsExpr(e, dp-1)
-	} else if k == NkBasicLit || k == NkBoolLit || k == NkNilLit {
+	} else if k is NkBasicLit | NkBoolLit | NkNilLit {
 		cgFail(e, "literal without a recorded value")
 	} else {
 		cgFail(e, "unsupported expression")
@@ -288,7 +288,7 @@ func cgPrimary(e u32, dp usize) decreases(dp) {
 	p := cgWmark()
 	cgExpr(e, dp-1)
 	uk := nkind(cgUnparenNode(e))
-	if (uk == NkUnaryExpr || uk == NkBinaryExpr) && nkind(e) != NkParenExpr {
+	if uk is NkUnaryExpr | NkBinaryExpr && nkind(e) != NkParenExpr {
 		cgWwrap(p)
 		return
 	}
@@ -314,7 +314,7 @@ func cgIdent(e u32, dp usize) decreases(dp) {
 		return
 	}
 	k := symKind(s)
-	if k == SymVar || k == SymFunc {
+	if k is SymVar | SymFunc {
 		cgWSymName(s)
 		return
 	}
@@ -345,7 +345,7 @@ func cgGoPrec(op u8) u8 {
 	if op >= OpEq && op <= OpGe {
 		return 3
 	}
-	if op == OpAdd || op == OpSub || op == OpOr || op == OpXor {
+	if op is OpAdd | OpSub | OpOr | OpXor {
 		return 4
 	}
 	return 5
@@ -373,7 +373,7 @@ func cgBinary(e u32, dp usize) decreases(dp) {
 	op := nop(e)
 	x := na(e)
 	xv := cgConstValueSlot(x)
-	if (op == OpShl || op == OpShr) && xv != 0 {
+	if op is OpShl | OpShr && xv != 0 {
 		cgTypedConst(x, slotGet(xv), dp-1)
 	} else {
 		cgOperand(x, op, false, dp-1)
@@ -393,7 +393,7 @@ func cgUnary(e u32, dp usize) decreases(dp) {
 	p := cgWmark()
 	cgExpr(x, dp-1)
 	uk := nkind(cgUnparenNode(x))
-	if (uk == NkUnaryExpr || uk == NkBinaryExpr) && nkind(x) != NkParenExpr {
+	if uk is NkUnaryExpr | NkBinaryExpr && nkind(x) != NkParenExpr {
 		cgWwrap(p)
 	}
 	if cgWhasPrefix(p, "-") || cgWhasPrefix(p, "&") || cgWhasPrefix(p, "*") {
@@ -644,13 +644,12 @@ func cgTupleValues(e u32, v Val, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
-	tt := ntype[usize(e)]
-	if v is Tuple(ref, nv) && isTupleT(tt) && tupleN(tt) == usize(nv) {
+	if v is Tuple(ref, nv) && trec(ntype[usize(e)]) is Tuple(ts, tn) && tn == nv {
 		for i := usize(0); i < usize(nv); i++ {
 			if i > 0 {
 				cgW(", ")
 			}
-			cgValue(e, slotGet(ref+u32(i)), tupleAt(tt, i), dp-1)
+			cgValue(e, slotGet(ref+u32(i)), tlist(ts, i), dp-1)
 		}
 		return
 	}
@@ -789,53 +788,38 @@ func cgBuiltinCall(e u32, c u32, b u8, dp usize) decreases(dp) {
 	if dp == 0 {
 		return
 	}
-	if b == BFLen {
-		cgW("uint(len(")
-		cgExpr(l1at(e, 0), dp-1)
-		cgW("))")
-	} else if b == BFCap {
-		cgW("uint(cap(")
-		cgExpr(l1at(e, 0), dp-1)
-		cgW("))")
-	} else if b == BFPanic {
-		cgW("panic(")
-		cgArgs(e, dp-1)
-		cgWc(')')
-	} else if b == BFFormatTo {
-		cgFormatTo(e, c, dp-1)
-	} else if b == BFCopy || b == BFBytesEqual || b == BFStrBytes || b == BFBytesToStr || b == BFFormatUint ||
-		b == BFParseUint || b == BFNewContext || b == BFNewScope {
-		cgRt(cgBuiltinGoName(b))
-		cgWc('(')
-		cgArgs(e, dp-1)
-		cgWc(')')
-	} else {
-		cgFail(e, "builtin cannot be called at run time")
+	match b {
+		BFLen | BFCap -> {
+			cgW(match b { BFLen -> "uint(len(", _ -> "uint(cap(" })
+			cgExpr(l1at(e, 0), dp-1)
+			cgW("))")
+		}
+		BFPanic -> {
+			cgW("panic(")
+			cgArgs(e, dp-1)
+			cgWc(')')
+		}
+		BFFormatTo -> cgFormatTo(e, c, dp-1)
+		BFCopy | BFBytesEqual | BFStrBytes | BFBytesToStr | BFFormatUint | BFParseUint | BFNewContext | BFNewScope -> {
+			cgRt(cgBuiltinGoName(b))
+			cgWc('(')
+			cgArgs(e, dp-1)
+			cgWc(')')
+		}
+		_ -> cgFail(e, "builtin cannot be called at run time")
 	}
 }
 
 // builtinGoName is resolve.Builtin.GoName for builtin functions.
 func cgBuiltinGoName(b u8) string {
-	if b == BFCopy {
-		return "Copy"
+	return match b {
+		BFCopy -> "Copy"
+		BFBytesEqual -> "BytesEqual"
+		BFStrBytes -> "StrBytes"
+		BFBytesToStr -> "BytesToStr"
+		BFFormatUint -> "FormatUint"
+		BFParseUint -> "ParseUint"
+		BFNewContext -> "NewContext"
+		_ -> "NewScope"
 	}
-	if b == BFBytesEqual {
-		return "BytesEqual"
-	}
-	if b == BFStrBytes {
-		return "StrBytes"
-	}
-	if b == BFBytesToStr {
-		return "BytesToStr"
-	}
-	if b == BFFormatUint {
-		return "FormatUint"
-	}
-	if b == BFParseUint {
-		return "ParseUint"
-	}
-	if b == BFNewContext {
-		return "NewContext"
-	}
-	return "NewScope"
 }

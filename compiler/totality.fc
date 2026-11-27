@@ -253,9 +253,9 @@ func checkEffects(fi u32) {
 type CalleeName u32
 
 func (call CalleeName) Format(dst []byte) usize {
-	match callTab.items[usize(ncall[usize(call)])].kind {
+	match callKind(u32(call)) {
 		Func(s, ..) | Method(s, ..) if funcOfSym(s) != 0 -> return formatTo(dst, "function %v", FuncName(funcOfSym(s)))
-		Builtin(b, ..) if b == BFPanic -> return formatTo(dst, "builtin panic")
+		Builtin(BFPanic, ..) -> return formatTo(dst, "builtin panic")
 		BuiltinMeth(m, ..) if m != 0 && meths.items[usize(m)].recv != 0 -> return formatTo(dst, "method %v.%v", NameRef(typeName(meths.items[usize(m)].recv)), NameRef(meths.items[usize(m)].name))
 		Value -> return formatTo(dst, "function value")
 		_ -> {}
@@ -338,7 +338,7 @@ func computeRootFacts() {
 				}
 			}
 		} else if k == NkCallExpr {
-			if callTab.items[usize(ncall[usize(x)])].kind is Method(_, _, r, true) | BuiltinMeth(_, r, true) {
+			if callKind(x) is Method(_, _, r, true) | BuiltinMeth(_, r, true) {
 				// x.M() with a pointer receiver takes &x (v0.2)
 				s := storageRoot(r)
 				if s != 0 {
@@ -468,7 +468,7 @@ func stripConv(e u32) u32 {
 		if x == 0 || nkind(x) != NkCallExpr || l1len(x) != 1 {
 			return x
 		}
-		if callTab.items[usize(ncall[usize(x)])].kind != CallKind.Conversion(ntype[usize(l1at(x, 0))]) {
+		if callKind(x) != CallKind.Conversion(ntype[usize(l1at(x, 0))]) {
 			return x
 		}
 		x = l1at(x, 0)
@@ -479,10 +479,7 @@ func stripConv(e u32) u32 {
 // lenArg returns x for len(x) (0 otherwise).
 func lenArg(e u32) u32 {
 	call := stripConv(e)
-	if call == 0 || nkind(call) != NkCallExpr || l1len(call) != 1 {
-		return 0
-	}
-	if callBuiltin(call) != BFLen {
+	if call == 0 || nkind(call) != NkCallExpr || l1len(call) != 1 || !(callKind(call) is Builtin(BFLen, ..)) {
 		return 0
 	}
 	return l1at(call, 0)
@@ -594,7 +591,7 @@ func atomsOf(e u32, fnode u32, dp usize) bool decreases(dp) {
 		return false
 	}
 	if k == NkCallExpr {
-		if l1len(e) == 1 && (callTab.items[usize(ncall[usize(e)])].kind is Conversion(_) || callBuiltin(e) is BFLen | BFCap) {
+		if l1len(e) == 1 && callKind(e) is Conversion(_) | Builtin(BFLen | BFCap, ..) {
 			return atomsOf(l1at(e, 0), fnode, dp-1)
 		}
 		return false
@@ -604,7 +601,7 @@ func atomsOf(e u32, fnode u32, dp usize) bool decreases(dp) {
 		// constant of every instance
 		return true
 	}
-	if k == NkIdent || k == NkSelectorExpr {
+	if k is NkIdent | NkSelectorExpr {
 		return pathAtom(e, fnode)
 	}
 	return false
@@ -896,10 +893,8 @@ func heapWriteConflicts(w0 u32, ai usize) bool {
 			}
 		}
 		if k == NkUnaryExpr {
-			if nop(w) == OpDeref {
-				if trec(underlying(ntype[usize(na(w))])) is Pointer(el) {
-					return containsAnyStr(el, ai) || containsAnyLeaf(el, ai)
-				}
+			if nop(w) == OpDeref && trec(underlying(ntype[usize(na(w))])) is Pointer(el) {
+				return containsAnyStr(el, ai) || containsAnyLeaf(el, ai)
 			}
 			return true
 		}
@@ -909,9 +904,9 @@ func heapWriteConflicts(w0 u32, ai usize) bool {
 }
 
 func callConflicts(call u32, ai usize) bool {
-	match callTab.items[usize(ncall[usize(call)])].kind {
+	match callKind(call) {
 		Conversion(_) | Variant(..) -> return false
-		Builtin(b, ok, fs, fn) if b == BFFormatTo -> {
+		Builtin(BFFormatTo, ok, fs, fn) -> {
 			// writes dst (argument 0); a %v Format method is a user call
 			if !ok || l1len(call) == 0 {
 				return true
@@ -926,7 +921,7 @@ func callConflicts(call u32, ai usize) bool {
 			}
 			return true
 		}
-		Builtin(b, ..) if b == BFCopy || b == BFFormatUint -> {
+		Builtin(b, ..) if b is BFCopy | BFFormatUint -> {
 			n := l1len(call)
 			if n == 0 {
 				return true
@@ -1018,17 +1013,11 @@ func constSigned(e u32) (bool, u64, bool) {
 	if v == 0 {
 		return false, 0, false
 	}
-	hi, lo, ok := intParts(slotGet(v))
-	if !ok {
-		return false, 0, false
+	match slotGet(v) {
+		Int(0, lo) -> return false, lo, true
+		Int(18446744073709551615, lo) if lo != 0 -> return true, 18446744073709551615 - lo + 1, true
+		_ -> return false, 0, false
 	}
-	if hi == 0 {
-		return false, lo, true
-	}
-	if hi == 18446744073709551615 && lo != 0 {
-		return true, 18446744073709551615 - lo + 1, true
-	}
-	return false, 0, false
 }
 
 func loopT1(fi u32, f u32) u32 {
@@ -1047,7 +1036,7 @@ func loopT1(fi u32, f u32) u32 {
 		step = 1
 		up = nflag(post)
 	} else if pk == NkAssignStmt {
-		if l1len(post) != 1 || l2len(post) != 1 || (nop(post) != AsgAdd && nop(post) != AsgSub) {
+		if l1len(post) != 1 || l2len(post) != 1 || !(nop(post) is AsgAdd | AsgSub) {
 			return WhyPostForm
 		}
 		ctr = varOf(l1at(post, 0))

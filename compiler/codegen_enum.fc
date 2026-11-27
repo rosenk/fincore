@@ -586,7 +586,7 @@ func cgFlatMatch(m u32) bool {
 		for k := usize(0); k < nalt; k++ {
 			alt := patAlt(pt, k)
 			ak := nkind(alt)
-			if ak == NkWildcardPattern || ak == NkLiteralPattern {
+			if ak is NkWildcardPattern | NkLiteralPattern {
 				continue
 			}
 			if ak != NkCtorPattern {
@@ -839,8 +839,8 @@ func cgPatBindings(p u32, t u32, s usize, sn usize, region u32, dp usize) decrea
 			et := u32(0)
 			if sn > 1 {
 				et = cgSubT[s+i]
-			} else {
-				et = tupleAt(t, i)
+			} else if trec(t) is Tuple(ts, _) {
+				et = tlist(ts, i)
 			}
 			cgPatBindings(l1at(p, i), et, 0, 1, region, dp-1)
 		}

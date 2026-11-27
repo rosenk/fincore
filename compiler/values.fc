@@ -419,15 +419,6 @@ func cmp128(ah u64, al u64, bh u64, bl u64) int {
 	return 0
 }
 
-// intParts returns the digits of an exact integer value (ok == false and
-// 0, 0 for IntOvf and non-integers).
-func intParts(v Val) (u64, u64, bool) {
-	match v {
-		Int(hi, lo) -> return hi, lo, true
-		_ -> return 0, 0, false
-	}
-}
-
 func isIntVal(v Val) bool {
 	return v is Int(..) | IntOvf
 }
@@ -462,11 +453,10 @@ func intSign(v Val) int {
 
 // putInt128 writes the decimal form of an integer value.
 func putInt128(o *OutBuf, v Val) {
-	if v == Val.IntOvf {
+	if !(v is Int(h, l)) {
 		o.WriteString("<overflow>")
 		return
 	}
-	h, l, _ := intParts(v)
 	if isNeg128(h) {
 		o.WriteByte('-')
 		h, l = neg128(h, l)
@@ -506,8 +496,7 @@ func divSmall128(h u64, l u64, d u64) (u64, u64, u64) {
 
 // inRange reports whether integer v fits a bits-wide integer type.
 func inRange(v Val, bits u32, signed bool) bool {
-	hi, lo, ok := intParts(v)
-	if !ok {
+	if !(v is Int(hi, lo)) {
 		return false
 	}
 	if signed {
@@ -898,7 +887,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 	if isCompareOp(op) {
 		return compareVals(op, x, y)
 	}
-	if op == OpLAnd || op == OpLOr {
+	if op is OpLAnd | OpLOr {
 		if x is Bool(a) && y is Bool(b) {
 			if op == OpLAnd {
 				return vBool(a && b), true
@@ -915,9 +904,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 		opNotDefined(op, x, y, true)
 		return z, false
 	}
-	xh, xl, xok := intParts(x)
-	yh, yl, yok := intParts(y)
-	if !xok || !yok {
+	if !(x is Int(xh, xl)) || !(y is Int(yh, yl)) {
 		return Val.IntOvf, true
 	}
 	if op == OpAdd {
@@ -932,7 +919,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 		h, l, ovf := mul128(xh, xl, yh, yl)
 		return intResult(h, l, ovf), true
 	}
-	if op == OpDiv || op == OpRem {
+	if op is OpDiv | OpRem {
 		if yh == 0 && yl == 0 {
 			etf(formatTo(mbuf[:], "division by zero"))
 			return z, false
@@ -952,7 +939,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 	if op == OpXor {
 		return vInt(xh^yh, xl^yl), true
 	}
-	if op == OpShl || op == OpShr {
+	if op is OpShl | OpShr {
 		if isNeg128(yh) {
 			etf(formatTo(mbuf[:], "negative shift count"))
 			return z, false
@@ -997,7 +984,7 @@ func intResult(h u64, l u64, ovf bool) Val {
 
 func compareVals(op u8, x Val, y Val) (Val, bool) {
 	var z Val
-	if op == OpEq || op == OpNe {
+	if op is OpEq | OpNe {
 		eq, ok := equalVals(x, y, SemaDepth)
 		if !ok {
 			return z, false
@@ -1006,12 +993,11 @@ func compareVals(op u8, x Val, y Val) (Val, bool) {
 	}
 	c := 0
 	match (x, y) {
-		(Int(..) | IntOvf, Int(..) | IntOvf) -> {
-			xh, xl, _ := intParts(x)
-			yh, yl, _ := intParts(y)
-			c = cmp128(xh, xl, yh, yl)
-		}
-		(Str(..), Str(..)) -> c = bytes.Compare(strOf(x), strOf(y))
+		(Int(xh, xl), Int(yh, yl)) -> c = cmp128(xh, xl, yh, yl)
+		(Int(xh, xl), IntOvf) -> c = cmp128(xh, xl, 0, 0) // IntOvf counts as 0
+		(IntOvf, Int(yh, yl)) -> c = cmp128(0, 0, yh, yl)
+		(IntOvf, IntOvf) -> {}
+		(Str(a, m), Str(b, n)) -> c = bytes.Compare(strSpan(a, m), strSpan(b, n))
 		(Int(..) | IntOvf | Str(..), _) -> {
 			etf(formatTo(mbuf[:], "mismatched operands"))
 			return z, false
@@ -1030,11 +1016,7 @@ func cannotCompare(x Val, y Val) {
 
 // isNilSlice reports whether v is a slice that compares equal to nil.
 func isNilSlice(v Val) bool {
-	return match v {
-		NilSlice -> true
-		Slice(_, lo, hi, _) -> lo == hi
-		_ -> false
-	}
+	return v is NilSlice || v is Slice(_, lo, hi, _) && lo == hi
 }
 
 // equalVals compares two values for == (types.Equal).
@@ -1103,32 +1085,21 @@ func codeListEqual(a u32, b u32, n u32, depth usize) bool decreases(depth) {
 // unaryOpVal evaluates !x or -x.
 func unaryOpVal(op u8, x Val) (Val, bool) {
 	var z Val
-	match x {
-		Bool(b) if op == OpNot -> return vBool(!b), true
-		Int(hi, lo) if op == OpNeg -> {
+	match (op, x) {
+		(OpNot, Bool(b)) -> return vBool(!b), true
+		(OpNeg, Int(SignBit, 0) | IntOvf) -> return Val.IntOvf, true
+		(OpNeg, Int(hi, lo)) -> {
 			h, l := neg128(hi, lo)
-			return intResult(h, l, hi == SignBit && lo == 0), true
+			return vInt(h, l), true
 		}
-		IntOvf if op == OpNeg -> return x, true
 		_ -> {}
 	}
 	etf(formatTo(mbuf[:], "operator %s not defined on %v", unaryOpString(op), ValRef(x)))
 	return z, false
 }
 
-// isVariant reports whether v is an enum value of variant vi.
-func isVariant(v Val, vi u32) bool {
-	return match v { Enum(x, _, _) -> x == vi, _ -> false }
-}
-
 func isCodeVal(v Val) bool {
 	return v is CodeBasic(_) | CodeArray(..) | CodeSlice(_) | CodeStruct(..) | CodeUniv(_)
-}
-
-// fieldSlot returns the slot of field i of a struct value (0 if v is not a
-// struct).
-func fieldSlot(v Val, i u32) u32 {
-	return match v { Struct(ref, _) -> ref + i, _ -> 0 }
 }
 
 // ---------------------------------------------------------------------------

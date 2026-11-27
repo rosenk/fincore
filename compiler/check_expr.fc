@@ -164,7 +164,7 @@ func symOperand(sym u32, id u32, dp usize) Operand decreases(dp) {
 		x.sym = sym
 		return x
 	}
-	if k == SymBuiltin || k == SymPackage {
+	if k is SymBuiltin | SymPackage {
 		x := opMode(KBuiltin, TyInvalid)
 		if k == SymPackage {
 			x.mode = KPackage
@@ -193,7 +193,7 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 		errAtOp(E2011, e, formatTo(mbuf[:], "operator %s inspects a value of type parameter type (%v, %v)", binOpString(op), TypeRef(x.typ), TypeRef(y.typ)))
 		return invalidOp(e)
 	}
-	if op == OpShl || op == OpShr {
+	if op is OpShl | OpShr {
 		return shiftExpr(e, &x, &y)
 	}
 	if isCompareOp(op) {
@@ -206,7 +206,7 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 	if op == OpAdd && isString(t) {
 		return concatExpr(e, &x, &y)
 	}
-	if op == OpLAnd || op == OpLOr {
+	if op is OpLAnd | OpLOr {
 		if !isBoolean(t) {
 			errAtOp(E2002, e, formatTo(mbuf[:], "operator %s not defined on %v (type %v)", binOpString(op), Expr(na(e)), TypeRef(t)))
 			return invalidOp(e)
@@ -215,11 +215,9 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 		errAtOp(E2002, e, formatTo(mbuf[:], "operator %s not defined on %v (type %v)", binOpString(op), Expr(na(e)), TypeRef(t)))
 		return invalidOp(e)
 	}
-	if (op == OpDiv || op == OpRem) && y.mode == KConst {
-		if y.val == vIntU(0) {
-			errAt(E2002, nb(e), formatTo(mbuf[:], "division by zero"))
-			return invalidOp(e)
-		}
+	if op is OpDiv | OpRem && y.mode == KConst && y.val == vIntU(0) {
+		errAt(E2002, nb(e), formatTo(mbuf[:], "division by zero"))
+		return invalidOp(e)
 	}
 	if x.mode == KConst && y.mode == KConst {
 		v, ok := binaryOpVal(op, x.val, y.val)
@@ -276,7 +274,7 @@ func matchTypes(e u32, x *Operand, y *Operand) bool {
 		kx := basicKind(x.typ)
 		ky := basicKind(y.typ)
 		if kx != ky {
-			if (kx == BkUntypedInt || kx == BkUntypedChar) && (ky == BkUntypedInt || ky == BkUntypedChar) {
+			if kx is BkUntypedInt | BkUntypedChar && ky is BkUntypedInt | BkUntypedChar {
 				x.typ = TyUntypedChar
 				y.typ = TyUntypedChar
 				return true
@@ -350,7 +348,7 @@ func comparisonExpr(e u32, x *Operand, y *Operand) Operand {
 		if !ok {
 			return invalidOp(e)
 		}
-		if op != OpEq && op != OpNe {
+		if !(op is OpEq | OpNe) {
 			errAtOp(E2002, e, formatTo(mbuf[:], "operator %s not defined on nil", binOpString(op)))
 			return invalidOp(e)
 		}
@@ -360,7 +358,7 @@ func comparisonExpr(e u32, x *Operand, y *Operand) Operand {
 		return invalidOp(e)
 	}
 	t := x.typ
-	if op == OpEq || op == OpNe {
+	if op is OpEq | OpNe {
 		if !comparable(t, SemaDepth) {
 			errAtOp(E2002, e, formatTo(mbuf[:], "operator %s not defined on %v (type %v is not comparable)", binOpString(op), Expr(na(e)), TypeRef(t)))
 			return invalidOp(e)
@@ -614,8 +612,7 @@ func sliceExpr(e u32, dp usize) Operand decreases(dp) {
 				if !hb {
 					continue
 				}
-				n, ok := valUint64(b)
-				if ok && n > alen {
+				if b is Int(0, n) && n > alen {
 					errAt(E4003, e, formatTo(mbuf[:], "slice bound %d out of range for array of length %d", n, alen))
 					return invalidOp(e)
 				}
@@ -668,7 +665,7 @@ func selectorExpr(e u32, dp usize) Operand decreases(dp) {
 		return x
 	}
 	x := rawExpr(na(e), dp-1)
-	if x.mode == KNone || x.mode == KPackage {
+	if x.mode is KNone | KPackage {
 		return invalidOp(e)
 	}
 	name := idName(sel)
@@ -818,7 +815,7 @@ func structLit(e u32, dp usize) Operand decreases(dp) {
 // are all constant.
 func structValue(e u32, st u32) (Val, bool) {
 	z, ok := zeroVal(st, false)
-	if !ok {
+	if !ok || !(z is Struct(ref, _)) {
 		return z, false
 	}
 	n := l1len(e)
@@ -830,7 +827,7 @@ func structValue(e u32, st u32) (Val, bool) {
 			if vs == 0 {
 				return z, false
 			}
-			slotSet(fieldSlot(z, u32(idx)), slotGet(vs))
+			slotSet(ref+u32(idx), slotGet(vs))
 		}
 	}
 	return z, true
@@ -989,7 +986,7 @@ func call0(e u32, dp usize) Operand decreases(dp) {
 		opStack.top = mark
 		return callResultType(sig)
 	}
-	if m == KValue || m == KVar {
+	if m is KValue | KVar {
 		sig := underlying(fun.typ)
 		if !isSigT(sig) {
 			errAt(E2002, na(e), formatTo(mbuf[:], "cannot call non-function %v (type %v)", Expr(na(e)), TypeRef(fun.typ)))
@@ -1027,17 +1024,13 @@ func arguments(e u32, params []u32, variadic bool, c Ctx, dp usize) bool decreas
 		x := rawExpr(l1at(e, i), dp-1)
 		opPush(x)
 	}
-	if nargs == 1 && opStack.items[mark].mode == KValue {
-		t0 := opStack.items[mark].typ
-		if isTupleT(t0) {
-			first := opStack.items[mark]
-			opStack.top = mark
-			nt := tupleN(t0)
-			for i := usize(0); i < nt; i++ {
-				x := opMode(KValue, tupleAt(t0, i))
-				x.expr = first.expr
-				opPush(x)
-			}
+	if nargs == 1 && opStack.items[mark].mode == KValue && trec(opStack.items[mark].typ) is Tuple(ts, tn) {
+		first := opStack.items[mark]
+		opStack.top = mark
+		for i := usize(0); i < usize(tn); i++ {
+			x := opMode(KValue, tlist(ts, i))
+			x.expr = first.expr
+			opPush(x)
 		}
 	}
 	ok := true
@@ -1160,7 +1153,7 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 	}
 	b := meths.items[usize(m)].builtin
 	callTab.items[usize(ci)].effect = methodEffect(m)
-	if b == BMConnClose || b == BMListenerClose {
+	if b is BMConnClose | BMListenerClose {
 		callTab.items[usize(ci)].consumesRecv = true
 	}
 	ctxT := univNamed[BTContext]
@@ -1200,7 +1193,7 @@ func builtinMethodCall(e u32, m u32, ci u32, dp usize) Operand decreases(dp) {
 		callTab.items[usize(ci)].sig = sig
 		return opMode(KValue, sigResultType(sig))
 	}
-	if b == BMScopeReleaseSlot || b == BMScopeGo {
+	if b is BMScopeReleaseSlot | BMScopeGo {
 		want := usize(1)
 		if b == BMScopeGo {
 			want = 2
@@ -1320,7 +1313,7 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		return codeCtor(e, b, ci, dp-1)
 	}
 	bytesT := mkSlice(TyU8)
-	if b == BFLen || b == BFCap {
+	if b is BFLen | BFCap {
 		if !builtinNargs(e, b, 1, dp-1) {
 			return invalidOp(e)
 		}
@@ -1372,9 +1365,7 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 				return invalidOp(e)
 			}
 		}
-		du := underlying(d.typ)
-		su := underlying(s.typ)
-		if !isSliceT(du) || !isSliceT(su) || elemOf(du) != elemOf(su) {
+		if !(trec(underlying(d.typ)) is Slice(de)) || !(trec(underlying(s.typ)) is Slice(se)) || de != se {
 			errAt(E2002, e, formatTo(mbuf[:], "arguments to copy must be slices with identical element types (have %v and %v)", TypeRef(d.typ), TypeRef(s.typ)))
 			return invalidOp(e)
 		}
@@ -1461,7 +1452,7 @@ func codeArg(a u32, b u8, dp usize) (Operand, bool) decreases(dp) {
 	if isInvalidOp(&x) {
 		return x, false
 	}
-	if !isCodeT(x.typ) {
+	if !(trec(x.typ) is Code(_)) {
 		errAt(E2002, a, formatTo(mbuf[:], "cannot use %v (type %v) as Code argument to %s", Expr(a), TypeRef(x.typ), builtinName(b)))
 		return x, false
 	}
@@ -1476,7 +1467,7 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 	}
 	callTab.items[usize(ci)].effect = EffComptime
 	want := usize(0)
-	if b == BFCodeArray || b == BFCodeField {
+	if b is BFCodeArray | BFCodeField {
 		want = 2
 	} else if b is BFCodeSlice | BFCodeStruct | BFCodeUniv {
 		want = 1
@@ -1542,8 +1533,7 @@ func codeCtor(e u32, b u8, ci u32, dp usize) Operand decreases(dp) {
 			errAt(E2010, a0, formatTo(mbuf[:], "CodeUniv level %v must be a compile-time constant (its type Code (n+1) depends on it)", Expr(a0)))
 			return invalidOp(e)
 		}
-		lv, ok := valUint64(n.val)
-		if !ok || lv >= 1<<20 {
+		if !(n.val is Int(0, lv)) || lv >= 1<<20 {
 			errAt(E2010, a0, formatTo(mbuf[:], "invalid universe level %v", ValRef(n.val)))
 			return invalidOp(e)
 		}
@@ -1580,6 +1570,12 @@ func conversion(e u32, t u32, ci u32, dp usize) Operand decreases(dp) {
 				return invalidOp(e)
 			}
 			updateType(a0, t, SemaDepth)
+			if x.mode != KConst {
+				// An untyped non-constant operand (a match expression
+				// whose arms are untyped constants but whose scrutinee is
+				// not constant, a comparison) converts to a value.
+				return opMode(KValue, t)
+			}
 			return opConst(t, x.val)
 		}
 		if !convertUntyped(&x, t) {
@@ -1613,10 +1609,7 @@ func convertible(v u32, t u32) bool {
 	if isInteger(vu) && isInteger(tu) {
 		return true
 	}
-	return match (trec(vu), trec(tu)) {
-		(Pointer(ve), Pointer(te)) -> underlying(ve) == underlying(te)
-		_ -> false
-	}
+	return trec(vu) is Pointer(ve) && trec(tu) is Pointer(te) && underlying(ve) == underlying(te)
 }
 
 func variantCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
@@ -1658,19 +1651,18 @@ func funcInstance(e u32, x *Operand, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	sig := x.typ
-	if sigNTParams(sig) == 0 { // also for non-signatures
+	if !(trec(sig) is Sig(.., tpS, tpN)) || tpN == 0 {
 		errAt(E2002, e, formatTo(mbuf[:], "%v is not a generic function", Expr(na(e))))
 		return invalidOp(e)
 	}
 	ni := l1len(e)
-	ntp := sigNTParams(sig)
-	if ni != ntp {
-		errAt(E2003, e, formatTo(mbuf[:], "wrong number of type arguments for %v: have %d, want %d", Expr(na(e)), ni, ntp))
+	if ni != usize(tpN) {
+		errAt(E2003, e, formatTo(mbuf[:], "wrong number of type arguments for %v: have %d, want %d", Expr(na(e)), ni, tpN))
 		return invalidOp(e)
 	}
 	mark := tmark()
 	for i := usize(0); i < ni; i++ {
-		ta := typeArg(l1at(e, i), sigTParam(sig, i), dp-1)
+		ta := typeArg(l1at(e, i), tlist(tpS, i), dp-1)
 		if isInvalid(ta) {
 			tdiscard(mark)
 			return invalidOp(e)
@@ -1680,7 +1672,6 @@ func funcInstance(e u32, x *Operand, dp usize) Operand decreases(dp) {
 	as, an := tcommitStack(mark)
 	args := tlistSlice(as, an)
 	generic := mkSigLists(sigEffect(sig), sigVariadic(sig), sigParamsSlice(sig), sigResultsSlice(sig), emptyU32())
-	tpS, tpN := sigTParamList(sig)
 	inst := subst(generic, tpS, tpN, as, an, SemaDepth)
 	rec := findInstRec(x.sym, args)
 	if rec == 0 {

@@ -310,11 +310,10 @@ func scHasSlice(t u32, dp usize) bool decreases(dp) {
 				}
 			}
 		}
-		Tuple(..) -> {
-			n := tupleN(t)
-			for i := usize(0); i < n; i++ {
+		Tuple(ts, n) -> {
+			for i := usize(0); i < usize(n); i++ {
 				if !r {
-					r = scHasSlice(tupleAt(t, i), dp-1)
+					r = scHasSlice(tlist(ts, i), dp-1)
 				}
 			}
 		}
@@ -550,7 +549,7 @@ func scCallOrigin(e u32, dp usize) u64 decreases(dp) {
 			}
 		}
 		Value -> o = scOrigin(na(e), dp-1)
-		Builtin(b, ..) if b is BFStrBytes | BFBytesToStr | BFNewContext | BFNewScope | BFFormatTo -> return o // views of immutable strings / fresh runtime resources
+		Builtin(BFStrBytes | BFBytesToStr | BFNewContext | BFNewScope | BFFormatTo, ..) -> return o // views of immutable strings / fresh runtime resources
 		Invalid | Func(..) | Builtin(..) | Variant(..) -> {}
 	}
 	for i := usize(0); i < nargs; i++ {
@@ -614,8 +613,8 @@ func wDiscard(rhs u32, idx int, at u32) {
 		return
 	}
 	t := ntype[usize(rhs)]
-	if isTupleT(t) && idx >= 0 && usize(idx) < tupleN(t) {
-		t = tupleAt(t, usize(idx))
+	if trec(t) is Tuple(ts, tn) && idx >= 0 && idx < int(tn) {
+		t = tlist(ts, usize(idx))
 	}
 	if t != 0 && isLinear(t) {
 		scReport(E3004, at, formatTo(mbuf[:], "Linear value of type %v cannot be discarded with _", TypeRef(t)))
@@ -852,10 +851,8 @@ func wExpr(e u32, dp usize) decreases(dp) {
 			wExpr(nb(l1at(e, i)), dp-1)
 		}
 	} else if k == NkCallExpr {
-		if wCollect {
-			if callTab.items[usize(ncall[usize(e)])].kind is Method(_, _, r, true) | BuiltinMeth(_, r, true) {
-				wAddrOf(r) // implicit & of the receiver (v0.2)
-			}
+		if wCollect && callKind(e) is Method(_, _, r, true) | BuiltinMeth(_, r, true) {
+			wAddrOf(r) // implicit & of the receiver (v0.2)
 		}
 		wExpr(na(e), dp-1)
 		n := l1len(e)
@@ -900,7 +897,7 @@ func wPatternBindings(p u32, x u32, depth usize) decreases(depth) {
 		if !isBlank(p) {
 			wFlow(wDefine(p), x)
 		}
-	} else if k == NkCtorPattern || k == NkOrPattern {
+	} else if k is NkCtorPattern | NkOrPattern {
 		if k == NkCtorPattern && na(p) == 0 && !nflag(p) {
 			// v0.2: a bare name at the top level or in a tuple element
 			// (a binding, or a variant or constant without a definition).

@@ -218,7 +218,7 @@ func isPrintRune(r u32) bool {
 	if r < 0x7F {
 		return true
 	}
-	if r <= 0xA0 || r == 0xAD || r == 0x1680 || r == 0x180E || r == 0x3000 || r == 0xFEFF {
+	if r <= 0xA0 || r is 0xAD | 0x1680 | 0x180E | 0x3000 | 0xFEFF {
 		return false
 	}
 	if r >= 0x2000 && r <= 0x200F {
@@ -236,7 +236,7 @@ func isPrintRune(r u32) bool {
 	if r >= 0xFFF0 && r <= 0xFFFB {
 		return false
 	}
-	if r == 0xFFFE || r == 0xFFFF {
+	if r is 0xFFFE | 0xFFFF {
 		return false
 	}
 	if r >= 0xE0000 {

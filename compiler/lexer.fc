@@ -880,7 +880,7 @@ func (l *Lexer) escape(quote byte) Esc {
 		l.advance()
 		return Esc.Ok('\\')
 	}
-	if c == '"' || c == '\'' {
+	if c is '"' | '\'' {
 		if c != quote {
 			return Esc.Invalid(c)
 		}

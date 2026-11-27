@@ -82,7 +82,7 @@ func armOperand(a u32) Operand {
 
 func isUntypedNumeric(t u32) bool {
 	k := basicKind(t)
-	return k == BkUntypedInt || k == BkUntypedChar
+	return k is BkUntypedInt | BkUntypedChar
 }
 
 func mArmType(a u32, have u32, want u32) {
@@ -237,11 +237,6 @@ func payloadIndex(p u32, i usize, n usize) usize {
 	return i
 }
 
-// enumPaySlot returns the slot of payload j of an enum value.
-func enumPaySlot(v Val, j usize) u32 {
-	return match v { Enum(_, s, _) -> s + u32(j), _ -> 0 }
-}
-
 // matchVal reports whether the constant value v matches the checked
 // pattern p (finc0's types.MatchValue without bindings).
 func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
@@ -249,12 +244,12 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 		return false
 	}
 	k := nkind(p)
-	if k == NkWildcardPattern || k == NkRestPattern {
+	if k is NkWildcardPattern | NkRestPattern {
 		return true
 	}
 	if k == NkIdent {
 		if nvarEnum[usize(p)] != 0 {
-			return isVariant(v, nvarIdx[usize(p)])
+			return v is Enum(vi, ..) && vi == nvarIdx[usize(p)]
 		}
 		cs := patConst(p)
 		return cs == 0 || valsEqual(v, slotGet(cs))
@@ -264,7 +259,7 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 			cs := patConst(p)
 			return cs == 0 || valsEqual(v, slotGet(cs))
 		}
-		if !isVariant(v, nvarIdx[usize(p)]) {
+		if !(v is Enum(vi, ps, _)) || vi != nvarIdx[usize(p)] {
 			return false
 		}
 		np := variantPayN(nvarEnum[usize(p)], usize(nvarIdx[usize(p)]))
@@ -274,7 +269,7 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 			if nkind(a) == NkRestPattern {
 				continue
 			}
-			if !matchVal(a, slotGet(enumPaySlot(v, payloadIndex(p, i, np))), depth-1) {
+			if !matchVal(a, slotGet(ps+u32(payloadIndex(p, i, np))), depth-1) {
 				return false
 			}
 		}
@@ -293,19 +288,15 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 		}
 		return false
 	}
-	if k == NkTuplePattern {
-		c := l1len(p)
-		if v is Tuple(ref, tn) && usize(tn) == c {
-			for i := usize(0); i < c; i++ {
-				if !matchVal(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
-					return false
-				}
-			}
-			return true
-		}
+	if k != NkTuplePattern || !(v is Tuple(ref, tn)) || usize(tn) != l1len(p) {
 		return false
 	}
-	return false
+	for i := u32(0); i < tn; i++ {
+		if !matchVal(l1at(p, usize(i)), slotGet(ref+i), depth-1) {
+			return false
+		}
+	}
+	return true
 }
 
 // isExpr checks `X is Pattern` (v0.2). Bindings are declared by the
@@ -568,18 +559,18 @@ func pat(p u32, t u32, payload bool, dp usize) bool decreases(dp) {
 		return orPat(p, t, payload, dp-1)
 	}
 	if k == NkTuplePattern {
-		if !isTupleT(t) {
+		if !(trec(t) is Tuple(ts, tn)) {
 			errAt(E2002, p, formatTo(mbuf[:], "tuple pattern %v does not match type %v", PatRef(p), TypeRef(t)))
 			return false
 		}
 		c := l1len(p)
-		if tupleN(t) != c {
-			errAt(E2003, p, formatTo(mbuf[:], "tuple pattern has %d elements, scrutinee has %d", c, tupleN(t)))
+		if usize(tn) != c {
+			errAt(E2003, p, formatTo(mbuf[:], "tuple pattern has %d elements, scrutinee has %d", c, tn))
 			return false
 		}
 		valid := true
 		for i := usize(0); i < c; i++ {
-			if !pat(l1at(p, i), tupleAt(t, i), false, dp-1) {
+			if !pat(l1at(p, i), tlist(ts, i), false, dp-1) {
 				valid = false
 			}
 		}
@@ -690,20 +681,15 @@ func constPat(p u32, name u32, sym u32, t u32, parens bool, dp usize) bool decre
 	if !isEnumT(en) {
 		return true
 	}
-	vi := usize(0)
-	match x.val {
-		Enum(ix, _, _) -> vi = usize(ix)
-		_ -> return false
-	}
-	if vi >= nvariants(en) {
+	if !(x.val is Enum(vi, ..)) || usize(vi) >= nvariants(en) {
 		return false
 	}
-	if variantPayN(en, vi) != 0 {
-		errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot be a pattern: its variant %v has a payload (match the variant instead)", NameRef(symName(sym)), NameRef(variantName(en, vi))))
+	if variantPayN(en, usize(vi)) != 0 {
+		errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot be a pattern: its variant %v has a payload (match the variant instead)", NameRef(symName(sym)), NameRef(variantName(en, usize(vi)))))
 		return false
 	}
 	nvarEnum[usize(p)] = en
-	nvarIdx[usize(p)] = u32(vi)
+	nvarIdx[usize(p)] = vi
 	ntype[usize(p)] = t
 	return true
 }
@@ -1032,7 +1018,7 @@ func uHead(p u32, t u32) (u8, usize, u32) {
 		return HWild, 0, 0
 	}
 	k := nkind(p)
-	if k == NkIdent || k == NkCtorPattern {
+	if k is NkIdent | NkCtorPattern {
 		// A variant (or a constant of enum type), a constant, or a
 		// binding (a wildcard).
 		if nvarEnum[usize(p)] != 0 {
@@ -1481,12 +1467,13 @@ func checkCoverage(m u32, t u32, isExpr bool) bool {
 	uSeenTop = 0
 	wTop = 1 // cell 0 is the empty list
 	wRowTop = 0
-	isTuple := isTupleT(t)
+	isTuple := false
 	w := usize(1)
-	if isTuple {
-		w = tupleN(t)
+	if trec(t) is Tuple(ts, tn) {
+		isTuple = true
+		w = usize(tn)
 		for i := usize(0); i < w; i++ {
-			uColPush(tupleAt(t, i))
+			uColPush(tlist(ts, i))
 		}
 	} else {
 		uColPush(t)

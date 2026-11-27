@@ -1,0 +1,55 @@
+// pass_match_conversion: a match expression whose arms are untyped
+// constants but whose scrutinee is not constant is an untyped value, not a
+// constant. Converting it (`u32(match c { .. })`) gives a value of the
+// target type, usable in constant-mixed arithmetic (regression: finc0 and
+// finc1 reported "constant evaluation: operator + not defined on 5,
+// nil"). A constant scrutinee still folds the conversion.
+package main
+
+type Color enum {
+	Red
+	Green
+	Blue
+}
+
+const Folded = 5 + u32(match Color.Green { Green -> 1, _ -> 2 })
+
+func pick(c Color) u32 {
+	return 5 + u32(match c { Green -> 1, _ -> 2 })
+}
+
+func pick8(c Color) u8 {
+	return u8(match c { Red -> 200, Green -> 1, Blue -> 2 }) + 50
+}
+
+func ok(c Color) bool {
+	return true && bool(match c { Red -> true, _ -> false })
+}
+
+comptime func ct(c Color) u32 {
+	return 10 * u32(match c { Blue -> 3, _ -> 4 })
+}
+
+const CT = ct(Color.Blue)
+
+driver func line(io Stdio, label string, v u64) error {
+	var b [64]byte
+	n := formatTo(b[:], "%s: %d\n", label, v)
+	return io.WriteStdout(b[:n])
+}
+
+driver func main(io Stdio) error {
+	if err := line(io, "green", u64(pick(Color.Green))); err != nil {
+		return err
+	}
+	if err := line(io, "blue", u64(pick(Color.Blue))); err != nil {
+		return err
+	}
+	if err := line(io, "red8", u64(pick8(Color.Red))); err != nil {
+		return err
+	}
+	if err := line(io, "ok", u64(match ok(Color.Red) { true -> 1, false -> 0 })); err != nil {
+		return err
+	}
+	return line(io, "consts", u64(Folded)*100+u64(CT))
+}

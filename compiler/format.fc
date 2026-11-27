@@ -129,7 +129,7 @@ func fmtNext(s []byte, i usize) FmtDir {
 		d.err = FePercent
 		return d
 	}
-	if v != 'd' && v != 'x' && v != 's' && v != 'c' && v != 'q' && v != 'v' {
+	if !(v is 'd' | 'x' | 's' | 'c' | 'q' | 'v') {
 		d.err = FeUnknown
 		return d
 	}
@@ -137,7 +137,7 @@ func fmtNext(s []byte, i usize) FmtDir {
 		d.err = FeWidth
 		return d
 	}
-	if d.zero && v != 'd' && v != 'x' {
+	if d.zero && !(v is 'd' | 'x') {
 		d.err = FeZero
 		return d
 	}
@@ -227,7 +227,7 @@ func fmtIntOp(t u32, hex bool) u8 {
 
 // isByteSliceT: t's underlying type is []u8.
 func isByteSliceT(t u32) bool {
-	return trec(underlying(t)) == TypeRec.Slice(TyU8)
+	return trec(underlying(t)) is Slice(TyU8)
 }
 
 // formatMethodOK: m is a value-receiver, total `Format(dst []byte) usize`.
@@ -355,11 +355,11 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 		return FmtNone, 0
 	}
 	op := u8(FmtNone)
-	if v == 'd' || v == 'x' {
+	if v is 'd' | 'x' {
 		if isInteger(t) {
 			op = fmtIntOp(t, v == 'x')
 		}
-	} else if v == 's' || v == 'q' {
+	} else if v is 's' | 'q' {
 		if isString(t) {
 			op = FmtStr
 		} else if isByteSliceT(t) {
@@ -406,25 +406,15 @@ func formatArg(a u32, t u32, v byte, dp usize) (u8, u32) decreases(dp) {
 // cgFmtParamType is formatParamType: the Go parameter type (and
 // conversion) of a non-Format argument.
 func cgFmtParamType(op u8) string {
-	if op == FmtInt || op == FmtHexInt {
-		return "int64"
+	return match op {
+		FmtInt | FmtHexInt -> "int64"
+		FmtUint | FmtHexUint -> "uint64"
+		FmtStr | FmtQuoteStr -> "string"
+		FmtBytes | FmtQuoteBytes -> "[]byte"
+		FmtByte -> "byte"
+		FmtBool -> "bool"
+		_ -> "_"
 	}
-	if op == FmtUint || op == FmtHexUint {
-		return "uint64"
-	}
-	if op == FmtStr || op == FmtQuoteStr {
-		return "string"
-	}
-	if op == FmtBytes || op == FmtQuoteBytes {
-		return "[]byte"
-	}
-	if op == FmtByte {
-		return "byte"
-	}
-	if op == FmtBool {
-		return "bool"
-	}
-	return "_"
 }
 
 // cgWFmtLit writes strconv.Quote of a literal piece with `%%` unescaped.
@@ -546,7 +536,7 @@ func cgFormatTo(e u32, c u32, dp usize) decreases(dp) {
 		} else {
 			cgW(", ")
 			cgWFmtWidth(p)
-			if op == FmtInt || op == FmtUint || op == FmtHexInt || op == FmtHexUint {
+			if op is FmtInt | FmtUint | FmtHexInt | FmtHexUint {
 				if p.zero {
 					cgW(", true")
 				} else {
@@ -829,7 +819,7 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 			cfBytes(strOf(v), width)
 		} else if op == FmtQuoteStr {
 			cfQuote(strOf(v), width)
-		} else if op == FmtBytes || op == FmtQuoteBytes {
+		} else if op is FmtBytes | FmtQuoteBytes {
 			if !bytesOfSlice(v) {
 				break
 			}
@@ -843,7 +833,7 @@ func iformatTo(e u32, m usize, dp usize) Val decreases(dp) {
 			cfPut(byte(intLo(v)))
 			cfPadRight(1, width)
 		} else if op == FmtBool {
-			if v == Val.Bool(true) {
+			if v is Bool(true) {
 				cfBytes("true", width)
 			} else {
 				cfBytes("false", width)

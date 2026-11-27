@@ -470,10 +470,6 @@ func newOpaque(name u32, builtin u8) u32 {
 // ---------------------------------------------------------------------------
 // Type forms
 
-func isBasicT(t u32) bool {
-	return trec(t) is Basic(_)
-}
-
 func isNamedT(t u32) bool {
 	return trec(t) is Named(_)
 }
@@ -500,10 +496,6 @@ func isEnumT(t u32) bool {
 
 func isSigT(t u32) bool {
 	return trec(t) is Sig(..)
-}
-
-func isCodeT(t u32) bool {
-	return trec(t) is Code(_)
 }
 
 func isTypeParamT(t u32) bool {
@@ -562,7 +554,7 @@ func namedClass(t u32) (u8, bool) {
 }
 
 func isInvalid(t u32) bool {
-	return t == 0 || t == TyInvalid
+	return t is 0 | TyInvalid
 }
 
 func basicKind(t u32) u8 {
@@ -571,7 +563,7 @@ func basicKind(t u32) u8 {
 
 func isInteger(t u32) bool {
 	k := basicKind(t)
-	return (k >= BkU8 && k <= BkUsize) || k == BkUntypedInt || k == BkUntypedChar
+	return (k >= BkU8 && k <= BkUsize) || k is BkUntypedInt | BkUntypedChar
 }
 
 func isUnsigned(t u32) bool {
@@ -586,12 +578,12 @@ func isUntyped(t u32) bool {
 
 func isBoolean(t u32) bool {
 	k := basicKind(t)
-	return k == BkBool || k == BkUntypedBool
+	return k is BkBool | BkUntypedBool
 }
 
 func isString(t u32) bool {
 	k := basicKind(t)
-	return k == BkString || k == BkUntypedString
+	return k is BkString | BkUntypedString
 }
 
 // intInfo returns bit width and signedness of an integer type.
@@ -611,7 +603,7 @@ func intInfo(t u32) (u32, bool, bool) {
 }
 
 func isPolyCode(t u32) bool {
-	return trec(t) == TypeRec.Code(0)
+	return trec(t) is Code(0)
 }
 
 // defaultOf returns the default type of an untyped type (types.Default).
@@ -624,11 +616,6 @@ func defaultOf(t u32) u32 {
 		_ if isPolyCode(t) -> mkCode(0)
 		_ -> t
 	}
-}
-
-// elemOf returns the element type of an array, slice or pointer type.
-func elemOf(t u32) u32 {
-	return match trec(t) { Array(e, ..) | Slice(e) | Pointer(e) -> e, _ -> 0 }
 }
 
 // typeName returns the name of a named type, type parameter or opaque type.
@@ -710,15 +697,6 @@ func variantByName(en u32, name u32) (usize, bool) {
 	return 0, false
 }
 
-// Tuples.
-func tupleN(t u32) usize {
-	return match trec(t) { Tuple(_, n) -> usize(n), _ -> 0 }
-}
-
-func tupleAt(t u32, i usize) u32 {
-	return match trec(t) { Tuple(s, _) -> tlist(s, i), _ -> 0 }
-}
-
 // Signatures.
 func sigEffect(s u32) u8 {
 	return match trec(s) { Sig(eff, ..) -> eff, _ -> EffComptime }
@@ -752,20 +730,8 @@ func sigResultsSlice(s u32) []u32 {
 	return match trec(s) { Sig(_, _, _, _, rs, rn, ..) -> tlistSlice(rs, rn), _ -> emptyU32() }
 }
 
-// sigTParamList returns the type parameter list of a generic signature.
-func sigTParamList(s u32) (u32, u32) {
-	if trec(s) is Sig(.., ts, tn) {
-		return ts, tn
-	}
-	return 0, 0
-}
-
 func sigNTParams(s u32) usize {
 	return match trec(s) { Sig(.., tn) -> usize(tn), _ -> 0 }
-}
-
-func sigTParam(s u32, i usize) u32 {
-	return match trec(s) { Sig(.., ts, _) -> tlist(ts, i), _ -> 0 }
 }
 
 // sigResultType: 0 for no results, the result, or a Tuple.
@@ -949,7 +915,7 @@ func comparable(t u32, depth usize) bool decreases(depth) {
 	}
 	u := underlying(t)
 	match trec(u) {
-		Basic(b) -> return b != BkUntypedNil && b != BkInvalid
+		Basic(b) -> return !(b is BkUntypedNil | BkInvalid)
 		Pointer(_) | Code(_) -> return true
 		Array(e, ..) -> return comparable(e, depth-1)
 		Struct(..) -> {
@@ -1276,7 +1242,7 @@ func mkUnivNamed(b u8, under u32, class u8) u32 {
 // on the type stack [m1:m2] / [m2:top]).
 func addUnivMethod(recv u8, name string, id u8, variadic bool, eff u8, m1 usize, m2 usize) {
 	sig := u32(0)
-	if id != BMScopeAcquireSlot && id != BMScopeReleaseSlot && id != BMScopeGo {
+	if !(id is BMScopeAcquireSlot | BMScopeReleaseSlot | BMScopeGo) {
 		sig = mkSig(eff, variadic, m1, m2, tmark())
 	} else {
 		tdiscard(m1)
@@ -1586,19 +1552,16 @@ type Call struct {
 	sig          u32
 }
 
-// callBuiltin returns the builtin that the CallExpr e calls (BNone if it
-// calls something else or was not checked).
-func callBuiltin(e u32) u8 {
-	return match callTab.items[usize(ncall[usize(e)])].kind {
-		Builtin(b, ..) -> b
-		_ -> BNone
-	}
+// callKind returns the kind of the CallExpr e (Invalid if it was not
+// checked).
+func callKind(e u32) CallKind {
+	return callTab.items[usize(ncall[usize(e)])].kind
 }
 
 // scopeGoRecv returns the receiver s of the CallExpr e if it is the
 // capability call s.Go(slot, fn), else 0.
 func scopeGoRecv(e u32) u32 {
-	if callTab.items[usize(ncall[usize(e)])].kind is BuiltinMeth(m, r, _) && meths.items[usize(m)].builtin == BMScopeGo {
+	if callKind(e) is BuiltinMeth(m, r, _) && meths.items[usize(m)].builtin == BMScopeGo {
 		return r
 	}
 	return 0

@@ -614,7 +614,7 @@ func bindType(t u32, depth usize) decreases(depth) {
 	} else if k == NkArrayType {
 		bindExpr(na(t), depth-1)
 		bindType(nb(t), depth-1)
-	} else if k == NkSliceType || k == NkPointerType {
+	} else if k is NkSliceType | NkPointerType {
 		bindType(na(t), depth-1)
 	} else if k == NkStructType {
 		n := l1len(t)
@@ -632,7 +632,7 @@ func bindType(t u32, depth usize) decreases(depth) {
 		}
 	} else if k == NkFuncType {
 		bSignatureTypes(na(t), depth-1)
-	} else if k == NkCodeType || k == NkElType {
+	} else if k is NkCodeType | NkElType {
 		bindExpr(na(t), depth-1)
 	}
 }
@@ -733,7 +733,7 @@ func bindExpr(e u32, depth usize) decreases(depth) {
 	k := nkind(e)
 	if k == NkIdent {
 		_ = bLookup(e)
-	} else if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) || k == NkIsExpr {
+	} else if k == NkBinaryExpr && nop(e) is OpLAnd | OpLOr || k == NkIsExpr {
 		// v0.2: `is` bindings flow into the right operand of && / ||.
 		mark := bFlowTop
 		_, _ = bFlow(e, depth-1)
@@ -741,9 +741,9 @@ func bindExpr(e u32, depth usize) decreases(depth) {
 	} else if k == NkBinaryExpr {
 		bindExpr(na(e), depth-1)
 		bindExpr(nb(e), depth-1)
-	} else if k == NkUnaryExpr || k == NkParenExpr {
+	} else if k is NkUnaryExpr | NkParenExpr {
 		bindExpr(na(e), depth-1)
-	} else if k == NkCallExpr || k == NkIndexExpr {
+	} else if k is NkCallExpr | NkIndexExpr {
 		bindExpr(na(e), depth-1)
 		n := l1len(e)
 		for i := usize(0); i < n; i++ {
@@ -997,7 +997,7 @@ func bPatWalk(p u32, declare bool, depth usize) decreases(depth) {
 		for i := usize(0); i < n; i++ {
 			bPatWalk(l1at(p, i), declare, depth-1)
 		}
-	} else if k == NkOrPattern || k == NkTuplePattern {
+	} else if k is NkOrPattern | NkTuplePattern {
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
 			bPatWalk(l1at(p, i), declare, depth-1)
@@ -1160,7 +1160,7 @@ func bFlow(e u32, depth usize) (usize, usize) decreases(depth) {
 		}
 		return n, 0
 	}
-	if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) {
+	if k == NkBinaryExpr && nop(e) is OpLAnd | OpLOr {
 		and := nop(e) == OpLAnd
 		base := bFlowTop
 		ta, fa := bFlow(na(e), depth-1)

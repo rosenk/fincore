@@ -255,13 +255,7 @@ func assignOpString(op u8) string {
 }
 
 func litKindString(op u8) string {
-	if op == LitString {
-		return "string"
-	}
-	if op == LitChar {
-		return "char"
-	}
-	return "int"
+	return match op { LitString -> "string", LitChar -> "char", _ -> "int" }
 }
 
 // kindName returns the finc0 Go type name of a node kind.
@@ -533,7 +527,7 @@ func (d *Dumper) scalars(n Node) {
 	if k == NkFile {
 		o.WriteString(" Path=")
 		putQuoted(o, strBytes(d.sa.files[usize(n.file)].path))
-	} else if k == NkImportDecl || k == NkConstDecl {
+	} else if k is NkImportDecl | NkConstDecl {
 		d.flagScalar(n, Flag1, "Grouped")
 	} else if k == NkTypeDecl {
 		d.flagScalar(n, Flag1, "Alias")
@@ -549,9 +543,9 @@ func (d *Dumper) scalars(n Node) {
 		d.flagScalar(n, Flag1, "ResultParen")
 	} else if k == NkParam {
 		d.flagScalar(n, Flag1, "Variadic")
-	} else if k == NkVariant || k == NkCtorPattern {
+	} else if k is NkVariant | NkCtorPattern {
 		d.flagScalar(n, Flag1, "HasParens")
-	} else if k == NkFuncType || k == NkFuncLit {
+	} else if k is NkFuncType | NkFuncLit {
 		d.flagScalar(n, Flag1, "Driver")
 	} else if k == NkAssignStmt {
 		o.WriteString(" Op=")
@@ -722,7 +716,7 @@ func (pr *Printer) printNode(id u32, depth usize) decreases(depth) {
 			pr.printNode(pr.na.listItem(n.l2s, i), depth-1)
 			o.WriteString("\n")
 		}
-	} else if k == NkImportDecl || k == NkConstDecl {
+	} else if k is NkImportDecl | NkConstDecl {
 		if k == NkImportDecl {
 			o.WriteString("import ")
 		} else {
@@ -874,7 +868,7 @@ func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
 	} else if k == NkPointerType {
 		o.WriteString("*")
 		pr.printNode(n.a, depth-1)
-	} else if k == NkStructType || k == NkEnumType {
+	} else if k is NkStructType | NkEnumType {
 		if k == NkStructType {
 			o.WriteString("struct {")
 		} else {
@@ -982,7 +976,7 @@ func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
 		}
 	} else if k == NkOrPattern {
 		pr.printList(n.l1s, n.l1n, " | ", false, depth-1)
-	} else if k == NkTuplePattern || k == NkTupleExpr {
+	} else if k is NkTuplePattern | NkTupleExpr {
 		o.WriteString("(")
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
 		o.WriteString(")")
@@ -1067,7 +1061,7 @@ func (pr *Printer) printExpr(n Node, depth usize) decreases(depth) {
 	}
 	o := pr.out
 	k := n.kind
-	if k == NkIdent || k == NkBasicLit {
+	if k is NkIdent | NkBasicLit {
 		o.WriteBytes(pr.text(n))
 	} else if k == NkBoolLit {
 		if hasFlag(n, Flag1) {

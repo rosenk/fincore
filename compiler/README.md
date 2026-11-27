@@ -177,7 +177,9 @@ symbol but no `defs` entry.
 form (`NoType` for TypeID 0, `Basic`, `Sig`, `Named`, `Array`, `Slice`,
 `Pointer`, `Struct`, `Enum`, `Code`, `TypeParam`, `ConstArg`, `Tuple`,
 `Opaque`; 40 bytes). Kind switches are `match trec(t) { ... }`; single
-tests are `isNamedT`, `isArrayT`, ... A `Named(id)` refers to a mutable
+tests are `isNamedT`, `isArrayT`, ...; a test that needs a payload binds
+it with `is` (`trec(t) is Tuple(ts, n)`, then `tlist(ts, i)`;
+`!(trec(u) is Slice(e))` as a let-else). A `Named(id)` refers to a mutable
 `NamedRec` in `typs.named` (name, symbol, package, builtin, underlying
 type, origin and type args of instances, type params, method and class
 caches). Basic
@@ -189,7 +191,7 @@ type table (a `maps.Table`) compares records with `==` (instances by
 origin and type args). Named types (`newNamed`), type parameters and opaque resource
 types are unique records. Helpers: `underlying`, `basicKind`, `isInteger`,
 `isUnsigned`, `isUntyped`, `isBoolean`, `isString`, `intInfo`, `defaultOf`,
-`derefType`, `elemOf`, `nfields/fieldName/fieldType/fieldByName`,
+`derefType`, `nfields/fieldName/fieldType/fieldByName`,
 `nvariants/variantName/variantPay*/variantByName`, `sig*` (effect,
 variadic, params, results, type params, `sigResultType`), `namedOrigin`,
 `namedSym`, `builtinOf`, `isResource`, `isCapability`, `comparable`,
@@ -208,7 +210,7 @@ params, results, type args) live in `typs.lists`.
 | `ntype[node]` | `Info.TypeOf`: final type of expressions (untyped constants defaulted), Tuple types of multi-result calls, 0 for calls without results and builtin/package names; the type of type nodes; the instantiated signature for a method selector used as callee |
 | `nmode[node]` | `Info.KindOf` (`KValue`, `KVar`, `KConst`, `KType`, `KNoValue`, `KBuiltin`, `KFunc`, `KPackage`, `KVariantCtor`) |
 | `nval[node]` | `Info.ValueOf`: value slot of constants and folded comptime calls (`VTuple` for multi-result ones) |
-| `ncall[callExpr]` → `callTab.items[CallID]` | `Info.CallOf`: `kind`, a `CallKind` enum carrying the kind-specific fields: `Func(sym, taS, taN)` (callee, TypeArgs), `Method(sym, method, recv, autoAddr)` (`recv` is the receiver expression; `RecvType` is the type of `recv`, `*T` with `autoAddr`), `BuiltinMeth(method, recv, autoAddr)`, `Builtin(id, fmtOK, fmtS, fmtN)` (formatTo: `Format != nil` and its (op, method) pairs), `Conversion(t)`, `Variant(type, index)`, `Value`, `Invalid`; and the common fields `sig` (instantiated signature), `effect` (EffComptime < EffTotal < EffDriver), `folded` and the linearity hints `consumesRecv`, `consumesArg0` (`ConsumesArgs == [0]`). `callBuiltin(e)` and `scopeGoRecv(e)` are the shortcuts the passes use |
+| `ncall[callExpr]` → `callTab.items[CallID]` | `Info.CallOf`: `kind`, a `CallKind` enum carrying the kind-specific fields: `Func(sym, taS, taN)` (callee, TypeArgs), `Method(sym, method, recv, autoAddr)` (`recv` is the receiver expression; `RecvType` is the type of `recv`, `*T` with `autoAddr`), `BuiltinMeth(method, recv, autoAddr)`, `Builtin(id, fmtOK, fmtS, fmtN)` (formatTo: `Format != nil` and its (op, method) pairs), `Conversion(t)`, `Variant(type, index)`, `Value`, `Invalid`; and the common fields `sig` (instantiated signature), `effect` (EffComptime < EffTotal < EffDriver), `folded` and the linearity hints `consumesRecv`, `consumesArg0` (`ConsumesArgs == [0]`). `callKind(e)` (`callKind(e) is Builtin(BFPanic, ..)`) and `scopeGoRecv(e)` are the shortcuts the passes use |
 | `nsel[selectorExpr]` → `selTab.items` | `Info.SelectionOf`: `kind` (SelField/SelMethod/SelVariant), `recv` (type of x), `indirect`, `ctype`+`index` (field of a struct type / variant of an enum type), `method`; no entry for package-qualified names |
 | `ninst[node]` → `insts.items[InstID]` | `Info.InstanceOf` / `Info.InstanceList` (records in first-use order): `sym`, `named` (type instances), `argS/argN`, `sig` (function instances), `generic` |
 | `nvarEnum[ctorPattern]`, `nvarIdx` | `Info.VariantOf` |

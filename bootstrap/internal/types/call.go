@@ -544,6 +544,12 @@ func (c *Checker) conversion(e *ast.CallExpr, t Type, ci *Call) operand {
 				return invalidOp(e)
 			}
 			c.updateType(e.Args[0], t)
+			if x.mode != KindConst {
+				// An untyped non-constant operand (a match expression
+				// whose arms are untyped constants but whose scrutinee is
+				// not constant, a comparison) converts to a value.
+				return operand{mode: KindValue, typ: t}
+			}
 			return operand{mode: KindConst, typ: t, val: x.val}
 		}
 		if !c.convertUntyped(&x, t) {

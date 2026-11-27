@@ -156,3 +156,32 @@ func TestSumTypesMessages(t *testing.T) {
 		t.Fatalf("got %v", d)
 	}
 }
+
+// A match expression with untyped constant arms and a non-constant
+// scrutinee is an untyped value; converting it must not produce a constant
+// without a value (regression: "constant evaluation: operator + not
+// defined on 5, nil").
+func TestMatchExprConversion(t *testing.T) {
+	src := sumDecls + `
+const K = 5 + u32(match Col.Green { Green -> 1, _ -> 2 })
+
+func f(c Col) u32 {
+	return 5 + u32(match c { Green -> 1, _ -> 2 })
+}
+
+func g(c Col) u8 {
+	return u8(match c { Red -> 200, _ -> 2 }) + 50
+}
+
+func h(c Col) bool {
+	return true && bool(match c { Red -> true, _ -> false })
+}
+` + mainStub
+	info, d := checkSrc(t, src, 1000)
+	if len(d) > 0 {
+		t.Fatalf("unexpected diagnostics: %v", d)
+	}
+	if v := info.SymValue(findSym(t, info, "K")); v == nil || v.String() != "6" {
+		t.Errorf("K = %v, want 6", v)
+	}
+}

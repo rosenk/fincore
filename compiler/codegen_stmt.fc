@@ -83,7 +83,7 @@ func cgStmt(s u32, dp usize) decreases(dp) {
 				}
 			}
 		}
-	} else if k == NkShortVarDecl || k == NkAssignStmt || k == NkIncDecStmt || k == NkExprStmt {
+	} else if k is NkShortVarDecl | NkAssignStmt | NkIncDecStmt | NkExprStmt {
 		p := cgWmark()
 		cgSimple(s, dp-1)
 		if cgWmark() > p {

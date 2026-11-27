@@ -551,7 +551,7 @@ func cgMarkStmt(s u32, dp usize) decreases(dp) {
 		if nkind(d) == NkVarDecl && nc(d) != 0 {
 			cgWalkMarkExpr(nc(d), dp-1)
 		}
-	} else if k == NkExprStmt || k == NkDeferStmt {
+	} else if k is NkExprStmt | NkDeferStmt {
 		cgWalkMarkExpr(na(s), dp-1)
 	} else if k == NkReturnStmt {
 		nr := l1len(s)
@@ -668,7 +668,7 @@ func cgIsPanicCall(e u32) bool {
 	if x == 0 || nkind(x) != NkCallExpr {
 		return false
 	}
-	return callBuiltin(x) == BFPanic
+	return callKind(x) is Builtin(BFPanic, ..)
 }
 
 func cgIsTerm(s u32, dp usize) bool decreases(dp) {
@@ -1402,9 +1402,8 @@ func cgBuiltinNamed(n u32, t u32, dp usize) decreases(dp) {
 		cgWc('[')
 		cgGoType(n, namedArg(t, 0), dp-1)
 		cgWc(']')
-	} else if b == BTDuration || b == BTSignal || b == BTExitStatus || b == BTNet || b == BTSignals ||
-		b == BTClock || b == BTListener || b == BTConn || b == BTContext || b == BTCancelFunc ||
-		b == BTFS || b == BTEnv || b == BTStdio || b == BTExec {
+	} else if b is BTDuration | BTSignal | BTExitStatus | BTNet | BTSignals | BTClock | BTListener | BTConn |
+		BTContext | BTCancelFunc | BTFS | BTEnv | BTStdio | BTExec {
 		cgRt(builtinName(b))
 	} else {
 		cgFail(n, "type cannot be used at run time")
@@ -1440,11 +1439,7 @@ func cgTypeParamList(tpS u32, tpN usize, withAny bool) {
 // Values (codegen/golang values.go)
 
 func cgIsUntypedOrInt(t u32) bool {
-	if !isBasicT(t) {
-		return false
-	}
-	k := basicKind(t)
-	return k == BkInt || k == BkUntypedInt
+	return trec(t) is Basic(BkInt | BkUntypedInt)
 }
 
 // isZeroVal reports whether v is the zero value of its type.
@@ -1587,8 +1582,7 @@ func cgValue(n u32, v Val, t u32, dp usize) decreases(dp) {
 			cgLayRelease(lay)
 		}
 		Array(ref, ne) -> {
-			at := underlying(t)
-			if t == 0 || !isArrayT(at) {
+			if t == 0 || !(trec(underlying(t)) is Array(et, ..)) {
 				cgFail(n, "array value of non-array type")
 				return
 			}
@@ -1604,7 +1598,7 @@ func cgValue(n u32, v Val, t u32, dp usize) decreases(dp) {
 					first = false
 					cgWu(u64(i))
 					cgW(": ")
-					cgValue(n, el, elemOf(at), dp-1)
+					cgValue(n, el, et, dp-1)
 				}
 			}
 			cgWc('}')
@@ -1613,8 +1607,7 @@ func cgValue(n u32, v Val, t u32, dp usize) decreases(dp) {
 			cgWrotate(p, q)
 		}
 		Slice(ref, lo, hi, _) -> {
-			sl := underlying(t)
-			if t == 0 || !isSliceT(sl) {
+			if t == 0 || !(trec(underlying(t)) is Slice(et)) {
 				cgFail(n, "slice value of non-slice type")
 				return
 			}
@@ -1624,7 +1617,7 @@ func cgValue(n u32, v Val, t u32, dp usize) decreases(dp) {
 				if i > lo {
 					cgW(", ")
 				}
-				cgValue(n, slotGet(ref+i), elemOf(sl), dp-1)
+				cgValue(n, slotGet(ref+i), et, dp-1)
 			}
 			cgWc('}')
 			q := cgWmark()
@@ -1661,7 +1654,7 @@ func cgConstNameOK(s u32) bool {
 	if isNamedT(t) && (namedOrigin(t) != 0 || namedNTParams(t) > 0) {
 		return false
 	}
-	return isBasicT(underlying(t))
+	return trec(underlying(t)) is Basic(_)
 }
 
 // wConstName writes gen.constName(sym) (constNameOK must hold).

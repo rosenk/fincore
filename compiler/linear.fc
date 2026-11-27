@@ -489,7 +489,7 @@ func lnRootIdent(e0 u32) u32 {
 			return e
 		}
 		k := nkind(e)
-		if k != NkSelectorExpr && k != NkIndexExpr {
+		if !(k is NkSelectorExpr | NkIndexExpr) {
 			return e
 		}
 		e = unparen(na(e))
@@ -511,7 +511,7 @@ func lnIsPanic(x u32) bool {
 	if call == 0 || nkind(call) != NkCallExpr {
 		return false
 	}
-	return callBuiltin(call) == BFPanic
+	return callKind(call) is Builtin(BFPanic, ..)
 }
 
 // ---------------------------------------------------------------------------
@@ -781,7 +781,7 @@ func lnStmt(fl u32, s u32, e u32, dp usize) u32 decreases(dp) {
 		lnFlows[usize(fl)].exits = lnJoin(lnFlows[usize(fl)].exits, e)
 		return lnDeadEnv(lnWidth(e))
 	}
-	if k == NkBreakStmt || k == NkContinueStmt {
+	if k is NkBreakStmt | NkContinueStmt {
 		if lnNLoops <= lnFlows[usize(fl)].loopBase {
 			return lnDeadEnv(lnWidth(e))
 		}
@@ -918,7 +918,7 @@ func lnLoop(fl u32, s u32, e0 u32, dp usize) u32 decreases(dp) {
 // lnNilTest recognizes `x != nil` (nonNil) and `x == nil`.
 func lnNilTest(cond u32) (u32, bool, bool) {
 	b := unparen(cond)
-	if b == 0 || nkind(b) != NkBinaryExpr || nop(b) != OpNe && nop(b) != OpEq {
+	if b == 0 || nkind(b) != NkBinaryExpr || !(nop(b) is OpNe | OpEq) {
 		return 0, false, false
 	}
 	x := unparen(na(b))
@@ -1027,8 +1027,7 @@ func lnAssign(fl u32, e u32, lS usize, lN usize, rS usize, rN usize, dp usize) d
 	// Error variable of a (Linear..., error) call result.
 	errSym := u32(0)
 	if rN == 1 && lN > 1 {
-		t := ntype[usize(lnTmp[rS])]
-		if isTupleT(t) && tupleN(t) == lN && tupleAt(t, lN-1) == TyError {
+		if trec(ntype[usize(lnTmp[rS])]) is Tuple(ts, tn) && usize(tn) == lN && tlist(ts, lN-1) == TyError {
 			last := lnTmp[lS+lN-1]
 			if nkind(last) == NkIdent {
 				errSym = scVarSym(last)
@@ -1086,7 +1085,7 @@ func lnExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
 		if i != LnNoVar {
 			lnUse(fl, e, i, x)
 		}
-	} else if k == NkParenExpr || k == NkUnaryExpr {
+	} else if k is NkParenExpr | NkUnaryExpr {
 		lnExpr(fl, na(x), e, dp-1)
 	} else if k == NkBinaryExpr {
 		lnExpr(fl, na(x), e, dp-1)

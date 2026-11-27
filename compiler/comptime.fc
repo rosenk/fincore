@@ -790,12 +790,12 @@ func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
 		return false
 	}
 	k := nkind(p)
-	if k == NkWildcardPattern || k == NkRestPattern {
+	if k is NkWildcardPattern | NkRestPattern {
 		return true
 	}
 	if k == NkIdent {
 		if nvarEnum[usize(p)] != 0 {
-			return isVariant(x, nvarIdx[usize(p)])
+			return x is Enum(vi, ..) && vi == nvarIdx[usize(p)]
 		}
 		cs := patConst(p)
 		if cs != 0 {
@@ -818,7 +818,7 @@ func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
 			}
 			return true
 		}
-		if !isVariant(x, nvarIdx[usize(p)]) {
+		if !(x is Enum(vi, ps, _)) || vi != nvarIdx[usize(p)] {
 			return false
 		}
 		if bsym != 0 {
@@ -831,7 +831,7 @@ func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
 			if nkind(a) == NkRestPattern {
 				continue
 			}
-			if !imatchPat(a, slotGet(enumPaySlot(x, payloadIndex(p, i, np))), depth-1) {
+			if !imatchPat(a, slotGet(ps+u32(payloadIndex(p, i, np))), depth-1) {
 				return false
 			}
 		}
@@ -850,19 +850,15 @@ func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
 		}
 		return false
 	}
-	if k == NkTuplePattern {
-		c := l1len(p)
-		if x is Tuple(ref, tn) && usize(tn) == c {
-			for i := usize(0); i < c; i++ {
-				if !imatchPat(l1at(p, i), slotGet(ref+u32(i)), depth-1) {
-					return false
-				}
-			}
-			return true
-		}
+	if k != NkTuplePattern || !(x is Tuple(ref, tn)) || usize(tn) != l1len(p) {
 		return false
 	}
-	return false
+	for i := u32(0); i < tn; i++ {
+		if !imatchPat(l1at(p, usize(i)), slotGet(ref+i), depth-1) {
+			return false
+		}
+	}
+	return true
 }
 
 func izero(t u32) Val {
@@ -913,9 +909,7 @@ func intArg(e u32, dp usize) usize decreases(dp) {
 	if ifail {
 		return 0
 	}
-	hi, lo, ok := intParts(v)
-	fits := ok && ((hi == 0 && lo < SignBit) || (hi == AllOnes && lo >= SignBit))
-	if !fits {
+	if !(v is Int(hi, lo)) || !((hi == 0 && lo < SignBit) || (hi == AllOnes && lo >= SignBit)) {
 		failS(E4003, "invalid index")
 		return 0
 	}
@@ -996,7 +990,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 	}
 	if k == NkBinaryExpr {
 		op := nop(e)
-		if op == OpLAnd || op == OpLOr {
+		if op is OpLAnd | OpLOr {
 			a := icond(na(e), dp-1)
 			if ifail {
 				return z
@@ -1135,7 +1129,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		if ifail {
 			return z
 		}
-		if !(sv is Struct(..)) {
+		if !(sv is Struct(ref, _)) {
 			failS(E2002, "invalid struct literal")
 			return z
 		}
@@ -1149,7 +1143,7 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 				if ifail {
 					return z
 				}
-				slotSet(fieldSlot(sv, u32(idx)), copyV(v))
+				slotSet(ref+u32(idx), copyV(v))
 			}
 		}
 		return sv
@@ -1563,7 +1557,7 @@ func ibuiltin(e u32, b u8, dp usize) Val decreases(dp) {
 
 func ibuiltin0(b u8, m usize) Val {
 	var z Val
-	if b == BFLen || b == BFCap {
+	if b is BFLen | BFCap {
 		x := vstack[m]
 		if x is Ptr(_) {
 			r := iderefSlot(x)
@@ -1572,11 +1566,11 @@ func ibuiltin0(b u8, m usize) Val {
 			}
 			x = slotGet(r)
 		}
-		match x {
-			Str(_, n) | Array(_, n) -> return vIntU(u64(n))
-			Slice(_, lo, _, alen) if b == BFCap -> return vIntU(alen - u64(lo))
-			Slice(_, lo, hi, _) -> return vIntU(u64(hi - lo))
-			NilSlice -> return vIntU(0)
+		match (b, x) {
+			(_, Str(_, n) | Array(_, n)) -> return vIntU(u64(n))
+			(BFCap, Slice(_, lo, _, alen)) -> return vIntU(alen - u64(lo))
+			(_, Slice(_, lo, hi, _)) -> return vIntU(u64(hi - lo))
+			(_, NilSlice) -> return vIntU(0)
 			_ -> {}
 		}
 	} else if b == BFCopy {
@@ -1624,9 +1618,7 @@ func ibuiltin0(b u8, m usize) Val {
 		}
 		return vStr(tmpBuf.Bytes())
 	} else if b == BFFormatUint {
-		v := vstack[m]
-		vh, vl, _ := intParts(v)
-		_, u := abs128(vh, vl)
+		u := intLo(vstack[m]) // a u64
 		var db [24]byte
 		nd, _ := formatUint(u, db[:])
 		d := vstack[m+1]
