@@ -407,14 +407,19 @@ func assignment(x *Operand, t u32, c Ctx) bool {
 	return false
 }
 
-// assignable reports whether a value of type v may be assigned to t.
+// assignable reports whether a value of type v may be assigned to t: v and
+// t are identical, or they have identical underlying types and at least
+// one of them is not named (decision 126). As in Go, the predeclared basic
+// types count as named (hasTypeName). error is an interface in Go, so
+// values of error types (`type E error`) stay mutually assignable.
 func assignable(v u32, t u32) bool {
 	if v == t {
 		return true
 	}
-	vn := isNamedT(v)
-	tn := isNamedT(t)
-	if !vn || !tn {
+	if basicKind(v) == BkError && basicKind(t) == BkError {
+		return true
+	}
+	if !hasTypeName(v) || !hasTypeName(t) {
 		vu := underlying(v)
 		tu := underlying(t)
 		if vu == tu && !(trec(vu) is TypeParam(..) | Opaque(..)) {
@@ -426,6 +431,12 @@ func assignable(v u32, t u32) bool {
 		}
 	}
 	return false
+}
+
+// hasTypeName reports whether t is a named type in the sense of Go's
+// assignability rule: a Named type or a typed predeclared basic type.
+func hasTypeName(t u32) bool {
+	return match trec(t) { Named(_) -> true, Basic(_) -> !isUntyped(t), _ -> false }
 }
 
 // convertUntyped converts an untyped operand to type t.

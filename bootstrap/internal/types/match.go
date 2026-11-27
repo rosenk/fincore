@@ -405,8 +405,13 @@ func (c *Checker) topPattern(p ast.Pattern, t Type) bool {
 	ok := c.pat(p, t, false, &bs)
 	bs = c.uniqBindings(bs)
 	for _, b := range bs {
-		if c.info.SymType(b.sym) == nil {
+		if t := c.info.SymType(b.sym); t == nil {
 			c.setSymType(b.sym, b.typ)
+		} else if b.id != b.sym.Ident && !IsInvalid(t) && !IsInvalid(b.typ) && !Identical(b.typ, t) {
+			// v0.2: an `is` binding intersected with an earlier one of
+			// the same name (one symbol, see resolve.intersect).
+			c.errorf(diag.E2002, b.id.Range, "variable %s has type %s here but %s in the first is test that binds it", b.id.Name, b.typ, t)
+			ok = false
 		}
 	}
 	c.invalidBindings(p)

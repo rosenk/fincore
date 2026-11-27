@@ -28,8 +28,11 @@ func (c *Checker) stmtList(list []ast.Stmt) {
 // outcome appends the variables bound by the `is` tests of e that are
 // definitely matched when e evaluates to want (v0.2 flow bindings; the
 // resolver's outcome sets): `!` swaps the outcomes, `A && B` has the true
-// bindings of both operands, `A || B` the false bindings of both,
-// parentheses are transparent and every other expression has none.
+// bindings of both operands and the false bindings bound by both
+// (intersection), `A || B` the false bindings of both and the true
+// bindings bound by both, parentheses are transparent and every other
+// expression has none. Every binding of a pattern counts: payload names,
+// top-level and tuple-element names and `@` names.
 func (c *Checker) outcome(e ast.Expr, want bool, out *[]*resolve.Symbol) {
 	switch e := e.(type) {
 	case *ast.ParenExpr:
@@ -43,27 +46,42 @@ func (c *Checker) outcome(e ast.Expr, want bool, out *[]*resolve.Symbol) {
 			return
 		}
 		walkPattern(e.Pattern, func(q ast.Pattern) {
-			id, ok := q.(*ast.Ident)
-			if !ok {
-				return
+			if sym, _ := c.info.PatBinding(q); sym != nil {
+				addSym(out, sym)
 			}
-			sym := c.prog.Defs[id.ID()]
-			if sym == nil {
-				return
-			}
-			for _, o := range *out {
-				if o == sym {
-					return
-				}
-			}
-			*out = append(*out, sym)
 		})
 	case *ast.BinaryExpr:
-		if (e.Op == ast.OpLAnd && want) || (e.Op == ast.OpLOr && !want) {
+		if e.Op != ast.OpLAnd && e.Op != ast.OpLOr {
+			return
+		}
+		if (e.Op == ast.OpLAnd) == want {
 			c.outcome(e.X, want, out)
 			c.outcome(e.Y, want, out)
+			return
+		}
+		// Intersection (merged symbols are one symbol).
+		var xs, ys []*resolve.Symbol
+		c.outcome(e.X, want, &xs)
+		c.outcome(e.Y, want, &ys)
+		for _, s := range xs {
+			for _, o := range ys {
+				if o == s {
+					addSym(out, s)
+					break
+				}
+			}
 		}
 	}
+}
+
+// addSym appends sym to out unless it is already there.
+func addSym(out *[]*resolve.Symbol, sym *resolve.Symbol) {
+	for _, o := range *out {
+		if o == sym {
+			return
+		}
+	}
+	*out = append(*out, sym)
 }
 
 func (c *Checker) stmt(s ast.Stmt) {

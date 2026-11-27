@@ -1,0 +1,20 @@
+// fail_is_flow_intersect_type (v0.2): the bindings of one name that are
+// intersected (here on the true side of ||) must have identical types.
+package main
+
+type Val enum {
+	Int(u32)
+	Bool(bool)
+}
+
+func f(a Val, b Val) u32 {
+	if a is Int(x) || b is Bool(x) { // ERROR E2002
+		return 1
+	}
+	return 0
+}
+
+driver func main(io Stdio) error {
+	_ = f(Val.Int(1), Val.Bool(true))
+	return nil
+}

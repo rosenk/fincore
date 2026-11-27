@@ -487,8 +487,14 @@ func topPattern(p u32, t u32, dp usize) bool decreases(dp) {
 	uniqBindings(mark)
 	top := pbN
 	for i := mark; i < top; i++ {
-		if syms.items[usize(pbSym[i])].typ == 0 {
+		st := syms.items[usize(pbSym[i])].typ
+		if st == 0 {
 			setSymType(pbSym[i], pbTyp[i])
+		} else if pbId[i] != syms.items[usize(pbSym[i])].ident && !isInvalid(st) && !isInvalid(pbTyp[i]) && pbTyp[i] != st {
+			// v0.2: an `is` binding intersected with an earlier one of
+			// the same name (one symbol, see bFlowIntersect).
+			errAt(E2002, pbId[i], formatTo(mbuf[:], "variable %v has type %v here but %v in the first is test that binds it", NameRef(idName(pbId[i])), TypeRef(pbTyp[i]), TypeRef(st)))
+			ok = false
 		}
 	}
 	pbN = mark

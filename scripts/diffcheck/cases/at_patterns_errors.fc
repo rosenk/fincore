@@ -111,6 +111,16 @@ func letElse(o Option[u32]) u32 {
 	return k + intOf(w)
 }
 
+func intersected(o Option[u32], n u32) u32 {
+	if o is w @ Some(_) || n is w @ 3 {
+		return 1
+	}
+	if o is v @ Some(k) || o is v @ None {
+		return intOf(v)
+	}
+	return 0
+}
+
 func intOf(o Option[u32]) u32 {
 	return 0
 }

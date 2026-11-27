@@ -32,45 +32,99 @@ func stmtList(bl u32, dp usize) decreases(dp) {
 var chkUnbound [MaxSyms]bool
 
 // markUnbound marks the variables bound by the `is` tests of e that are
-// definitely matched when e evaluates to want (finc0's Checker.outcome:
-// `!` swaps the outcomes, `A && B` has the true bindings of both
-// operands, `A || B` the false bindings of both, parentheses are
-// transparent and every other expression has none).
+// definitely matched when e evaluates to want (finc0's Checker.outcome).
 func markUnbound(e u32, want bool, dp usize) decreases(dp) {
+	m := ocTop
+	outcomeSyms(e, want, dp)
+	top := ocTop
+	for i := m; i < top; i++ {
+		chkUnbound[usize(ocSyms[i])] = true
+	}
+	ocTop = m
+}
+
+// ocSyms is a LIFO stack of outcome-set symbols (duplicates allowed).
+const MaxOutcomeSyms = 65536
+
+var ocSyms [MaxOutcomeSyms]u32
+var ocTop usize
+
+func ocPush(sym u32) {
+	if ocTop >= MaxOutcomeSyms {
+		setFull("outcome sets")
+		return
+	}
+	ocSyms[ocTop] = sym
+	ocTop++
+}
+
+// outcomeSyms pushes the outcome set of e for want: `!` swaps the
+// outcomes, `A && B` has the true bindings of both operands and the false
+// bindings bound by both (intersection), `A || B` the false bindings of
+// both and the true bindings bound by both, parentheses are transparent
+// and every other expression has none.
+func outcomeSyms(e u32, want bool, dp usize) decreases(dp) {
 	if dp == 0 || e == 0 {
 		return
 	}
 	k := nkind(e)
 	if k == NkParenExpr {
-		markUnbound(na(e), want, dp-1)
+		outcomeSyms(na(e), want, dp-1)
 	} else if k == NkUnaryExpr && nop(e) == OpNot {
-		markUnbound(na(e), !want, dp-1)
+		outcomeSyms(na(e), !want, dp-1)
 	} else if k == NkIsExpr {
 		if want {
-			markPatUnbound(nb(e), dp-1)
+			patOutcomeSyms(nb(e), dp-1)
 		}
-	} else if k == NkBinaryExpr && (nop(e) == OpLAnd && want || nop(e) == OpLOr && !want) {
-		markUnbound(na(e), want, dp-1)
-		markUnbound(nb(e), want, dp-1)
+	} else if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) {
+		if (nop(e) == OpLAnd) == want {
+			outcomeSyms(na(e), want, dp-1)
+			outcomeSyms(nb(e), want, dp-1)
+			return
+		}
+		// Intersection (merged symbols are one symbol).
+		m := ocTop
+		outcomeSyms(na(e), want, dp-1)
+		mid := ocTop
+		outcomeSyms(nb(e), want, dp-1)
+		top := ocTop
+		w := m
+		for i := m; i < mid; i++ {
+			s := ocSyms[i]
+			found := false
+			for j := mid; j < top; j++ {
+				if ocSyms[j] == s {
+					found = true
+					break
+				}
+			}
+			if found {
+				ocSyms[w] = s
+				w++
+			}
+		}
+		ocTop = w
 	}
 }
 
-func markPatUnbound(p u32, dp usize) decreases(dp) {
+// patOutcomeSyms pushes every binding of pattern p: payload names,
+// top-level and tuple-element names and `@` names.
+func patOutcomeSyms(p u32, dp usize) decreases(dp) {
 	if dp == 0 || p == 0 {
 		return
 	}
+	bs := patBindSym(p)
+	if bs != 0 {
+		ocPush(bs)
+	}
 	k := nkind(p)
-	if k == NkIdent {
-		if sym := defs[usize(p)]; sym != 0 {
-			chkUnbound[usize(sym)] = true
-		}
-	} else if k == NkAtPattern {
-		markPatUnbound(na(p), dp-1)
-		markPatUnbound(nb(p), dp-1)
+	if k == NkAtPattern {
+		patOutcomeSyms(na(p), dp-1)
+		patOutcomeSyms(nb(p), dp-1)
 	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
-			markPatUnbound(l1at(p, i), dp-1)
+			patOutcomeSyms(l1at(p, i), dp-1)
 		}
 	}
 }

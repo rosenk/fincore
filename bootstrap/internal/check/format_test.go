@@ -239,7 +239,8 @@ const F Fmt = "%d"
 driver func main(io Stdio) error {
 	var b [8]byte
 	_ = formatTo(b[:], 42) // ERROR E2002
-	_ = formatTo(b[:], F, 1)
+	_ = formatTo(b[:], F, 1) // ERROR E2002
+	_ = formatTo(b[:], string(F), 1)
 	_ = formatTo(b[:], strBytes("x")) // ERROR E2002
 	return nil
 }

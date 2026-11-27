@@ -32,6 +32,7 @@ func Resolve(p *Program) diag.List {
 	for _, pkg := range p.Packages {
 		b.bindPackage(pkg)
 	}
+	b.applyMerges()
 	b.diags.Sort()
 	return b.diags
 }
@@ -85,6 +86,10 @@ type binder struct {
 	// the program (v0.2 patterns: such a bare pattern name is declared
 	// hidden, see patternNames).
 	variantNames map[string]bool
+	// merged maps an `is` binding to the binding of the same name it was
+	// intersected with (v0.2 flow intersections, see intersect); the
+	// symbols are unified by applyMerges.
+	merged map[*Symbol]*Symbol
 }
 
 func (b *binder) errorf(code diag.Code, sp diag.SourceSpan, format string, args ...any) {
@@ -750,14 +755,18 @@ func (b *binder) ifStmt(s *ast.IfStmt, inList bool) {
 //
 //	e is P      t = bindings of P, f = {}
 //	!A          t = f(A), f = t(A)
-//	A && B      t = t(A) + t(B), f = {}; t(A) is visible in B
-//	A || B      t = {}, f = f(A) + f(B); f(A) is visible in B
+//	A && B      t = t(A) + t(B), f = f(A) * (t(A) + f(B)); t(A) is visible in B
+//	A || B      t = t(A) * (f(A) + t(B)), f = f(A) + f(B); f(A) is visible in B
 //	(A)         those of A
 //	otherwise   {}, {}
 //
-// The symbols of an `is` pattern are created in a scope of their own and
-// become visible only where flow makes them visible. A name in both
-// operand sets of a union is E2001.
+// where + is a union and * an intersection by name. The symbols of an
+// `is` pattern are created in a scope of their own and become visible
+// only where flow makes them visible. A name in both operand sets of a
+// union is E2001. The true and false set of an expression never share a
+// name (by induction over the rules), so f(A) * (t(A) + f(B)) = f(A) *
+// f(B) and t(A) * (f(A) + t(B)) = t(A) * t(B), which is what flow
+// computes (intersect).
 func (b *binder) flow(e ast.Expr) (t, f []*Symbol) {
 	switch e := e.(type) {
 	case *ast.ParenExpr:
@@ -786,9 +795,9 @@ func (b *binder) flow(e ast.Expr) (t, f []*Symbol) {
 			tb, fb := b.flow(e.Y)
 			closeV()
 			if e.Op == ast.OpLAnd {
-				return b.union(ta, tb), nil
+				return b.union(ta, tb), b.intersect(fa, fb)
 			}
-			return nil, b.union(fa, fb)
+			return b.intersect(ta, tb), b.union(fa, fb)
 		}
 	}
 	b.bindExpr(e)
@@ -831,4 +840,74 @@ func (b *binder) union(x, y []*Symbol) []*Symbol {
 		out = append(out, sym)
 	}
 	return out
+}
+
+// intersect returns the symbols of x whose name is also bound in y, in
+// the order of x (v0.2 flow intersections: a name is bound in an outcome
+// if it is bound on every path to it). The binding of y is merged into
+// the one of x: both name one variable, which either `is` test assigns.
+// The type checker requires identical types.
+func (b *binder) intersect(x, y []*Symbol) []*Symbol {
+	var out []*Symbol
+	for _, sym := range x {
+		for _, o := range y {
+			if o.Name == sym.Name {
+				if b.merged == nil {
+					b.merged = map[*Symbol]*Symbol{}
+				}
+				b.merged[o] = sym
+				out = append(out, sym)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// mergedRoot returns the symbol sym was (transitively) merged into.
+func (b *binder) mergedRoot(sym *Symbol) *Symbol {
+	for {
+		m, ok := b.merged[sym]
+		if !ok {
+			return sym
+		}
+		sym = m
+	}
+}
+
+// applyMerges replaces every merged `is` binding by its root in Defs,
+// Uses and Captures, so the intersected bindings of a name are one
+// symbol for every later pass (like the alternatives of an or-pattern).
+func (b *binder) applyMerges() {
+	if len(b.merged) == 0 {
+		return
+	}
+	p := b.prog
+	for i, s := range p.Defs {
+		if s != nil {
+			p.Defs[i] = b.mergedRoot(s)
+		}
+	}
+	for i, s := range p.Uses {
+		if s != nil {
+			p.Uses[i] = b.mergedRoot(s)
+		}
+	}
+	for id, caps := range p.Captures {
+		var out []*Symbol
+		for _, s := range caps {
+			s = b.mergedRoot(s)
+			dup := false
+			for _, o := range out {
+				if o == s {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				out = append(out, s)
+			}
+		}
+		p.Captures[id] = out
+	}
 }

@@ -119,6 +119,12 @@ func TestBuiltins(t *testing.T) {
 	if !BytesEqual([]byte("ab"), StrBytes("ab")) || BytesEqual([]byte("a"), []byte("b")) {
 		t.Fatal("BytesEqual")
 	}
+	s := "abc"
+	b := StrBytes(s)
+	b[0] = 'X'
+	if s != "abc" || string(b) != "Xbc" {
+		t.Fatal("StrBytes must return a writable copy")
+	}
 	if StrBytes("") != nil || BytesToStr([]byte("xy")) != "xy" {
 		t.Fatal("StrBytes/BytesToStr")
 	}

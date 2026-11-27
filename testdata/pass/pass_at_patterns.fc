@@ -121,6 +121,17 @@ func code(v Val) u32 {
 	return colorCode(c) * 1000
 }
 
+// `@` names in intersected `is` tests: one variable bound by either test.
+func either(a Option[u32], b Option[u32]) u32 {
+	if a is w @ Some(x @ 1) || b is w @ Some(x) {
+		return optOr(w, 0) * 10 + x
+	}
+	if !(a is w2 @ None) && !(b is w2 @ None) {
+		return 7
+	}
+	return optOr(w2, 3)
+}
+
 // comptime evaluates `@` bindings at every position.
 comptime func ctAt(a u32, b u32) u32 {
 	return match (a, b) {
@@ -193,6 +204,12 @@ driver func main(io Stdio) error {
 		return err
 	}
 	if err := line(io, "code", u64(code(vals[0]))*100000000+u64(code(vals[2]))*100000+u64(code(Val.Paint(Color.Green)))*10+u64(code(vals[7]))); err != nil {
+		return err
+	}
+	s1 := Option[u32].Some(1)
+	s2 := Option[u32].Some(2)
+	no := Option[u32].None
+	if err := line(io, "either", u64(either(s1, s2))*1000+u64(either(s2, s2))*100+u64(either(s2, no))*10+u64(either(no, s2))); err != nil {
 		return err
 	}
 	return line(io, "comptime", u64(CT1)*1000000000+u64(CT2)*1000000+u64(CT3)*10000+u64(CT4)*100+u64(CT5))

@@ -783,6 +783,8 @@ func (f *fnCtx) bindUsed(sym *resolve.Symbol, region ast.Node) bool {
 // is test assigns them (isExpr). The expressions of s are those outside
 // its nested blocks and function literals, including the conditions of
 // an else-if chain and a for statement's init, condition and post.
+// Intersected bindings of one name (v0.2) are one symbol: declared once,
+// at its first test, and assigned by every test that binds it.
 func (f *fnCtx) hoistIs(s ast.Stmt) {
 	var exprs []ast.Expr
 	var parts func(s ast.Stmt)
@@ -824,6 +826,7 @@ func (f *fnCtx) hoistIs(s ast.Stmt) {
 		}
 	}
 	parts(s)
+	done := map[*resolve.Symbol]bool{}
 	for _, e := range exprs {
 		if e == nil {
 			continue
@@ -836,6 +839,10 @@ func (f *fnCtx) hoistIs(s ast.Stmt) {
 				var bs []patBinding
 				f.patBindings(n.Pattern, f.typeOf(n.X), nil, &bs)
 				for _, b := range bs {
+					if done[b.sym] {
+						continue // intersected with an earlier test (one variable)
+					}
+					done[b.sym] = true
 					name := f.newTemp() + "_" + b.sym.Name
 					f.g.p.SetName(b.sym, name)
 					f.line("var %s %s", name, f.goType(n, b.typ))

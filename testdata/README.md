@@ -60,8 +60,8 @@ code line. The other directives go in the leading comment block, before
   3. There is no diagnostic that does not match a marker. Each fail program is
      valid apart from the marked violation, so a conforming checker reports
      exactly the marked error(s) and no cascades.
-- A file may contain several markers. All files in `fail/` currently have
-  exactly one.
+- A file may contain several markers (`fail_named_assign.fc` has several;
+  the others have exactly one).
 
 ### `// FLAGS: <args...>`
 

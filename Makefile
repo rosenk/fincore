@@ -10,7 +10,7 @@ export CGO_ENABLED ?= 0
 
 .PHONY: all build finc0 test race vet fmt fmt-check lint parse-corpus check-corpus \
         integration finc1 diff-parse diff-check diff-check-scope diff-check-totality diff-check-all \
-        diff-check-fuzz diff-build finc2 bootstrap ci clean help
+        diff-check-fuzz diff-build diff-build-vet finc2 bootstrap ci clean help
 
 all: vet test build ## vet, test and build finc0
 
@@ -87,6 +87,9 @@ diff-check-fuzz: finc1 ## diff-check plus 20 random mutants per corpus file (SEE
 
 diff-build: finc1 ## finc0 vs finc1: byte-identical `build --emit-go` (corpus, edge cases, unit-test snippets, compiler/)
 	$(GO) run ./scripts/diffbuild
+
+diff-build-vet: finc1 ## diff-build plus `go vet` on the emitted Go of every built case
+	$(GO) run ./scripts/diffbuild -govet
 
 finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3.go
 	@mkdir -p $(STAGE)

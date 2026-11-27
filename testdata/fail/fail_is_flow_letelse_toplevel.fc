@@ -1,0 +1,19 @@
+// fail_is_flow_letelse_toplevel (v0.2): a let-else binding at the top
+// level of an `is` pattern (`v is n`, parsed as a bare CtorPattern) is
+// bound after the if only if the then block cannot complete normally;
+// here it falls through, so using n would read a zero value (E2002).
+package main
+
+var global u32
+
+func f(v u32) u32 {
+	if !(v is n) {
+		global = 1
+	}
+	return n // ERROR E2002
+}
+
+driver func main(io Stdio) error {
+	_ = f(1)
+	return nil
+}
