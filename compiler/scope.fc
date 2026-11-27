@@ -1021,7 +1021,7 @@ func scFirstRef(n u32, s u32, dp usize) u32 decreases(dp) {
 			start, cnt := slotList(nd, slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				r := scFirstRef(nodes.lists[usize(start)+j], s, dp-1)
+				r := scFirstRef(listAt(start, j), s, dp-1)
 				if r != 0 {
 					return r
 				}

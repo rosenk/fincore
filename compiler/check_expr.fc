@@ -52,9 +52,9 @@ func exprWith(e u32, t u32, c Ctx, dp usize) Operand decreases(dp) {
 // stringLitVal decodes a STRING BasicLit into a string value.
 func stringLitVal(e u32) Val {
 	t := &tmpBuf
-	t.reset()
+	t.Reset()
 	decodeStringLit(t, ntext(e))
-	return vStr(tmpBuf.data[:tmpBuf.len])
+	return vStr(t.Bytes())
 }
 
 func expr0(e u32, dp usize) Operand decreases(dp) {
@@ -260,7 +260,7 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 		if !ok {
 			mreset()
 			ms("constant evaluation: ")
-			mbytes(errTxt.data[:errTxt.len])
+			mbytes((&errTxt).Bytes())
 			errAtOp(E2002, e)
 			return invalidOp(e)
 		}
@@ -365,7 +365,7 @@ func shiftExpr(e u32, x *Operand, y *Operand) Operand {
 		if !ok {
 			mreset()
 			ms("constant evaluation: ")
-			mbytes(errTxt.data[:errTxt.len])
+			mbytes((&errTxt).Bytes())
 			errAtOp(E2002, e)
 			return invalidOp(e)
 		}
@@ -452,7 +452,7 @@ func comparisonExpr(e u32, x *Operand, y *Operand) Operand {
 		if !ok {
 			mreset()
 			ms("constant evaluation: ")
-			mbytes(errTxt.data[:errTxt.len])
+			mbytes((&errTxt).Bytes())
 			errAtOp(E2002, e)
 			return invalidOp(e)
 		}
@@ -545,7 +545,7 @@ func unaryExpr(e u32, dp usize) Operand decreases(dp) {
 		if !ok {
 			mreset()
 			ms("constant evaluation: ")
-			mbytes(errTxt.data[:errTxt.len])
+			mbytes((&errTxt).Bytes())
 			errAt(E2002, e)
 			return invalidOp(e)
 		}
@@ -1355,7 +1355,7 @@ func foldComptime(e u32, fn u32, sig u32, mark usize, ci u32, dp usize) Operand 
 	if !ok {
 		if ifailCode != 0 {
 			mreset()
-			mbytes(ifailMsg.data[:ifailMsg.len])
+			mbytes((&ifailMsg).Bytes())
 			errAt(ifailCode, e)
 		}
 		return invalidOp(e)
@@ -1585,7 +1585,7 @@ func containsCall(e u32, dp usize) bool decreases(dp) {
 			start, cnt := slotList(n, slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				if containsCall(nodes.lists[usize(start)+j], dp-1) {
+				if containsCall(listAt(start, j), dp-1) {
 					return true
 				}
 			}

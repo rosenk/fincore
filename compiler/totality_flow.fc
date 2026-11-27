@@ -1085,7 +1085,7 @@ func twExpr(e u32, st u32, dp usize) decreases(dp) {
 			ls, cnt := slotList(nodes.items[usize(e)], slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				wExprChild(nodes.lists[usize(ls)+j], st, dp-1)
+				wExprChild(listAt(ls, j), st, dp-1)
 			}
 		} else {
 			wExprChild(slotChild(nodes.items[usize(e)], slot), st, dp-1)

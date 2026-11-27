@@ -118,6 +118,18 @@ func run() {
 	w.WriteHex(1, 17, false)
 	flag("repeat/hex truncated", w.Truncated())
 	line("len after dropped writes", int(w.Len()))
+	w.Reset()
+	w.WriteString("ab")
+	sp := w.Spare()
+	line("spare len", int(len(sp)))
+	sp[0] = 'c'
+	sp[1] = 'd'
+	w.Extend(2)
+	quoted("extend", w.Bytes())
+	flag("extend truncated", w.Truncated())
+	w.Extend(61)
+	flag("extend too far truncated", w.Truncated())
+	line("len after extend", int(w.Len()))
 }
 
 driver func main(io Stdio) error {

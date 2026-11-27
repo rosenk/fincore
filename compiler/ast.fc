@@ -773,9 +773,9 @@ func (d *Dumper) text(n Node) []byte {
 
 func (d *Dumper) flagScalar(n Node, f u8, name string) {
 	if hasFlag(n, f) {
-		d.out.putByte(' ')
-		d.out.putStr(name)
-		d.out.putStr("=true")
+		d.out.WriteByte(' ')
+		d.out.WriteString(name)
+		d.out.WriteString("=true")
 	}
 }
 
@@ -784,7 +784,7 @@ func (d *Dumper) scalars(n Node) {
 	o := d.out
 	k := n.kind
 	if k == NkFile {
-		o.putStr(" Path=")
+		o.WriteString(" Path=")
 		putQuoted(o, strBytes(d.sa.files[usize(n.file)].path))
 	} else if k == NkImportDecl || k == NkConstDecl {
 		d.flagScalar(n, Flag1, "Grouped")
@@ -792,9 +792,9 @@ func (d *Dumper) scalars(n Node) {
 		d.flagScalar(n, Flag1, "Alias")
 	} else if k == NkFuncDecl {
 		if n.op == ModDriver {
-			o.putStr(" Modifier=driver")
+			o.WriteString(" Modifier=driver")
 		} else if n.op == ModComptime {
-			o.putStr(" Modifier=comptime")
+			o.WriteString(" Modifier=comptime")
 		}
 	} else if k == NkReceiver {
 		d.flagScalar(n, Flag1, "Pointer")
@@ -807,40 +807,40 @@ func (d *Dumper) scalars(n Node) {
 	} else if k == NkFuncType || k == NkFuncLit {
 		d.flagScalar(n, Flag1, "Driver")
 	} else if k == NkAssignStmt {
-		o.putStr(" Op=")
-		o.putStr(assignOpString(n.op))
+		o.WriteString(" Op=")
+		o.WriteString(assignOpString(n.op))
 	} else if k == NkIncDecStmt {
 		d.flagScalar(n, Flag1, "Inc")
 	} else if k == NkForStmt {
 		d.flagScalar(n, Flag1, "Driver")
 		d.flagScalar(n, Flag2, "ThreeClause")
 	} else if k == NkIdent {
-		o.putStr(" Name=")
+		o.WriteString(" Name=")
 		putQuoted(o, d.text(n))
 	} else if k == NkBasicLit {
-		o.putStr(" Kind=")
-		o.putStr(litKindString(n.op))
-		o.putStr(" Raw=")
+		o.WriteString(" Kind=")
+		o.WriteString(litKindString(n.op))
+		o.WriteString(" Raw=")
 		putQuoted(o, d.text(n))
 		if n.ival != 0 {
-			o.putStr(" Int=")
-			o.putUint(n.ival)
+			o.WriteString(" Int=")
+			o.WriteUint(n.ival)
 		}
 		if n.op == LitString && !stringLitEmpty(d.text(n)) {
 			t := d.tmp
-			t.reset()
+			t.Reset()
 			decodeStringLit(t, d.text(n))
-			o.putStr(" Str=")
-			putQuoted(o, t.data[:t.len])
+			o.WriteString(" Str=")
+			putQuoted(o, t.Bytes())
 		}
 	} else if k == NkBoolLit {
 		d.flagScalar(n, Flag1, "Value")
 	} else if k == NkBinaryExpr {
-		o.putStr(" Op=")
-		o.putStr(binOpString(n.op))
+		o.WriteString(" Op=")
+		o.WriteString(binOpString(n.op))
 	} else if k == NkUnaryExpr {
-		o.putStr(" Op=")
-		o.putStr(unaryOpString(n.op))
+		o.WriteString(" Op=")
+		o.WriteString(unaryOpString(n.op))
 	}
 }
 
@@ -852,19 +852,19 @@ func (d *Dumper) dumpNode(id u32, indent usize, depth usize) decreases(depth) {
 	}
 	n := d.na.items[usize(id)]
 	o := d.out
-	o.putStr(kindName(n.kind))
-	o.putStr(" #")
-	o.putUint(u64(n.id))
-	o.putStr(" @")
-	o.putUint(u64(n.sLine))
-	o.putByte(':')
-	o.putUint(u64(n.sCol))
-	o.putByte('-')
-	o.putUint(u64(n.eLine))
-	o.putByte(':')
-	o.putUint(u64(n.eCol))
+	o.WriteString(kindName(n.kind))
+	o.WriteString(" #")
+	o.WriteUint(u64(n.id))
+	o.WriteString(" @")
+	o.WriteUint(u64(n.sLine))
+	o.WriteByte(':')
+	o.WriteUint(u64(n.sCol))
+	o.WriteByte('-')
+	o.WriteUint(u64(n.eLine))
+	o.WriteByte(':')
+	o.WriteUint(u64(n.eCol))
 	d.scalars(n)
-	o.putByte('\n')
+	o.WriteByte('\n')
 	for i := usize(0); i < MaxSlots; i++ {
 		slot, name := layout(n.kind, i)
 		if slot == SlotNone {
@@ -874,21 +874,21 @@ func (d *Dumper) dumpNode(id u32, indent usize, depth usize) decreases(depth) {
 			start, cnt := slotList(n, slot)
 			m := usize(cnt)
 			if m > 0 {
-				o.putSpaces(2 * (indent + 1))
-				o.putStr(name)
-				o.putStr(":\n")
+				o.WriteRepeat(' ', 2 * (indent + 1))
+				o.WriteString(name)
+				o.WriteString(":\n")
 				for j := usize(0); j < m; j++ {
-					o.putSpaces(2 * (indent + 2))
-					o.putStr("- ")
+					o.WriteRepeat(' ', 2 * (indent + 2))
+					o.WriteString("- ")
 					d.dumpNode(d.na.listItem(start, j), indent+2, depth-1)
 				}
 			}
 		} else {
 			c := slotChild(n, slot)
 			if c != 0 {
-				o.putSpaces(2 * (indent + 1))
-				o.putStr(name)
-				o.putStr(": ")
+				o.WriteRepeat(' ', 2 * (indent + 1))
+				o.WriteString(name)
+				o.WriteString(": ")
 				d.dumpNode(c, indent+1, depth-1)
 			}
 		}
@@ -912,13 +912,13 @@ func (pr *Printer) text(n Node) []byte {
 }
 
 func (pr *Printer) nl() {
-	pr.out.putByte('\n')
-	pr.out.putTabs(pr.indent)
+	pr.out.WriteByte('\n')
+	pr.out.WriteRepeat('\t', pr.indent)
 }
 
 // name writes the text of an Ident node.
 func (pr *Printer) name(id u32) {
-	pr.out.putBytes(pr.text(pr.na.items[usize(id)]))
+	pr.out.WriteBytes(pr.text(pr.na.items[usize(id)]))
 }
 
 // names writes a comma-separated identifier list.
@@ -926,7 +926,7 @@ func (pr *Printer) names(start u32, cnt u32) {
 	m := usize(cnt)
 	for i := usize(0); i < m; i++ {
 		if i > 0 {
-			pr.out.putStr(", ")
+			pr.out.WriteString(", ")
 		}
 		pr.name(pr.na.listItem(start, i))
 	}
@@ -943,7 +943,7 @@ func (pr *Printer) printList(start u32, cnt u32, sep string, lines bool, depth u
 		if lines {
 			pr.nl()
 		} else if i > 0 {
-			pr.out.putStr(sep)
+			pr.out.WriteString(sep)
 		}
 		pr.printNode(pr.na.listItem(start, i), depth-1)
 	}
@@ -961,138 +961,138 @@ func (pr *Printer) printNode(id u32, depth usize) decreases(depth) {
 	o := pr.out
 	k := n.kind
 	if k == NkFile {
-		o.putStr("package ")
+		o.WriteString("package ")
 		pr.name(n.a)
-		o.putStr("\n")
+		o.WriteString("\n")
 		m := usize(n.l1n)
 		for i := usize(0); i < m; i++ {
-			o.putStr("\n")
+			o.WriteString("\n")
 			pr.printNode(pr.na.listItem(n.l1s, i), depth-1)
 		}
 		m2 := usize(n.l2n)
 		for i := usize(0); i < m2; i++ {
-			o.putStr("\n")
+			o.WriteString("\n")
 			pr.printNode(pr.na.listItem(n.l2s, i), depth-1)
-			o.putStr("\n")
+			o.WriteString("\n")
 		}
 	} else if k == NkImportDecl || k == NkConstDecl {
 		if k == NkImportDecl {
-			o.putStr("import ")
+			o.WriteString("import ")
 		} else {
-			o.putStr("const ")
+			o.WriteString("const ")
 		}
 		if hasFlag(n, Flag1) {
-			o.putStr("(")
+			o.WriteString("(")
 			pr.indent++
 			pr.printList(n.l1s, n.l1n, "", true, depth-1)
 			pr.indent--
 			pr.nl()
-			o.putStr(")")
+			o.WriteString(")")
 		} else if n.l1n > 0 {
 			pr.printNode(pr.na.listItem(n.l1s, 0), depth-1)
 		}
 	} else if k == NkImportSpec {
 		if n.a != 0 {
 			pr.name(n.a)
-			o.putStr(" ")
+			o.WriteString(" ")
 		}
 		pr.printNode(n.b, depth-1)
 	} else if k == NkConstSpec {
 		pr.name(n.a)
 		if n.b != 0 {
-			o.putStr(" ")
+			o.WriteString(" ")
 			pr.printNode(n.b, depth-1)
 		}
-		o.putStr(" = ")
+		o.WriteString(" = ")
 		pr.printNode(n.c, depth-1)
 	} else if k == NkTypeDecl {
-		o.putStr("type ")
+		o.WriteString("type ")
 		pr.name(n.a)
 		pr.printNode(n.b, depth-1)
 		if hasFlag(n, Flag1) {
-			o.putStr(" =")
+			o.WriteString(" =")
 		}
-		o.putStr(" ")
+		o.WriteString(" ")
 		pr.printNode(n.c, depth-1)
 	} else if k == NkVarDecl {
-		o.putStr("var ")
+		o.WriteString("var ")
 		pr.name(n.a)
 		if n.b != 0 {
-			o.putStr(" ")
+			o.WriteString(" ")
 			pr.printNode(n.b, depth-1)
 		}
 		if n.c != 0 {
-			o.putStr(" = ")
+			o.WriteString(" = ")
 			pr.printNode(n.c, depth-1)
 		}
 	} else if k == NkFuncDecl {
 		if n.op == ModDriver {
-			o.putStr("driver ")
+			o.WriteString("driver ")
 		} else if n.op == ModComptime {
-			o.putStr("comptime ")
+			o.WriteString("comptime ")
 		}
-		o.putStr("func ")
+		o.WriteString("func ")
 		if n.a != 0 {
 			pr.printNode(n.a, depth-1)
-			o.putStr(" ")
+			o.WriteString(" ")
 		}
 		pr.name(n.b)
 		pr.printNode(n.c, depth-1)
 		pr.printNode(n.d, depth-1)
 		if n.e != 0 {
-			o.putStr(" ")
+			o.WriteString(" ")
 			pr.printNode(n.e, depth-1)
 		}
-		o.putStr(" ")
+		o.WriteString(" ")
 		pr.printNode(n.f, depth-1)
 	} else if k == NkReceiver {
-		o.putStr("(")
+		o.WriteString("(")
 		pr.name(n.a)
-		o.putStr(" ")
+		o.WriteString(" ")
 		if hasFlag(n, Flag1) {
-			o.putStr("*")
+			o.WriteString("*")
 		}
 		pr.name(n.b)
 		if n.l1n > 0 {
-			o.putStr("[")
+			o.WriteString("[")
 			pr.names(n.l1s, n.l1n)
-			o.putStr("]")
+			o.WriteString("]")
 		}
-		o.putStr(")")
+		o.WriteString(")")
 	} else if k == NkTypeParamList {
-		o.putStr("[")
+		o.WriteString("[")
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.putStr("]")
+		o.WriteString("]")
 	} else if k == NkTypeParam {
 		pr.names(n.l1s, n.l1n)
-		o.putStr(" ")
+		o.WriteString(" ")
 		pr.printNode(n.a, depth-1)
 	} else if k == NkSignature {
-		o.putStr("(")
+		o.WriteString("(")
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.putStr(")")
+		o.WriteString(")")
 		if n.l2n > 0 {
-			o.putStr(" ")
+			o.WriteString(" ")
 			paren := hasFlag(n, Flag1) || n.l2n > 1
 			if paren {
-				o.putStr("(")
+				o.WriteString("(")
 			}
 			pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
 			if paren {
-				o.putStr(")")
+				o.WriteString(")")
 			}
 		}
 	} else if k == NkParam {
 		pr.names(n.l1s, n.l1n)
-		o.putStr(" ")
+		o.WriteString(" ")
 		if hasFlag(n, Flag1) {
-			o.putStr("...")
+			o.WriteString("...")
 		}
 		pr.printNode(n.a, depth-1)
 	} else if k == NkDecreasesClause {
-		o.putStr("decreases(")
+		o.WriteString("decreases(")
 		pr.printNode(n.a, depth-1)
-		o.putStr(")")
+		o.WriteString(")")
 	} else {
 		pr.printTypeOrStmt(n, depth-1)
 	}
@@ -1108,122 +1108,122 @@ func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
 	if k == NkNamedType {
 		if n.a != 0 {
 			pr.name(n.a)
-			o.putStr(".")
+			o.WriteString(".")
 		}
 		pr.name(n.b)
 		if n.l1n > 0 {
-			o.putStr("[")
+			o.WriteString("[")
 			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-			o.putStr("]")
+			o.WriteString("]")
 		}
 	} else if k == NkArrayType {
-		o.putStr("[")
+		o.WriteString("[")
 		pr.printNode(n.a, depth-1)
-		o.putStr("]")
+		o.WriteString("]")
 		pr.printNode(n.b, depth-1)
 	} else if k == NkSliceType {
-		o.putStr("[]")
+		o.WriteString("[]")
 		pr.printNode(n.a, depth-1)
 	} else if k == NkPointerType {
-		o.putStr("*")
+		o.WriteString("*")
 		pr.printNode(n.a, depth-1)
 	} else if k == NkStructType || k == NkEnumType {
 		if k == NkStructType {
-			o.putStr("struct {")
+			o.WriteString("struct {")
 		} else {
-			o.putStr("enum {")
+			o.WriteString("enum {")
 		}
 		m := usize(n.l1n)
 		for i := usize(0); i < m; i++ {
 			if i > 0 {
-				o.putStr(";")
+				o.WriteString(";")
 			}
-			o.putStr(" ")
+			o.WriteString(" ")
 			pr.printNode(pr.na.listItem(n.l1s, i), depth-1)
 		}
 		if m > 0 {
-			o.putStr(" ")
+			o.WriteString(" ")
 		}
-		o.putStr("}")
+		o.WriteString("}")
 	} else if k == NkFieldDecl {
 		pr.names(n.l1s, n.l1n)
-		o.putStr(" ")
+		o.WriteString(" ")
 		pr.printNode(n.a, depth-1)
 	} else if k == NkVariant {
 		pr.name(n.a)
 		if hasFlag(n, Flag1) {
-			o.putStr("(")
+			o.WriteString("(")
 			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-			o.putStr(")")
+			o.WriteString(")")
 		}
 	} else if k == NkFuncType {
 		if hasFlag(n, Flag1) {
-			o.putStr("driver ")
+			o.WriteString("driver ")
 		}
-		o.putStr("func")
+		o.WriteString("func")
 		pr.printNode(n.a, depth-1)
 	} else if k == NkCodeType {
-		o.putStr("Code ")
+		o.WriteString("Code ")
 		pr.printNode(n.a, depth-1)
 	} else if k == NkElType {
-		o.putStr("El(")
+		o.WriteString("El(")
 		pr.printNode(n.a, depth-1)
-		o.putStr(")")
+		o.WriteString(")")
 	} else if k == NkAnyType {
-		o.putStr("any")
+		o.WriteString("any")
 	} else if k == NkBlockStmt {
-		o.putStr("{")
+		o.WriteString("{")
 		pr.indent++
 		pr.printList(n.l1s, n.l1n, "", true, depth-1)
 		pr.indent--
 		if n.l1n > 0 {
 			pr.nl()
 		}
-		o.putStr("}")
+		o.WriteString("}")
 	} else if k == NkDeclStmt || k == NkExprStmt || k == NkLiteralPattern || k == NkTypeExpr {
 		pr.printNode(n.a, depth-1)
 	} else if k == NkShortVarDecl {
 		pr.names(n.l1s, n.l1n)
-		o.putStr(" := ")
+		o.WriteString(" := ")
 		pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
 	} else if k == NkAssignStmt {
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.putStr(" ")
-		o.putStr(assignOpString(n.op))
-		o.putStr(" ")
+		o.WriteString(" ")
+		o.WriteString(assignOpString(n.op))
+		o.WriteString(" ")
 		pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
 	} else if k == NkIncDecStmt {
 		pr.printNode(n.a, depth-1)
 		if hasFlag(n, Flag1) {
-			o.putStr("++")
+			o.WriteString("++")
 		} else {
-			o.putStr("--")
+			o.WriteString("--")
 		}
 	} else if k == NkIfStmt {
-		o.putStr("if ")
+		o.WriteString("if ")
 		if n.a != 0 {
 			pr.printNode(n.a, depth-1)
-			o.putStr("; ")
+			o.WriteString("; ")
 		}
 		pr.printNode(n.b, depth-1)
-		o.putStr(" ")
+		o.WriteString(" ")
 		pr.printNode(n.c, depth-1)
 		if n.d != 0 {
-			o.putStr(" else ")
+			o.WriteString(" else ")
 			pr.printNode(n.d, depth-1)
 		}
 	} else if k == NkMatchStmt {
-		o.putStr("match ")
+		o.WriteString("match ")
 		pr.printNode(n.a, depth-1)
-		o.putStr(" {")
+		o.WriteString(" {")
 		pr.indent++
 		pr.printList(n.l1s, n.l1n, "", true, depth-1)
 		pr.indent--
 		pr.nl()
-		o.putStr("}")
+		o.WriteString("}")
 	} else if k == NkMatchArm {
 		pr.printNode(n.a, depth-1)
-		o.putStr(" -> ")
+		o.WriteString(" -> ")
 		if n.c != 0 {
 			pr.printNode(n.c, depth-1)
 		} else {
@@ -1233,67 +1233,67 @@ func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
 		pr.printList(n.l1s, n.l1n, " | ", false, depth-1)
 	} else if k == NkMatchExpr {
 		// one line, so that diagnostics embedding it stay single-line
-		o.putStr("match ")
+		o.WriteString("match ")
 		pr.printNode(n.a, depth-1)
-		o.putStr(" { ")
+		o.WriteString(" { ")
 		pr.printList(n.l1s, n.l1n, "; ", false, depth-1)
-		o.putStr(" }")
+		o.WriteString(" }")
 	} else if k == NkWildcardPattern {
-		o.putStr("_")
+		o.WriteString("_")
 	} else if k == NkCtorPattern {
 		if n.a != 0 {
 			pr.name(n.a)
-			o.putStr(".")
+			o.WriteString(".")
 		}
 		pr.name(n.b)
 		if hasFlag(n, Flag1) {
-			o.putStr("(")
+			o.WriteString("(")
 			pr.names(n.l1s, n.l1n)
-			o.putStr(")")
+			o.WriteString(")")
 		}
 	} else if k == NkForStmt {
 		if hasFlag(n, Flag1) {
-			o.putStr("driver ")
+			o.WriteString("driver ")
 		}
-		o.putStr("for ")
+		o.WriteString("for ")
 		if hasFlag(n, Flag2) {
 			pr.printNode(n.a, depth-1)
-			o.putStr("; ")
+			o.WriteString("; ")
 			pr.printNode(n.b, depth-1)
-			o.putStr("; ")
+			o.WriteString("; ")
 			pr.printNode(n.c, depth-1)
 			if n.c != 0 {
-				o.putStr(" ")
+				o.WriteString(" ")
 			}
 		} else if n.b != 0 {
 			pr.printNode(n.b, depth-1)
-			o.putStr(" ")
+			o.WriteString(" ")
 		}
 		if n.d != 0 {
 			pr.printNode(n.d, depth-1)
-			o.putStr(" ")
+			o.WriteString(" ")
 		}
 		pr.printNode(n.e, depth-1)
 	} else if k == NkScopeStmt {
-		o.putStr("scope ")
+		o.WriteString("scope ")
 		pr.name(n.a)
-		o.putStr(" := ")
+		o.WriteString(" := ")
 		pr.printNode(n.b, depth-1)
-		o.putStr(" ")
+		o.WriteString(" ")
 		pr.printNode(n.c, depth-1)
 	} else if k == NkDeferStmt {
-		o.putStr("defer ")
+		o.WriteString("defer ")
 		pr.printNode(n.a, depth-1)
 	} else if k == NkReturnStmt {
-		o.putStr("return")
+		o.WriteString("return")
 		if n.l1n > 0 {
-			o.putStr(" ")
+			o.WriteString(" ")
 			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
 		}
 	} else if k == NkBreakStmt {
-		o.putStr("break")
+		o.WriteString("break")
 	} else if k == NkContinueStmt {
-		o.putStr("continue")
+		o.WriteString("continue")
 	} else {
 		pr.printExpr(n, depth-1)
 	}
@@ -1307,65 +1307,65 @@ func (pr *Printer) printExpr(n Node, depth usize) decreases(depth) {
 	o := pr.out
 	k := n.kind
 	if k == NkIdent || k == NkBasicLit {
-		o.putBytes(pr.text(n))
+		o.WriteBytes(pr.text(n))
 	} else if k == NkBoolLit {
 		if hasFlag(n, Flag1) {
-			o.putStr("true")
+			o.WriteString("true")
 		} else {
-			o.putStr("false")
+			o.WriteString("false")
 		}
 	} else if k == NkNilLit {
-		o.putStr("nil")
+		o.WriteString("nil")
 	} else if k == NkBinaryExpr {
 		pr.printNode(n.a, depth-1)
-		o.putStr(" ")
-		o.putStr(binOpString(n.op))
-		o.putStr(" ")
+		o.WriteString(" ")
+		o.WriteString(binOpString(n.op))
+		o.WriteString(" ")
 		pr.printNode(n.b, depth-1)
 	} else if k == NkUnaryExpr {
-		o.putStr(unaryOpString(n.op))
+		o.WriteString(unaryOpString(n.op))
 		pr.printNode(n.a, depth-1)
 	} else if k == NkParenExpr {
-		o.putStr("(")
+		o.WriteString("(")
 		pr.printNode(n.a, depth-1)
-		o.putStr(")")
+		o.WriteString(")")
 	} else if k == NkCallExpr {
 		pr.printNode(n.a, depth-1)
-		o.putStr("(")
+		o.WriteString("(")
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.putStr(")")
+		o.WriteString(")")
 	} else if k == NkIndexExpr {
 		pr.printNode(n.a, depth-1)
-		o.putStr("[")
+		o.WriteString("[")
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.putStr("]")
+		o.WriteString("]")
 	} else if k == NkSliceExpr {
 		pr.printNode(n.a, depth-1)
-		o.putStr("[")
+		o.WriteString("[")
 		pr.printNode(n.b, depth-1)
-		o.putStr(":")
+		o.WriteString(":")
 		pr.printNode(n.c, depth-1)
-		o.putStr("]")
+		o.WriteString("]")
 	} else if k == NkSelectorExpr {
 		pr.printNode(n.a, depth-1)
-		o.putStr(".")
+		o.WriteString(".")
 		pr.name(n.b)
 	} else if k == NkFuncLit {
 		if hasFlag(n, Flag1) {
-			o.putStr("driver ")
+			o.WriteString("driver ")
 		}
-		o.putStr("func")
+		o.WriteString("func")
 		pr.printNode(n.a, depth-1)
-		o.putStr(" ")
+		o.WriteString(" ")
 		pr.printNode(n.b, depth-1)
 	} else if k == NkStructLit {
 		pr.printNode(n.a, depth-1)
-		o.putStr("{")
+		o.WriteString("{")
 		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.putStr("}")
+		o.WriteString("}")
 	} else if k == NkFieldInit {
 		pr.name(n.a)
-		o.putStr(": ")
+		o.WriteString(": ")
 		pr.printNode(n.b, depth-1)
 	}
 }
