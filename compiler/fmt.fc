@@ -1130,7 +1130,7 @@ func fmSameDump(a []byte, b []byte) bool {
 // driver
 
 driver func fmtUsage(io Stdio) error {
-	if err := say(io, true, "usage: finc1 fmt [-w] [-l] [-d] [--check] <file.fc | dir>...\n  -check\n    \tlist files whose formatting differs and fail if there are any\n  -d\tdisplay diffs instead of rewriting files\n  -l\tlist files whose formatting differs\n  -w\twrite result to (source) file instead of stdout\n"); err != nil {
+	if err := say(io, true, "usage: finc fmt [-w] [-l] [-d] [--check] <file.fc | dir>...\n  -check\n    \tlist files whose formatting differs and fail if there are any\n  -d\tdisplay diffs instead of rewriting files\n  -l\tlist files whose formatting differs\n  -w\twrite result to (source) file instead of stdout\n"); err != nil {
 		return err
 	}
 	return ErrParse
@@ -1243,7 +1243,7 @@ driver func fmtFile(fs FS, io Stdio, path string) (bool, error) {
 			_ = io.WriteStdout(fmOut.Bytes())
 		}
 		errBuf.Reset()
-		if e := sayf(io, formatTo(mbuf[:], "finc1 fmt: internal error: the formatted %s does not parse; file left unchanged\n", path)); e != nil {
+		if e := sayf(io, formatTo(mbuf[:], "finc fmt: internal error: the formatted %s does not parse; file left unchanged\n", path)); e != nil {
 			return false, e
 		}
 		return false, ErrParse
@@ -1256,7 +1256,7 @@ driver func fmtFile(fs FS, io Stdio, path string) (bool, error) {
 		if fmDebug {
 			_ = io.WriteStdout(fmOut.Bytes())
 		}
-		if e := sayf(io, formatTo(mbuf[:], "finc1 fmt: internal error: formatting %s changes its AST; file left unchanged\n", path)); e != nil {
+		if e := sayf(io, formatTo(mbuf[:], "finc fmt: internal error: formatting %s changes its AST; file left unchanged\n", path)); e != nil {
 			return false, e
 		}
 		return false, ErrParse
@@ -1327,7 +1327,7 @@ driver func fmDiff(fs FS, io Stdio, exec Exec, path string) error {
 	st, n, rerr := exec.Run(ctx, "/bin/sh", argv[:5], envs[:0], "", execErr[:])
 	_ = fs.RemoveAll(dir)
 	if rerr != nil || st.Code > 1 {
-		if e := sayf(io, formatTo(mbuf[:], "finc1 fmt: diff %s: %s\n", path, execErr[:n])); e != nil {
+		if e := sayf(io, formatTo(mbuf[:], "finc fmt: diff %s: %s\n", path, execErr[:n])); e != nil {
 			return e
 		}
 		return ErrExec

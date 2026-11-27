@@ -103,7 +103,8 @@ line).
 - Each compiler knows the version it implements: `finc0` is frozen at v0.2
   (`LangVersion` in `bootstrap/cmd/finc0/main.go`); `compiler/` declares
   `LangVersion`/`LangMajor`/`LangMinor` in `compiler/main.fc`. Both print it
-  with `finc version` (or `--version`): `finc1 language v0.2`.
+  with `finc version` (or `--version`): `finc0 language v0.2`, `finc
+  language v0.3`.
 - A runner **skips** a test whose version is newer than the compiler's and
   counts it: `finc0 test` and `finc1 test` end with
   `N tests, P passed, F failed, S skipped (needs vX.Y)` (the newest version

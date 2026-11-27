@@ -1,0 +1,10 @@
+// SINCE: v0.3
+// context: Go's compound assignment operators |=, &=, ^=, %=, <<= and >>=
+// are not FinCore: E1001 at the '=' names the operator and the plain
+// assignment to write instead.
+package main
+
+func halve(c u64) u64 {
+	c >>= 1
+	return c
+}

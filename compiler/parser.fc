@@ -641,6 +641,10 @@ func (p *Parser) varDecl(depth usize) u32 decreases(depth) {
 	d := p.mk(NkVarDecl, p.start())
 	p.expect(TkVar)
 	p.setA(d, p.ident())
+	if p.tok.kind == TkComma {
+		// `var a, b u64`, at the ',' (E1001, where a type is expected).
+		p.errorTok("a var declaration declares one name; write separate var declarations")
+	}
 	if p.tok.kind == TkAssign {
 		p.next()
 		p.setC(d, p.expr(depth-1))
@@ -1846,7 +1850,13 @@ func (p *Parser) binary(prec u8, depth usize) u32 decreases(depth) {
 			return x
 		}
 		opPos := (u64(p.tok.line) << 32) | u64(p.tok.col)
+		opTok := p.tok
 		p.next()
+		if p.tok.kind == TkAssign && p.tok.off == opTok.end && op is OpOr | OpXor | OpRem | OpAnd | OpShl | OpShr {
+			// `c >>= 1`: FinCore has no such assignment operator.
+			p.errorCompoundAssign(x, opTok)
+			return x
+		}
 		y := p.binary(binOpPrec(op)+1, depth-1)
 		be := p.mk(NkBinaryExpr, s)
 		p.setOp(be, op)
@@ -1856,6 +1866,57 @@ func (p *Parser) binary(prec u8, depth usize) u32 decreases(depth) {
 		x = p.finish(be)
 	}
 	return x
+}
+
+// errorCompoundAssign reports an assignment operator FinCore does not have
+// (`|=`, `^=`, `%=`, `&=`, `<<=`, `>>=`), lexed as the binary operator
+// opTok followed by the current '=' token, at that '=' (E1001, where the
+// parser would expect an expression). x is the left operand; the
+// right-hand side is quoted from the source up to the end of the statement.
+func (p *Parser) errorCompoundAssign(x u32, opTok Token) {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	op := p.tokText(opTok)
+	p.diag.WriteString("compound assignment operator ")
+	p.diag.WriteBytes(op)
+	p.diag.WriteString("= is not supported; write ")
+	p.putNode(x)
+	p.diag.WriteString(" = ")
+	p.putNode(x)
+	p.diag.WriteString(" ")
+	p.diag.WriteBytes(op)
+	p.diag.WriteString(" ")
+	// The right-hand side: the tokens after '=' up to the end of the
+	// statement (';', ',' or a closing bracket of an enclosing expression).
+	first := p.pos + 1
+	n := usize(0)
+	nest := 0
+	lim := usize(64)
+	for i := usize(0); i < lim; i++ {
+		k := p.peek(1 + i).kind
+		if k is TkLParen | TkLBrack | TkLBrace {
+			nest++
+		} else if k is TkRParen | TkRBrack | TkRBrace {
+			if nest == 0 {
+				break
+			}
+			nest--
+		} else if k is TkSemicolon | TkEOF | TkIllegal || k == TkComma && nest == 0 {
+			break
+		}
+		n = i + 1
+	}
+	if n == 0 || n == lim || first+n > p.ntok {
+		p.diag.WriteString("value")
+	} else if n == 1 {
+		p.diag.WriteBytes(p.tokText(p.toks[first]))
+	} else {
+		p.diag.WriteString("(")
+		p.diag.WriteBytes(p.fsrc[usize(p.toks[first].off):usize(p.toks[first+n-1].end)])
+		p.diag.WriteString(")")
+	}
+	p.errEnd()
 }
 
 func (p *Parser) unary(depth usize) u32 decreases(depth) {
@@ -1873,6 +1934,9 @@ func (p *Parser) unary(depth usize) u32 decreases(depth) {
 		op = OpAddr
 	} else if k == TkMul {
 		op = OpDeref
+	} else if k == TkXor {
+		p.errorUnaryXor()
+		return 0
 	} else {
 		return p.postfix(depth - 1)
 	}
@@ -1884,6 +1948,24 @@ func (p *Parser) unary(depth usize) u32 decreases(depth) {
 	p.setOp(u, op)
 	p.setA(u, x)
 	return p.finish(u)
+}
+
+// errorUnaryXor reports Go's unary ^ (bitwise complement), which FinCore
+// does not have, at the '^' (E1001, where the parser would expect an
+// expression).
+func (p *Parser) errorUnaryXor() {
+	if !p.errBegin(p.tok.line, p.tok.col, E1001) {
+		return
+	}
+	p.diag.WriteString("unary ^ (bitwise complement) is not supported; write ")
+	t := p.peek(1)
+	if t.kind is TkIdent | TkInt && t.off == p.tok.end {
+		p.diag.WriteBytes(p.tokText(t))
+	} else {
+		p.diag.WriteString("x")
+	}
+	p.diag.WriteString(" ^ M, where M is the all-ones value of its type (0xFF for u8, 0xFFFF_FFFF for u32)")
+	p.errEnd()
 }
 
 func (p *Parser) postfix(depth usize) u32 decreases(depth) {

@@ -74,7 +74,14 @@ Every difference is classified; the worst step decides a case:
 | EXPECTED | the previous release rejected the program and the current compiler accepts it (a new feature), or the case's `// SINCE:` is newer than the previous release and both reject it. A program only the current compiler builds must still pass `go vet` and match its `.out` file, if any (else REGRESSION) | ok, counted |
 
 Intentional changes (a reworded message, a codegen improvement) go into
-`scripts/diffprev/allow.txt` as `<case name> # <reason>`. Unused entries
+`scripts/diffprev/allow.txt` as `<case name> # <reason>`. A reworded
+diagnostic is better allowlisted by a rule,
+`E#### "old text" => "new text" # <reason>` (scripts/diagallow): it
+covers every DIAG-CHANGED case whose only differences are diagnostics at
+the same position with the same code, the old message containing the old
+text and the new one the new text (`driver "old" => "new"` does the same
+for the compiler's own non-diagnostic lines). `make diff-check*` reads
+the same rules from `scripts/diffcheck/allow.txt`. Unused entries
 are reported, and the list empties when the seed moves past the change. The
 summary looks like this:
 

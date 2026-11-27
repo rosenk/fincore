@@ -178,12 +178,11 @@ driver func main(io Stdio) error {
 ```text
 $ finc1 check index.fc
 index.fc:7:2: error[E4002]: cannot prove termination of for loop: not a counting loop (no post statement), slice-shrink loop, or loop with decreases clause
-error: fincore: invalid number
 ```
 
-(The last line is the compiler's exit status. It always reads `invalid
-number` after diagnostics; see the note in section 13.) Two fixes: make it
-a counting loop with an early exit, or name the measure.
+A failed check prints only the diagnostics and exits with status 1 (see
+the note in section 13). Two fixes: make it a counting loop with an early
+exit, or name the measure.
 
 ```go
 // file: index2.fc
@@ -338,7 +337,6 @@ driver func main(net Net, io Stdio) error {
 ```text
 $ finc1 check leak.fc
 leak.fc:5:2: error[E3005]: Linear resource ln (Listener) is not closed, released or moved on every path
-error: fincore: invalid number
 ```
 
 The early `return err` leaks the listener. Note what the checker does *not*
@@ -395,14 +393,13 @@ driver func main(io Stdio) error {
 
 ```text
 $ finc1 check borrow.fc
-borrow.fc:11:2: error[E3002]: scope escape: a value referring to the storage of parameter src (depth 0) cannot be stored in the storage of parameter l (depth 0), which outlives it
+borrow.fc:11:2: error[E3002]: scope escape: a value referring to the storage of parameter src cannot be stored in the storage of parameter l: each parameter is its own region, and memory reached through one parameter must not refer to another parameter's storage
 borrow.fc:18:2: error[E3002]: scope escape: a value referring to the storage of parameter line (depth 0) cannot be stored in package-level storage, which outlives it
-error: fincore: invalid number
 ```
 
-The checker cannot know that `lx` and `buf` live equally long, so it
-rejects the store. The fix is to build the struct where both are visible,
-or to copy the bytes into storage you own:
+Each parameter is its own region: the checker cannot know that `lx` and
+`buf` live equally long, so it rejects the store. The fix is to build the
+struct where both are visible, or to copy the bytes into storage you own:
 
 ```go
 // file: borrow2.fc
@@ -530,7 +527,6 @@ driver func main(io Stdio) error {
 ```text
 $ finc1 check shapes.fc
 shapes.fc:12:9: error[E2012]: non-exhaustive match on Shape: missing Triangle
-error: fincore: invalid number
 ```
 
 Variants are constructed qualified (`Shape.Rect(3, 4)`) and matched
@@ -715,7 +711,6 @@ driver func main(io Stdio) error {
 ```text
 $ finc1 check fuel.fc
 fuel.fc:12:13: error[E4001]: comptime evaluation ran out of fuel (budget 1000000 steps); call stack (innermost first): spin
-error: fincore: invalid number
 ```
 
 `Code n` / `El` are FinCore's answer to "types as values" without
@@ -741,7 +736,9 @@ driver func main(fs FS, env Env, io Stdio) error
 `main` takes any subset of `Net`, `Signals`, `Clock`, `FS`, `Env`, `Stdio`
 and `Exec` (each at most once), in any order, and returns `error`; a
 non-nil error is printed as `error: <text>` on stderr and the process exits
-with status 1. Capabilities are
+with status 1. If the program has already written to stderr
+(`io.WriteStderr`), it has reported the failure itself: the process then
+exits with status 1 without that line (v0.3). Capabilities are
 Scoped: they cannot be stored in globals, so a function can only do I/O if
 a caller passed it the capability. A function's signature tells you what
 it can touch:
@@ -859,10 +856,12 @@ The targets you will use:
 The examples are part of the corpus: `make diff-prev` compares their
 output with the `.out` files under both compilers.
 
-A note on the output of a failed `finc1 check`: the diagnostics are followed
-by `error: fincore: invalid number`. That line is the compiler's own exit
-error (it reports every failed check with the runtime's `ErrParse`), not
-a problem in your program. `bin/finc0` does not print it.
+A note on the output of a failed `finc1 check`: it prints only the
+diagnostics and exits with status 1. The compiler is a FinCore program, so
+this is the rule of section 11 at work: its `main` returns an error after
+writing the diagnostics to stderr, so the runtime does not add an
+`error: <err>` line. (Up to v0.2 the output ended with a misleading
+`error: fincore: invalid number`.)
 
 ## 14. Where to go next
 

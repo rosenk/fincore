@@ -172,16 +172,19 @@ testdata/context/match.fc:29:13: error[E2002]: mismatched types u32 and u64 for 
   trailing `//` comment is not underlined). Syntax errors carry no range:
   one caret.
 - Tabs are shown as four spaces, and the caret column counts the same way.
-- Hints exist for E4002 (loops and recursion separately), E4004, E3002,
-  E3005 and E2012 (non-exhaustive and unreachable separately).
+- Hints exist for E4002 (loops, slice-shrink loops and recursion
+  separately), E4004, E3002 (stores into longer-lived storage and between
+  parameters separately), E3005 and E2012 (non-exhaustive and unreachable
+  separately).
 
 The default output is unchanged, byte for byte: the spec 11 line only.
 `make diff-check*`/`diff-build` (finc1 against finc0) and `make diff-prev`
 (against the seed) run without the flag and stay identical.
 
 `make context-test` runs `check --context` on `testdata/context/*.fc` and
-compares stderr (without the generated `main`'s final `error: fincore:`
-line) with the `.out` file next to each (`UPDATE=1` rewrites them). It also
+compares stderr (only the diagnostics: since v0.3 a failing finc prints no
+`error: fincore:` line, decision 156) with the `.out` file next to each
+(`UPDATE=1` rewrites them). It also
 checks that `FINC_DIAG=context` gives the same output and that the output
 without the flag is exactly the diagnostic lines of the `.out` file. The
 files are marked `// SINCE: v0.3`: they test behaviour that finc0 and the

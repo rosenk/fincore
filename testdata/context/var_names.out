@@ -1,0 +1,3 @@
+testdata/context/var_names.fc:6:7: error[E1001]: a var declaration declares one name; write separate var declarations
+    6 |     var a, b, c u64
+      |          ^

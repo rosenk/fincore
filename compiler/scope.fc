@@ -124,6 +124,23 @@ func (o Origin) Format(dst []byte) usize {
 	return formatTo(dst, "storage at depth %d", d-1)
 }
 
+// OriginName renders an origin like Origin, without the depth (E3002
+// between parameters at the same depth, decision 44).
+type OriginName u64
+
+func (o OriginName) Format(dst []byte) usize {
+	d := scOD(u64(o))
+	r := scOR(u64(o))
+	if d != ScLevelGlobal && r != 0 {
+		return formatTo(dst, "the storage of parameter %v", NameRef(symName(r)))
+	}
+	if d == ScLevelCaller {
+		// The join of different parameters' regions (scJoin).
+		return formatTo(dst, "the storage of more than one parameter")
+	}
+	return Origin(o).Format(dst)
+}
+
 func scJoin(a u64, b u64) u64 {
 	ad := scOD(a)
 	bd := scOD(b)
@@ -785,7 +802,12 @@ func wAssign(s u32, dp usize) decreases(dp) {
 		o := scOrigin(rhs, SemaDepth)
 		st := scStorage(l, SemaDepth)
 		if !scFits(o, st) {
-			scReport(E3002, s, formatTo(mbuf[:], "scope escape: a value referring to %v cannot be stored in %v, which outlives it", Origin(o), Origin(st)))
+			if scOD(o) == scOD(st) {
+				// Same depth: st belongs to another parameter (decision 44).
+				scReport(E3002, s, formatTo(mbuf[:], "scope escape: a value referring to %v cannot be stored in %v: each parameter is its own region, and memory reached through one parameter must not refer to another parameter's storage", OriginName(o), OriginName(st)))
+			} else {
+				scReport(E3002, s, formatTo(mbuf[:], "scope escape: a value referring to %v cannot be stored in %v, which outlives it", Origin(o), Origin(st)))
+			}
 		}
 	}
 }

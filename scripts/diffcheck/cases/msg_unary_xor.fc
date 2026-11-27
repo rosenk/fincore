@@ -1,0 +1,7 @@
+// msg_unary_xor (v0.2 input, v0.3 message): unary ^ is E1001 at the '^' in
+// both compilers; finc1 explains it (decision 157, allowlisted).
+package main
+
+func invert(x u8) u8 {
+	return ^x
+}

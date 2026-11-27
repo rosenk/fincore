@@ -106,11 +106,11 @@ driver func emsg(io Stdio, s string) error {
 
 driver func buildUsage(io Stdio, name string, withOut bool) error {
 	if withOut {
-		if err := emsg(io, "usage: finc1 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n"); err != nil {
+		if err := emsg(io, "usage: finc build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n"); err != nil {
 			return err
 		}
 	} else {
-		if err := emsg(io, "usage: finc1 run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n"); err != nil {
+		if err := emsg(io, "usage: finc run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n"); err != nil {
 			return err
 		}
 	}
@@ -255,7 +255,7 @@ driver func parseBuildFlags(env Env, io Stdio, from usize, to usize, withOut boo
 		evalFuel = v
 	}
 	if evalFuel == 0 {
-		if err := sayf(io, formatTo(mbuf[:], "finc1 %s: --comptime-fuel must be positive\n", name)); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc %s: --comptime-fuel must be positive\n", name)); err != nil {
 			return 0, err
 		}
 		return 0, ErrParse
@@ -377,7 +377,7 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 		}
 		if !isRoot {
 			if !quiet {
-				_ = sayf(io, formatTo(mbuf[:], "finc1: FINCORE_ROOT=%s does not contain the fincore go.mod\n", r))
+				_ = sayf(io, formatTo(mbuf[:], "finc: FINCORE_ROOT=%s does not contain the fincore go.mod\n", r))
 			}
 			return ""
 		}
@@ -410,7 +410,7 @@ driver func findModuleRoot(fs FS, env Env, io Stdio, quiet bool) string {
 		}
 	}
 	if !quiet {
-		_ = emsg(io, "finc1: cannot find the fincore module root (go.mod with `module fincore`); set FINCORE_ROOT\n")
+		_ = emsg(io, "finc: cannot find the fincore module root (go.mod with `module fincore`); set FINCORE_ROOT\n")
 	}
 	return ""
 }
@@ -467,7 +467,7 @@ driver func compileGo(fs FS, io Stdio, src string) error {
 		if semaFull {
 			return capacityFail(io, src, semaFullWhat)
 		}
-		if err := sayf(io, formatTo(mbuf[:], "finc1: %s\n", cgErrBuf.Bytes())); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc: %s\n", cgErrBuf.Bytes())); err != nil {
 			return err
 		}
 		return ErrParse
@@ -476,7 +476,7 @@ driver func compileGo(fs FS, io Stdio, src string) error {
 }
 
 // runGo runs the go command (or bin if not "") with args in workdir; on
-// failure it reports "finc1: <what>: exit status N\n<stderr>".
+// failure it reports "finc: <what>: exit status N\n<stderr>".
 driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []string, workdir string, what string, strip string) error {
 	ctx, cancel := NewContext()
 	defer cancel()
@@ -487,9 +487,9 @@ driver func runTool(io Stdio, exec Exec, bin string, args []string, envs []strin
 	eb := &errBuf
 	eb.Reset()
 	if err != nil {
-		putMsg(eb, formatTo(mbuf[:], "finc1: %s: cannot run %s\n", what, bin))
+		putMsg(eb, formatTo(mbuf[:], "finc: %s: cannot run %s\n", what, bin))
 	} else {
-		putMsg(eb, formatTo(mbuf[:], "finc1: %s: exit status %d\n", what, st.Code))
+		putMsg(eb, formatTo(mbuf[:], "finc: %s: exit status %d\n", what, st.Code))
 	}
 	putStripped(eb, execErr[:n], strip)
 	eb.WriteByte('\n')
@@ -544,7 +544,7 @@ driver func buildIn(fs FS, env Env, io Stdio, exec Exec, dir string, out string,
 	}
 	absOut := absPath(env, out)
 	if len(absOut) == 0 {
-		_ = sayf(io, formatTo(mbuf[:], "finc1: cannot make %s absolute ($PWD is not set)\n", out))
+		_ = sayf(io, formatTo(mbuf[:], "finc: cannot make %s absolute ($PWD is not set)\n", out))
 		return ErrNotFound
 	}
 	_, goVer := goModInfo(fs, root)
@@ -615,7 +615,7 @@ driver func runBuild(fs FS, env Env, io Stdio, exec Exec) error {
 		return err
 	}
 	if argc-first != 1 {
-		if err := emsg(io, "usage: finc1 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n"); err != nil {
+		if err := emsg(io, "usage: finc build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n"); err != nil {
 			return err
 		}
 		return ErrParse
@@ -654,7 +654,7 @@ driver func runRun(fs FS, env Env, io Stdio, exec Exec) error {
 		return err
 	}
 	if dash-first != 1 {
-		if err := emsg(io, "usage: finc1 run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n"); err != nil {
+		if err := emsg(io, "usage: finc run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n"); err != nil {
 			return err
 		}
 		return ErrParse
@@ -1428,7 +1428,7 @@ driver func runPassTest(fs FS, exec Exec, self string, src string, outPath strin
 }
 
 driver func testUsage(io Stdio) error {
-	if err := emsg(io, "usage: finc1 test [-v] [--context] <dir>\n  -context\n    \tshow source context in the diagnostics of failing tests\n  -v\tprint every test result\n"); err != nil {
+	if err := emsg(io, "usage: finc test [-v] [--context] <dir>\n  -context\n    \tshow source context in the diagnostics of failing tests\n  -v\tprint every test result\n"); err != nil {
 		return err
 	}
 	return ErrParse
@@ -1460,7 +1460,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		return testUsage(io)
 	}
 	if !fs.IsDir(dir) {
-		if err := sayf(io, formatTo(mbuf[:], "finc1 test: %s is not a directory\n", dir)); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc test: %s is not a directory\n", dir)); err != nil {
 			return err
 		}
 		return ErrParse
@@ -1485,7 +1485,7 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 		return ioFail(io, "open ", dir, err)
 	}
 	if nTests == 0 {
-		if err := sayf(io, formatTo(mbuf[:], "finc1 test: no tests in %s\n", dir)); err != nil {
+		if err := sayf(io, formatTo(mbuf[:], "finc test: no tests in %s\n", dir)); err != nil {
 			return err
 		}
 		return ErrNotFound

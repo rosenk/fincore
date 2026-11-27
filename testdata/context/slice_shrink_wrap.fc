@@ -1,0 +1,14 @@
+// SINCE: v0.3
+// context: E4002 for a slice-shrink loop whose start index n+1 may wrap
+// around to 0; the hint explains the overflow case.
+package main
+
+func count(rem []byte) usize {
+	c := usize(0)
+	for len(rem) > 0 {
+		n := usize(rem[0])
+		c++
+		rem = rem[n+1:]
+	}
+	return c
+}

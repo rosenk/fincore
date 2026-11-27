@@ -1,0 +1,13 @@
+// SINCE: v0.3
+// context: E3002 between two parameters at the same depth (decision 44:
+// each parameter is its own region). The message has no depths and states
+// the rule; the hint fits it.
+package main
+
+type Lexer struct {
+	src []byte
+}
+
+func (l *Lexer) reset(src []byte) {
+	l.src = src
+}

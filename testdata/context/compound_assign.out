@@ -1,0 +1,3 @@
+testdata/context/compound_assign.fc:8:6: error[E1001]: compound assignment operator >>= is not supported; write c = c >> 1
+    8 |     c >>= 1
+      |         ^

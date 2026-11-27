@@ -28,9 +28,20 @@
 // with the default fuel and with --comptime-fuel=1000.
 //
 // A case matches when stdout, stderr and the exit status are identical.
-// finc1's generated main prints "error: <err>" after a failing driver and
-// always exits 1 on error, so its final "error: fincore: ..." line is
-// removed before comparing and exit statuses are compared as 0 / non-zero.
+// finc1 always exits 1 on error, so exit statuses are compared as 0 /
+// non-zero; a final "error: fincore: ..." line of finc1's generated main
+// (printed only when finc1 failed without writing to stderr, decision 156)
+// is removed before comparing.
+//
+// Allowlist (-allow, default scripts/diffcheck/allow.txt): deliberate
+// rewordings of finc1's diagnostics (compiler/ is ahead of the frozen
+// finc0). One rule per line, `E#### "old text" => "new text" # reason`
+// (scripts/diagallow); blank lines and `#` comments are ignored. A
+// mismatching case is allowlisted when stdout and the success status agree
+// and every differing stderr line is a diagnostic at the same position with
+// the same code whose finc0 message contains the old text and whose finc1
+// message contains the new text of a rule for that code. It is counted
+// separately and does not fail the run; -v prints it.
 //
 // finc0 is frozen at language v0.2, so this is a regression check of the
 // v0.2 subset: corpus files and packages whose leading comment block says
@@ -54,6 +65,7 @@ import (
 	"strconv"
 	"strings"
 
+	"fincore/scripts/diagallow"
 	"fincore/scripts/langver"
 )
 
@@ -73,7 +85,12 @@ func main() {
 	mutants := flag.Int("mutate", 0, "also check N random token-level mutants of every corpus file")
 	seed := flag.Int64("seed", 1, "mutation seed")
 	passes := flag.String("passes", "types", "passes to compare (--passes= value of both compilers: types, scope, totality, all)")
+	allowPath := flag.String("allow", "scripts/diffcheck/allow.txt", "allowlist of deliberate diagnostic rewordings")
 	flag.Parse()
+	rules, err := readAllow(*allowPath)
+	if err != nil {
+		fatal(err)
+	}
 	abs0, _ := filepath.Abs(*finc0)
 	abs1, _ := filepath.Abs(*finc1)
 
@@ -118,7 +135,7 @@ func main() {
 		cases = append(cases, mutantCases(tmp, *mutants, *seed, *passes != "types")...)
 	}
 
-	match, mismatch := 0, 0
+	match, mismatch, allowed := 0, 0, 0
 	var failed []string
 	for _, c := range cases {
 		pf := "--passes=" + *passes
@@ -133,20 +150,58 @@ func main() {
 			}
 			continue
 		}
+		if o0 == o1 && (x0 == 0) == (x1 == 0) && diagallow.Explain(rules, e0, e1) {
+			allowed++
+			if *verbose {
+				fmt.Printf("ALLOW %s\n", c.name)
+				fmt.Print(indent("finc0: ", e0))
+				fmt.Print(indent("finc1: ", e1))
+			}
+			continue
+		}
 		mismatch++
 		failed = append(failed, c.name)
 		fmt.Printf("DIFF  %s (exit %d vs %d)\n", c.name, x0, x1)
 		fmt.Print(indent("finc0: ", e0+o0))
 		fmt.Print(indent("finc1: ", e1+o1))
 	}
-	fmt.Printf("diff-check (--passes=%s): %d cases, %d match, %d mismatch", *passes, len(cases), match, mismatch)
+	fmt.Printf("diff-check (--passes=%s): %d cases, %d match, %d mismatch, %d allowlisted", *passes, len(cases), match, mismatch, allowed)
 	if skipped > 0 {
 		fmt.Printf(", %d inputs skipped (// SINCE: newer than finc0's %s)", skipped, langver.Finc0)
 	}
 	fmt.Println()
+	if allowed > 0 || *verbose {
+		for _, r := range rules {
+			fmt.Printf("  allowlist: %d diagnostics: %s (%s)\n", r.Used, r, r.Reason)
+		}
+	}
 	if mismatch > 0 {
 		os.Exit(1)
 	}
+}
+
+// readAllow reads the allowlist rules (a missing file is an empty list).
+func readAllow(path string) ([]*diagallow.Rule, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rules []*diagallow.Rule
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		r, err := diagallow.ParseRule(line)
+		if err != nil {
+			return nil, fmt.Errorf("%s:%d: %v", path, i+1, err)
+		}
+		rules = append(rules, r)
+	}
+	return rules, nil
 }
 
 func fatal(err error) {

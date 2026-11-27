@@ -46,7 +46,15 @@
 // line, `<case name> # <reason>`; blank lines and lines starting with `#`
 // are ignored. An allowlisted REGRESSION or DIAG-CHANGED case does not
 // fail the run; unused entries are reported. Case names are those printed
-// by -v.
+// by -v. A line `E#### "old text" => "new text" # <reason>` is a rewording
+// rule (scripts/diagallow): a DIAG-CHANGED case whose every differing step
+// has the same stdout and exit status and differs only in diagnostics at
+// the same position with the same code, reworded as a rule says, is
+// allowlisted without naming the case.
+//
+// A failing compiler's final `error: fincore: ...` line (the generated
+// main's report, which the current runtime leaves out after diagnostics,
+// decision 156) is removed from stderr before comparing.
 package main
 
 import (
@@ -71,6 +79,7 @@ import (
 	"sync"
 	"time"
 
+	"fincore/scripts/diagallow"
 	"fincore/scripts/langver"
 )
 
@@ -646,14 +655,25 @@ func run(bin, dir string, env []string, args []string) outcome {
 	if ctx.Err() != nil {
 		errb.WriteString("\n(timed out)")
 	}
-	return outcome{out.String(), errb.String(), code}
+	return outcome{out.String(), stripRuntimeError(errb.String()), code}
+}
+
+// stripRuntimeError removes a final `error: fincore: ...` line.
+func stripRuntimeError(s string) string {
+	t := strings.TrimSuffix(s, "\n")
+	i := strings.LastIndex(t, "\n")
+	if strings.HasPrefix(t[i+1:], "error: fincore: ") {
+		return t[:i+1]
+	}
+	return s
 }
 
 type stepDiff struct {
-	step   string
-	cls    class
-	reason string
-	detail string
+	step     string
+	cls      class
+	reason   string
+	detail   string
+	old, cur *outcome // the compilers' outcomes (compared steps)
 }
 
 type result struct {
@@ -668,7 +688,7 @@ func (r *result) add(step string, cls class, reason, detail string) {
 	if cls > r.cls {
 		r.cls = cls
 	}
-	r.diffs = append(r.diffs, stepDiff{step, cls, reason, detail})
+	r.diffs = append(r.diffs, stepDiff{step: step, cls: cls, reason: reason, detail: detail})
 }
 
 func (c tcase) newer() bool {
@@ -707,6 +727,7 @@ func runCase(c tcase, out string) result {
 		cls, why := classify(o, n, newer, c.failTest)
 		if cls != identical {
 			r.add(name, cls, why, outcomeDetail(o, n))
+			r.diffs[len(r.diffs)-1].old, r.diffs[len(r.diffs)-1].cur = &o, &n
 		}
 	}
 	step("parse", []string{"parse", "--dump-ast", c.path})
@@ -735,6 +756,9 @@ func runCase(c tcase, out string) result {
 		o.out, n.out = "", ""
 		cls, why := classify(o, n, newer, c.failTest)
 		r.add("build", cls, why, outcomeDetail(o, n))
+		if cls != identical {
+			r.diffs[len(r.diffs)-1].old, r.diffs[len(r.diffs)-1].cur = &o, &n
+		}
 		if n.ok() {
 			newOnly(&r, c, out, gNew, bNew)
 		}
@@ -910,23 +934,75 @@ type allowEntry struct {
 	used   bool
 }
 
-// readAllow parses the allowlist: `<case name> # <reason>` per line.
-func readAllow(r io.Reader) (map[string]*allowEntry, error) {
+// readAllow parses the allowlist: `<case name> # <reason>` per line, and
+// rewording rules `E#### "old" => "new" # <reason>` (scripts/diagallow).
+func readAllow(r io.Reader) (map[string]*allowEntry, []*diagallow.Rule, error) {
 	allow := map[string]*allowEntry{}
+	var rules []*diagallow.Rule
 	sc := bufio.NewScanner(r)
 	for ln := 1; sc.Scan(); ln++ {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		if diagallow.IsRule(line) {
+			rule, err := diagallow.ParseRule(line)
+			if err != nil {
+				return nil, nil, fmt.Errorf("line %d: %v", ln, err)
+			}
+			rules = append(rules, rule)
+			continue
+		}
 		name, reason, ok := strings.Cut(line, " # ")
 		name, reason = strings.TrimSpace(name), strings.TrimSpace(reason)
 		if !ok || name == "" || reason == "" {
-			return nil, fmt.Errorf("line %d: want `<case name> # <reason>`", ln)
+			return nil, nil, fmt.Errorf("line %d: want `<case name> # <reason>`", ln)
 		}
 		allow[name] = &allowEntry{reason: reason}
 	}
-	return allow, sc.Err()
+	return allow, rules, sc.Err()
+}
+
+// reworded reports whether the rules explain every difference of a
+// DIAG-CHANGED result: each differing step has the same stdout and exit
+// status, and stderr differs only by reworded diagnostics.
+func reworded(r result, rules []*diagallow.Rule) (*allowEntry, bool) {
+	if r.cls != diagChanged || len(rules) == 0 {
+		return nil, false
+	}
+	for _, d := range r.diffs {
+		if d.old == nil || d.old.out != d.cur.out || d.old.code != d.cur.code {
+			return nil, false
+		}
+	}
+	var why []string
+	for _, d := range r.diffs {
+		before := make([]int, len(rules))
+		for i, rule := range rules {
+			before[i] = rule.Used
+		}
+		if !diagallow.Explain(rules, d.old.err, d.cur.err) {
+			return nil, false
+		}
+		for i, rule := range rules {
+			if rule.Used > before[i] {
+				why = append(why, rule.Code+": "+rule.Reason)
+			}
+		}
+	}
+	return &allowEntry{reason: strings.Join(dedupeStrings(why), "; ")}, true
+}
+
+func dedupeStrings(l []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, s := range l {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -967,8 +1043,9 @@ func main() {
 	newVer = compilerVersion(newBin, tagVer)
 
 	var allow map[string]*allowEntry
+	var rules []*diagallow.Rule
 	if f, err := os.Open(*allowPath); err == nil {
-		allow, err = readAllow(f)
+		allow, rules, err = readAllow(f)
 		f.Close()
 		if err != nil {
 			fatal(fmt.Errorf("%s: %v", *allowPath, err))
@@ -1030,6 +1107,9 @@ func main() {
 		if r.cls >= diagChanged {
 			a = allow[c.name]
 		}
+		if a == nil {
+			a, _ = reworded(r, rules)
+		}
 		switch {
 		case r.cls == identical:
 			if *verbose {
@@ -1061,6 +1141,13 @@ func main() {
 	for name, a := range allow {
 		if !a.used {
 			fmt.Printf("warning: unused allowlist entry %q (%s)\n", name, a.reason)
+		}
+	}
+	for _, rule := range rules {
+		if rule.Used == 0 {
+			fmt.Printf("warning: unused allowlist rule %s (%s)\n", rule, rule.Reason)
+		} else if *verbose {
+			fmt.Printf("allowlist rule %s: %d diagnostics\n", rule, rule.Used)
 		}
 	}
 	fail := counts[regression] + counts[diagChanged] - allowed

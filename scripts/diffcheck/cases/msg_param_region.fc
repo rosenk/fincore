@@ -1,0 +1,27 @@
+// msg_param_region (v0.2 input, v0.3 message): storing one parameter into
+// memory reached through another is E3002 (decision 44). finc1 states the
+// rule without depths when both are at the same depth (decision 157,
+// allowlisted); a store into longer-lived storage keeps the finc0 wording.
+package main
+
+type Lexer struct {
+	src []byte
+}
+
+var last []byte
+
+func (l *Lexer) reset(src []byte) {
+	l.src = src
+}
+
+func remember(line []byte) {
+	last = line
+}
+
+func pick(l *Lexer, a []byte, b []byte, first bool) {
+	s := a
+	if !first {
+		s = b
+	}
+	l.src = s
+}

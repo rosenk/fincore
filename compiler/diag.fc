@@ -412,13 +412,21 @@ func diagGutter(o *OutBuf, width usize, line u32) {
 func diagHint(code u32, msg []byte) string {
 	match code {
 		E4002 -> {
+			if bytesContains(msg, "is not provably shortened") {
+				return "the start index k of `rem = rem[k:]` must be provably >= 1 without overflow: a positive constant, or a variable checked by `if k == 0 { return }`. An index like n+1 can wrap around to 0, so write `k := n + 1` and check k == 0 before `rem = rem[k:]`"
+			}
 			if bytesHasPrefix(msg, "cannot prove termination of for loop") {
 				return "write a counting loop `for i := usize(0); i < n; i++` whose bound n the body does not assign, or give the loop a `decreases(m)` measure"
 			}
 			return "add `decreases(n)` with an unsigned parameter n and pass a smaller value (such as n-1) on every recursive call"
 		}
 		E4004 -> return "give every function of the cycle a `decreases(n)` measure and pass a smaller value on each call inside the cycle"
-		E3002 -> return "the value refers to memory that dies first: copy the data into a longer-lived value, or declare the target inside the inner scope"
+		E3002 -> {
+			if bytesContains(msg, "each parameter is its own region") {
+				return "store a copy of the data (for example in a fixed array field) instead of a reference to the other parameter's memory, or pass both values to the code that needs them"
+			}
+			return "the value refers to memory that dies first: copy the data into a longer-lived value, or declare the target inside the inner scope"
+		}
 		E3005 -> return "close, release or move the resource on every path (for example `defer r.Close()` right after acquiring it)"
 		E2012 -> {
 			if bytesHasPrefix(msg, "non-exhaustive") {
@@ -458,6 +466,22 @@ func diagCodeEnd(text []byte) usize {
 func bytesHasPrefix(b []byte, p string) bool {
 	pb := strBytes(p)
 	return len(b) >= len(pb) && bytesEqual(b[:len(pb)], pb)
+}
+
+// bytesContains reports whether p occurs in b.
+func bytesContains(b []byte, p string) bool {
+	pb := strBytes(p)
+	n := len(b)
+	m := len(pb)
+	if m > n {
+		return false
+	}
+	for i := usize(0); i < n-m+1; i++ {
+		if bytesEqual(b[i:i+m], pb) {
+			return true
+		}
+	}
+	return false
 }
 
 // putDiagContext writes the source context of diagnostic i (see above).

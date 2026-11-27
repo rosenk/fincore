@@ -57,7 +57,7 @@ frame. Capacities:
 Overflow never panics: `alloc` and the std containers set a sticky flag
 (`full`, `Full()`, `Truncated()`; writes go to the reserved slot 0 or are
 dropped) and the driver
-reports `finc1: <file>: compiler capacity exceeded (...)` and returns
+reports `finc: <file>: compiler capacity exceeded (...)` and returns
 `ErrArenaFull`. The semantic arenas are listed in "Semantic model" below.
 `finc1 check --stats <path>` (hidden flag) prints the usage of every arena.
 
@@ -347,9 +347,12 @@ for the interpreter, generics, enums, Code and error paths), compiler/ and
 every FinCore snippet embedded in finc0's resolve/types/comptime unit tests
 (single files and multi-file import modules, each with the default and a
 small fuel), and requires byte-identical stdout/stderr and the same
-success/failure status (finc1's generated `main` appends one
-`error: fincore: ...` line and always exits 1 on failure; that line is
-removed before comparing). `make diff-check-fuzz SEED=n` adds 20 random
+success/failure status (finc1 always exits 1 on failure; a trailing
+`error: fincore: ...` line of the generated `main`, printed only when
+finc1 failed without writing to stderr (decision 156), is removed before
+comparing). Intentional message changes are allowlisted in
+scripts/diffcheck/allow.txt (a diagnostic code plus an old-text/new-text
+substring pair per entry). `make diff-check-fuzz SEED=n` adds 20 random
 token-level mutants per source. Both compilers get the same hidden
 `--passes` value (`types` by default). The finc0 totality unit-test
 snippets are part of the corpus.
@@ -524,9 +527,9 @@ the unit-test snippets of finc0 (library snippets get a trivial main).
 `make finc2` is the fixed-point smoke test (stage2.go == stage3.go).
 
 Differences from finc0: `run` cannot forward stdin or the child's exit
-status (Exec), so a failing program makes finc1 exit 1 with
-`error: fincore: exec failed`, and the child's stderr is printed after it
-exits. `test` runs pass programs through `/bin/sh -c 'exec "$0" >"$1"'`
+status (Exec), so a failing program makes finc1 exit 1, and the child's
+stderr is printed after it exits (followed by `error: fincore: exec
+failed` only if the child wrote nothing to stderr, decision 156). `test` runs pass programs through `/bin/sh -c 'exec "$0" >"$1"'`
 (Exec does not capture stdout), lists subdirectories with /bin/sh, runs
 `finc1 check`/`build` as subprocesses (Arg(0)) and prints no timings (no
 clock). Flag parsing covers the Go flag forms used in practice.
@@ -542,7 +545,7 @@ clock). Flag parsing covers the Go flag forms used in practice.
   everything else is printed raw. This only matters for unusual Unicode in
   string literals.
 - **I/O error texts are approximations** of Go's `os` errors (for example
-  `finc1: stat x.fc: no such file or directory`, `I/O error`).
+  `finc: stat x.fc: no such file or directory`, `I/O error`).
 - **Flag parsing** handles only `-dump-ast` / `--dump-ast[=true|false]`
   and `--`. Go's `flag` package accepts more spellings.
 - **Path cleaning.** Directory entries are joined with a port of

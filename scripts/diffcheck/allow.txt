@@ -1,0 +1,14 @@
+# diff-check allowlist (scripts/diffcheck, make diff-check*): deliberate
+# rewordings of finc1's diagnostics against the frozen finc0.
+#
+# One rule per line: E#### "old text" => "new text" # <reason>
+# (scripts/diagallow). A differing stderr line pair is allowed when both
+# lines are diagnostics at the same file:line:col with this code, the finc0
+# message contains the old text and the finc1 message contains the new
+# text. Positions and codes can never differ through a rule. The texts are
+# Go string literals.
+
+E1001 "expected expression, found '='" => "compound assignment operator " # v0.3, decision 157: `c >>= 1` (also |= &= ^= %= <<=) names the operator and the assignment to write; same position (the '=')
+E1001 "expected expression, found '^'" => "unary ^ (bitwise complement) is not supported" # v0.3, decision 157: Go's unary ^ is explained; same position (the '^')
+E1001 "expected type, found ','" => "a var declaration declares one name; write separate var declarations" # v0.3, decision 157: `var a, b T`; same position (the ',')
+E3002 ", which outlives it" => ": each parameter is its own region" # v0.3, decision 157: a store between parameters at the same depth (decision 44) states the rule instead of "(depth N) ... (depth N), which outlives it"

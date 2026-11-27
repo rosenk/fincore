@@ -69,14 +69,37 @@ func TestSinceNewer(t *testing.T) {
 }
 
 func TestReadAllow(t *testing.T) {
-	a, err := readAllow(strings.NewReader("# comment\n\ntestdata/fail/x.fc # reworded E2002\nbootstrap/internal/types/check_test.go:73 [fuel 1000] # a # b\n"))
+	a, rules, err := readAllow(strings.NewReader("# comment\n\ntestdata/fail/x.fc # reworded E2002\nbootstrap/internal/types/check_test.go:73 [fuel 1000] # a # b\nE2002 \"old\" => \"new\" # why\n"))
 	if err != nil || len(a) != 2 || a["testdata/fail/x.fc"].reason != "reworded E2002" ||
-		a["bootstrap/internal/types/check_test.go:73 [fuel 1000]"].reason != "a # b" {
-		t.Fatalf("%v %v", a, err)
+		a["bootstrap/internal/types/check_test.go:73 [fuel 1000]"].reason != "a # b" ||
+		len(rules) != 1 || rules[0].Code != "E2002" || rules[0].Reason != "why" {
+		t.Fatalf("%v %v %v", a, rules, err)
 	}
-	for _, bad := range []string{"no reason\n", "name #\n", "name #  \n"} {
-		if _, err := readAllow(strings.NewReader(bad)); err == nil {
+	for _, bad := range []string{"no reason\n", "name #\n", "name #  \n", "E2002 \"old\" => \"new\"\n"} {
+		if _, _, err := readAllow(strings.NewReader(bad)); err == nil {
 			t.Errorf("%q accepted", bad)
+		}
+	}
+	// A DIAG-CHANGED case reworded as a rule says is allowlisted; other
+	// differences (another position, stdout, exit status) are not.
+	old := outcome{err: "t.fc:1:1: error[E2002]: old message\n", code: 1}
+	diag := func(cur outcome) result {
+		var r result
+		cls, _ := classify(old, cur, false, false)
+		r.add("check", cls, "", "")
+		r.diffs[0].old, r.diffs[0].cur = &old, &cur
+		return r
+	}
+	if _, ok := reworded(diag(outcome{err: "t.fc:1:1: error[E2002]: new message\n", code: 1}), rules); !ok {
+		t.Error("reworded diagnostic not allowlisted")
+	}
+	for _, cur := range []outcome{
+		{err: "t.fc:1:2: error[E2002]: new message\n", code: 1},
+		{err: "t.fc:1:1: error[E2002]: other message\n", code: 1},
+		{err: "t.fc:1:1: error[E2002]: new message\n", code: 2},
+	} {
+		if _, ok := reworded(diag(cur), rules); ok {
+			t.Errorf("%+v allowlisted", cur)
 		}
 	}
 }
