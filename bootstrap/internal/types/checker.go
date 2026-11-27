@@ -822,6 +822,8 @@ func writeExpr(b *strings.Builder, e ast.Expr) {
 		b.WriteString(e.Type.Name.Name + "{...}")
 	case *ast.TypeExpr:
 		b.WriteString("type expression")
+	case *ast.MatchExpr:
+		b.WriteString("match expression")
 	default:
 		b.WriteString("expression")
 	}

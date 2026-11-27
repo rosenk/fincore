@@ -20,6 +20,7 @@ files (spec 9.5.6); there are no local imports.
 | `checker.fc` | Type checker part 1: operands, assignability and untyped constants, package-level declarations, type expressions, recursive types, `main`, finishing |
 | `check_expr.fc` | Type checker part 2: expressions and calls (builtins, conversions, methods, capability methods, variants, generic instances, comptime folding) |
 | `check_stmt.fc` | Type checker part 3: statements, match patterns, terminating statements |
+| `check_match.fc` | Type checker part 4 (v0.2 sum types, finc0's types/match.go): match statements and expressions, or-patterns, exhaustiveness and reachability (E2012), untyped match expressions |
 | `comptime.fc` | Fuel-bounded comptime interpreter (the checker's evaluator) |
 | `totality.fc` | Totality checker part 1 (finc0's `totality`: totality.go, invariant.go, loops.go): pre-order program index, E5001 effects, root facts, loop invariance, T1, T2 setup |
 | `totality_flow.fc` | Totality checker part 2 (flow.go, T2/T3 walks): abstract states, bounds, the path-sensitive walker |
@@ -28,6 +29,7 @@ files (spec 9.5.6); there are no local imports.
 | `codegen.fc` | Code generator part 1 (finc0's `ir` + `codegen/golang` gen.go, types.go, values.go): emission buffers, Go names, usage/scope/dead-code analyses, match arm lowering, monomorphization, types, constant values, declarations, entry point |
 | `codegen_expr.fc` | Code generator part 2 (expr.go): expressions and calls |
 | `codegen_stmt.fc` | Code generator part 3 (stmt.go): bodies, statements, scope barriers, labeled breaks, returns through scopes |
+| `codegen_enum.fc` | Code generator part 4 (v0.2 sum types, enum.go): compact enum layouts (LIFO layout pools), match switches, match expressions, `return match` |
 | `build.fc` | `build`, `run`, `test` (finc0's build.go / test.go): temporary module, gofmt and `go build` via Exec, test conventions of testdata/README.md |
 
 ## Architecture
@@ -379,7 +381,8 @@ function; overflow is reported as capacity exceeded.
 - Every recursive function carries `decreases(depth)`, opens with
   `if depth == 0 { return ... }` and passes `depth - 1` (or `depth-1`)
   on every call inside its SCC (T3). There are three SCCs: the parser
-  (33 methods on `*Parser`), the printer (4 methods on `*Printer`), and
+  (35 methods on `*Parser` since v0.2's `matchExpr` and `patternAlt`;
+  the SCC has 33 members), the printer (4 methods on `*Printer`), and
   two directly recursive methods (`NodeArena.assignIDs`,
   `Dumper.dumpNode`). Parser entry points start the measure at
   `ParseDepth = 65_536`, far above the frames reachable within

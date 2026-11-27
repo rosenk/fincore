@@ -752,7 +752,7 @@ func addLess(x u32, y u32, strict bool, st u32, dp usize) decreases(dp) {
 // The walker
 
 func isExprKind(k u8) bool {
-	return k >= NkIdent && k <= NkStructLit || k == NkTypeExpr
+	return k >= NkIdent && k <= NkStructLit || k == NkTypeExpr || k == NkMatchExpr
 }
 
 func asgPush(n u32) {
@@ -949,38 +949,17 @@ func killPattern(p u32, st u32) {
 }
 
 // matchExhaustive reports whether a match statement covers all cases: it
-// has a wildcard arm, or it matches an enum and names every variant.
+// has a wildcard arm, or it matches an enum (v0.2: the type checker
+// rejects non-exhaustive enum matches with E2012).
 func matchExhaustive(m u32) bool {
 	n := l1len(m)
-	seen := usize(0)
 	for i := usize(0); i < n; i++ {
 		p := na(l1at(m, i))
-		if p == 0 {
-			continue
-		}
-		if nkind(p) == NkWildcardPattern {
+		if p != 0 && nkind(p) == NkWildcardPattern {
 			return true
 		}
-		if nkind(p) != NkCtorPattern || nvarEnum[usize(p)] == 0 {
-			continue
-		}
-		dup := false
-		for j := usize(0); j < i; j++ {
-			q := na(l1at(m, j))
-			if q != 0 && nkind(q) == NkCtorPattern && nvarEnum[usize(q)] != 0 && nvarIdx[usize(q)] == nvarIdx[usize(p)] {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			seen++
-		}
 	}
-	en := underlying(ntype[usize(na(m))])
-	if tkOf(en) == TCEnum {
-		return seen == nvariants(en)
-	}
-	return false
+	return tkOf(underlying(ntype[usize(na(m))])) == TCEnum
 }
 
 // wNestedLoop analyses a loop inside the analysed body: facts about the
@@ -1076,6 +1055,18 @@ func twExpr(e u32, st u32, dp usize) decreases(dp) {
 	}
 	k := nkind(e)
 	if k == NkFuncLit {
+		return
+	}
+	if k == NkMatchExpr {
+		// v0.2: the arms are branches; the payload bindings are fresh.
+		twExpr(na(e), st, dp-1)
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			arm := l1at(e, i)
+			a := cloneState(st)
+			killPattern(na(arm), a)
+			twExpr(nb(arm), a, dp-1)
+		}
 		return
 	}
 	if k == NkBinaryExpr && (nop(e) == OpLAnd || nop(e) == OpLOr) {

@@ -285,6 +285,15 @@ func (w *walker) expr(e ast.Expr, st *state) {
 	switch x := e.(type) {
 	case *ast.FuncLit:
 		return
+	case *ast.MatchExpr:
+		// v0.2: the arms are branches; the payload bindings are fresh.
+		w.expr(x.X, st)
+		for _, arm := range x.Arms {
+			a := st.clone()
+			w.killPattern(arm.Pattern, a)
+			w.expr(arm.Expr, a)
+		}
+		return
 	case *ast.BinaryExpr:
 		if x.Op == ast.OpLAnd || x.Op == ast.OpLOr {
 			w.expr(x.X, st)
@@ -642,21 +651,14 @@ func minus1(b bnds) bnds {
 }
 
 // exhaustive reports whether a match statement covers all cases: it has a
-// wildcard arm, or it matches an enum and names every variant.
+// wildcard arm, or it matches an enum (v0.2: the type checker rejects
+// non-exhaustive enum matches with E2012).
 func (c *checker) exhaustive(m *ast.MatchStmt) bool {
-	seen := map[int]bool{}
 	for _, arm := range m.Arms {
-		switch p := arm.Pattern.(type) {
-		case *ast.WildcardPattern:
+		if _, ok := arm.Pattern.(*ast.WildcardPattern); ok {
 			return true
-		case *ast.CtorPattern:
-			if v := c.info.VariantOf(p); v != nil {
-				seen[v.Index] = true
-			}
 		}
 	}
-	if e, ok := under(c.info.TypeOf(m.X)).(*types.Enum); ok {
-		return len(seen) == len(e.Variants)
-	}
-	return false
+	_, ok := under(c.info.TypeOf(m.X)).(*types.Enum)
+	return ok
 }

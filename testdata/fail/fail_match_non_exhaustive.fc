@@ -1,0 +1,25 @@
+// fail_match_non_exhaustive (v0.2): a match statement on an enum without a
+// `_` arm must name every variant; E2012 is reported at `match` and lists
+// the missing variants in declaration order.
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+func area(s Shape) u64 {
+	var a u64
+	match s { // ERROR E2012
+		Circle(r) -> {
+			a = u64(r)
+		}
+	}
+	return a
+}
+
+driver func main(io Stdio) error {
+	_ = area(Shape.Empty)
+	return nil
+}

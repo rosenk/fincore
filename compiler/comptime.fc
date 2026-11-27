@@ -761,52 +761,106 @@ func imatch(s u32, dp usize) u8 decreases(dp) {
 	if ifail {
 		return CtlReturn
 	}
-	n := l1len(s)
-	for i := usize(0); i < n; i++ {
-		arm := l1at(s, i)
-		p := na(arm)
-		pk := nkind(p)
-		ok := false
-		if pk == NkWildcardPattern {
-			ok = true
-		} else if pk == NkLiteralPattern {
-			v := ieval(na(p), dp-1)
-			if ifail {
-				return CtlReturn
-			}
-			ok = iequal(x, v)
-			if ifail {
-				return CtlReturn
-			}
-		} else if pk == NkCtorPattern {
-			if nvarEnum[usize(p)] != 0 {
-				if x.kind == VEnum && x.lo == u64(nvarIdx[usize(p)]) {
-					ok = true
-					nb2 := l1len(p)
-					for j := usize(0); j < nb2; j++ {
-						bs := defs[usize(l1at(p, j))]
-						if bs != 0 && j < usize(x.aux) {
-							define(bs, slotGet(x.ref+u32(j)))
-						}
-					}
-				}
-			} else if nval[usize(nb(p))] != 0 {
-				ok = iequal(x, slotGet(nval[usize(nb(p))]))
-				if ifail {
-					return CtlReturn
-				}
-			}
-		}
-		if !ok {
-			continue
-		}
-		if nb(arm) != 0 {
-			_ = ieval(nb(arm), dp-1)
-			return CtlNone
-		}
-		return iblock(nc(arm), dp-1)
+	i := iselectArm(x, s, dp-1)
+	if ifail {
+		return CtlReturn
 	}
-	return CtlNone
+	if i >= l1len(s) {
+		return CtlNone
+	}
+	arm := l1at(s, i)
+	if nb(arm) != 0 {
+		_ = ieval(nb(arm), dp-1)
+		return CtlNone
+	}
+	return iblock(nc(arm), dp-1)
+}
+
+// imatchExpr evaluates a match expression (v0.2).
+func imatchExpr(e u32, dp usize) Val decreases(dp) {
+	var z Val
+	if dp == 0 {
+		tooDeep()
+		failSilent()
+		return z
+	}
+	x := ieval(na(e), dp-1)
+	if ifail {
+		return z
+	}
+	i := iselectArm(x, e, dp-1)
+	if ifail {
+		return z
+	}
+	if i >= l1len(e) {
+		failS(E2002, "no match arm for the value")
+		return z
+	}
+	return ieval(nb(l1at(e, i)), dp-1)
+}
+
+// iselectArm returns the index of the first arm of match m whose pattern
+// (or one of whose or-pattern alternatives) matches x, defining its
+// payload bindings; the arm count if none matches.
+func iselectArm(x Val, m u32, dp usize) usize decreases(dp) {
+	n := l1len(m)
+	if dp == 0 {
+		tooDeep()
+		failSilent()
+		return n
+	}
+	for i := usize(0); i < n; i++ {
+		p := na(l1at(m, i))
+		nalt := patAltN(p)
+		for j := usize(0); j < nalt; j++ {
+			ok := ipatternMatches(x, patAlt(p, j), dp-1)
+			if ifail {
+				return n
+			}
+			if ok {
+				return i
+			}
+		}
+	}
+	return n
+}
+
+func ipatternMatches(x Val, p u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		failSilent()
+		return false
+	}
+	pk := nkind(p)
+	if pk == NkWildcardPattern {
+		return true
+	}
+	if pk == NkLiteralPattern {
+		v := ieval(na(p), dp-1)
+		if ifail {
+			return false
+		}
+		return iequal(x, v)
+	}
+	if pk == NkCtorPattern {
+		if nvarEnum[usize(p)] != 0 {
+			if x.kind != VEnum || x.lo != u64(nvarIdx[usize(p)]) {
+				return false
+			}
+			nb2 := l1len(p)
+			for j := usize(0); j < nb2; j++ {
+				bs := defs[usize(l1at(p, j))]
+				if bs != 0 && j < usize(x.aux) {
+					define(bs, slotGet(x.ref+u32(j)))
+				}
+			}
+			return true
+		}
+		if nval[usize(nb(p))] != 0 {
+			return iequal(x, slotGet(nval[usize(nb(p))]))
+		}
+	}
+	return false
 }
 
 func izero(t u32) Val {
@@ -1119,6 +1173,9 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 	if k == NkFuncLit {
 		failS(E2002, "function literals are not supported at compile time")
 		return z
+	}
+	if k == NkMatchExpr {
+		return imatchExpr(e, dp-1)
 	}
 	failS(E2002, "unsupported expression at compile time")
 	return z

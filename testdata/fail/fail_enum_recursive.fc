@@ -1,0 +1,12 @@
+// fail_enum_recursive: an enum that contains itself by value (directly or
+// through a struct) has infinite size; use an ID into an arena instead.
+package main
+
+type Expr enum { // ERROR E2002
+	Lit(u64)
+	Add(Expr, Expr)
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

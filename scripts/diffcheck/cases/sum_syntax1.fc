@@ -1,0 +1,11 @@
+// sum_syntax1 (v0.2): match-expression arms are expressions, not blocks.
+package main
+
+func f(n u32) u32 {
+	return match n {
+		0 -> 1
+		_ -> {
+			return 2
+		}
+	}
+}

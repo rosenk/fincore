@@ -237,9 +237,12 @@ func (f *fnCtx) returnStmt(s *ast.ReturnStmt) {
 		for _, sv := range scopes {
 			f.line("%s.Wait()", sv)
 		}
-		if len(s.Results) == 0 {
+		switch {
+		case len(s.Results) == 0:
 			f.line("return")
-		} else {
+		case len(s.Results) == 1 && len(f.fn.Info.Sig.Results) == 1:
+			f.returnValue(s.Results[0])
+		default:
 			f.line("return %s", f.rhs(s.Results, len(f.fn.Info.Sig.Results)))
 		}
 		return
@@ -385,65 +388,6 @@ func (f *fnCtx) scopeStmt(s *ast.ScopeStmt) {
 	f.w.WriteString("}\n")
 }
 
-func (f *fnCtx) matchStmt(s *ast.MatchStmt) {
-	arms := ir.MatchArms(f.g.info, s)
-	needBind := false
-	if arms.Enum != nil {
-		for _, a := range arms.Arms {
-			if cp, ok := a.Pattern.(*ast.CtorPattern); ok {
-				for _, b := range cp.Bindings {
-					if sym := f.g.p.Prog.Defs[b.ID()]; sym != nil && f.g.p.Used(sym) {
-						needBind = true
-					}
-				}
-			}
-		}
-	}
-	f.header++
-	var base, hdr string
-	switch {
-	case arms.Enum == nil:
-		hdr = "switch " + f.expr(s.X)
-	case needBind && !isPlainVar(f, s.X):
-		base = f.newTemp()
-		hdr = "switch " + base + " := " + f.expr(s.X) + "; " + base + "._tag"
-	default:
-		base = f.primary(s.X)
-		hdr = "switch " + base + "._tag"
-	}
-	f.header--
-	f.w.WriteString(hdr + " {\n")
-	f.frames = append(f.frames, &frame{kind: frameSwitch})
-	for i, a := range arms.Arms {
-		if i == len(arms.Arms)-1 && arms.HasDefault {
-			f.w.WriteString("default:\n")
-		} else {
-			f.w.WriteString("case " + f.caseLabel(s, a) + ":\n")
-		}
-		if cp, ok := a.Pattern.(*ast.CtorPattern); ok && arms.Enum != nil {
-			if v := f.g.info.VariantOf(cp); v != nil {
-				for j, b := range cp.Bindings {
-					sym := f.g.p.Prog.Defs[b.ID()]
-					if sym == nil || !f.g.p.Used(sym) {
-						continue
-					}
-					f.line("%s := %s.%s", f.g.p.Name(sym), base, variantField(v, j))
-				}
-			}
-		}
-		if a.Expr != nil {
-			if txt := f.exprStmt(a.Expr); txt != "" {
-				f.line("%s", txt)
-			}
-		}
-		if a.Block != nil {
-			f.stmts(a.Block.Stmts)
-		}
-	}
-	f.frames = f.frames[:len(f.frames)-1]
-	f.w.WriteString("}\n")
-}
-
 func isPlainVar(f *fnCtx, e ast.Expr) bool {
 	id, ok := e.(*ast.Ident)
 	if !ok {
@@ -451,22 +395,4 @@ func isPlainVar(f *fnCtx, e ast.Expr) bool {
 	}
 	sym := f.g.p.Prog.Uses[id.ID()]
 	return sym != nil && sym.Kind == resolve.SymVar && sym.Func != nil
-}
-
-func (f *fnCtx) caseLabel(s *ast.MatchStmt, a *ast.MatchArm) string {
-	switch p := a.Pattern.(type) {
-	case *ast.CtorPattern:
-		if v := f.g.info.VariantOf(p); v != nil {
-			return fmt.Sprint(v.Index)
-		}
-		if v := f.g.info.ValueOf(p.Name); v != nil {
-			return f.g.value(p, v, f.typeOf(s.X), f.env)
-		}
-	case *ast.LiteralPattern:
-		if v := f.g.info.ValueOf(p.Lit); v != nil {
-			return f.g.value(p, v, f.typeOf(s.X), f.env)
-		}
-	}
-	f.g.fail(a, "unsupported match pattern")
-	return ""
 }

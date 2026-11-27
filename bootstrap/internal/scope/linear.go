@@ -445,15 +445,7 @@ func (f *flow) stmt(s ast.Stmt, e *env) *env {
 		for _, arm := range s.Arms {
 			a := e.clone()
 			f.frames = append(f.frames, nil)
-			if p, ok := arm.Pattern.(*ast.CtorPattern); ok {
-				for _, b := range p.Bindings {
-					if sym := c.varSym(b); sym != nil {
-						if i, ok := f.idx[sym]; ok {
-							a.st[i], a.tie[i] = stBorrowed, nil
-						}
-					}
-				}
-			}
+			f.borrowBindings(arm.Pattern, a)
 			if arm.Expr != nil {
 				f.expr(arm.Expr, a)
 				if call, ok := unparen(arm.Expr).(*ast.CallExpr); ok {
@@ -569,28 +561,53 @@ func (f *flow) nilTest(cond ast.Expr) (*resolve.Symbol, bool, bool) {
 	return s, b.Op == ast.OpNe, true
 }
 
+// exhaustive reports whether a match statement covers all cases: it has a
+// '_' arm, or it matches an enum (v0.2: the type checker rejects
+// non-exhaustive enum matches with E2012).
 func (f *flow) exhaustive(s *ast.MatchStmt) bool {
-	covered := map[string]bool{}
 	for _, arm := range s.Arms {
-		switch p := arm.Pattern.(type) {
-		case *ast.WildcardPattern:
+		if _, ok := arm.Pattern.(*ast.WildcardPattern); ok {
 			return true
-		case *ast.CtorPattern:
-			if v := f.c.info.VariantOf(p); v != nil {
-				covered[v.Name] = true
+		}
+	}
+	_, ok := under(f.c.info.TypeOf(s.X)).(*types.Enum)
+	return ok && len(s.Arms) > 0
+}
+
+// borrowBindings marks the Linear payload bindings of a match-arm pattern
+// as Borrowed (decision 46).
+func (f *flow) borrowBindings(p ast.Pattern, a *env) {
+	cp, ok := p.(*ast.CtorPattern)
+	if !ok {
+		return
+	}
+	for _, b := range cp.Bindings {
+		if sym := f.c.varSym(b); sym != nil {
+			if i, ok := f.idx[sym]; ok {
+				a.st[i], a.tie[i] = stBorrowed, nil
 			}
 		}
 	}
-	en, ok := under(f.c.info.TypeOf(s.X)).(*types.Enum)
-	if !ok || len(en.Variants) == 0 {
-		return false
-	}
-	for _, v := range en.Variants {
-		if !covered[v.Name] {
-			return false
+}
+
+// matchExpr handles a match expression (v0.2): the arms are branches,
+// payload bindings are borrowed, and an arm that is a Linear variable
+// moves it (like the right-hand side of an assignment).
+func (f *flow) matchExpr(x *ast.MatchExpr, e *env) {
+	c := f.c
+	f.expr(x.X, e)
+	out := deadEnv(len(e.st))
+	for _, arm := range x.Arms {
+		a := e.clone()
+		f.borrowBindings(arm.Pattern, a)
+		if i := f.linVar(arm.Expr); i >= 0 && types.IsLinear(c.info.TypeOf(arm.Expr)) {
+			f.consume(a, i, rootIdent(arm.Expr), kMove)
+		} else {
+			f.expr(arm.Expr, a)
 		}
+		out = joinEnv(out, a)
 	}
-	return true
+	*e = *out
 }
 
 // assign handles `lhs = rhs`, `lhs := rhs` and `var x = v`.
@@ -690,6 +707,8 @@ func (f *flow) expr(x ast.Expr, e *env) {
 		f.call(x, e, false)
 	case *ast.FuncLit:
 		f.lit(x, e, false)
+	case *ast.MatchExpr:
+		f.matchExpr(x, e)
 	}
 }
 

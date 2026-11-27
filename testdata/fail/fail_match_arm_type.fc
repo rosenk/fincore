@@ -1,0 +1,21 @@
+// fail_match_arm_type (v0.2): all arms of a match expression must have the
+// same type; untyped constants adapt, but a typed u64 arm and a typed u32
+// arm do not.
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+}
+
+func measure(s Shape) u64 {
+	return match s {
+		Circle(r) -> u64(r)
+		Rect(w, h) -> w * h // ERROR E2002
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = measure(Shape.Circle(1))
+	return nil
+}

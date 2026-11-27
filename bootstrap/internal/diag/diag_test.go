@@ -12,8 +12,8 @@ func TestFormat(t *testing.T) {
 
 func TestCodes(t *testing.T) {
 	all := AllCodes()
-	if len(all) != 21 {
-		t.Fatalf("want 21 codes, got %d", len(all))
+	if len(all) != 22 {
+		t.Fatalf("want 22 codes, got %d", len(all))
 	}
 	for _, c := range all {
 		if c.Name() == "" {

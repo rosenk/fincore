@@ -586,7 +586,7 @@ func IsTerminating(info *types.Info, s ast.Stmt) bool {
 	case *ast.ScopeStmt:
 		return IsTerminatingList(info, s.Body.Stmts)
 	case *ast.MatchStmt:
-		arms := MatchArms(info, s)
+		arms := MatchArms(info, s.X, s.Arms)
 		if !arms.HasDefault {
 			return false
 		}
@@ -661,17 +661,21 @@ type Arms struct {
 	Enum *types.Enum
 }
 
-// MatchArms lowers the arms of a match statement.
-func MatchArms(info *types.Info, s *ast.MatchStmt) Arms {
+// MatchArms lowers the arms of a match statement or expression (v0.2)
+// with scrutinee x.
+func MatchArms(info *types.Info, x ast.Expr, arms []*ast.MatchArm) Arms {
 	var out Arms
-	t := info.TypeOf(s.X)
+	t := info.TypeOf(x)
 	if t != nil {
 		out.Enum, _ = t.Underlying().(*types.Enum)
 	}
 	var seenVariants []int
 	var seenValues []types.Value
-	for _, a := range s.Arms {
+	for _, a := range arms {
 		switch pt := a.Pattern.(type) {
+		case *ast.OrPattern:
+			// The type checker rejects repeated alternatives (E2012).
+			out.Arms = append(out.Arms, a)
 		case *ast.WildcardPattern:
 			out.Arms = append(out.Arms, a)
 			out.HasDefault = true
@@ -698,7 +702,8 @@ func MatchArms(info *types.Info, s *ast.MatchStmt) Arms {
 			out.Arms = append(out.Arms, a)
 		}
 	}
-	if out.Enum != nil && len(out.Enum.Variants) > 0 && len(seenVariants) == len(out.Enum.Variants) {
+	// v0.2: enum matches without a wildcard are exhaustive (E2012).
+	if out.Enum != nil && len(out.Arms) > 0 {
 		out.HasDefault = true
 	}
 	return out

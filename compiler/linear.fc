@@ -854,19 +854,7 @@ func lnMatch(fl u32, s u32, e u32, dp usize) u32 decreases(dp) {
 		arm := l1at(s, i)
 		a := lnClone(e)
 		lnPushFrame()
-		p := na(arm)
-		if p != 0 && nkind(p) == NkCtorPattern {
-			nbind := l1len(p)
-			for j := usize(0); j < nbind; j++ {
-				sym := scVarSym(l1at(p, j))
-				if sym != 0 {
-					vi := lnIdx(fl, sym)
-					if vi != LnNoVar {
-						lnSet(a, vi, StBorrowed, 0)
-					}
-				}
-			}
-		}
+		lnBorrowBindings(fl, na(arm), a)
 		ae := nb(arm)
 		if ae != 0 {
 			lnExpr(fl, ae, a, dp-1)
@@ -963,6 +951,9 @@ func lnNilTest(cond u32) (u32, bool, bool) {
 	return s, nop(b) == OpNe, true
 }
 
+// lnExhaustive reports whether a match statement covers all cases: it has
+// a '_' arm, or it matches an enum (v0.2: the type checker rejects
+// non-exhaustive enum matches with E2012).
 func lnExhaustive(s u32) bool {
 	n := l1len(s)
 	for i := usize(0); i < n; i++ {
@@ -975,27 +966,61 @@ func lnExhaustive(s u32) bool {
 	if t == 0 {
 		return false
 	}
-	en := underlying(t)
-	if tk(en) != TCEnum || nvariants(en) == 0 {
-		return false
+	return tk(underlying(t)) == TCEnum && n > 0
+}
+
+// lnBorrowBindings marks the Linear payload bindings of a match-arm
+// pattern as Borrowed (decision 46).
+func lnBorrowBindings(fl u32, p u32, a u32) {
+	if p == 0 || nkind(p) != NkCtorPattern {
+		return
 	}
-	nv := nvariants(en)
-	for j := usize(0); j < nv; j++ {
-		name := variantName(en, j)
-		covered := false
-		for i := usize(0); i < n; i++ {
-			p := na(l1at(s, i))
-			if p != 0 && nkind(p) == NkCtorPattern && nvarEnum[usize(p)] != 0 &&
-				variantName(nvarEnum[usize(p)], usize(nvarIdx[usize(p)])) == name {
-				covered = true
-				break
+	nbind := l1len(p)
+	for j := usize(0); j < nbind; j++ {
+		sym := scVarSym(l1at(p, j))
+		if sym != 0 {
+			vi := lnIdx(fl, sym)
+			if vi != LnNoVar {
+				lnSet(a, vi, StBorrowed, 0)
 			}
 		}
-		if !covered {
-			return false
-		}
 	}
-	return true
+}
+
+// lnCopyInto overwrites env dst with src (same width).
+func lnCopyInto(dst u32, src u32) {
+	lnEnv.dead[usize(dst)] = lnEnv.dead[usize(src)]
+	n := lnWidth(dst)
+	for i := u32(0); i < n; i++ {
+		lnSet(dst, i, lnSt(src, i), lnTie(src, i))
+	}
+}
+
+// lnMatchExpr handles a match expression (v0.2): the arms are branches,
+// payload bindings are borrowed, and an arm that is a Linear variable
+// moves it (like the right-hand side of an assignment).
+func lnMatchExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	lnExpr(fl, na(x), e, dp-1)
+	out := lnDeadEnv(lnWidth(e))
+	n := l1len(x)
+	for i := usize(0); i < n; i++ {
+		arm := l1at(x, i)
+		a := lnClone(e)
+		lnBorrowBindings(fl, na(arm), a)
+		ae := nb(arm)
+		vi := lnLinArg(fl, ae)
+		if vi != LnNoVar {
+			lnConsume(fl, a, vi, lnRootIdent(ae), KMove)
+		} else {
+			lnExpr(fl, ae, a, dp-1)
+		}
+		out = lnJoin(out, a)
+	}
+	lnCopyInto(e, out)
 }
 
 // lnAssign handles `lhs = rhs`, `lhs := rhs` and `var x = v`; the targets
@@ -1111,6 +1136,8 @@ func lnExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
 		lnCall(fl, x, e, false, dp-1)
 	} else if k == NkFuncLit {
 		lnLit(fl, x, e, false, dp-1)
+	} else if k == NkMatchExpr {
+		lnMatchExpr(fl, x, e, dp-1)
 	}
 }
 

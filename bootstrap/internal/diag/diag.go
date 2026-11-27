@@ -65,6 +65,7 @@ const (
 	E2006 Code = 2006 // IMPORT_CYCLE
 	E2010 Code = 2010 // UNIVERSE_LEVEL_MISMATCH
 	E2011 Code = 2011 // NON_PARAMETRIC_OP
+	E2012 Code = 2012 // NON_EXHAUSTIVE_MATCH (v0.2; also unreachable match arms)
 	E3001 Code = 3001 // GLOBAL_SCOPED_VAR
 	E3002 Code = 3002 // SCOPE_ESCAPE
 	E3003 Code = 3003 // USE_AFTER_MOVE
@@ -90,6 +91,7 @@ const (
 	ImportCycle              = E2006
 	UniverseLevelMismatch    = E2010
 	NonParametricOp          = E2011
+	NonExhaustiveMatch       = E2012
 	GlobalScopedVar          = E3001
 	ScopeEscape              = E3002
 	UseAfterMove             = E3003
@@ -114,6 +116,7 @@ var codeNames = map[Code]string{
 	E2006: "IMPORT_CYCLE",
 	E2010: "UNIVERSE_LEVEL_MISMATCH",
 	E2011: "NON_PARAMETRIC_OP",
+	E2012: "NON_EXHAUSTIVE_MATCH",
 	E3001: "GLOBAL_SCOPED_VAR",
 	E3002: "SCOPE_ESCAPE",
 	E3003: "USE_AFTER_MOVE",

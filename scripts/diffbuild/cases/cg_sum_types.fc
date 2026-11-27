@@ -1,0 +1,114 @@
+// cg_sum_types (v0.2): compact enum layout and match lowering edge cases:
+// slot sharing by Go type (u8/byte share), composite payload types
+// (numbered slot groups), named and generic payloads, a monomorphized
+// enum with a const parameter, an enum type literal, match expressions as
+// IIFEs and as direct returns (also inside scopes), or-patterns in
+// statement and expression matches, unused bindings, folded constants.
+package main
+
+type ID u32
+
+type Option[T any] enum {
+	Some(T)
+	None
+}
+
+type Big enum {
+	A(u8, byte, u32)
+	B([]byte, [4]u8, string)
+	C(ID, ID, Option[u32])
+	D(u32, u8, u8, u8)
+	E
+}
+
+type Ring[N usize] enum {
+	Full([N]u8)
+	Part([N]u8, usize)
+	Gone
+}
+
+type Holder struct {
+	k enum {
+		On(u32)
+		Off
+	}
+}
+
+const Pick = match Big.E {
+	A(_, _, _) | B(_, _, _) -> 1
+	C(_, _, _) -> 2
+	_ -> 3
+}
+
+func size(b Big) usize {
+	return match b {
+		A(x, y, z) -> usize(x) + usize(y) + usize(z)
+		B(s, a, p) -> len(s) + usize(a[0]) + len(p)
+		C(i, j, o) -> usize(i) + usize(j) + match o {
+			Some(v) -> usize(v)
+			None -> 0
+		}
+		D(w, _, _, last) -> usize(w) + usize(last)
+		E -> 0
+	}
+}
+
+func ring(r Ring[8]) usize {
+	var n usize
+	match r {
+		Full(_) | Gone -> {
+			n = 8
+		}
+		Part(_, k) -> {
+			n = k
+		}
+	}
+	return n
+}
+
+func inScope() u32 {
+	o := Option[u32].Some(3)
+	scope s := NewScope(1) {
+		_ = s
+		return match o {
+			Some(v) -> v
+			None -> 0
+		}
+	}
+}
+
+func twice(o Option[u32]) (u32, u32) {
+	v := match o { Some(x) -> x; None -> 0 }
+	return v, match o { Some(_) -> 1; None -> 0 }
+}
+
+driver func main(io Stdio) error {
+	var b8 [8]u8
+	var buf [4]u8
+	var bs [5]Big
+	bs[0] = Big.A(1, 2, 3)
+	bs[1] = Big.B(buf[:], buf, "id")
+	bs[2] = Big.C(ID(1), ID(2), Option[u32].Some(9))
+	bs[3] = Big.D(1, 2, 3, 4)
+	bs[4] = Big.E
+	var total usize
+	for i := usize(0); i < len(bs); i++ {
+		total += size(bs[i])
+	}
+	h := Holder{}
+	match h.k {
+		On(x) -> {
+			total += usize(x)
+		}
+		Off -> {
+		}
+	}
+	var rg Ring[8]
+	rg = Ring[8].Part(b8, 5)
+	total += ring(rg) + usize(inScope()) + usize(Pick)
+	a, b := twice(Option[u32].None)
+	if total == 0 || a+b != 0 {
+		return ErrNotFound
+	}
+	return nil
+}

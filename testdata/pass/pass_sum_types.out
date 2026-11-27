@@ -1,0 +1,26 @@
+Code: 2
+classify: 2030
+shapeCode: 12
+area circle: 12
+area rect: 15
+area scaled: 60
+rect==circle: 0
+after change: 1
+empty equal
+small: 7
+big: 1099511627776
+n: 2
+code green: 200
+is green
+not warm
+digits: 210
+names: 102
+sum2: 82
+isSome ok
+dflt
+parsed: 492
+ErrParse
+eval: 955
+array areas: 5
+struct areas: 312
+done

@@ -729,12 +729,13 @@ func TestCompilerSCCs(t *testing.T) {
 		}
 	}
 	slices.Sort(sizes)
-	// The M6 front end contributes the 31-member Parser SCC and the
+	// The M6 front end contributes the Parser SCC (31 members; 33 since the
+	// v0.2 matchExpr and patternAlt methods) and the
 	// 4-member Printer SCC; the semantic phases added since (M7: resolver,
 	// checker + comptime interpreter, value and type helpers) add their
 	// own SCCs, so only require the M6 ones to be intact.
-	if !slices.Contains(sizes, 31) || !slices.Contains(sizes, 4) {
-		t.Errorf("nontrivial SCC sizes = %v, want the Parser (31) and Printer (4) SCCs among them", sizes)
+	if !slices.Contains(sizes, 33) || !slices.Contains(sizes, 4) {
+		t.Errorf("nontrivial SCC sizes = %v, want the Parser (33) and Printer (4) SCCs among them", sizes)
 	}
 }
 
@@ -796,4 +797,44 @@ func TestCorpus(t *testing.T) {
 			}
 		})
 	}
+}
+
+// v0.2 sum types: match-expression arms are branches of the flow walker.
+func TestMatchExprTotality(t *testing.T) {
+	runAll(t, []tcase{
+		{"driver call in arm", `
+driver func side() u32 {
+	return 1
+}
+func pure(n u32) u32 {
+	return match n { 0 -> 1; _ -> side() } // ERROR E5001
+}`},
+		{"recursion in arm after guard", `
+type T enum {
+	Leaf(u32)
+	Pair(u32, u32)
+}
+func size(t T, d usize) usize decreases(d) {
+	if d == 0 {
+		return 0
+	}
+	return match t {
+		Leaf(_) -> 1
+		Pair(a, b) -> size(T.Leaf(a), d-1) + size(T.Leaf(b), d-1)
+	}
+}`},
+		{"recursion in arm without guard", `
+func f(n usize) usize decreases(n) {
+	return match n { 0 -> 1; _ -> f(n - 1) } // ERROR E4002
+}`},
+		{"loop bound from match expr", `
+func f(k u32) u32 {
+	var s u32
+	lim := match k { 0 -> u32(4); _ -> k }
+	for i := u32(0); i < lim; i++ {
+		s += match i { 1 | 3 -> i; _ -> 0 }
+	}
+	return s
+}`},
+	})
 }

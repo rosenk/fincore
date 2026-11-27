@@ -99,16 +99,7 @@ func (g *gen) typeLit(n ast.Node, t types.Type, e *env) string {
 		b.WriteString("}")
 		return b.String()
 	case *types.Enum:
-		var b strings.Builder
-		b.WriteString("struct {\n")
-		fmt.Fprintf(&b, "_tag %s\n", tagType(t))
-		for _, v := range t.Variants {
-			for i, p := range v.Payload {
-				fmt.Fprintf(&b, "%s %s\n", variantField(v, i), g.goType(n, p, e))
-			}
-		}
-		b.WriteString("}")
-		return b.String()
+		return g.enumStruct(n, t, e)
 	case *types.Signature:
 		return "func" + g.sigTypes(n, t, e)
 	}
@@ -145,18 +136,6 @@ func (g *gen) results(n ast.Node, rs []types.Type, e *env) string {
 		parts[i] = g.goType(n, r, e)
 	}
 	return " (" + strings.Join(parts, ", ") + ")"
-}
-
-func tagType(en *types.Enum) string {
-	if len(en.Variants) <= 256 {
-		return "uint8"
-	}
-	return "uint32"
-}
-
-// variantField is the struct field holding payload element i of v.
-func variantField(v *types.Variant, i int) string {
-	return fmt.Sprintf("_%s_%d", v.Name, i)
 }
 
 // namedType renders a named type or instance.

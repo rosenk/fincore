@@ -63,7 +63,7 @@ func classify(t Tok) u32 {
 		Tok.A -> {
 			return 1
 		}
-		Tok.A -> {
+		Tok.C -> {
 			return 9
 		}
 		_ -> {
@@ -81,14 +81,11 @@ func ints(x u32) u32 {
 		Two -> {
 			n = 20
 		}
-		2 -> {
-			n = 99
+		3 | 4 -> {
+			n = 40
 		}
 		_ -> {
 			n = 30
-		}
-		3 -> {
-			n = 40
 		}
 	}
 	return n

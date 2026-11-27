@@ -1,0 +1,86 @@
+// sum_types (v0.2): exhaustiveness, reachability, or-pattern and
+// match-expression type errors; both compilers must report the same
+// diagnostics in the same order.
+package main
+
+type Shape enum {
+	Circle(u32)
+	Rect(u32, u32)
+	Empty
+}
+
+type Opt[T any] enum {
+	Some(T)
+	None
+}
+
+const K = 2
+const S = Shape.Empty
+
+const C1 = match Shape.Empty { Circle(_) -> 1; _ -> 2 }
+const C2 = match K { 1 | 2 -> "a"; _ -> 3 }
+
+func f1(s Shape) u32 {
+	match s {
+		Circle(r) -> {
+			return r
+		}
+		Empty | Rect(_, _) -> {
+			return 0
+		}
+		Shape.Empty -> {
+			return 9
+		}
+		_ -> {
+			return 1
+		}
+	}
+}
+
+func f2(n u32) u32 {
+	return match n {
+		1 | K | 3 -> 1
+		2 -> 2
+		_ -> 3
+		4 -> 4
+	}
+}
+
+func f3(s Shape) u64 {
+	return match s {
+		Circle(r) -> u64(r)
+		Rect(w, _) -> w
+	}
+}
+
+func f4(o Opt[u32], s Shape) u32 {
+	a := match o { Opt.Some(x) | None -> u32(0) }
+	b := match s { S -> 1; _ -> 0 }
+	c := match o { Some(_) -> nil; None -> nil }
+	d := match o { Some(_) -> 'a'; None -> 300 }
+	var e u8 = match o { Some(_) -> 'a'; None -> 300 }
+	return a + b + d + u32(e) + match c { _ -> 1 }
+}
+
+func f5(b bool, s string) u32 {
+	x := match b { true -> 1; false -> 2 }
+	y := match s { "a" | "b" -> 1; "a" -> 2; _ -> 3 }
+	match s {
+		"x" -> f6()
+	}
+	return x + y + match 7 { _ -> 0; 1 -> 1 }
+}
+
+func f6() {
+}
+
+func f7(o Opt[string]) string {
+	return match o {
+		Some(v) -> v
+		None -> match 1 { 1 -> "one" }
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

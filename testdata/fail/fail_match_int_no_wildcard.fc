@@ -1,0 +1,15 @@
+// fail_match_int_no_wildcard (v0.2): a match expression on an integer needs
+// a `_` arm even when the listed literals look complete for its use.
+package main
+
+func kind(b u8) u32 {
+	return match b { // ERROR E2012
+		'a' | 'e' | 'i' | 'o' | 'u' -> 1
+		0 -> 2
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = kind('a')
+	return nil
+}

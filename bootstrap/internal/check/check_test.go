@@ -103,6 +103,10 @@ func assertComplete(t *testing.T, info *types.Info) {
 					}
 				case *ast.FieldInit:
 					skip[n.Name] = true
+				case *ast.NamedType:
+					if n.Pkg != nil {
+						skip[n.Pkg] = true // package name of pkg.T
+					}
 				case *ast.CtorPattern:
 					skip[n.Name] = true
 					if n.Qual != nil {

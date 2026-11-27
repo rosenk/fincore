@@ -403,6 +403,13 @@ type LiteralPattern struct {
 	Lit Expr // *BasicLit, *BoolLit or *NilLit
 }
 
+// OrPattern is `P1 | P2 | ...` (v0.2): two or more alternatives, none of
+// which is itself an OrPattern. A single pattern is never wrapped.
+type OrPattern struct {
+	Base
+	Alts []Pattern
+}
+
 // ForStmt is `[driver] for [header] [decreases(M)] Body`.
 //
 // Forms: `for {}` (all nil), `for Cond {}` (Cond only), and the three-clause
@@ -620,6 +627,14 @@ type FieldInit struct {
 	Value Expr
 }
 
+// MatchExpr is `match X { arms }` in expression position (v0.2). Every arm
+// has an Expr and no Block.
+type MatchExpr struct {
+	Base
+	X    Expr
+	Arms []*MatchArm
+}
+
 // TypeExpr is a syntactic type appearing in expression position (generic
 // arguments, Code/El in TypeOrExpr contexts).
 type TypeExpr struct {
@@ -644,6 +659,7 @@ func (*SelectorExpr) exprNode() {}
 func (*FuncLit) exprNode()      {}
 func (*StructLit) exprNode()    {}
 func (*TypeExpr) exprNode()     {}
+func (*MatchExpr) exprNode()    {}
 
 func (*NamedType) typeNode()   {}
 func (*ArrayType) typeNode()   {}
@@ -679,3 +695,4 @@ func (*FuncDecl) declNode()  {}
 func (*WildcardPattern) patternNode() {}
 func (*CtorPattern) patternNode()     {}
 func (*LiteralPattern) patternNode()  {}
+func (*OrPattern) patternNode()       {}

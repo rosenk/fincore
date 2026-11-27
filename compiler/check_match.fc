@@ -1,0 +1,415 @@
+// check_match.fc — the type checker, part 4 (v0.2 sum types): match
+// statements and expressions, or-patterns, exhaustiveness and
+// reachability (E2012). Port of finc0's types/match.go. Functions taking
+// `dp` are members of the checker SCC (see checker.fc).
+package main
+
+// Scratch for the coverage phase of matchPatterns (not re-entrant: the
+// phase evaluates no expressions).
+const (
+	MaxMatchVariants = 65536
+	MaxMatchCases    = 65536
+)
+
+var mCovered [MaxMatchVariants]bool
+var mSeen [MaxMatchCases]u32
+
+func matchStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	x := exprValue(na(s), dp-1)
+	if !isInvalidOp(&x) && isUntyped(x.typ) {
+		_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+	}
+	_ = matchPatterns(s, &x, false, dp-1)
+	n := l1len(s)
+	for i := usize(0); i < n; i++ {
+		arm := l1at(s, i)
+		if nb(arm) != 0 {
+			exprStmt(nb(arm), "match arm", dp-1)
+		}
+		if nc(arm) != 0 {
+			stmtList(nc(arm), dp-1)
+		}
+	}
+}
+
+// armOperand rebuilds the operand of a checked arm expression from the
+// recorded tables.
+func armOperand(a u32) Operand {
+	var x Operand
+	x.expr = a
+	x.mode = nmode[usize(a)]
+	x.typ = ntype[usize(a)]
+	if x.mode == KConst && nval[usize(a)] != 0 {
+		x.val = slotGet(nval[usize(a)])
+	}
+	return x
+}
+
+func isUntypedNumeric(t u32) bool {
+	k := basicKind(t)
+	return k == BkUntypedInt || k == BkUntypedChar
+}
+
+func mArmType(a u32, have u32, want u32) {
+	mreset()
+	ms("match arm has type ")
+	mtype(have)
+	ms(", want ")
+	mtype(want)
+	errAt(E2002, a)
+}
+
+// matchExpr checks a match expression. The arms' types must agree;
+// untyped constant arms take the type of the typed arms. If every arm is
+// untyped the result is untyped and is converted by its context (see
+// updateType). The result is constant if the scrutinee is constant and the
+// selected arm is a constant expression.
+func matchExpr(e u32, dp usize) Operand decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return invalidOp(e)
+	}
+	x := exprValue(na(e), dp-1)
+	if !isInvalidOp(&x) && isUntyped(x.typ) {
+		_ = defaultTypeOp(&x, mkCtx(CtxMatch))
+	}
+	valid := matchPatterns(e, &x, true, dp-1)
+	n := l1len(e)
+	rt := u32(0)
+	bad := false
+	for i := usize(0); i < n; i++ {
+		o := exprValue(nb(l1at(e, i)), dp-1)
+		if isInvalidOp(&o) {
+			bad = true
+			continue
+		}
+		if rt == 0 && !isUntyped(o.typ) {
+			rt = o.typ
+		}
+	}
+	if bad {
+		return invalidOp(e)
+	}
+	if rt != 0 {
+		for i := usize(0); i < n; i++ {
+			a := nb(l1at(e, i))
+			o := armOperand(a)
+			if isUntyped(o.typ) {
+				if !convertUntyped(&o, rt) {
+					bad = true
+				}
+			} else if o.typ != rt {
+				mArmType(a, o.typ, rt)
+				bad = true
+			}
+		}
+	} else {
+		rt = ntype[usize(nb(l1at(e, 0)))]
+		for i := usize(1); i < n; i++ {
+			a := nb(l1at(e, i))
+			t := ntype[usize(a)]
+			if t == rt {
+			} else if isUntypedNumeric(t) && isUntypedNumeric(rt) {
+				rt = TyUntypedInt
+			} else {
+				mArmType(a, t, rt)
+				bad = true
+			}
+		}
+	}
+	if bad {
+		return invalidOp(e)
+	}
+	r := opMode(KValue, rt)
+	if valid && x.mode == KConst {
+		sel := selectArm(x.val, e)
+		if sel < n {
+			a := nb(l1at(e, sel))
+			if nmode[usize(a)] == KConst {
+				r.mode = KConst
+				r.val = slotGet(nval[usize(a)])
+			}
+		}
+	}
+	return r
+}
+
+// convertMatchArms converts the untyped arms of a match expression whose
+// result was given type t by its context.
+func convertMatchArms(e u32, t u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return
+	}
+	n := l1len(e)
+	for i := usize(0); i < n; i++ {
+		a := nb(l1at(e, i))
+		old := ntype[usize(a)]
+		if old == 0 || !isUntyped(old) {
+			continue
+		}
+		x := armOperand(a)
+		_ = convertUntypedDp(&x, t, dp-1)
+	}
+}
+
+// patAltN / patAlt: the alternatives of a pattern (itself unless it is an
+// or-pattern).
+func patAltN(p u32) usize {
+	if nkind(p) == NkOrPattern {
+		return l1len(p)
+	}
+	return 1
+}
+
+func patAlt(p u32, i usize) u32 {
+	if nkind(p) == NkOrPattern {
+		return l1at(p, i)
+	}
+	return p
+}
+
+func valsEqual(a Val, b Val) bool {
+	eq, ok := equalVals(a, b, SemaDepth)
+	return ok && eq
+}
+
+// selectArm returns the index of the arm of match m selected by the
+// constant scrutinee value v (the arm count if none).
+func selectArm(v Val, m u32) usize {
+	n := l1len(m)
+	for i := usize(0); i < n; i++ {
+		p := na(l1at(m, i))
+		na2 := patAltN(p)
+		for j := usize(0); j < na2; j++ {
+			alt := patAlt(p, j)
+			k := nkind(alt)
+			if k == NkWildcardPattern {
+				return i
+			}
+			if k == NkCtorPattern {
+				if nvarEnum[usize(alt)] != 0 {
+					if v.kind == VEnum && v.lo == u64(nvarIdx[usize(alt)]) {
+						return i
+					}
+				} else if nval[usize(nb(alt))] != 0 && valsEqual(v, slotGet(nval[usize(nb(alt))])) {
+					return i
+				}
+			} else if k == NkLiteralPattern {
+				if nval[usize(na(alt))] != 0 && valsEqual(v, slotGet(nval[usize(na(alt))])) {
+					return i
+				}
+			}
+		}
+	}
+	return n
+}
+
+// matchPatterns checks the patterns of match m (statement or expression)
+// on x and reports E2012 for unreachable arms and non-exhaustive matches.
+// It reports whether every pattern is valid.
+func matchPatterns(m u32, x *Operand, isExpr bool, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
+	}
+	valid := !isInvalidOp(x)
+	n := l1len(m)
+	for i := usize(0); i < n; i++ {
+		pat := na(l1at(m, i))
+		if isInvalidOp(x) {
+			if nkind(pat) == NkCtorPattern {
+				bindInvalid(pat)
+			}
+			continue
+		}
+		if !armPattern(pat, x.typ, dp-1) {
+			valid = false
+		}
+	}
+	if !valid {
+		return false
+	}
+	matchCoverage(m, x.typ, isExpr)
+	return true
+}
+
+func mAllCovered(nv usize) bool {
+	for i := usize(0); i < nv; i++ {
+		if !mCovered[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// matchCoverage is the reachability and exhaustiveness phase of
+// matchPatterns (all patterns are valid).
+func matchCoverage(m u32, t u32, isExpr bool) {
+	en := underlying(t)
+	isEnum := tk(en) == TCEnum
+	nv := usize(0)
+	if isEnum {
+		nv = nvariants(en)
+		if nv > MaxMatchVariants {
+			setFull("match variants")
+			return
+		}
+	}
+	for i := usize(0); i < nv; i++ {
+		mCovered[i] = false
+	}
+	nseen := usize(0)
+	wild := false
+	n := l1len(m)
+	for i := usize(0); i < n; i++ {
+		pat := na(l1at(m, i))
+		if wild {
+			mreset()
+			ms("unreachable match arm: it follows the '_' arm")
+			errAt(E2012, pat)
+			continue
+		}
+		na2 := patAltN(pat)
+		for j := usize(0); j < na2; j++ {
+			alt := patAlt(pat, j)
+			k := nkind(alt)
+			vi := -1
+			val := u32(0)
+			lit := u32(0)
+			if k == NkWildcardPattern {
+				if isEnum && nv > 0 && mAllCovered(nv) {
+					mreset()
+					ms("unreachable '_' arm: all variants of ")
+					mtype(t)
+					ms(" are covered")
+					errAt(E2012, alt)
+				}
+				wild = true
+				continue
+			}
+			if k == NkCtorPattern {
+				if nvarEnum[usize(alt)] != 0 {
+					vi = int(nvarIdx[usize(alt)])
+				} else {
+					val = nval[usize(nb(alt))]
+					lit = nb(alt)
+				}
+			} else if k == NkLiteralPattern {
+				val = nval[usize(na(alt))]
+				lit = na(alt)
+			}
+			if vi >= 0 {
+				if mCovered[usize(vi)] {
+					mreset()
+					ms("unreachable pattern: variant ")
+					mname(variantName(en, usize(vi)))
+					ms(" is already covered")
+					errAt(E2012, alt)
+				}
+				mCovered[usize(vi)] = true
+				continue
+			}
+			if val == 0 {
+				continue
+			}
+			dup := false
+			for s := usize(0); s < nseen; s++ {
+				if valsEqual(slotGet(mSeen[s]), slotGet(val)) {
+					dup = true
+				}
+			}
+			if dup {
+				mreset()
+				ms("unreachable pattern: duplicate case ")
+				mexpr(lit)
+				errAt(E2012, alt)
+				continue
+			}
+			if nseen >= MaxMatchCases {
+				setFull("match cases")
+				return
+			}
+			mSeen[nseen] = val
+			nseen++
+		}
+	}
+	if wild {
+		return
+	}
+	if isEnum {
+		missing := false
+		for i := usize(0); i < nv; i++ {
+			if !mCovered[i] {
+				if !missing {
+					mreset()
+					ms("non-exhaustive match on ")
+					mtype(t)
+					ms(": missing ")
+				} else {
+					ms(", ")
+				}
+				missing = true
+				mname(variantName(en, i))
+			}
+		}
+		if missing {
+			errAt(E2012, m)
+		}
+	} else if isExpr {
+		mreset()
+		ms("non-exhaustive match expression on ")
+		mtype(t)
+		ms(": missing '_' arm")
+		errAt(E2012, m)
+	}
+}
+
+// armPattern checks an arm's pattern (or each alternative of an
+// or-pattern) against the scrutinee type t and reports whether it is
+// valid. Or-pattern alternatives may not be '_' and may not bind names.
+func armPattern(p u32, t u32, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
+	}
+	if nkind(p) != NkOrPattern {
+		return pattern(p, t, dp-1)
+	}
+	valid := true
+	n := l1len(p)
+	for i := usize(0); i < n; i++ {
+		alt := l1at(p, i)
+		if nkind(alt) == NkWildcardPattern {
+			mreset()
+			ms("'_' cannot be an alternative of an or-pattern")
+			errAt(E2002, alt)
+			valid = false
+			continue
+		}
+		if !pattern(alt, t, dp-1) {
+			valid = false
+			continue
+		}
+		if nkind(alt) == NkCtorPattern {
+			nbind := l1len(alt)
+			for j := usize(0); j < nbind; j++ {
+				b := l1at(alt, j)
+				if idName(b) != nameBlank {
+					mreset()
+					ms("or-pattern alternatives cannot bind variables (")
+					mname(idName(b))
+					ms(")")
+					errAt(E2002, b)
+					valid = false
+					break
+				}
+			}
+		}
+	}
+	return valid
+}

@@ -61,11 +61,9 @@ func (g *gen) value(n ast.Node, v types.Value, t types.Type, e *env) string {
 			g.fail(n, "enum value of non-enum type %v", t)
 		}
 		vr := en.Variants[v.Variant]
-		payload := make([]string, len(v.Payload))
-		for i, p := range v.Payload {
-			payload[i] = g.value(n, p, vr.Payload[i], e)
-		}
-		return g.variantLit(n, t, vr, payload, e)
+		return g.variantLit(n, t, vr, len(v.Payload), func(i int) string {
+			return g.value(n, v.Payload[i], vr.Payload[i], e)
+		}, e)
 	case *types.ArrayVal:
 		at, ok := t.Underlying().(*types.Array)
 		if !ok {
@@ -96,18 +94,6 @@ func (g *gen) value(n ast.Node, v types.Value, t types.Type, e *env) string {
 	}
 	g.fail(n, "unsupported constant %v", v)
 	return ""
-}
-
-// variantLit renders an enum variant construction.
-func (g *gen) variantLit(n ast.Node, t types.Type, v *types.Variant, payload []string, e *env) string {
-	var parts []string
-	if v.Index != 0 {
-		parts = append(parts, fmt.Sprintf("_tag: %d", v.Index))
-	}
-	for i, p := range payload {
-		parts = append(parts, variantField(v, i)+": "+p)
-	}
-	return g.goType(n, t, e) + "{" + strings.Join(parts, ", ") + "}"
 }
 
 func isUntypedOrInt(t types.Type) bool {

@@ -1,0 +1,534 @@
+// codegen_enum.fc — code generator part 4 (v0.2 sum types; finc0's
+// codegen/golang/enum.go): compact enum layout, match switches, match
+// expressions and returns of match expressions.
+//
+// Layout rule (docs/v0_2.md). An enum is a Go struct `{ _tag; slots }`.
+// _tag is uint8 (<= 256 variants), uint16 (<= 65536) or uint32. Payload
+// slots are shared between variants by Go type: the payload Go types form
+// groups in order of first appearance (variants in declaration order,
+// payloads left to right); a group has as many slots as the largest number
+// of payloads of that type in one variant, and each variant maps its
+// payloads of a type to the group's slots in order. Slot j of a group is
+// `_<key>_<j>`: key is the FinCore spelling of a basic type (u8, u32,
+// usize, int, bool, string, error, ...), the Go type itself if it is an
+// identifier, and otherwise (or if an earlier group has the key) the
+// group's index in decimal.
+//
+// Layouts live in LIFO pools (cgLay*): a caller computes one, uses it and
+// releases it; layouts computed meanwhile (nested types, nested matches)
+// are released first.
+package main
+
+const (
+	CgMaxLayBytes  = 1_048_576
+	CgMaxLayGroups = 65_536
+	CgMaxLayPay    = 262_144
+)
+
+var cgLayBytes [CgMaxLayBytes]byte
+var cgLayBTop usize
+var cgLayGT0 [CgMaxLayGroups]u32 // Go type: span in cgLayBytes
+var cgLayGTn [CgMaxLayGroups]u32
+var cgLayK0 [CgMaxLayGroups]u32 // key: span in cgLayBytes
+var cgLayKn [CgMaxLayGroups]u32
+var cgLayGCnt [CgMaxLayGroups]u32  // slots of the group
+var cgLayGUsed [CgMaxLayGroups]u32 // scratch: payloads of the group in the current variant
+var cgLayGTop usize
+var cgLayPG [CgMaxLayPay]u32 // per payload position: group (absolute index)
+var cgLayPS [CgMaxLayPay]u32 //   and slot in the group
+var cgLayPTop usize
+
+// CgLay is a computed layout: the declaration enum, its groups
+// [g0, g0+gn) and payload positions from p0 (variants in order).
+type CgLay struct {
+	en    u32
+	g0    usize
+	gn    usize
+	p0    usize
+	bmark usize
+}
+
+func cgLayRelease(l CgLay) {
+	cgLayBTop = l.bmark
+	cgLayGTop = l.g0
+	cgLayPTop = l.p0
+}
+
+func cgLayPutBytes(b []byte) u32 {
+	off := cgLayBTop
+	n := len(b)
+	if off+n > CgMaxLayBytes {
+		setFull("codegen enum layouts")
+		return u32(off)
+	}
+	for i := usize(0); i < n; i++ {
+		cgLayBytes[off+i] = b[i]
+	}
+	cgLayBTop = off + n
+	return u32(off)
+}
+
+func cgLayGoType(g usize) []byte {
+	a := usize(cgLayGT0[g])
+	return cgLayBytes[a : a+usize(cgLayGTn[g])]
+}
+
+func cgLayKey(g usize) []byte {
+	a := usize(cgLayK0[g])
+	return cgLayBytes[a : a+usize(cgLayKn[g])]
+}
+
+// cgBasicSlotKey returns the FinCore spelling of a Go basic type name
+// ("" if b is not one).
+func cgBasicSlotKey(b []byte) string {
+	if cgBytesIs(b, "uint8") {
+		return "u8"
+	}
+	if cgBytesIs(b, "uint16") {
+		return "u16"
+	}
+	if cgBytesIs(b, "uint32") {
+		return "u32"
+	}
+	if cgBytesIs(b, "uint64") {
+		return "u64"
+	}
+	if cgBytesIs(b, "int8") {
+		return "i8"
+	}
+	if cgBytesIs(b, "int16") {
+		return "i16"
+	}
+	if cgBytesIs(b, "int32") {
+		return "i32"
+	}
+	if cgBytesIs(b, "int64") {
+		return "i64"
+	}
+	if cgBytesIs(b, "uint") {
+		return "usize"
+	}
+	if cgBytesIs(b, "int") || cgBytesIs(b, "bool") || cgBytesIs(b, "string") || cgBytesIs(b, "error") {
+		return "same"
+	}
+	return ""
+}
+
+func cgIsGoIdentBytes(b []byte) bool {
+	n := len(b)
+	if n == 0 {
+		return false
+	}
+	for i := usize(0); i < n; i++ {
+		c := b[i]
+		ok := c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || i > 0 && c >= '0' && c <= '9'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// cgLayout returns the layout of enum type t (finc0's enumLayout):
+// instances of generic enums use the layout of the generic declaration
+// (its const parameters bound to the instance's values), because that is
+// the struct Go sees.
+func cgLayout(n u32, t u32, dp usize) CgLay decreases(dp) {
+	if dp == 0 {
+		var z CgLay
+		z.g0 = cgLayGTop
+		z.p0 = cgLayPTop
+		z.bmark = cgLayBTop
+		return z
+	}
+	if tk(t) == TCNamed {
+		origin := namedOrigin(t)
+		if origin != 0 {
+			saveN := cgEnvN
+			if cgTypeConstParams(origin) > 0 {
+				// Values first (in the current environment), then bind.
+				vmark := cgValTop
+				nt := tl2n(origin)
+				for i := usize(0); i < nt; i++ {
+					if tpIsConst(tl2(origin, i)) {
+						cgValPush(cgConstArg(n, tl1(t, i)))
+					}
+				}
+				k := vmark
+				for i := usize(0); i < nt; i++ {
+					tp := tl2(origin, i)
+					if !tpIsConst(tp) {
+						continue
+					}
+					if cgEnvN >= CgMaxEnv {
+						setFull("codegen environment")
+						break
+					}
+					cgEnvTP[cgEnvN] = tp
+					cgEnvSym[cgEnvN] = typs.items[usize(tp)].b
+					cgEnvVal[cgEnvN] = cgValStack[k]
+					cgEnvN++
+					k++
+				}
+				cgValTop = vmark
+			}
+			l := cgComputeLayout(n, underlying(origin), dp-1)
+			cgEnvN = saveN
+			return l
+		}
+	}
+	return cgComputeLayout(n, underlying(t), dp-1)
+}
+
+func cgComputeLayout(n u32, en u32, dp usize) CgLay decreases(dp) {
+	var l CgLay
+	l.en = en
+	l.g0 = cgLayGTop
+	l.p0 = cgLayPTop
+	l.bmark = cgLayBTop
+	if dp == 0 || tk(en) != TCEnum {
+		cgFail(n, "enum layout of non-enum type")
+		return l
+	}
+	nv := nvariants(en)
+	for vi := usize(0); vi < nv; vi++ {
+		top := cgLayGTop
+		for g := l.g0; g < top; g++ {
+			cgLayGUsed[g] = 0
+		}
+		np := variantPayN(en, vi)
+		for j := usize(0); j < np; j++ {
+			m := cgWmark()
+			cgGoType(n, variantPay(en, vi, j), dp-1)
+			gt := cgBuf.data[m:cgBuf.len]
+			gi := usize(0)
+			found := false
+			top2 := cgLayGTop
+			for g := l.g0; g < top2; g++ {
+				if bytesEqual(cgLayGoType(g), gt) {
+					gi = g
+					found = true
+				}
+			}
+			if !found {
+				if cgLayGTop >= CgMaxLayGroups {
+					setFull("codegen enum layouts")
+					cgWtruncate(m)
+					return l
+				}
+				gi = cgLayGTop
+				cgLayGT0[gi] = cgLayPutBytes(gt)
+				cgLayGTn[gi] = u32(len(gt))
+				cgLayGCnt[gi] = 0
+				cgLayGUsed[gi] = 0
+				cgLayGTop++
+			}
+			cgWtruncate(m)
+			cgLayGUsed[gi]++
+			if cgLayGUsed[gi] > cgLayGCnt[gi] {
+				cgLayGCnt[gi] = cgLayGUsed[gi]
+			}
+			if cgLayPTop >= CgMaxLayPay {
+				setFull("codegen enum layouts")
+				return l
+			}
+			cgLayPG[cgLayPTop] = u32(gi)
+			cgLayPS[cgLayPTop] = cgLayGUsed[gi] - 1
+			cgLayPTop++
+		}
+	}
+	top := cgLayGTop
+	for g := l.g0; g < top; g++ {
+		gt := cgLayGoType(g)
+		bk := cgBasicSlotKey(gt)
+		kind := u8(0) // 0: index, 1: basic spelling, 2: the Go type
+		if bk == "same" || bk == "" && cgIsGoIdentBytes(gt) {
+			kind = 2
+		} else if bk != "" {
+			kind = 1
+		}
+		var kb []byte
+		if kind == 1 {
+			kb = strBytes(bk)
+		} else if kind == 2 {
+			kb = gt
+		}
+		for h := l.g0; h < g; h++ {
+			if kind != 0 && bytesEqual(cgLayKey(h), kb) {
+				kind = 0
+			}
+		}
+		if kind == 0 {
+			var digits [24]byte
+			nd, _ := formatUint(u64(g-l.g0), digits[:])
+			cgLayK0[g] = cgLayPutBytes(digits[:nd])
+			cgLayKn[g] = u32(nd)
+		} else {
+			cgLayK0[g] = cgLayPutBytes(kb)
+			cgLayKn[g] = u32(len(kb))
+		}
+	}
+	l.gn = cgLayGTop - l.g0
+	return l
+}
+
+// cgWSlotName writes slot j of group g: `_<key>_<j>`.
+func cgWSlotName(g usize, j u32) {
+	cgWc('_')
+	cgWb(cgLayKey(g))
+	cgWc('_')
+	cgWu(u64(j))
+}
+
+// cgWSlot writes the slot field of payload j of variant vi.
+func cgWSlot(l CgLay, vi usize, j usize) {
+	p := l.p0
+	for k := usize(0); k < vi; k++ {
+		p += variantPayN(l.en, k)
+	}
+	p += j
+	cgWSlotName(usize(cgLayPG[p]), cgLayPS[p])
+}
+
+func cgTagType(en u32) string {
+	nv := nvariants(en)
+	if nv <= 256 {
+		return "uint8"
+	}
+	if nv <= 65536 {
+		return "uint16"
+	}
+	return "uint32"
+}
+
+// cgWEnumStruct writes the Go struct type of an enum literal (current
+// environment).
+func cgWEnumStruct(n u32, en u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	l := cgComputeLayout(n, en, dp-1)
+	cgW("struct {\n")
+	cgW("_tag ")
+	cgW(cgTagType(en))
+	cgWc('\n')
+	top := l.g0 + l.gn
+	for g := l.g0; g < top; g++ {
+		cnt := cgLayGCnt[g]
+		for j := u32(0); j < cnt; j++ {
+			cgWSlotName(g, j)
+			cgWc(' ')
+			cgWb(cgLayGoType(g))
+			cgWc('\n')
+		}
+	}
+	cgWc('}')
+	cgLayRelease(l)
+}
+
+// ---------------------------------------------------------------------------
+// Match statements and expressions
+
+// Arm bodies of cgMatchSwitch.
+const (
+	CgArmStmt   = 0 // statement arms (expression statement or block)
+	CgArmReturn = 1 // `return <arm>` (match expression)
+)
+
+func cgMatchStmt(s u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	_ = cgPushFrame(CgFrSwitch, 0, 0)
+	cgMatchSwitch(s, CgArmStmt, dp-1)
+	cgPopFrame()
+}
+
+// cgMatchExpr writes a match expression as an immediately invoked
+// function literal `func() T { switch ... { case ...: return arm } }()`;
+// the switch always ends with a default case.
+func cgMatchExpr(e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	saveHeader := cgHeader
+	cgHeader = 0
+	cgW("func() ")
+	cgGoType(e, ntype[usize(e)], dp-1)
+	cgW(" {\n")
+	cgMatchSwitch(e, CgArmReturn, dp-1)
+	cgW("}()")
+	cgHeader = saveHeader
+}
+
+// cgReturnValue writes `return e` (single result, no enclosing scope
+// blocks). A match expression becomes a switch whose arms return their
+// values (nested match expressions recursively), without a function
+// literal.
+func cgReturnValue(e u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	u := unparen(e)
+	if nkind(u) == NkMatchExpr && cgConstValueSlot(u) == 0 {
+		cgMatchSwitch(u, CgArmReturn, dp-1)
+		return
+	}
+	cgW("return ")
+	cgExpr(e, dp-1)
+	cgWc('\n')
+}
+
+// cgMatchSwitch writes the Go switch of match m (statement or
+// expression; both have the scrutinee in slot a and the arms in l1).
+func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	mark, cnt, hasDef, en := cgMatchArms(s)
+	x := na(s)
+	var lay CgLay
+	lay.g0 = cgLayGTop
+	lay.p0 = cgLayPTop
+	lay.bmark = cgLayBTop
+	needBind := false
+	if en != 0 {
+		lay = cgLayout(x, ntype[usize(x)], dp-1)
+		for i := usize(0); i < cnt; i++ {
+			pt := na(cgArms[mark+i])
+			if nkind(pt) != NkCtorPattern {
+				continue
+			}
+			nbd := l1len(pt)
+			for j := usize(0); j < nbd; j++ {
+				sym := defs[usize(l1at(pt, j))]
+				if sym != 0 && cgSymUsed(sym) {
+					needBind = true
+				}
+			}
+		}
+	}
+	cgHeader++
+	smark := cgStash.len
+	bTmp := u64(0)
+	if en == 0 {
+		cgW("switch ")
+		cgExpr(x, dp-1)
+	} else if needBind && !cgIsPlainVar(x) {
+		bTmp = cgNewTemp() + 1
+		cgW("switch ")
+		cgWtemp(bTmp - 1)
+		cgW(" := ")
+		cgExpr(x, dp-1)
+		cgW("; ")
+		cgWtemp(bTmp - 1)
+		cgW("._tag")
+	} else {
+		cgW("switch ")
+		p := cgWmark()
+		cgPrimary(x, dp-1)
+		o := &cgStash
+		o.putBytes(cgBuf.data[p:cgBuf.len])
+		cgW("._tag")
+	}
+	bEnd := cgStash.len
+	cgHeader--
+	cgW(" {\n")
+	for i := usize(0); i < cnt; i++ {
+		a := cgArms[mark+i]
+		pt := na(a)
+		if i == cnt-1 && hasDef {
+			cgW("default:\n")
+		} else {
+			cgW("case ")
+			cgCaseLabels(x, a, dp-1)
+			cgW(":\n")
+		}
+		if nkind(pt) == NkCtorPattern && en != 0 && nvarEnum[usize(pt)] != 0 {
+			vi := usize(nvarIdx[usize(pt)])
+			nbd := l1len(pt)
+			for j := usize(0); j < nbd; j++ {
+				sym := defs[usize(l1at(pt, j))]
+				if sym == 0 || !cgSymUsed(sym) {
+					continue
+				}
+				cgWSymName(sym)
+				cgW(" := ")
+				if bTmp != 0 {
+					cgWtemp(bTmp - 1)
+				} else {
+					cgStashEmit(smark, bEnd)
+				}
+				cgWc('.')
+				cgWSlot(lay, vi, j)
+				cgWc('\n')
+			}
+		}
+		if mode == CgArmReturn {
+			cgReturnValue(nb(a), dp-1)
+		} else {
+			if nb(a) != 0 {
+				p := cgWmark()
+				cgExprStmt(nb(a), dp-1)
+				if cgWmark() > p {
+					cgWc('\n')
+				}
+			}
+			if nc(a) != 0 {
+				cgStmts(nc(a), dp-1)
+			}
+		}
+	}
+	cgW("}\n")
+	cgArmTop = mark
+	cgStash.len = smark
+	if en != 0 {
+		cgLayRelease(lay)
+	}
+}
+
+// cgCaseLabels writes the case list of an arm (one label per or-pattern
+// alternative).
+func cgCaseLabels(x u32, a u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	pt := na(a)
+	if nkind(pt) != NkOrPattern {
+		cgCaseLabel(x, a, pt, dp-1)
+		return
+	}
+	n := l1len(pt)
+	for i := usize(0); i < n; i++ {
+		if i > 0 {
+			cgW(", ")
+		}
+		cgCaseLabel(x, a, l1at(pt, i), dp-1)
+	}
+}
+
+func cgCaseLabel(x u32, a u32, pt u32, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	k := nkind(pt)
+	xt := ntype[usize(x)]
+	if k == NkCtorPattern {
+		if nvarEnum[usize(pt)] != 0 {
+			cgWu(u64(nvarIdx[usize(pt)]))
+			return
+		}
+		v := nval[usize(nb(pt))]
+		if v != 0 {
+			cgValue(pt, slotGet(v), xt, dp-1)
+			return
+		}
+	} else if k == NkLiteralPattern {
+		v := nval[usize(na(pt))]
+		if v != 0 {
+			cgValue(pt, slotGet(v), xt, dp-1)
+			return
+		}
+	}
+	cgFail(a, "unsupported match pattern")
+}
