@@ -1003,6 +1003,21 @@ func lnMatchExpr(fl u32, x u32, e u32, dp usize) decreases(dp) {
 		lnBorrowBindings(fl, na(arm), a, SemaDepth)
 		lnExpr(fl, nd(arm), a, dp-1)
 		ae := nb(arm)
+		if nkind(ae) == NkTupleExpr {
+			// v0.3: each value of a multi-value arm is moved like an arm
+			m := l1len(ae)
+			for j := usize(0); j < m; j++ {
+				v := l1at(ae, j)
+				vj := lnLinArg(fl, v)
+				if vj != LnNoVar {
+					lnConsume(fl, a, vj, lnRootIdent(v), Consume.Move)
+				} else {
+					lnExpr(fl, v, a, dp-1)
+				}
+			}
+			out = lnJoin(out, a)
+			continue
+		}
 		vi := lnLinArg(fl, ae)
 		if vi != LnNoVar {
 			lnConsume(fl, a, vi, lnRootIdent(ae), Consume.Move)

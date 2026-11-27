@@ -44,6 +44,10 @@ func mutantCases(tmp string, n int, seed int64) []tcase {
 		if rel, err := filepath.Rel(tmp, f); err == nil && !strings.HasPrefix(rel, "..") {
 			name = "snippet " + filepath.Dir(rel)
 		}
+		// A mutant needs the language version of its source: mutants of
+		// `// SINCE: v0.3` sources are rejected by the previous release
+		// for that reason, not because of the mutation.
+		since := required(f)
 		reps := n
 		if strings.HasPrefix(f, "compiler/") {
 			reps = max(1, n/4)
@@ -60,7 +64,7 @@ func mutantCases(tmp string, n int, seed int64) []tcase {
 			_ = os.MkdirAll(root, 0o755)
 			_ = os.WriteFile(filepath.Join(root, "t.fc"), []byte(m), 0o644)
 			out = append(out, tcase{name: fmt.Sprintf("mutant %d of %s (seed %d)", i, name, seed), dir: root, path: "t.fc",
-				flags: []string{"--comptime-fuel=5000"}, passes: []string{"types", "all"}, mutant: true})
+				flags: []string{"--comptime-fuel=5000"}, passes: []string{"types", "all"}, mutant: true, since: since})
 		}
 	}
 	return out

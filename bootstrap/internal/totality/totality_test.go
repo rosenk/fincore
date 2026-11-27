@@ -13,6 +13,7 @@ import (
 	"fincore/bootstrap/internal/diag"
 	"fincore/bootstrap/internal/resolve"
 	"fincore/bootstrap/internal/types"
+	"fincore/scripts/langver"
 )
 
 var markerRE = regexp.MustCompile(`//\s*ERROR\s+(E\d{4})`)
@@ -791,11 +792,15 @@ func TestCorpus(t *testing.T) {
 	var ins []string
 	for _, pat := range []string{"examples/*.fc", "testdata/pass/*.fc", "testdata/fail/*.fc", "testdata/integration/*.fc"} {
 		m, _ := filepath.Glob(pat)
-		ins = append(ins, m...)
+		for _, in := range m {
+			if finc0Can(t, ".", in) {
+				ins = append(ins, in)
+			}
+		}
 	}
 	ents, _ := os.ReadDir("testdata/pass")
 	for _, e := range ents {
-		if e.IsDir() {
+		if e.IsDir() && finc0Can(t, ".", "testdata/pass/"+e.Name()) {
 			ins = append(ins, "testdata/pass/"+e.Name())
 		}
 	}
@@ -942,4 +947,17 @@ func f() u32 {
 	return s
 }`},
 	})
+}
+
+// finc0Can reports whether the input in (relative to the module root
+// root) needs at most the language version finc0 implements (v0.2, frozen):
+// tests of newer versions carry `// SINCE: vX.Y` and are skipped here
+// (testdata/README.md).
+func finc0Can(t *testing.T, root, in string) bool {
+	t.Helper()
+	v, ok, err := langver.RequiredIn(root, os.Getenv("FINCROOT"), filepath.Join(root, in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return !ok || !langver.MustParse(langver.Finc0).Less(v)
 }

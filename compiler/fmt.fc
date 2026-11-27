@@ -647,6 +647,39 @@ func fmNext(toks []Token, ti usize) (u8, u32) {
 	return TkEOF, 0
 }
 
+// fmArmSep reports whether the ',' at toks[ti], directly inside a match
+// expression, separates arms rather than continuing a multi-value arm.
+// It mirrors Parser.armValuesFollow (v0.3): the comma ends the arm if the
+// next token is '}' or if the tokens up to the end of the arm (a ';',
+// explicit or inserted at a newline, or the closing bracket at depth 0)
+// contain a '->' at bracket depth 0.
+func fmArmSep(toks []Token, ti usize) bool {
+	n := len(toks)
+	nk, _ := fmNext(toks, ti)
+	if nk == TkRBrace {
+		return true
+	}
+	lev := 0
+	for i := ti + 1; i < n; i++ {
+		k := toks[i].kind
+		if k is TkLParen | TkLBrack | TkLBrace {
+			lev++
+		} else if k is TkRParen | TkRBrack | TkRBrace {
+			if lev == 0 {
+				return false
+			}
+			lev--
+		} else if k == TkSemicolon && lev == 0 {
+			return false
+		} else if k == TkArrow && lev == 0 {
+			return true
+		} else if k is TkEOF | TkIllegal {
+			return false
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // alignment rows
 
@@ -783,7 +816,7 @@ func fmToken(toks []Token, ti usize) {
 			}
 		}
 	}
-	if k == TkComma && top == FoMatchX {
+	if k == TkComma && top == FoMatchX && fmArmSep(toks, ti) {
 		nk, nline := fmNext(toks, ti)
 		if nline == t.line && nk != TkRBrace {
 			fmForceNL = true

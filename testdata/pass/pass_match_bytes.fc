@@ -1,0 +1,175 @@
+// SINCE: v0.3
+// pass_match_bytes (v0.3): string patterns on string and []byte values.
+// String literals and string constants (untyped, typed, named string
+// types) match a string scrutinee by ==, and a []byte value (also a named
+// byte slice type) by its bytes, in every pattern position: top level
+// (flat switch), or-patterns, guards, bindings, tuple elements, enum
+// payloads and `is` (with let-else). A string or []byte match expression
+// needs '_' or a binding; statement matches need not be exhaustive.
+// Comptime evaluation of all forms.
+package main
+
+type Name string
+
+type Buf []byte
+
+const Get = "GET"
+const Put string = "PUT"
+const Del Name = "DELETE"
+
+// Flat match on []byte: a Go switch on string(b).
+func method(b []byte) u32 {
+	return match b {
+		Get -> 1
+		Put | "POST" -> 2
+		Del -> 3
+		"" -> 9
+		_ -> 0
+	}
+}
+
+// The same on string, with a binding catch-all (a constant of a named
+// string type is not assignable to string, as in Go).
+func methodS(s string) u32 {
+	return match s {
+		Get -> 1
+		Put | "POST" -> 2
+		"DELETE" -> 3
+		other -> 10 + u32(len(other))
+	}
+}
+
+// A named byte slice type, guards and a binding (if chain).
+func classify(b Buf) u32 {
+	return match b {
+		"x" | "y" -> 1
+		v if len(v) > 3 -> 2
+		"" -> 3
+		_ -> 4
+	}
+}
+
+// Tuple elements of string and []byte.
+func route(m string, p []byte) u32 {
+	return match (m, p) {
+		("GET", "/") -> 1
+		("GET", _) -> 2
+		(_, "/admin") | ("DELETE", _) -> 3
+		_ -> 0
+	}
+}
+
+type Tok enum {
+	Word([]byte)
+	Text(string)
+	End
+}
+
+// Payload positions.
+func kw(t Tok) u32 {
+	return match t {
+		Word("if") | Text("if") -> 1
+		Word("for") -> 2
+		Word(w) if len(w) == 0 -> 3
+		Word(_) -> 4
+		Text(Get) -> 5
+		Text(_) | End -> 0
+	}
+}
+
+// `is` with []byte and string patterns, let-else on a payload.
+func isVerb(b []byte) bool {
+	return b is "GET" | "PUT"
+}
+
+func wordLen(t Tok) u32 {
+	if !(t is Word(w)) {
+		return 0
+	}
+	if w is "skip" {
+		return 100
+	}
+	return u32(len(w))
+}
+
+// A statement match on []byte without '_': no arm runs for other values.
+func count(b []byte) u32 {
+	n := u32(0)
+	match b {
+		"a" -> n = 1
+		"b" -> n = 2
+	}
+	return n
+}
+
+comptime func ctMethod(s string) u32 {
+	b := strBytes(s)
+	t := Tok.Word(strBytes(s))
+	r := method(b)*1000 + classify(Buf(b))*100 + kw(t)*10
+	if isVerb(b) {
+		r += 1
+	}
+	return r
+}
+
+const CtGet = ctMethod("GET")
+const CtIf = ctMethod("if")
+
+driver func line(io Stdio, label string, v u64) error {
+	var b [64]byte
+	n := formatTo(b[:], "%s: %d\n", label, v)
+	return io.WriteStdout(b[:n])
+}
+
+driver func main(io Stdio) error {
+	var words [6]string
+	words[0] = "GET"
+	words[1] = "POST"
+	words[2] = "DELETE"
+	words[3] = ""
+	words[4] = "PATCH"
+	words[5] = "PUT"
+	var m u64 = 0
+	var ms u64 = 0
+	for i := usize(0); i < 6; i++ {
+		m = m*10 + u64(method(strBytes(words[i])))
+		ms = ms*100 + u64(methodS(words[i]))
+	}
+	if err := line(io, "method", m); err != nil {
+		return err
+	}
+	if err := line(io, "methodS", ms); err != nil {
+		return err
+	}
+	c := u64(classify(Buf("x")))*1000 + u64(classify(Buf("long!")))*100 + u64(classify(Buf("")))*10 + u64(classify(Buf("ab")))
+	if err := line(io, "classify", c); err != nil {
+		return err
+	}
+	r := u64(route("GET", "/"))*1000 + u64(route("GET", "/x"))*100 + u64(route("PUT", "/admin"))*10 + u64(route("PUT", "/"))
+	if err := line(io, "route", r+u64(route("DELETE", "/x"))*10000); err != nil {
+		return err
+	}
+	k := u64(kw(Tok.Word("if")))*100000 + u64(kw(Tok.Text("if")))*10000 + u64(kw(Tok.Word("for")))*1000
+	k += u64(kw(Tok.Word("")))*100 + u64(kw(Tok.Word("x")))*10 + u64(kw(Tok.Text("GET")))
+	if err := line(io, "kw", k); err != nil {
+		return err
+	}
+	v := u64(0)
+	if isVerb("PUT") {
+		v += 10
+	}
+	if !isVerb("put") {
+		v += 1
+	}
+	if err := line(io, "isVerb", v); err != nil {
+		return err
+	}
+	wl := u64(wordLen(Tok.Word("skip")))*1000 + u64(wordLen(Tok.Word("abc")))*10 + u64(wordLen(Tok.End))
+	if err := line(io, "wordLen", wl); err != nil {
+		return err
+	}
+	if err := line(io, "count", u64(count("a"))*100+u64(count("b"))*10+u64(count("c"))); err != nil {
+		return err
+	}
+	return line(io, "comptime", u64(CtGet)*10000+u64(CtIf))
+}

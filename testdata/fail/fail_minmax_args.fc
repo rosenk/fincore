@@ -1,0 +1,14 @@
+// SINCE: v0.3
+// fail_minmax_args (v0.3): min and max need at least two operands.
+package main
+
+func one(x u32) u32 {
+	return min(x) // ERROR E2003
+}
+
+driver func main(io Stdio) error {
+	if one(1) == 0 {
+		return nil
+	}
+	return nil
+}

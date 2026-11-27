@@ -1,0 +1,19 @@
+// SINCE: v0.3
+// fail_match_multi_assign_type (v0.3): the values of a multi-value match
+// must be assignable to existing variables.
+package main
+
+func f(n u32) bool {
+	var ok bool
+	var m u32
+	m, ok = match n { // ERROR E2002
+		0 -> n, n
+		_ -> 1, n
+	}
+	_ = m
+	return ok
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

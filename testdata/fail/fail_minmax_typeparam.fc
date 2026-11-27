@@ -1,0 +1,12 @@
+// SINCE: v0.3
+// fail_minmax_typeparam (v0.3): like the comparison operators, min may
+// not inspect a value of type parameter type (E2011).
+package main
+
+func least[T any](a T, b T) T {
+	return min(a, b) // ERROR E2011
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

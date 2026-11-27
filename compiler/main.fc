@@ -31,9 +31,9 @@ const (
 // frozen at v0.2; bump these when compiler/ starts a new language version.
 // Tooling (`fmt`, `--context`) is not language and does not bump it.
 const (
-	LangVersion = "0.2"
+	LangVersion = "0.3"
 	LangMajor   = 0
-	LangMinor   = 2
+	LangMinor   = 3
 )
 
 // Package-level arenas (Value types only, rule S1).

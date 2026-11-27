@@ -1,0 +1,15 @@
+// SINCE: v0.3
+// fail_match_multi_arm_single (v0.3): in a multi-value match every arm
+// gives all values; a single value is a wrong count.
+package main
+
+func f(n u32) (u32, bool) {
+	return match n {
+		0 -> 0, false
+		_ -> n // ERROR E2003
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

@@ -1,0 +1,88 @@
+// SINCE: v0.3
+// cg_v03_match_bytes (v0.3): lowering of string patterns on []byte
+// values. A flat match switches on `string(b)` (a call scrutinee is
+// converted in the switch header; case values are string literals,
+// constants folded); if chains compare `string(path) == "..."` for top
+// level, tuple elements and enum payloads; `is` tests (single-read,
+// on a call, hoisted with bindings); statement matches without '_';
+// match expressions in a function literal; a named byte slice type.
+package main
+
+type Buf []byte
+
+type Tok enum {
+	Word([]byte)
+	Num(u32)
+}
+
+const Get = "GET"
+const Put string = "PUT"
+
+func src() []byte {
+	return "GET"
+}
+
+func flat(b []byte) u32 {
+	return match b {
+		Get | "HEAD" -> 1
+		Put -> 2
+		_ -> 0
+	}
+}
+
+func flatCall() u32 {
+	return match src() {
+		"GET" -> 1
+		_ -> 0
+	}
+}
+
+func stmt(b Buf) u32 {
+	n := u32(0)
+	match b {
+		"a" -> n = 1
+		"b" | "c" -> {
+			n = 2
+		}
+	}
+	return n
+}
+
+func chain(t Tok, b []byte) u32 {
+	return match (t, b) {
+		(Word("if"), "x") -> 1
+		(Word(w), "y") if len(w) > 1 -> 2
+		(Num(n), "") -> n
+		_ -> 0
+	}
+}
+
+func isTests(t Tok, b []byte) u32 {
+	if src() is "GET" {
+		return 1
+	}
+	if !(t is Word(w)) || w is "skip" {
+		return 2
+	}
+	if b is "a" | "b" {
+		return 3
+	}
+	return u32(len(w))
+}
+
+func inExpr(b []byte) u32 {
+	x := match b { "a" -> u32(1), _ -> 2 } + 1
+	return x
+}
+
+comptime func ctFlat(s string) u32 {
+	return flat(strBytes(s)) + chain(Tok.Word(strBytes("if")), strBytes("x"))
+}
+
+const CT = ctFlat("PUT")
+
+driver func main() error {
+	_ = flat("GET") + flatCall() + stmt(Buf("b")) + chain(Tok.Num(3), "") + CT
+	_ = isTests(Tok.Word("abc"), "b") + inExpr("a")
+	return nil
+}

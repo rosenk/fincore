@@ -1,0 +1,19 @@
+// SINCE: v0.3
+// fail_match_multi_scope_escape (v0.3): the values of a multi-value match
+// carry their origins (the join over all arms and positions); returning
+// the address of a local through one of them is a scope escape (S3).
+package main
+
+var global u32
+
+func leak(n u32) (*u32, bool) {
+	var local u32
+	return match n { // ERROR E3002
+		0 -> &local, true
+		_ -> &global, false
+	}
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

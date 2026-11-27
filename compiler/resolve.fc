@@ -91,8 +91,10 @@ const (
 	BFCodeStruct = 76
 	BFCodeField  = 77
 	BFCodeUniv   = 78
+	BFMin        = 79 // v0.3
+	BFMax        = 80 // v0.3
 
-	NumBuiltins = 79
+	NumBuiltins = 81
 )
 
 func builtinName(b u8) string {
@@ -197,6 +199,8 @@ func builtinFuncName(b u8) string {
 		BFCodeStruct -> "CodeStruct"
 		BFCodeField -> "CodeField"
 		BFCodeUniv -> "CodeUniv"
+		BFMin -> "min"
+		BFMax -> "max"
 		_ -> "?"
 	}
 }
@@ -214,7 +218,7 @@ func builtinIsErrorSentinel(b u8) bool {
 }
 
 func builtinIsFunc(b u8) bool {
-	return b >= BFLen && b <= BFCodeUniv
+	return b >= BFLen && b <= BFMax
 }
 
 func builtinIsCodeCtor(b u8) bool {

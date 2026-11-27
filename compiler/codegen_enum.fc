@@ -368,7 +368,19 @@ func cgMatchExpr(e u32, dp usize) decreases(dp) {
 	saveHeader := cgHeader
 	cgHeader = 0
 	cgW("func() ")
-	cgGoType(e, ntype[usize(e)], dp-1)
+	if trec(ntype[usize(e)]) is Tuple(ts, tn) {
+		// v0.3: a multi-value match returns its values
+		cgWc('(')
+		for i := usize(0); i < usize(tn); i++ {
+			if i > 0 {
+				cgW(", ")
+			}
+			cgGoType(e, tlist(ts, i), dp-1)
+		}
+		cgWc(')')
+	} else {
+		cgGoType(e, ntype[usize(e)], dp-1)
+	}
 	cgW(" {\n")
 	cgMatchArmsEmit(e, dp-1)
 	cgW("}()")
@@ -389,7 +401,18 @@ func cgReturnValue(e u32, dp usize) decreases(dp) {
 		return
 	}
 	cgW("return ")
-	cgExpr(e, dp-1)
+	if nkind(e) == NkTupleExpr {
+		// v0.3: the values of a multi-value match arm
+		n := l1len(e)
+		for i := usize(0); i < n; i++ {
+			if i > 0 {
+				cgW(", ")
+			}
+			cgExpr(l1at(e, i), dp-1)
+		}
+	} else {
+		cgExpr(e, dp-1)
+	}
 	cgWc('\n')
 }
 
@@ -430,7 +453,13 @@ func cgMatchSwitch(s u32, mode u8, dp usize) decreases(dp) {
 	cgHeader++
 	smark := cgStash.Len()
 	bTmp := u64(0)
-	if en == 0 {
+	if en == 0 && isByteSliceT(ntype[usize(x)]) {
+		// v0.3: a []byte scrutinee is switched on as a string (Go does
+		// not allocate for the conversion).
+		cgW("switch string(")
+		cgExpr(x, dp-1)
+		cgWc(')')
+	} else if en == 0 {
 		cgW("switch ")
 		cgExpr(x, dp-1)
 	} else if needBind && !cgIsPlainVar(x) {
@@ -523,6 +552,9 @@ func cgCaseLabel(x u32, a u32, pt u32, dp usize) decreases(dp) {
 	}
 	k := nkind(pt)
 	xt := ntype[usize(x)]
+	if isByteSliceT(xt) {
+		xt = TyString // v0.3: the case values of `switch string(b)`
+	}
 	if k == NkCtorPattern {
 		if nvarEnum[usize(pt)] != 0 {
 			cgWu(u64(nvarIdx[usize(pt)]))
@@ -757,9 +789,7 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 		} else {
 			cs := patConst(p)
 			if cs != 0 {
-				cgWPath(s)
-				cgW(" == ")
-				cgValue(p, slotGet(cs), cgSubT[s], dp-1)
+				cgEqTest(p, s, slotGet(cs), dp-1)
 			}
 		}
 		return false
@@ -772,9 +802,7 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 			if cs == 0 {
 				return false // a binding
 			}
-			cgWPath(s)
-			cgW(" == ")
-			cgValue(p, slotGet(cs), t, dp-1)
+			cgEqTest(p, s, slotGet(cs), dp-1)
 			return false
 		}
 		vi := usize(nvarIdx[usize(p)])
@@ -806,16 +834,36 @@ func cgPatTest(p u32, s usize, sn usize, dp usize) bool decreases(dp) {
 		return parts > 1
 	}
 	if k == NkLiteralPattern {
-		cgWPath(s)
-		cgW(" == ")
 		v := nval[usize(na(p))]
 		if v == 0 {
+			cgWPath(s)
+			cgW(" == ")
 			cgFail(p, BadPattern)
 			return false
 		}
-		cgValue(p, slotGet(v), cgSubT[s], dp-1)
+		cgEqTest(p, s, slotGet(v), dp-1)
 	}
 	return false
+}
+
+// cgEqTest writes the test `path == value` of a literal or constant
+// pattern p on subject s; on a []byte subject (v0.3) the slice is compared
+// as a string: `string(path) == "..."` (Go does not allocate for it).
+func cgEqTest(p u32, s usize, v Val, dp usize) decreases(dp) {
+	if dp == 0 {
+		return
+	}
+	t := cgSubT[s]
+	if isByteSliceT(t) {
+		cgW("string(")
+		cgWPath(s)
+		cgW(") == ")
+		cgValue(p, v, TyString, dp-1)
+		return
+	}
+	cgWPath(s)
+	cgW(" == ")
+	cgValue(p, v, t, dp-1)
 }
 
 // cgBindUsed reports whether a binding is read in region (anywhere if

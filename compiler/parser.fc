@@ -1592,7 +1592,25 @@ func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
 		p.setA(a, p.pattern(depth-1))
 		p.setD(a, p.guard(depth-1))
 		p.expect(TkArrow)
-		p.setB(a, p.expr(depth-1))
+		vs := p.start()
+		v := p.expr(depth - 1)
+		if p.tok.kind == TkComma && !p.failed && p.armValuesFollow() {
+			// v0.3: a multi-value arm `-> X1, X2, ...` (a TupleExpr).
+			te := p.mk(NkTupleExpr, vs)
+			vmark := p.ls.Mark()
+			p.ls.Push(v)
+			vlim := p.ntok
+			for g2 := usize(0); g2 < vlim; g2++ {
+				if p.failed || p.tok.kind != TkComma || !p.armValuesFollow() {
+					break
+				}
+				p.next()
+				p.ls.Push(p.expr(depth - 1))
+			}
+			p.setL1(te, vmark)
+			v = p.finish(te)
+		}
+		p.setB(a, v)
 		p.ls.Push(p.finish(a))
 		k := p.tok.kind
 		if k is TkSemicolon | TkComma {
@@ -1608,6 +1626,40 @@ func (p *Parser) matchExpr(depth usize) u32 decreases(depth) {
 	p.next()
 	p.exprLev = old
 	return p.finish(m)
+}
+
+// armValuesFollow decides what the ',' at the current token means after a
+// value of a match expression arm (v0.3). It continues the arm's value
+// list unless it ends the arm: the next token is '}' (a trailing
+// separator), or the tokens up to the end of the arm (a ';' or the
+// closing '}' at bracket depth 0) contain a '->' at bracket depth 0, i.e.
+// they form another arm. So `A -> 1, B -> 2` has two arms and
+// `A -> 1, 2; B -> 3, 4` two arms of two values; a match with
+// multi-value arms separates its arms with ';' or newlines.
+func (p *Parser) armValuesFollow() bool {
+	if p.peek(1).kind == TkRBrace {
+		return false
+	}
+	lev := 0
+	lim := p.ntok
+	for g := usize(1); g < lim; g++ {
+		k := p.peek(g).kind
+		if k is TkLParen | TkLBrack | TkLBrace {
+			lev++
+		} else if k is TkRParen | TkRBrack | TkRBrace {
+			if lev == 0 {
+				return true
+			}
+			lev--
+		} else if k == TkSemicolon && lev == 0 {
+			return true
+		} else if k == TkArrow && lev == 0 {
+			return false
+		} else if k is TkEOF | TkIllegal {
+			return true
+		}
+	}
+	return true
 }
 
 // patternAlt parses one alternative (v0.2 grammar):

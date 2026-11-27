@@ -71,7 +71,7 @@ Every difference is classified; the worst step decides a case:
 | :--- | :--- | :--- |
 | REGRESSION | the previous release accepted the program and the current compiler rejects it; or both accept and the AST dump, emitted Go or run output differs; or a `// ERROR` fail test is accepted now; or go build / go vet rejects the emitted Go | fails |
 | DIAG-CHANGED | both reject the program with different diagnostics | fails unless allowlisted |
-| EXPECTED | the previous release rejected the program and the current compiler accepts it (a new feature), or the case's `// SINCE:` is newer than the previous release and both reject it | ok, counted |
+| EXPECTED | the previous release rejected the program and the current compiler accepts it (a new feature), or the case's `// SINCE:` is newer than the previous release and both reject it. A program only the current compiler builds must still pass `go vet` and match its `.out` file, if any (else REGRESSION) | ok, counted |
 
 Intentional changes (a reworded message, a codegen improvement) go into
 `scripts/diffprev/allow.txt` as `<case name> # <reason>`. Unused entries
@@ -93,7 +93,8 @@ The mutators of `diff-check-fuzz` (identifier swaps, literal and operator
 changes, deleted, duplicated and moved lines, and the loop and measure edits
 aimed at the totality checker) produce N mutants of every corpus file and
 snippet (`-mutate 20 -seed $(FUZZ_SEED)`). They are compared with the same
-classification. Most mutants are invalid programs, so this mostly exercises
+classification; a mutant needs the language version of its source (its
+`// SINCE:`), so mutants of new-version tests rejected by both are EXPECTED. Most mutants are invalid programs, so this mostly exercises
 the diagnostics of the error paths, the code that hand-written tests cover
 least. A mutant that the seed accepted and the current compiler rejects, or
 that gets different diagnostics, is a regression. Accepted mutants are also
@@ -104,7 +105,9 @@ built, so their emitted Go is compared too.
 finc's output is Go. A program finc accepts but `go build` rejects means
 the type checker is unsound, and `go vet` findings point at codegen bugs.
 `finc build` compiles every pass test. diff-prev fails on a go build
-failure and vets every program both compilers build. `make diff-build-vet`
+failure and vets every program the current compiler builds (also new
+programs the previous release rejects, whose run output it checks against
+their `.out` file). `make diff-build-vet`
 does the same for the v0.2 subset, and the bootstrap vets stage1.go.
 
 ### 5. The fixed point (`make bootstrap`)
