@@ -13,15 +13,9 @@ func cgBody(b u32, dp usize) decreases(dp) {
 	if cgFn != 0 {
 		n := u64(cgScopeCount[usize(cgFn)])
 		for i := u64(0); i < n; i++ {
-			cgW("var _fc_s")
-			cgWu(i)
-			cgW(" *")
+			cgWf(formatTo(mbuf[:], "var _fc_s%d *", i))
 			cgRt("Scope")
-			cgW("\ndefer func() {\nif _fc_s")
-			cgWu(i)
-			cgW(" != nil {\n_fc_s")
-			cgWu(i)
-			cgW(".Wait()\n}\n}()\n")
+			cgWf(formatTo(mbuf[:], "\ndefer func() {\nif _fc_s%d != nil {\n_fc_s%d.Wait()\n}\n}()\n", i, i))
 		}
 	}
 	cgStmts(b, dp-1)
@@ -334,7 +328,7 @@ func cgCountScopes() usize {
 
 func cgStashStr(s string) {
 	o := &cgStash
-	o.putStr(s)
+	o.WriteString(s)
 }
 
 func cgReturnStmt(s u32, dp usize) decreases(dp) {
@@ -358,7 +352,7 @@ func cgReturnStmt(s u32, dp usize) decreases(dp) {
 		return
 	}
 	// Evaluate the results inside the scope, then wait, then return.
-	smark := cgStash.len
+	smark := (&cgStash).Len()
 	if nres == 1 && nw > 1 {
 		r0 := l1at(s, 0)
 		cs := cgConstValueSlot(r0)
@@ -420,9 +414,9 @@ func cgReturnStmt(s u32, dp usize) decreases(dp) {
 	}
 	_ = cgWaitScopes()
 	cgW("return ")
-	cgStashEmit(smark, cgStash.len)
+	cgStashEmit(smark, (&cgStash).Len())
 	cgWc('\n')
-	cgStash.len = smark
+	(&cgStash).Truncate(smark)
 }
 
 func cgIfStmt(s u32, dp usize) decreases(dp) {
@@ -510,9 +504,7 @@ func cgForStmt(s u32, dp usize) decreases(dp) {
 	cgPopFrame()
 	if lbl != 0 {
 		q := cgWmark()
-		cgW("_fc_L")
-		cgWu(lbl - 1)
-		cgW(":\n")
+		cgWf(formatTo(mbuf[:], "_fc_L%d:\n", lbl - 1))
 		cgWrotate(p, q)
 	}
 }
@@ -550,9 +542,7 @@ func cgBranch(s u32, isBreak bool) {
 			cgFrameLabel[loop] = cgLabel + 1
 			cgLabel++
 		}
-		cgW("break _fc_L")
-		cgWu(cgFrameLabel[loop] - 1)
-		cgWc('\n')
+		cgWf(formatTo(mbuf[:], "break _fc_L%d\n", cgFrameLabel[loop] - 1))
 		return
 	}
 	if isBreak {
@@ -579,9 +569,7 @@ func cgScopeStmt(s u32, dp usize) decreases(dp) {
 	cgWc('\n')
 	idx := cgScopeIdx[usize(s)]
 	if idx > 0 {
-		cgW("_fc_s")
-		cgWu(u64(idx - 1))
-		cgW(" = ")
+		cgWf(formatTo(mbuf[:], "_fc_s%d = ", idx - 1))
 		cgWScopeVar(fr)
 		cgWc('\n')
 	}

@@ -18,6 +18,11 @@
 // are sorted afterwards.
 package main
 
+import (
+	"std/bytes"
+	"std/sort"
+)
+
 const (
 	MaxGraphEdges = MaxCalls + 2*MaxFuncs
 )
@@ -260,20 +265,12 @@ func checkRecursion() {
 		s1 := usize(sccS[c+1])
 		for i := s0; i < s1; i++ {
 			v := sccMem[i]
-			if v == hub {
-				continue
+			if v != hub {
+				rcMem[nrc] = v
+				nrc++
 			}
-			j := nrc
-			for g := usize(0); g < nrc; g++ {
-				if j == 0 || rcMem[j-1] < v {
-					break
-				}
-				rcMem[j] = rcMem[j-1]
-				j--
-			}
-			rcMem[j] = v
-			nrc++
 		}
+		sort.SortU32(rcMem[:nrc])
 		if nrc == 0 {
 			continue
 		}
@@ -295,6 +292,51 @@ func checkRecursion() {
 	}
 }
 
+// RecMembers renders the first n members of the sorted SCC (rcSorted),
+// comma-separated; with missing set only those without a decreases clause.
+type RecMembers struct {
+	n       usize
+	missing bool
+}
+
+func (r RecMembers) Format(dst []byte) usize {
+	k := usize(0)
+	sep := false
+	n := r.n
+	for i := usize(0); i < n; i++ {
+		fi := gfi[usize(rcSorted[i])]
+		if r.missing && funcs.items[usize(fi)].measure != 0 {
+			continue
+		}
+		if sep {
+			k += formatTo(dst[k:], ", ")
+		}
+		sep = true
+		k += formatTo(dst[k:], "%v", FuncName(fi))
+	}
+	return k
+}
+
+// MeasureWhy renders why a decreases measure is invalid (measureParam);
+// sym is the measure parameter.
+type MeasureWhy struct {
+	why u32
+	sym u32
+}
+
+func (w MeasureWhy) Format(dst []byte) usize {
+	if w.why == 1 {
+		return formatTo(dst, "the measure must be a parameter of the function")
+	} else if w.why == 2 {
+		return formatTo(dst, "the measure parameter must be unsigned")
+	} else if w.why == 3 {
+		return formatTo(dst, "the measure parameter must not be variadic")
+	} else if w.why == 4 {
+		return formatTo(dst, "the measure parameter %v must not be addressed or written by a function literal", NameRef(symName(w.sym)))
+	}
+	return formatTo(dst, "the measure parameter %v must not be assigned", NameRef(symName(w.sym)))
+}
+
 // spanBefore orders FuncInfo nodes by (file path, position).
 func spanBefore(a u32, b u32) bool {
 	na0 := fiNode(gfi[usize(a)])
@@ -302,7 +344,7 @@ func spanBefore(a u32, b u32) bool {
 	fa := nfile(na0)
 	fb := nfile(nb0)
 	if fa != fb {
-		c := bytesCompare(strBytes(sources.files[fa].path), strBytes(sources.files[fb].path))
+		c := bytes.Compare(strBytes(sources.files[fa].path), strBytes(sources.files[fb].path))
 		if c != 0 {
 			return c < 0
 		}
@@ -321,18 +363,8 @@ func checkSCC(comp u32) {
 		code = E4002
 	}
 	n := nrc
-	for i := usize(0); i < n; i++ {
-		v := rcMem[i]
-		j := i
-		for g := usize(0); g < i; g++ {
-			if j == 0 || !spanBefore(v, rcSorted[j-1]) {
-				break
-			}
-			rcSorted[j] = rcSorted[j-1]
-			j--
-		}
-		rcSorted[j] = v
-	}
+	copy(rcSorted[:n], rcMem[:n])
+	sort.Stable[u32](rcSorted[:n], spanBefore)
 	// every member needs a decreases clause
 	missing := false
 	for i := usize(0); i < n; i++ {
@@ -342,35 +374,11 @@ func checkSCC(comp u32) {
 	}
 	first := gfi[usize(rcSorted[0])]
 	if missing {
-		mreset()
 		if n == 1 {
-			ms("recursive function ")
-			mfuncName(first)
-			ms(" has no decreases clause")
+			errAt(code, fiNode(first), formatTo(mbuf[:], "recursive function %v has no decreases clause", FuncName(first)))
 		} else {
-			ms("mutually recursive functions {")
-			for i := usize(0); i < n; i++ {
-				if i > 0 {
-					ms(", ")
-				}
-				mfuncName(gfi[usize(rcSorted[i])])
-			}
-			ms("} need a decreases clause each (missing in ")
-			k := 0
-			for i := usize(0); i < n; i++ {
-				fi := gfi[usize(rcSorted[i])]
-				if funcs.items[usize(fi)].measure != 0 {
-					continue
-				}
-				if k > 0 {
-					ms(", ")
-				}
-				k++
-				mfuncName(fi)
-			}
-			ms(")")
+			errAt(code, fiNode(first), formatTo(mbuf[:], "mutually recursive functions {%v} need a decreases clause each (missing in %v)", RecMembers{n: n, missing: false}, RecMembers{n: n, missing: true}))
 		}
-		errAt(code, fiNode(first))
 		return
 	}
 	// measures: an unsigned parameter that the function never writes
@@ -379,26 +387,7 @@ func checkSCC(comp u32) {
 		fi := gfi[usize(v)]
 		idx, why, ws := measureParam(fi)
 		if why != 0 {
-			mreset()
-			ms("decreases measure of recursive function ")
-			mfuncName(fi)
-			ms(": ")
-			if why == 1 {
-				ms("the measure must be a parameter of the function")
-			} else if why == 2 {
-				ms("the measure parameter must be unsigned")
-			} else if why == 3 {
-				ms("the measure parameter must not be variadic")
-			} else if why == 4 {
-				ms("the measure parameter ")
-				mname(symName(ws))
-				ms(" must not be addressed or written by a function literal")
-			} else {
-				ms("the measure parameter ")
-				mname(symName(ws))
-				ms(" must not be assigned")
-			}
-			errAt(code, funcs.items[usize(fi)].measure)
+			errAt(code, funcs.items[usize(fi)].measure, formatTo(mbuf[:], "decreases measure of recursive function %v: %v", FuncName(fi), MeasureWhy{why: why, sym: ws}))
 			return
 		}
 		rcMeas[usize(v)] = u32(idx)
@@ -488,9 +477,7 @@ func recOnCall(call u32, st u32) {
 		if callTab.items[usize(ci)].effect == EffDriver || !rcHasEsc {
 			return
 		}
-		mreset()
-		ms("call through a function value inside a recursive group cannot be proven to decrease a measure")
-		errAt(rcCode, call)
+		errAt(rcCode, call, formatTo(mbuf[:], "call through a function value inside a recursive group cannot be proven to decrease a measure"))
 		return
 	}
 	if k == CallBuiltin && callTab.items[usize(ci)].fmtOK {
@@ -501,11 +488,7 @@ func recOnCall(call u32, st u32) {
 			}
 			j := gidx[usize(funcOfSym(meths.items[usize(fmtArgMethod(ci, a))].sym))]
 			if j != 0 && tjComp[usize(j-1)] == rcComp {
-				mreset()
-				ms("formatTo call of ")
-				mfuncName(gfi[usize(j-1)])
-				ms(" inside a recursive group cannot be proven to decrease a measure")
-				errAt(rcCode, call)
+				errAt(rcCode, call, formatTo(mbuf[:], "formatTo call of %v inside a recursive group cannot be proven to decrease a measure", FuncName(gfi[usize(j-1)])))
 				return
 			}
 		}
@@ -521,24 +504,11 @@ func recOnCall(call u32, st u32) {
 	callee := gfi[usize(j-1)]
 	jm := usize(rcMeas[usize(j-1)])
 	if jm >= l1len(call) {
-		mreset()
-		ms("cannot find the measure argument of the call to ")
-		mfuncName(callee)
-		errAt(rcCode, call)
+		errAt(rcCode, call, formatTo(mbuf[:], "cannot find the measure argument of the call to %v", FuncName(callee)))
 		return
 	}
 	if !smaller(l1at(call, jm), rcD, st) {
-		mreset()
-		ms("recursive call to ")
-		mfuncName(callee)
-		ms(" must pass a measure strictly smaller than ")
-		mname(symName(rcD))
-		ms(" (e.g. ")
-		mname(symName(rcD))
-		ms(" - 1 after `if ")
-		mname(symName(rcD))
-		ms(" == 0 { return ... }`)")
-		errAt(rcCode, call)
+		errAt(rcCode, call, formatTo(mbuf[:], "recursive call to %v must pass a measure strictly smaller than %v (e.g. %v - 1 after `if %v == 0 { return ... }`)", FuncName(callee), NameRef(symName(rcD)), NameRef(symName(rcD)), NameRef(symName(rcD))))
 	}
 }
 

@@ -20,4 +20,5 @@ pending: 1
 depth/used: 6
 overflow run/full: 1
 stack overflow depth/full: 41
+truncate rollback: 3235
 after reset store: 12

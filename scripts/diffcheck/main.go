@@ -695,7 +695,7 @@ var compilerMutations = []struct{ file, old, new string }{
 	{"compiler/lexer.fc", "i < n; i++", "i <= n; i++"},
 	{"compiler/sema.fc", "for i := usize(0); i < n; i++ {", "for i := usize(0); i < n; i += 2 {"},
 	{"compiler/sema.fc", "for i := usize(0); i < n; i++ {", "for i := usize(0); i < n; i-- {"},
-	{"compiler/arena.fc", "i < n; i++ {", "i < n; i++ {\n\t\tn++"},
+	{"compiler/build.fc", "i < n; i++ {", "i < n; i++ {\n\t\tn++"},
 	{"compiler/totality.fc", "for p := s; p < e; p++ {", "for p := s; p < e; p++ {\n\t\te = e + 0"},
 	{"compiler/values.fc", "decreases(depth)", ""},
 	{"compiler/checker.fc", "func tooDeep() {", "func tooDeep() {\n\tfor {\n\t\tbreak\n\t}"},

@@ -188,9 +188,7 @@ func cgBasicLit(lit u32, v Val, typed bool, dp usize) decreases(dp) {
 		return
 	}
 	cgGoType(lit, t, dp-1)
-	cgWc('(')
-	cgWb(raw)
-	cgWc(')')
+	cgWf(formatTo(mbuf[:], "(%s)", raw))
 }
 
 // convType writes the type of a conversion T(x).
@@ -760,9 +758,7 @@ func cgBuiltinMethod(e u32, c u32, dp usize) decreases(dp) {
 		return
 	}
 	cgPrimary(ci.recv, dp-1)
-	cgWc('.')
-	cgWb(nameBytes(meths.items[usize(ci.method)].name))
-	cgWc('(')
+	cgWf(formatTo(mbuf[:], ".%s(", nameBytes(meths.items[usize(ci.method)].name)))
 	cgArgs(e, dp-1)
 	cgWc(')')
 }

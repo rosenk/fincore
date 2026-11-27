@@ -43,18 +43,9 @@ func stmt(s u32, dp usize) decreases(dp) {
 			return
 		}
 		if x.mode != KVar {
-			mreset()
-			ms("cannot assign to ")
-			mexpr(na(s))
-			errAt(E2002, na(s))
+			errAt(E2002, na(s), formatTo(mbuf[:], "cannot assign to %v", Expr(na(s))))
 		} else if !isInteger(x.typ) {
-			mreset()
-			ms("invalid operation: ")
-			mexpr(na(s))
-			ms(" (non-integer type ")
-			mtype(x.typ)
-			ms(")")
-			errAt(E2002, na(s))
+			errAt(E2002, na(s), formatTo(mbuf[:], "invalid operation: %v (non-integer type %v)", Expr(na(s)), TypeRef(x.typ)))
 		}
 	} else if k == NkExprStmt {
 		exprStmt(na(s), "statement", dp-1)
@@ -86,27 +77,17 @@ func stmt(s u32, dp usize) decreases(dp) {
 		x := exprValue(v, dp-1)
 		st := univNamed[BTScope]
 		if !isInvalidOp(&x) && x.typ != st {
-			mreset()
-			ms("scope value ")
-			mexpr(v)
-			ms(" must have type Scope (have ")
-			mtype(x.typ)
-			ms(")")
-			errAt(E2002, v)
+			errAt(E2002, v, formatTo(mbuf[:], "scope value %v must have type Scope (have %v)", Expr(v), TypeRef(x.typ)))
 		}
 		setSymType(defs[usize(na(s))], st)
 		stmtList(nc(s), dp-1)
 	} else if k == NkBreakStmt {
 		if chkLoops == 0 {
-			mreset()
-			ms("break is not in a loop")
-			errAt(E2002, s)
+			errAt(E2002, s, formatTo(mbuf[:], "break is not in a loop"))
 		}
 	} else if k == NkContinueStmt {
 		if chkLoops == 0 {
-			mreset()
-			ms("continue is not in a loop")
-			errAt(E2002, s)
+			errAt(E2002, s, formatTo(mbuf[:], "continue is not in a loop"))
 		}
 	}
 }
@@ -153,13 +134,7 @@ func condition(e u32, what string, dp usize) decreases(dp) {
 		return
 	}
 	if !isBoolean(x.typ) {
-		mreset()
-		ms("non-boolean condition in ")
-		ms(what)
-		ms(" statement (type ")
-		mtype(x.typ)
-		ms(")")
-		errAt(E2002, e)
+		errAt(E2002, e, formatTo(mbuf[:], "non-boolean condition in %s statement (type %v)", what, TypeRef(x.typ)))
 		return
 	}
 	if isUntyped(x.typ) {
@@ -179,12 +154,7 @@ func exprStmt(e u32, what string, dp usize) decreases(dp) {
 	if nkind(call) != NkCallExpr {
 		x := rawExpr(e, dp-1)
 		if !isInvalidOp(&x) {
-			mreset()
-			mexpr(e)
-			ms(" is not used (")
-			ms(what)
-			ms(" requires a function call)")
-			errAt(E2002, e)
+			errAt(E2002, e, formatTo(mbuf[:], "%v is not used (%s requires a function call)", Expr(e), what))
 		}
 		return
 	}
@@ -200,10 +170,7 @@ func exprStmt(e u32, what string, dp usize) decreases(dp) {
 		bad = b != BFPanic && b != BFCopy && b != BFFormatTo
 	}
 	if bad {
-		mreset()
-		mexpr(e)
-		ms(" is not used")
-		errAt(E2002, e)
+		errAt(E2002, e, formatTo(mbuf[:], "%v is not used", Expr(e)))
 	}
 }
 
@@ -229,26 +196,12 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 			if isInvalidOp(&x) {
 				return false
 			}
-			mreset()
-			ms("assignment mismatch: ")
-			mu(u64(nl))
-			ms(" variables but ")
-			mexpr(r0)
-			ms(" returns 1 value")
-			errAt(E2003, r0)
+			errAt(E2003, r0, formatTo(mbuf[:], "assignment mismatch: %d variables but %v returns 1 value", nl, Expr(r0)))
 			return false
 		}
 		nt := tupleN(x.typ)
 		if nt != nl {
-			mreset()
-			ms("assignment mismatch: ")
-			mu(u64(nl))
-			ms(" variables but ")
-			mexpr(r0)
-			ms(" returns ")
-			mu(u64(nt))
-			ms(" values")
-			errAt(E2003, r0)
+			errAt(E2003, r0, formatTo(mbuf[:], "assignment mismatch: %d variables but %v returns %d values", nl, Expr(r0), nt))
 			return false
 		}
 		tv := u32(0)
@@ -277,13 +230,7 @@ func rhsValues(s u32, nl usize, dp usize) bool decreases(dp) {
 		opPush(x)
 	}
 	if nr != nl {
-		mreset()
-		ms("assignment mismatch: ")
-		mu(u64(nl))
-		ms(" variables but ")
-		mu(u64(nr))
-		ms(" values")
-		errAt(E2003, r0)
+		errAt(E2003, r0, formatTo(mbuf[:], "assignment mismatch: %d variables but %d values", nl, nr))
 		opStack.top = mark
 		return false
 	}
@@ -315,11 +262,7 @@ func shortVarDecl(s u32, dp usize) decreases(dp) {
 		use := uses[usize(id)]
 		if use != 0 {
 			if symKind(use) != SymVar {
-				mreset()
-				ms("cannot assign to ")
-				mname(idName(id))
-				ms(" (not a variable)")
-				errAt(E2002, id)
+				errAt(E2002, id, formatTo(mbuf[:], "cannot assign to %v (not a variable)", NameRef(idName(id))))
 				continue
 			}
 			t := symType(use, dp-1)
@@ -345,12 +288,7 @@ func assignValue(x *Operand, t u32) {
 		rt := ntype[usize(e)]
 		if rt != 0 && isTupleT(rt) {
 			if !assignable(x.typ, t) && !isInvalid(t) {
-				mreset()
-				ms("cannot assign value of type ")
-				mtype(x.typ)
-				ms(" to variable of type ")
-				mtype(t)
-				errAt(E2002, e)
+				errAt(E2002, e, formatTo(mbuf[:], "cannot assign value of type %v to variable of type %v", TypeRef(x.typ), TypeRef(t)))
 			}
 			return
 		}
@@ -368,11 +306,7 @@ func assignStmt(s u32, dp usize) decreases(dp) {
 	op := nop(s)
 	if op != AsgAssign {
 		if nl != 1 || nr != 1 {
-			mreset()
-			ms("compound assignment ")
-			ms(assignOpString(op))
-			ms(" requires exactly one operand on each side")
-			errAt(E2003, s)
+			errAt(E2003, s, formatTo(mbuf[:], "compound assignment %s requires exactly one operand on each side", assignOpString(op)))
 			return
 		}
 		l0 := l1at(s, 0)
@@ -382,22 +316,11 @@ func assignStmt(s u32, dp usize) decreases(dp) {
 			return
 		}
 		if l.mode != KVar {
-			mreset()
-			ms("cannot assign to ")
-			mexpr(l0)
-			errAt(E2002, l0)
+			errAt(E2002, l0, formatTo(mbuf[:], "cannot assign to %v", Expr(l0)))
 			return
 		}
 		if !isInteger(l.typ) {
-			mreset()
-			ms("operator ")
-			ms(assignOpString(op))
-			ms(" not defined on ")
-			mexpr(l0)
-			ms(" (type ")
-			mtype(l.typ)
-			ms(")")
-			errAt(E2002, s)
+			errAt(E2002, s, formatTo(mbuf[:], "operator %s not defined on %v (type %v)", assignOpString(op), Expr(l0), TypeRef(l.typ)))
 			return
 		}
 		_ = assignment(&r, l.typ, mkCtx(CtxAssign))
@@ -414,10 +337,7 @@ func assignStmt(s u32, dp usize) decreases(dp) {
 		}
 		x := exprValue(l, dp-1)
 		if !isInvalidOp(&x) && x.mode != KVar {
-			mreset()
-			ms("cannot assign to ")
-			mexpr(l)
-			errAt(E2002, l)
+			errAt(E2002, l, formatTo(mbuf[:], "cannot assign to %v", Expr(l)))
 			x.mode = KNone
 		}
 		opPush(x)
@@ -461,10 +381,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 	nr := l1len(s)
 	if nr == 0 {
 		if want > 0 {
-			mreset()
-			ms("not enough return values: have 0, want ")
-			mu(u64(want))
-			errAt(E2003, s)
+			errAt(E2003, s, formatTo(mbuf[:], "not enough return values: have 0, want %d", want))
 		}
 		return
 	}
@@ -473,11 +390,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		for i := usize(0); i < nr; i++ {
 			_ = rawExpr(l1at(s, i), dp-1)
 		}
-		mreset()
-		ms("too many return values: have ")
-		mu(u64(nr))
-		ms(", want 0")
-		errAt(E2003, r0)
+		errAt(E2003, r0, formatTo(mbuf[:], "too many return values: have %d, want 0", nr))
 		return
 	}
 	if nr == 1 && want > 1 {
@@ -488,36 +401,20 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		if x.typ == 0 || !isTupleT(x.typ) {
 			singleValue(&x)
 			if !isInvalidOp(&x) {
-				mreset()
-				ms("not enough return values: have 1, want ")
-				mu(u64(want))
-				errAt(E2003, r0)
+				errAt(E2003, r0, formatTo(mbuf[:], "not enough return values: have 1, want %d", want))
 			}
 			return
 		}
 		nt := tupleN(x.typ)
 		if nt != want {
-			mreset()
-			ms("wrong number of return values: have ")
-			mu(u64(nt))
-			ms(", want ")
-			mu(u64(want))
-			errAt(E2003, r0)
+			errAt(E2003, r0, formatTo(mbuf[:], "wrong number of return values: have %d, want %d", nt, want))
 			return
 		}
 		for i := usize(0); i < nt; i++ {
 			t := tupleAt(x.typ, i)
 			w := sigResult(sig, i)
 			if !assignable(t, w) && !isInvalid(w) {
-				mreset()
-				ms("cannot use result ")
-				mu(u64(i + 1))
-				ms(" of type ")
-				mtype(t)
-				ms(" as type ")
-				mtype(w)
-				ms(" in return statement")
-				errAt(E2002, r0)
+				errAt(E2002, r0, formatTo(mbuf[:], "cannot use result %d of type %v as type %v in return statement", i + 1, TypeRef(t), TypeRef(w)))
 			}
 		}
 		return
@@ -526,17 +423,7 @@ func returnStmt(s u32, dp usize) decreases(dp) {
 		for i := usize(0); i < nr; i++ {
 			_ = rawExpr(l1at(s, i), dp-1)
 		}
-		mreset()
-		if nr > want {
-			ms("too many")
-		} else {
-			ms("not enough")
-		}
-		ms(" return values: have ")
-		mu(u64(nr))
-		ms(", want ")
-		mu(u64(want))
-		errAt(E2003, r0)
+		errAt(E2003, r0, formatTo(mbuf[:], "%s return values: have %d, want %d", tooMany(nr > want), nr, want))
 		return
 	}
 	for i := usize(0); i < nr; i++ {
@@ -568,11 +455,7 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 				return false
 			}
 			if !comparable(t, SemaDepth) {
-				mreset()
-				ms("cannot match values of type ")
-				mtype(t)
-				ms(" against literals")
-				errAt(E2002, p)
+				errAt(E2002, p, formatTo(mbuf[:], "cannot match values of type %v against literals", TypeRef(t)))
 				return false
 			}
 			return true
@@ -592,21 +475,12 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 	}
 	if sym != 0 && symKind(sym) == SymConst && !isVariant {
 		if nflag(p) {
-			mreset()
-			ms("constant ")
-			mname(symName(sym))
-			ms(" cannot have bindings")
-			errAt(E2002, p)
+			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot have bindings", NameRef(symName(sym))))
 			bindInvalid(p)
 			return false
 		}
 		if isEnum {
-			mreset()
-			ms("constant ")
-			mname(symName(sym))
-			ms(" cannot be a pattern for enum type ")
-			mtype(t)
-			errAt(E2002, p)
+			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot be a pattern for enum type %v", NameRef(symName(sym)), TypeRef(t)))
 			return false
 		}
 		x := symOperand(sym, name, dp-1)
@@ -625,10 +499,7 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 			return false
 		}
 		if symKind(qs) != SymType {
-			mreset()
-			mname(idName(q))
-			ms(" is not an enum type")
-			errAt(E2002, q)
+			errAt(E2002, q, formatTo(mbuf[:], "%v is not an enum type", NameRef(idName(q))))
 			bindInvalid(p)
 			return false
 		}
@@ -641,10 +512,7 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 		}
 		qe := underlying(qt)
 		if !isEnumT(qe) {
-			mreset()
-			mtype(qt)
-			ms(" is not an enum type")
-			errAt(E2002, q)
+			errAt(E2002, q, formatTo(mbuf[:], "%v is not an enum type", TypeRef(qt)))
 			bindInvalid(p)
 			return false
 		}
@@ -654,23 +522,13 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 		if isNamedT(t) && namedOrigin(t) != 0 && namedOrigin(t) == qt && isEnum {
 			qe = en
 		} else if qt != t {
-			mreset()
-			ms("pattern of type ")
-			mtype(qt)
-			ms(" does not match scrutinee of type ")
-			mtype(t)
-			errAt(E2002, p)
+			errAt(E2002, p, formatTo(mbuf[:], "pattern of type %v does not match scrutinee of type %v", TypeRef(qt), TypeRef(t)))
 			bindInvalid(p)
 			return false
 		}
 		v, found := variantByName(qe, nm)
 		if !found {
-			mreset()
-			ms("enum ")
-			mtype(qt)
-			ms(" has no variant ")
-			mname(nm)
-			errAt(E2001, name)
+			errAt(E2001, name, formatTo(mbuf[:], "enum %v has no variant %v", TypeRef(qt), NameRef(nm)))
 			bindInvalid(p)
 			return false
 		}
@@ -679,23 +537,14 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 	} else if isEnum {
 		v, found := variantByName(en, nm)
 		if !found {
-			mreset()
-			ms("undefined: ")
-			mname(nm)
-			ms(" (no constant or variant of ")
-			mtype(t)
-			ms(")")
-			errAt(E2001, name)
+			errAt(E2001, name, formatTo(mbuf[:], "undefined: %v (no constant or variant of %v)", NameRef(nm), TypeRef(t)))
 			bindInvalid(p)
 			return false
 		}
 		venum = en
 		vi = v
 	} else {
-		mreset()
-		ms("undefined: ")
-		mname(nm)
-		errAt(E2001, name)
+		errAt(E2001, name, formatTo(mbuf[:], "undefined: %v", NameRef(nm)))
 		bindInvalid(p)
 		return false
 	}
@@ -705,14 +554,7 @@ func pattern(p u32, t u32, dp usize) bool decreases(dp) {
 	nbind := l1len(p)
 	npay := variantPayN(venum, vi)
 	if nbind != npay || (nflag(p) && npay == 0) {
-		mreset()
-		ms("variant ")
-		mname(nm)
-		ms(" has ")
-		mu(u64(npay))
-		ms(" payload values, pattern binds ")
-		mu(u64(nbind))
-		errAt(E2003, p)
+		errAt(E2003, p, formatTo(mbuf[:], "variant %v has %d payload values, pattern binds %d", NameRef(nm), npay, nbind))
 		bindInvalid(p)
 		return false
 	}

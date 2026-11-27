@@ -72,7 +72,7 @@ func tindex(n u32, lit u32, dp usize) decreases(dp) {
 			st, cnt := slotList(nodes.items[usize(n)], slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				tindex(nodes.lists[usize(st)+j], inner, dp-1)
+				tindex(listAt(st, j), inner, dp-1)
 			}
 		} else {
 			tindex(slotChild(nodes.items[usize(n)], slot), inner, dp-1)
@@ -99,7 +99,7 @@ func buildTotIndex() {
 // ---------------------------------------------------------------------------
 // Diagnostics state
 
-// Reason codes of unproven loops (rendered by putWhy).
+// Reason codes of unproven loops (rendered by LoopWhy).
 const (
 	WhyNone         = 0
 	WhyNoPost       = 1
@@ -137,99 +137,78 @@ const (
 
 var totWhySym u32
 
-func putWhy(why u32, s u32) {
+// LoopWhy renders the reason of an unproven loop; sym is the loop's
+// counter, slice or measure variable.
+type LoopWhy struct {
+	why u32
+	sym u32
+}
+
+func (w LoopWhy) Format(dst []byte) usize {
+	why := w.why
+	v := NameRef(symName(w.sym))
 	if why == WhyNoPost {
-		ms("not a counting loop (no post statement), slice-shrink loop, or loop with decreases clause")
+		return formatTo(dst, "not a counting loop (no post statement), slice-shrink loop, or loop with decreases clause")
 	} else if why == WhyPostForm {
-		ms("post statement must be i++, i--, i += c or i -= c")
+		return formatTo(dst, "post statement must be i++, i--, i += c or i -= c")
 	} else if why == WhyStep {
-		ms("step of the counting loop must be a positive constant")
+		return formatTo(dst, "step of the counting loop must be a positive constant")
 	} else if why == WhyPostCounter {
-		ms("post statement must update a local counter variable")
+		return formatTo(dst, "post statement must update a local counter variable")
 	} else if why == WhyCtrNotInt {
-		ms("loop counter ")
-		mname(symName(s))
-		ms(" is not an integer")
+		return formatTo(dst, "loop counter %v is not an integer", v)
 	} else if why == WhyInitDeclCtr {
-		ms("init statement must declare only the counter")
+		return formatTo(dst, "init statement must declare only the counter")
 	} else if why == WhyInitAsgCtr {
-		ms("init statement must assign only the counter")
+		return formatTo(dst, "init statement must assign only the counter")
 	} else if why == WhyInitCtr {
-		ms("init statement must initialize the counter")
+		return formatTo(dst, "init statement must initialize the counter")
 	} else if why == WhyCtrUnstable {
-		ms("loop counter ")
-		mname(symName(s))
-		ms(" may be modified through a pointer or closure")
+		return formatTo(dst, "loop counter %v may be modified through a pointer or closure", v)
 	} else if why == WhyCondCompare {
-		ms("condition must compare the counter with a bound")
+		return formatTo(dst, "condition must compare the counter with a bound")
 	} else if why == WhyCondCtr {
-		ms("condition must compare the counter ")
-		mname(symName(s))
-		ms(" with a bound")
+		return formatTo(dst, "condition must compare the counter %v with a bound", v)
 	} else if why == WhyUpCond {
-		ms("a counter counting up needs a condition ")
-		mname(symName(s))
-		ms(" < bound")
+		return formatTo(dst, "a counter counting up needs a condition %v < bound", v)
 	} else if why == WhyDownCond {
-		ms("a counter counting down needs a condition ")
-		mname(symName(s))
-		ms(" > bound")
+		return formatTo(dst, "a counter counting down needs a condition %v > bound", v)
 	} else if why == WhyWrap {
-		ms("the counter may wrap around: use step 1 with a strict comparison, or a constant bound")
+		return formatTo(dst, "the counter may wrap around: use step 1 with a strict comparison, or a constant bound")
 	} else if why == WhyCtrModified {
-		ms("loop counter ")
-		mname(symName(s))
-		ms(" is modified in the loop body")
+		return formatTo(dst, "loop counter %v is modified in the loop body", v)
 	} else if why == WhyBoundVariant {
-		ms("loop bound is not invariant in the loop body")
+		return formatTo(dst, "loop bound is not invariant in the loop body")
 	} else if why == WhyNoCond {
-		ms("a loop without condition needs a decreases clause")
+		return formatTo(dst, "a loop without condition needs a decreases clause")
 	} else if why == WhyShrinkPost {
-		ms("a slice-shrink loop must not have a post statement")
+		return formatTo(dst, "a slice-shrink loop must not have a post statement")
 	} else if why == WhyInitDeclSlice {
-		ms("init statement must declare only the slice ")
-		mname(symName(s))
+		return formatTo(dst, "init statement must declare only the slice %v", v)
 	} else if why == WhyInitAsgSlice {
-		ms("init statement must assign only the slice ")
-		mname(symName(s))
+		return formatTo(dst, "init statement must assign only the slice %v", v)
 	} else if why == WhyInitSlice {
-		ms("init statement must initialize the slice ")
-		mname(symName(s))
+		return formatTo(dst, "init statement must initialize the slice %v", v)
 	} else if why == WhySliceUnstable {
-		ms("slice ")
-		mname(symName(s))
-		ms(" may be modified through a pointer or closure")
+		return formatTo(dst, "slice %v may be modified through a pointer or closure", v)
 	} else if why == WhySliceModified {
-		ms("slice ")
-		mname(symName(s))
-		ms(" is modified other than by ")
-		mname(symName(s))
-		ms(" = ")
-		mname(symName(s))
-		ms("[k:]")
+		return formatTo(dst, "slice %v is modified other than by %v = %v[k:]", v, v, v)
 	} else if why == WhyNotShortened {
-		ms("slice ")
-		mname(symName(s))
-		ms(" is not provably shortened on every path (need ")
-		mname(symName(s))
-		ms(" = ")
-		mname(symName(s))
-		ms("[k:] with k > 0: a positive constant, or after `if k == 0 { return }`)")
+		return formatTo(dst, "slice %v is not provably shortened on every path (need %v = %v[k:] with k > 0: a positive constant, or after `if k == 0 { return }`)", v, v, v)
 	} else if why == WhyLenMeasure {
-		ms("len(...) in the measure must be of an unmodified local slice")
+		return formatTo(dst, "len(...) in the measure must be of an unmodified local slice")
 	} else if why == WhyMeasureForm {
-		ms("measure must be X or X - Y with X, Y local variables, constants or len(s)")
+		return formatTo(dst, "measure must be X or X - Y with X, Y local variables, constants or len(s)")
 	} else if why == WhyMeasureVar {
-		ms("measure variable ")
-		mname(symName(s))
-		ms(" may be modified through a pointer or closure")
+		return formatTo(dst, "measure variable %v may be modified through a pointer or closure", v)
 	} else if why == WhyMeasureNonNeg {
-		ms("the loop condition must imply that the measure is non-negative (e.g. lo < hi for hi - lo)")
+		return formatTo(dst, "the loop condition must imply that the measure is non-negative (e.g. lo < hi for hi - lo)")
 	} else if why == WhyMeasureUnsign {
-		ms("a single-variable measure must be unsigned")
+		return formatTo(dst, "a single-variable measure must be unsigned")
 	} else if why == WhyNoDecrease {
-		ms("measure does not provably decrease on every path through the loop body")
+		return formatTo(dst, "measure does not provably decrease on every path through the loop body")
 	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -260,12 +239,12 @@ func fiNode(fi u32) u32 {
 // ---------------------------------------------------------------------------
 // E5001: effect containment (spec 6.1)
 
-func putMode(fi u32) {
+// modeName is "comptime" or "total" (the effect of a non-driver function).
+func modeName(fi u32) string {
 	if funcs.items[usize(fi)].effect == EffComptime {
-		ms("comptime")
-	} else {
-		ms("total")
+		return "comptime"
 	}
+	return "total"
 }
 
 func checkEffects(fi u32) {
@@ -284,13 +263,7 @@ func checkEffects(fi u32) {
 		if ci == 0 || callTab.items[usize(ci)].effect != EffDriver {
 			continue
 		}
-		mreset()
-		putMode(fi)
-		ms(" function ")
-		mfuncName(fi)
-		ms(" calls driver ")
-		putCalleeName(call, ci)
-		errAt(E5001, call)
+		errAt(E5001, call, formatTo(mbuf[:], "%s function %v calls driver %v", modeName(fi), FuncName(fi), CalleeName(call)))
 	}
 	b := f.body
 	lit := f.lit
@@ -301,47 +274,37 @@ func checkEffects(fi u32) {
 		if tlit[usize(n)] != lit || nkind(n) != NkForStmt || !nflag(n) {
 			continue
 		}
-		mreset()
-		ms("driver for loop in ")
-		putMode(fi)
-		ms(" function ")
-		mfuncName(fi)
-		errAt(E5001, n)
+		errAt(E5001, n, formatTo(mbuf[:], "driver for loop in %s function %v", modeName(fi), FuncName(fi)))
 	}
 }
 
-func putCalleeName(call u32, ci u32) {
-	cl := callTab.items[usize(ci)]
+// CalleeName renders the callee of a call in E5001 messages.
+type CalleeName u32
+
+func (call CalleeName) Format(dst []byte) usize {
+	cl := callTab.items[usize(ncall[usize(call)])]
 	if cl.kind == CallFunc || cl.kind == CallMethod {
 		f := funcOfSym(cl.callee)
 		if f != 0 {
-			ms("function ")
-			mfuncName(f)
-			return
+			return formatTo(dst, "function %v", FuncName(f))
 		}
 	} else if cl.kind == CallBuiltin {
 		if cl.builtin == BFPanic {
-			ms("builtin panic")
-			return
+			return formatTo(dst, "builtin panic")
 		}
 	} else if cl.kind == CallBuiltinMeth {
 		if cl.method != 0 && meths.items[usize(cl.method)].recv != 0 {
-			ms("method ")
-			mname(typeName(meths.items[usize(cl.method)].recv))
-			mbyte('.')
-			mname(meths.items[usize(cl.method)].name)
-			return
+			m := meths.items[usize(cl.method)]
+			return formatTo(dst, "method %v.%v", NameRef(typeName(m.recv)), NameRef(m.name))
 		}
 	} else if cl.kind == CallValue {
-		ms("function value")
-		return
+		return formatTo(dst, "function value")
 	}
-	fun := na(call)
+	fun := na(u32(call))
 	if nkind(fun) == NkIdent {
-		mbytes(ntext(fun))
-		return
+		return formatTo(dst, "%s", ntext(fun))
 	}
-	ms("function")
+	return formatTo(dst, "function")
 }
 
 // ---------------------------------------------------------------------------
@@ -365,10 +328,7 @@ func checkLoops(fi u32) {
 		totWhySym = 0
 		why := checkLoop(fi, n)
 		if why != WhyNone {
-			mreset()
-			ms("cannot prove termination of for loop: ")
-			putWhy(why, totWhySym)
-			errAt(E4002, n)
+			errAt(E4002, n, formatTo(mbuf[:], "cannot prove termination of for loop: %v", LoopWhy{why: why, sym: totWhySym}))
 		}
 	}
 }

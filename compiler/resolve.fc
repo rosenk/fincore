@@ -455,12 +455,7 @@ func pkgAddDecl(pkg u32, kind u8, id u32, decl u32) {
 	}
 	old := scopeInsert(pkgs.items[usize(pkg)].scp, sym)
 	if old != 0 {
-		mreset()
-		mname(idName(id))
-		ms(" redeclared in this package (previous declaration at ")
-		mpos(syms.items[usize(old)].ident)
-		ms(")")
-		errAt(E2001, id)
+		errAt(E2001, id, formatTo(mbuf[:], "%v redeclared in this package (previous declaration at %v)", NameRef(idName(id)), PosRef(syms.items[usize(old)].ident)))
 	}
 }
 
@@ -469,7 +464,7 @@ func declarePackage(pkg u32) {
 	pkgs.items[usize(pkg)].scp = sc
 	f0 := pkgs.items[usize(pkg)].f0
 	f1 := pkgs.items[usize(pkg)].f1
-	mark := ustack.count
+	mark := umark()
 	for fi := f0; fi < f1; fi++ {
 		if !sources.files[fi].ok {
 			continue
@@ -509,31 +504,23 @@ func declarePackage(pkg u32) {
 	pkgs.items[usize(pkg)].declS = ds
 	pkgs.items[usize(pkg)].declN = dn
 	// Methods (redeclared ones are reported and left out).
-	mark2 := ustack.count
+	mark2 := umark()
 	for i := usize(0); i < usize(dn); i++ {
 		s := uat(ds, i)
 		if syms.items[usize(s)].recvType == 0 {
 			continue
 		}
 		old := u32(0)
-		top := ustack.count
-		for j := mark2; j < top; j++ {
-			m := ustack.items[j]
+		prev := (&ulists).Pending(mark2)
+		for j := usize(0); j < len(prev); j++ {
+			m := prev[j]
 			if syms.items[usize(m)].recvType == syms.items[usize(s)].recvType && syms.items[usize(m)].name == syms.items[usize(s)].name {
 				old = m
 				break
 			}
 		}
 		if old != 0 {
-			mreset()
-			ms("method ")
-			mname(syms.items[usize(s)].recvType)
-			mbyte('.')
-			mname(syms.items[usize(s)].name)
-			ms(" redeclared (previous declaration at ")
-			mpos(syms.items[usize(old)].ident)
-			ms(")")
-			errAt(E2001, syms.items[usize(s)].ident)
+			errAt(E2001, syms.items[usize(s)].ident, formatTo(mbuf[:], "method %v.%v redeclared (previous declaration at %v)", NameRef(syms.items[usize(s)].recvType), NameRef(syms.items[usize(s)].name), PosRef(syms.items[usize(old)].ident)))
 		} else {
 			upush(s)
 		}
@@ -554,9 +541,9 @@ func declarePackage(pkg u32) {
 // returns it.
 func importPathOf(spec u32) []byte {
 	t := &tmpBuf
-	t.reset()
+	t.Reset()
 	decodeStringLit(t, ntext(nb(spec)))
-	return tmpBuf.data[:tmpBuf.len]
+	return t.Bytes()
 }
 
 func bindPackage(pkg u32, depth usize) decreases(depth) {
@@ -608,16 +595,9 @@ func bindPackage(pkg u32, depth usize) decreases(depth) {
 					defs[usize(id)] = sym
 				}
 				if scopeInsert(fs, sym) != 0 {
-					mreset()
-					mname(name)
-					ms(" redeclared in this file")
-					errAt(E2001, spec)
+					errAt(E2001, spec, formatTo(mbuf[:], "%v redeclared in this file", NameRef(name)))
 				} else if lookupLocal(pkgs.items[usize(pkg)].scp, name) != 0 {
-					mreset()
-					ms("import name ")
-					mname(name)
-					ms(" conflicts with a package-level declaration")
-					errAt(E2001, spec)
+					errAt(E2001, spec, formatTo(mbuf[:], "import name %v conflicts with a package-level declaration", NameRef(name)))
 				}
 			}
 		}
@@ -696,10 +676,7 @@ func bDeclare(kind u8, vk u8, id u32, decl u32) u32 {
 	}
 	defs[usize(id)] = sym
 	if scopeInsert(bScope, sym) != 0 {
-		mreset()
-		mname(idName(id))
-		ms(" redeclared in this block")
-		errAt(E2001, id)
+		errAt(E2001, id, formatTo(mbuf[:], "%v redeclared in this block", NameRef(idName(id))))
 	}
 	return sym
 }
@@ -716,13 +693,7 @@ func bFuncDecl(d u32, depth usize) decreases(depth) {
 		tn := nb(r)
 		tsym := lookupLocal(pkgs.items[usize(bPkg)].scp, idName(tn))
 		if tsym == 0 || symKind(tsym) != SymType {
-			mreset()
-			ms("undefined receiver type ")
-			mname(idName(tn))
-			ms(" (must be a type declared in package ")
-			mname(pkgs.items[usize(bPkg)].name)
-			ms(")")
-			errAt(E2001, tn)
+			errAt(E2001, tn, formatTo(mbuf[:], "undefined receiver type %v (must be a type declared in package %v)", NameRef(idName(tn)), NameRef(pkgs.items[usize(bPkg)].name)))
 		} else {
 			uses[usize(tn)] = tsym
 		}
@@ -835,19 +806,9 @@ func bQualified(pkg u32, name u32) bool {
 	imp := syms.items[usize(ps)].imported
 	member := lookupLocal(pkgs.items[usize(imp)].scp, nm)
 	if member == 0 {
-		mreset()
-		ms("undefined: ")
-		mname(idName(pkg))
-		mbyte('.')
-		mname(nm)
-		errAt(E2001, name)
+		errAt(E2001, name, formatTo(mbuf[:], "undefined: %v.%v", NameRef(idName(pkg)), NameRef(nm)))
 	} else if !isExportedName(nm) {
-		mreset()
-		mname(idName(pkg))
-		mbyte('.')
-		mname(nm)
-		ms(" is not exported")
-		errAt(E2001, name)
+		errAt(E2001, name, formatTo(mbuf[:], "%v.%v is not exported", NameRef(idName(pkg)), NameRef(nm)))
 	} else {
 		uses[usize(name)] = member
 	}
@@ -857,17 +818,12 @@ func bQualified(pkg u32, name u32) bool {
 // bLookup resolves an identifier use, reporting E2001 if undefined.
 func bLookup(id u32) u32 {
 	if isBlank(id) {
-		mreset()
-		ms("cannot use _ as value")
-		errAt(E2001, id)
+		errAt(E2001, id, formatTo(mbuf[:], "cannot use _ as value"))
 		return 0
 	}
 	sym := lookupChain(bScope, idName(id))
 	if sym == 0 {
-		mreset()
-		ms("undefined: ")
-		mname(idName(id))
-		errAt(E2001, id)
+		errAt(E2001, id, formatTo(mbuf[:], "undefined: %v", NameRef(idName(id))))
 		return 0
 	}
 	uses[usize(id)] = sym
@@ -1030,9 +986,7 @@ func bStmt(s u32, depth usize) decreases(depth) {
 			_ = bDeclare(SymVar, VarLocal, id, s)
 		}
 		if fresh == 0 {
-			mreset()
-			ms("no new variables on left side of :=")
-			errAt(E2002, s)
+			errAt(E2002, s, formatTo(mbuf[:], "no new variables on left side of :="))
 		}
 	} else if k == NkAssignStmt {
 		nl := l1len(s)

@@ -234,6 +234,16 @@ func (la *ListArena[NI, NS, T]) Set(i usize, x T) bool {
 	return true
 }
 
+// Truncate drops every run stored at or after store slot used (a value
+// returned by Used() earlier), rolling the store back to that point; it
+// is a no-op when used >= Used(). The scratch stack is not touched
+// (Discard(0) empties it). O(1).
+func (la *ListArena[NI, NS, T]) Truncate(used usize) {
+	if used < la.nitem {
+		la.nitem = used
+	}
+}
+
 // Used returns the number of store slots in use (including the reserved
 // slot 0 once anything was stored). O(1).
 func (la *ListArena[NI, NS, T]) Used() usize {

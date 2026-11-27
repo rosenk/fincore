@@ -167,6 +167,16 @@ driver func main(io Stdio) error {
 	la.Reset()
 	_ = vp.Push(4)
 	_ = vp.Push(5)
+	_, _ = la.Store(vp.Slice())
+	cp := la.Used()
+	ts, tn := la.Store(vp.Slice())
+	la.Truncate(cp)
+	ts2, _ := la.Store(vp.Slice())
+	la.Truncate(100)
+	if err := put(io, "truncate rollback: ", u64(ts)*1000+u64(tn)*100+u64(ts2)*10+u64(la.Used())); err != nil {
+		return err
+	}
+	la.Reset()
 	rs, rn := la.Store(vp.Slice())
 	if err := put(io, "after reset store: ", u64(rs)*10+u64(rn)+b2u(la.Full())*100); err != nil {
 		return err

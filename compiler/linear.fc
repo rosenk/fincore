@@ -380,13 +380,7 @@ func lnLeak(fl u32, i u32) {
 		return
 	}
 	scLeaked[usize(s)] = true
-	mreset()
-	ms("Linear resource ")
-	mname(symName(s))
-	ms(" (")
-	mtype(syms.items[usize(s)].typ)
-	ms(") is not closed, released or moved on every path")
-	scReport(E3005, syms.items[usize(s)].ident)
+	scReport(E3005, syms.items[usize(s)].ident, formatTo(mbuf[:], "Linear resource %v (%v) is not closed, released or moved on every path", NameRef(symName(s)), TypeRef(syms.items[usize(s)].typ)))
 }
 
 func lnGoneWord(st u8) string {
@@ -403,12 +397,7 @@ func lnUse(fl u32, e u32, i u32, at u32) {
 	}
 	st := lnSt(e, i)
 	if st&StGone != 0 {
-		mreset()
-		ms("use of Linear resource ")
-		mname(symName(lnVarSym(fl, i)))
-		ms(" after it was ")
-		ms(lnGoneWord(st))
-		scReport(E3003, at)
+		scReport(E3003, at, formatTo(mbuf[:], "use of Linear resource %v after it was %s", NameRef(symName(lnVarSym(fl, i))), lnGoneWord(st)))
 	}
 }
 
@@ -420,18 +409,9 @@ func lnConsume(fl u32, e u32, i u32, at u32, kind Consume) {
 	st := lnSt(e, i)
 	name := symName(lnVarSym(fl, i))
 	if st&StGone != 0 && st&StDeferred == 0 {
-		mreset()
-		ms("use of Linear resource ")
-		mname(name)
-		ms(" after it was ")
-		ms(lnGoneWord(st))
-		scReport(E3003, at)
+		scReport(E3003, at, formatTo(mbuf[:], "use of Linear resource %v after it was %s", NameRef(name), lnGoneWord(st)))
 	} else if st&StBorrowed != 0 {
-		mreset()
-		ms("borrowed Linear resource ")
-		mname(name)
-		ms(" cannot be closed or moved here (it is owned by the caller)")
-		scReport(E3003, at)
+		scReport(E3003, at, formatTo(mbuf[:], "borrowed Linear resource %v cannot be closed or moved here (it is owned by the caller)", NameRef(name)))
 	}
 	n := u8(StDeferred)
 	if kind != Consume.Defer {
@@ -617,7 +597,7 @@ func lnCollectVars(fl u32, n u32, dp usize) decreases(dp) {
 			start, cnt := slotList(nd, slot)
 			m := usize(cnt)
 			for j := usize(0); j < m; j++ {
-				lnCollectVars(fl, nodes.lists[usize(start)+j], dp-1)
+				lnCollectVars(fl, listAt(start, j), dp-1)
 			}
 		} else {
 			lnCollectVars(fl, slotChild(nd, slot), dp-1)

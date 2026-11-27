@@ -11,6 +11,8 @@
 // slot indices. String bytes live in strPool.
 package main
 
+import "std/bytes"
+
 const (
 	VtabCap          = 1 << 20
 	HeapCap          = 1 << 21
@@ -77,14 +79,12 @@ var nstr usize
 // errTxt receives the text of value-operation errors (Go's error values).
 var errTxt OutBuf
 
-func etReset() {
-	errTxt.len = 0
-	errTxt.full = false
-}
-
-func et(s string) {
+// etf sets errTxt to the first k bytes of mbuf:
+// etf(formatTo(mbuf[:], "...", ...)).
+func etf(k usize) {
 	o := &errTxt
-	o.putStr(s)
+	o.Reset()
+	o.WriteBytes(mbuf[:k])
 }
 
 // valAlloc reserves n zeroed slots in the heap or persistent region and
@@ -481,16 +481,16 @@ func intSign(v Val) int {
 // putInt128 writes the decimal form of an integer value.
 func putInt128(o *OutBuf, v Val) {
 	if v == Val.IntOvf {
-		o.putStr("<overflow>")
+		o.WriteString("<overflow>")
 		return
 	}
 	h, l, _ := intParts(v)
 	if isNeg128(h) {
-		o.putByte('-')
+		o.WriteByte('-')
 		h, l = neg128(h, l)
 	}
 	if h == 0 {
-		o.putUint(l)
+		o.WriteUint(l)
 		return
 	}
 	var digits [48]byte
@@ -506,7 +506,7 @@ func putInt128(o *OutBuf, v Val) {
 		l = ql
 	}
 	for i := usize(0); i < n; i++ {
-		o.putByte(digits[n-1-i])
+		o.WriteByte(digits[n-1-i])
 	}
 }
 
@@ -613,81 +613,81 @@ func putVal(o *OutBuf, v Val, depth usize) decreases(depth) {
 		Int(_, _) | IntOvf -> putInt128(o, v)
 		Bool(b) -> {
 			if b {
-				o.putStr("true")
+				o.WriteString("true")
 			} else {
-				o.putStr("false")
+				o.WriteString("false")
 			}
 		}
 		Str(off, n) -> putQuoted(o, strSpan(off, n))
 		Err(b) -> {
 			if b == 0 {
-				o.putStr("nil")
+				o.WriteString("nil")
 			} else {
-				o.putStr(builtinName(b))
+				o.WriteString(builtinName(b))
 			}
 		}
-		Nil -> o.putStr("nil")
+		Nil -> o.WriteString("nil")
 		Array(ref, n) -> putElems(o, ref, usize(n), depth-1)
 		Slice(ref, lo, hi, _) -> putElems(o, ref+lo, usize(hi-lo), depth-1)
-		NilSlice -> o.putStr("[]")
+		NilSlice -> o.WriteString("[]")
 		Struct(ref, n) -> {
-			o.putByte('{')
+			o.WriteByte('{')
 			putValList(o, ref, usize(n), depth-1)
-			o.putByte('}')
+			o.WriteByte('}')
 		}
 		Enum(vi, ref, n) -> {
-			o.putStr("variant#")
-			o.putUint(u64(vi))
+			o.WriteString("variant#")
+			o.WriteUint(u64(vi))
 			if n > 0 {
-				o.putByte('(')
+				o.WriteByte('(')
 				putValList(o, ref, usize(n), depth-1)
-				o.putByte(')')
+				o.WriteByte(')')
 			}
 		}
 		Tuple(ref, n) -> {
-			o.putByte('(')
+			o.WriteByte('(')
 			putValList(o, ref, usize(n), depth-1)
-			o.putByte(')')
+			o.WriteByte(')')
 		}
 		CodeBasic(k) -> {
-			o.putStr(codeKindName(k))
-			o.putStr("()")
+			o.WriteString(codeKindName(k))
+			o.WriteString("()")
 		}
 		CodeArray(n, el) -> {
-			o.putStr("CodeArray(")
-			o.putUint(n)
-			o.putStr(", ")
+			o.WriteString("CodeArray(")
+			o.WriteUint(n)
+			o.WriteString(", ")
 			putVal(o, slotGet(el), depth-1)
-			o.putByte(')')
+			o.WriteByte(')')
 		}
 		CodeSlice(el) -> {
-			o.putStr("CodeSlice(")
+			o.WriteString("CodeSlice(")
 			putVal(o, slotGet(el), depth-1)
-			o.putByte(')')
+			o.WriteByte(')')
 		}
 		CodeStruct(ref, n) -> {
-			o.putStr("CodeStruct(")
+			o.WriteString("CodeStruct(")
 			putValList(o, ref, usize(n), depth-1)
-			o.putByte(')')
+			o.WriteByte(')')
 		}
 		CodeUniv(l) -> {
-			o.putStr("CodeUniv(")
-			o.putUint(l)
-			o.putByte(')')
+			o.WriteString("CodeUniv(")
+			o.WriteUint(l)
+			o.WriteByte(')')
 		}
 		FieldCode(off, n, c) -> {
-			o.putStr("CodeField(")
+			o.WriteString("CodeField(")
 			putQuoted(o, strSpan(off, n))
-			o.putStr(", ")
+			o.WriteString(", ")
 			putVal(o, slotGet(c), depth-1)
-			o.putByte(')')
+			o.WriteByte(')')
 		}
 		Ptr(r) -> {
-			o.putByte('&')
+			o.WriteByte('&')
 			if r != 0 {
 				putVal(o, slotGet(r), depth-1)
 			} else {
-				o.putStr("<nil>")
+				o.WriteString("<nil>")
 			}
 		}
 	}
@@ -699,7 +699,7 @@ func putValList(o *OutBuf, ref u32, n usize, depth usize) decreases(depth) {
 	}
 	for i := usize(0); i < n; i++ {
 		if i > 0 {
-			o.putStr(", ")
+			o.WriteString(", ")
 		}
 		putVal(o, slotGet(ref+u32(i)), depth-1)
 	}
@@ -709,18 +709,18 @@ func putElems(o *OutBuf, ref u32, n usize, depth usize) decreases(depth) {
 	if depth == 0 {
 		return
 	}
-	o.putByte('[')
+	o.WriteByte('[')
 	for i := usize(0); i < n; i++ {
 		if i > 0 {
-			o.putStr(", ")
+			o.WriteString(", ")
 		}
 		if i == 8 {
-			o.putStr("...")
+			o.WriteString("...")
 			break
 		}
 		putVal(o, slotGet(ref+u32(i)), depth-1)
 	}
-	o.putByte(']')
+	o.WriteByte(']')
 }
 
 func codeKindName(k u8) string {
@@ -738,17 +738,6 @@ func codeKindName(k u8) string {
 		CKI64 -> "CodeI64"
 		_ -> "CodeUniv"
 	}
-}
-
-// mval writes a value into the diagnostic message; etval into errTxt.
-func mval(v Val) {
-	o := &msgBuf
-	putVal(o, v, SemaDepth)
-}
-
-func etval(v Val) {
-	o := &errTxt
-	putVal(o, v, SemaDepth)
 }
 
 // ---------------------------------------------------------------------------
@@ -841,8 +830,7 @@ func zeroVal(t u32, heap bool) (Val, bool) {
 func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 	var z Val
 	if depth == 0 {
-		etReset()
-		et("type too deep")
+		etf(formatTo(mbuf[:], "type too deep"))
 		return z, false
 	}
 	u := underlying(t)
@@ -866,13 +854,11 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 		}
 		Array(elem, lenParam, alen) -> {
 			if lenParam != 0 {
-				etReset()
-				et("array with generic length")
+				etf(formatTo(mbuf[:], "array with generic length"))
 				return z, false
 			}
 			if alen > u64(zeroBudget) {
-				etReset()
-				et("array too large for compile-time evaluation")
+				etf(formatTo(mbuf[:], "array too large for compile-time evaluation"))
 				return z, false
 			}
 			zeroBudget -= usize(alen)
@@ -924,13 +910,10 @@ func zeroRec(t u32, heap bool, depth usize) (Val, bool) decreases(depth) {
 		slotSet(c, Val.CodeBasic(CKEmpty))
 		return Val.FieldCode(0, 0, c), true
 	}
-	etReset()
-	o := &errTxt
-	putType(o, t, SemaDepth)
 	if t != 0 && isNamedT(t) && namedBuiltin(t) != 0 {
-		et(" has no compile-time value")
+		etf(formatTo(mbuf[:], "%v has no compile-time value", TypeRef(t)))
 	} else {
-		et(" has no zero value")
+		etf(formatTo(mbuf[:], "%v has no zero value", TypeRef(t)))
 	}
 	return z, false
 }
@@ -944,14 +927,10 @@ func emptyBytes() []byte {
 // false with the error text in errTxt.
 
 func opNotDefined(op u8, x Val, y Val, two bool) {
-	etReset()
-	et("operator ")
-	et(binOpString(op))
-	et(" not defined on ")
-	etval(x)
 	if two {
-		et(", ")
-		etval(y)
+		etf(formatTo(mbuf[:], "operator %s not defined on %v, %v", binOpString(op), ValRef(x), ValRef(y)))
+	} else {
+		etf(formatTo(mbuf[:], "operator %s not defined on %v", binOpString(op), ValRef(x)))
 	}
 }
 
@@ -980,8 +959,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 		a, aok := boolOf(x)
 		b, bok := boolOf(y)
 		if !aok || !bok {
-			etReset()
-			et("non-boolean operands")
+			etf(formatTo(mbuf[:], "non-boolean operands"))
 			return z, false
 		}
 		if op == OpLAnd {
@@ -1012,8 +990,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 	}
 	if op == OpDiv || op == OpRem {
 		if yh == 0 && yl == 0 {
-			etReset()
-			et("division by zero")
+			etf(formatTo(mbuf[:], "division by zero"))
 			return z, false
 		}
 		qh, ql, rh, rl, ovf := quoRem128(xh, xl, yh, yl)
@@ -1033,8 +1010,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 	}
 	if op == OpShl || op == OpShr {
 		if isNeg128(yh) {
-			etReset()
-			et("negative shift count")
+			etf(formatTo(mbuf[:], "negative shift count"))
 			return z, false
 		}
 		if yh != 0 || yl > MaxShift {
@@ -1044,8 +1020,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 				}
 				return vIntU(0), true
 			}
-			etReset()
-			et("shift count too large")
+			etf(formatTo(mbuf[:], "shift count too large"))
 			return z, false
 		}
 		if op == OpShl {
@@ -1065,9 +1040,7 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 		h, l := sar128(xh, xl, yl)
 		return vInt(h, l), true
 	}
-	etReset()
-	et("unsupported operator ")
-	et(binOpString(op))
+	etf(formatTo(mbuf[:], "unsupported operator %s", binOpString(op)))
 	return z, false
 }
 
@@ -1090,8 +1063,7 @@ func compareVals(op u8, x Val, y Val) (Val, bool) {
 	c := 0
 	if isIntVal(x) {
 		if !isIntVal(y) {
-			etReset()
-			et("mismatched operands")
+			etf(formatTo(mbuf[:], "mismatched operands"))
 			return z, false
 		}
 		xh, xl, _ := intParts(x)
@@ -1099,11 +1071,10 @@ func compareVals(op u8, x Val, y Val) (Val, bool) {
 		c = cmp128(xh, xl, yh, yl)
 	} else if isStrVal(x) {
 		if !isStrVal(y) {
-			etReset()
-			et("mismatched operands")
+			etf(formatTo(mbuf[:], "mismatched operands"))
 			return z, false
 		}
-		c = bytesCompare(strOf(x), strOf(y))
+		c = bytes.Compare(strOf(x), strOf(y))
 	} else {
 		opNotDefined(op, x, y, false)
 		return z, false
@@ -1121,11 +1092,7 @@ func compareVals(op u8, x Val, y Val) (Val, bool) {
 }
 
 func cannotCompare(x Val, y Val) {
-	etReset()
-	et("cannot compare ")
-	etval(x)
-	et(" and ")
-	etval(y)
+	etf(formatTo(mbuf[:], "cannot compare %v and %v", ValRef(x), ValRef(y)))
 }
 
 // isNilSlice reports whether v is a slice that compares equal to nil.
@@ -1300,11 +1267,7 @@ func unaryOpVal(op u8, x Val) (Val, bool) {
 		}
 		_ -> {}
 	}
-	etReset()
-	et("operator ")
-	et(unaryOpString(op))
-	et(" not defined on ")
-	etval(x)
+	etf(formatTo(mbuf[:], "operator %s not defined on %v", unaryOpString(op), ValRef(x)))
 	return z, false
 }
 
