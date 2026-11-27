@@ -1,0 +1,13 @@
+// SINCE: v0.3
+// fail_minmax_convert (v0.3): an untyped operand is converted to the
+// type of the typed operands like any untyped constant; a string constant
+// is not a u32.
+package main
+
+func pick(x u32) u32 {
+	return min(x, "a") // ERROR E2002
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

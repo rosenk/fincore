@@ -13,5 +13,7 @@ assign: one
 assign small: 200
 define: 1
 define int: 301
+redeclare: 250097
+callArg: 51
 scoped: 10160
 comptime: 3049

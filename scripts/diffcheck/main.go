@@ -788,9 +788,34 @@ func mutantStdCases(tmp string) []tcase {
 			fmt.Printf("warning: std mutation %d (%s) does not apply\n", i, m.file)
 			continue
 		}
+		linkStd(root, pkg)
 		out = append(out, tcase{name: fmt.Sprintf("std mutant %d: %s %q -> %q", i, m.file, m.old, m.new), dir: root, path: pkg})
 	}
 	return out
+}
+
+// linkStd makes the module root's std/ packages visible in the temporary
+// root of a compiler/ or std/ mutant: compiler/ imports std/bytes,
+// std/maps, ..., which resolve against the working directory, so without
+// them both compilers stop at E2001 (cannot find package) and the mutation
+// never reaches the totality and scope checks. Each package is a symlink
+// root/std/<pkg> -> <module root>/std/<pkg>, except the mutated package
+// skip (a std mutant's own copy); diagnostics then name std files
+// std/<pkg>/... as in the corpus cases. finc0 and finc1 check the same
+// program, so both see the same (current) std/.
+func linkStd(root, skip string) {
+	abs, err := filepath.Abs("std")
+	if err != nil {
+		fatal(err)
+	}
+	pkgs, _ := filepath.Glob(filepath.Join(abs, "*"))
+	for _, p := range pkgs {
+		if st, err := os.Stat(p); err != nil || !st.IsDir() || "std/"+filepath.Base(p) == skip {
+			continue
+		}
+		_ = os.MkdirAll(filepath.Join(root, "std"), 0o755)
+		_ = os.Symlink(p, filepath.Join(root, "std", filepath.Base(p)))
+	}
 }
 
 // mutantCompilerCases writes copies of compiler/ with one mutation each.
@@ -821,6 +846,7 @@ func mutantCompilerCases(tmp string) []tcase {
 			fmt.Printf("warning: compiler mutation %d (%s) does not apply\n", i, m.file)
 			continue
 		}
+		linkStd(root, "")
 		out = append(out, tcase{name: fmt.Sprintf("compiler mutant %d: %s %q -> %q", i, m.file, m.old, m.new), dir: root, path: "compiler"})
 	}
 	return out

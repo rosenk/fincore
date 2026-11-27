@@ -1,0 +1,13 @@
+// SINCE: v0.3
+// fail_match_multi_assign_count (v0.3): the number of targets must equal
+// the number of values of the match.
+package main
+
+func f(n u32) int {
+	a, b, c := match n { 0 -> 1, 2; _ -> 3, 4 } // ERROR E2003
+	return a + b + c
+}
+
+driver func main(io Stdio) error {
+	return nil
+}

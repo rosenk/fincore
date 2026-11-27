@@ -1,0 +1,21 @@
+// fail_pattern_rest_paren: `..` is a payload pattern only directly in the
+// payload list of a variant pattern (PayloadPat); inside parentheses (a
+// parenthesized pattern or a tuple pattern) it is a syntax error.
+package main
+
+type E enum {
+	A(u32, u32)
+	B
+}
+
+func f(e E) u32 {
+	match e {
+		A((.., x)) -> return x // ERROR E1001
+		_ -> return 0
+	}
+}
+
+driver func main(io Stdio) error {
+	_ = f(E.B)
+	return nil
+}

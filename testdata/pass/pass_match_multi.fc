@@ -9,7 +9,11 @@
 // target (result or existing variable) or their default type. Flat
 // matches, if chains (guards, bindings), tuple scrutinees, string
 // scrutinees, `return` inside a scope block, '_' targets, parenthesized
-// matches, a ',' continuing a value list over a line break, and comptime.
+// matches, a ',' continuing a value list over a line break, a `:=` that
+// redeclares a typed variable (an all-untyped position takes its type;
+// untyped int and char mix to untyped int), a match as the only argument
+// of a call (one argument per value, like a multi-result call), and
+// comptime.
 package main
 
 type Val enum {
@@ -83,6 +87,19 @@ func paren(n u32) (u32, u64) {
 		0 -> n, 5
 		_ -> 7, u64(n)
 	})
+}
+
+func add3(a u32, b u32, c bool) u32 {
+	if c {
+		return a + b
+	}
+	return a
+}
+
+// The only argument of a call: one argument per value (Go's f(g())). The
+// parameters give no types: typed values (or default types) are needed.
+func callArg(n u32) u32 {
+	return add3(match n { 0 -> n, u32(5), true; _ -> u32(1), n, false })
 }
 
 // `return match` inside a scope block (results evaluated before Wait).
@@ -194,6 +211,16 @@ driver func main(io Stdio) error {
 		return err
 	}
 	if err := line(io, "define int", u64(small2+1)); err != nil {
+		return err
+	}
+	// `:=` redeclaring the u8 small: its all-untyped position takes u8;
+	// 'a' and 3 mix to untyped int, so fresh is an int.
+	small, fresh := match h { 1 -> 250, 'a'; _ -> 2, 3 }
+	var wide int = fresh
+	if err := line(io, "redeclare", u64(small)*1000+u64(wide)); err != nil {
+		return err
+	}
+	if err := line(io, "callArg", u64(callArg(0))*10+u64(callArg(4))); err != nil {
 		return err
 	}
 	s1, s2 := scoped(0)
