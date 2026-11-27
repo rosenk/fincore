@@ -280,6 +280,15 @@ func bPopFunc() {
 // dependency order). Diagnostics go to `diags`.
 func resolveProgram() {
 	newUniverse()
+	nn := nodes.count
+	for i := usize(1); i < nn; i++ {
+		if nodes.items[i].kind == NkVariant {
+			nm := idName(na(u32(i)))
+			if usize(nm) < MaxNames {
+				bVariantName[usize(nm)] = true
+			}
+		}
+	}
 	n := pkgs.norder
 	for i := usize(0); i < n; i++ {
 		declarePackage(pkgs.order[i])
@@ -911,15 +920,12 @@ func bStmt(s u32, depth usize) decreases(depth) {
 	}
 }
 
-// bCtorPattern resolves the names of a constructor pattern.
+// bCtorPattern resolves the qualifier of a qualified constructor pattern:
+// Qual.Name is a package member (an imported constant), or Type.Variant
+// (the variant is resolved by the type checker).
 func bCtorPattern(cp u32) {
 	if na(cp) != 0 {
 		_ = bQualified(na(cp), nb(cp))
-	} else if !nflag(cp) {
-		sym := lookupChain(bScope, idName(nb(cp)))
-		if sym != 0 && symKind(sym) == SymConst {
-			uses[usize(nb(cp))] = sym
-		}
 	}
 }
 
@@ -944,17 +950,32 @@ func bMatchArm(arm u32, depth usize) decreases(depth) {
 // declared without unifying repeated names).
 const MaxPatternBindings = 256
 
+// bVariantName marks the names (interned name IDs) of the variants of every
+// enum type of the program: such a bare pattern name is declared hidden
+// (see bPatternNames).
+var bVariantName [MaxNames]bool
+
 // bPatSeen holds the symbols declared by the pattern being bound.
 var bPatSeen [MaxPatternBindings]u32
 var bPatN usize
 
-// bPatternNames resolves the names of a pattern (qualifiers and constants
-// of variant patterns) and, if declare is set, declares its payload
-// bindings (v0.2) in the current scope. A name bound in several places of
-// one pattern (or-pattern alternatives) is one symbol; the type checker
-// checks that the alternatives agree and that no alternative binds a name
-// twice. Bindings of an undeclared pattern keep no symbol (E2002 in the
-// type checker unless the name is a variant).
+// bPatternNames resolves the names of a pattern and, if declare is set,
+// declares its bindings in the current scope (v0.2). A bare identifier in
+// any pattern position (top level, tuple element or payload: an Ident in
+// payloads, an unqualified CtorPattern without parentheses elsewhere) that
+// resolves to a constant is a constant pattern (a use of the constant);
+// any other bare identifier is declared as a binding. The type checker
+// later classifies a bare name that is a variant of the expected enum type
+// as that variant (the binding, if declared, is then bound to the value,
+// which is that variant). A name bound in several places of one pattern
+// (or-pattern alternatives) is one symbol; the type checker checks that
+// the alternatives agree and that no alternative binds a name twice. A
+// name that is the name of a variant of some enum type of the program is
+// declared hidden: it gets a symbol (a binding if the type checker finds
+// no such variant in the expected type) but is not inserted into the
+// scope, so variant names shadow nothing and cannot be referenced.
+// Bindings of an undeclared pattern keep no symbol (E2002 in the type
+// checker unless the name is a variant).
 func bPatternNames(p u32, declare bool, depth usize) decreases(depth) {
 	bPatN = 0
 	bPatWalk(p, declare, depth-1)
@@ -966,22 +987,12 @@ func bPatWalk(p u32, declare bool, depth usize) decreases(depth) {
 	}
 	k := nkind(p)
 	if k == NkIdent {
-		if !declare || isBlank(p) {
+		bPatBare(p, declare)
+	} else if k == NkCtorPattern {
+		if na(p) == 0 && !nflag(p) {
+			bPatBare(nb(p), declare)
 			return
 		}
-		nseen := bPatN
-		for i := usize(0); i < nseen; i++ {
-			if symName(bPatSeen[i]) == idName(p) {
-				defs[usize(p)] = bPatSeen[i]
-				return
-			}
-		}
-		sym := bDeclare(SymVar, VarBinding, p, p)
-		if bPatN < MaxPatternBindings && sym != 0 {
-			bPatSeen[bPatN] = sym
-			bPatN++
-		}
-	} else if k == NkCtorPattern {
 		bCtorPattern(p)
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
@@ -992,6 +1003,49 @@ func bPatWalk(p u32, declare bool, depth usize) decreases(depth) {
 		for i := usize(0); i < n; i++ {
 			bPatWalk(l1at(p, i), declare, depth-1)
 		}
+	}
+}
+
+// bPatBare resolves the bare pattern name id: a constant in scope (a use),
+// else, if declare is set, a binding (one symbol per name per pattern).
+func bPatBare(id u32, declare bool) {
+	if isBlank(id) {
+		return
+	}
+	csym := lookupChain(bScope, idName(id))
+	if csym != 0 && symKind(csym) == SymConst {
+		uses[usize(id)] = csym
+		return
+	}
+	if !declare {
+		return
+	}
+	nseen := bPatN
+	for i := usize(0); i < nseen; i++ {
+		if symName(bPatSeen[i]) == idName(id) {
+			defs[usize(id)] = bPatSeen[i]
+			return
+		}
+	}
+	sym := u32(0)
+	if usize(idName(id)) < MaxNames && bVariantName[usize(idName(id))] {
+		// Probably a variant of the expected enum type: declared but not
+		// visible, so it shadows nothing (and two `is` tests of one &&
+		// chain may name the same variant).
+		sym = newSym(SymVar, idName(id), id, id, bPkg)
+		if sym != 0 {
+			syms.items[usize(sym)].varKind = VarBinding
+			if bNFuncs > 0 {
+				syms.items[usize(sym)].fn = bFuncs[bNFuncs-1]
+			}
+			defs[usize(id)] = sym
+		}
+	} else {
+		sym = bDeclare(SymVar, VarBinding, id, id)
+	}
+	if bPatN < MaxPatternBindings && sym != 0 {
+		bPatSeen[bPatN] = sym
+		bPatN++
 	}
 }
 

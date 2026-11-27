@@ -176,6 +176,9 @@ func (f *flow) collectVars(body *ast.BlockStmt) {
 		case *ast.VarDecl:
 			ids = []*ast.Ident{n.Name}
 		case *ast.CtorPattern:
+			if n.Qual == nil && !n.HasParens {
+				ids = append(ids, n.Name) // v0.2: top-level/tuple binding
+			}
 			for _, a := range n.Args {
 				if id, ok := a.(*ast.Ident); ok {
 					ids = append(ids, id)
@@ -583,6 +586,9 @@ func (f *flow) borrowBindings(p ast.Pattern, a *env) {
 			}
 		}
 	case *ast.CtorPattern:
+		if p.Qual == nil && !p.HasParens {
+			f.borrowBindings(p.Name, a) // v0.2: top-level/tuple binding
+		}
 		for _, x := range p.Args {
 			f.borrowBindings(x, a)
 		}

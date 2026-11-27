@@ -14,9 +14,17 @@ func Resolve(p *Program) diag.List {
 		p.Captures = map[ast.NodeID][]*Symbol{}
 	}
 	p.Universe = newUniverse(p)
-	b := &binder{prog: p, declOf: map[*ast.Ident]*Symbol{}}
+	b := &binder{prog: p, declOf: map[*ast.Ident]*Symbol{}, variantNames: map[string]bool{}}
 	for _, pkg := range p.Packages {
 		b.declarePackage(pkg)
+		for _, f := range pkg.AST.Files {
+			ast.Inspect(f, func(n ast.Node) bool {
+				if v, ok := n.(*ast.Variant); ok {
+					b.variantNames[v.Name.Name] = true
+				}
+				return true
+			})
+		}
 	}
 	n := p.IDs.Count() + 1
 	p.Defs = make([]*Symbol, n)
@@ -73,6 +81,10 @@ type binder struct {
 	// declOf maps the defining identifier of each package-level symbol
 	// (including methods and redeclared duplicates) to its symbol.
 	declOf map[*ast.Ident]*Symbol
+	// variantNames holds the names of the variants of every enum type of
+	// the program (v0.2 patterns: such a bare pattern name is declared
+	// hidden, see patternNames).
+	variantNames map[string]bool
 }
 
 func (b *binder) errorf(code diag.Code, sp diag.SourceSpan, format string, args ...any) {
@@ -470,18 +482,12 @@ func (b *binder) bindExpr(e ast.Expr) {
 	}
 }
 
-// ctorPattern resolves the names of a constructor pattern.
+// ctorPattern resolves the qualifier of a qualified constructor pattern:
+// Qual.Name is a package member (an imported constant), or Type.Variant
+// (the variant is resolved by the type checker).
 func (b *binder) ctorPattern(cp *ast.CtorPattern) {
-	switch {
-	case cp.Qual != nil:
-		// Qual.Name: a package member, or Type.Variant (the variant is
-		// resolved by the type checker).
+	if cp.Qual != nil {
 		b.qualified(cp.Qual, cp.Name)
-	case !cp.HasParens:
-		// A constant, or an unqualified variant of the scrutinee's enum.
-		if sym := b.scope.Lookup(cp.Name.Name); sym != nil && sym.Kind == SymConst {
-			b.prog.Uses[cp.Name.ID()] = sym
-		}
 	}
 }
 
@@ -612,45 +618,83 @@ func (b *binder) matchArm(arm *ast.MatchArm) {
 	}
 }
 
-// patternNames resolves the names of a pattern (qualifiers and constants
-// of variant patterns) and, if declare is set, declares its payload
-// bindings (v0.2) in the current scope. A name bound in several places of
-// one pattern (or-pattern alternatives) is one symbol; the type checker
-// checks that the alternatives agree and that no alternative binds a name
-// twice. Bindings of an undeclared pattern keep no symbol (E2002 in the
-// type checker unless the name is a variant).
+// patternNames resolves the names of a pattern and, if declare is set,
+// declares its bindings in the current scope (v0.2, decisions 110-113).
+// A bare identifier in any pattern position (top level, tuple element or
+// payload; an *ast.Ident in payloads, an unqualified *ast.CtorPattern
+// without parentheses elsewhere) that resolves to a constant is a
+// constant pattern (a use of the constant); any other bare identifier is
+// declared as a binding. The type checker later classifies a bare name
+// that is a variant of the expected enum type as that variant (the
+// binding, if declared, is then bound to the value, which is that
+// variant). A name bound in several places of one pattern (or-pattern
+// alternatives) is one symbol; the type checker checks that the
+// alternatives agree and that no alternative binds a name twice. A name
+// that is the name of a variant of some enum type of the program is
+// declared hidden: it gets a symbol (a binding if the type checker finds
+// no such variant in the expected type) but is not inserted into the
+// scope, so variant names shadow nothing and cannot be referenced.
+// Bindings of an undeclared pattern keep no symbol (E2002 in the type
+// checker unless the name is a variant).
 func (b *binder) patternNames(p ast.Pattern, declare bool) {
 	var seen []*Symbol
-	var walk func(p ast.Pattern, payload bool)
-	walk = func(p ast.Pattern, payload bool) {
-		switch p := p.(type) {
-		case *ast.Ident:
-			if !declare || p.Name == "_" {
+	bare := func(id *ast.Ident) {
+		if id.Name == "_" {
+			return
+		}
+		if sym := b.scope.Lookup(id.Name); sym != nil && sym.Kind == SymConst {
+			b.prog.Uses[id.ID()] = sym
+			return
+		}
+		if !declare {
+			return
+		}
+		for _, sym := range seen {
+			if sym.Name == id.Name {
+				b.prog.Defs[id.ID()] = sym
 				return
 			}
-			for _, sym := range seen {
-				if sym.Name == p.Name {
-					b.prog.Defs[p.ID()] = sym
-					return
-				}
+		}
+		if b.variantNames[id.Name] {
+			// Probably a variant of the expected enum type: declared but
+			// not visible, so it shadows nothing (and two `is` tests of
+			// one && chain may name the same variant).
+			sym := b.prog.NewSymbol(SymVar, id.Name, id, id, b.pkg)
+			sym.VarKind = VarBinding
+			if len(b.funcs) > 0 {
+				sym.Func = b.funcs[len(b.funcs)-1]
 			}
-			seen = append(seen, b.declare(SymVar, VarBinding, p, p))
+			b.def(sym)
+			seen = append(seen, sym)
+			return
+		}
+		seen = append(seen, b.declare(SymVar, VarBinding, id, id))
+	}
+	var walk func(p ast.Pattern)
+	walk = func(p ast.Pattern) {
+		switch p := p.(type) {
+		case *ast.Ident:
+			bare(p)
 		case *ast.CtorPattern:
+			if p.Qual == nil && !p.HasParens {
+				bare(p.Name)
+				return
+			}
 			b.ctorPattern(p)
 			for _, a := range p.Args {
-				walk(a, true)
+				walk(a)
 			}
 		case *ast.OrPattern:
 			for _, a := range p.Alts {
-				walk(a, payload)
+				walk(a)
 			}
 		case *ast.TuplePattern:
 			for _, a := range p.Elems {
-				walk(a, payload)
+				walk(a)
 			}
 		}
 	}
-	walk(p, false)
+	walk(p)
 }
 
 // condWithBindings reports whether an if condition has an `is` expression

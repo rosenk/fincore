@@ -1,0 +1,83 @@
+// const_patterns_flow (v0.2): constant patterns and top-level / tuple-
+// element bindings in the scope and totality passes: bindings carry the
+// origin of their scrutinee element and are borrowed (Linear values too),
+// guards read them, constants give no facts (recursion guarded by a
+// constant arm is still unmeasured), and bindings shadow outer variables.
+package main
+
+type PtrOpt enum {
+	PSome(*u32)
+	PNone
+}
+
+const Zero = 0
+const One u32 = 1
+
+var global u32
+
+func pickTop(p *u32, q *u32, n u32) *u32 {
+	var local u32
+	match (p, n) {
+		(a, One) -> return a
+		(_, Zero) -> return q
+		_ -> return &local
+	}
+}
+
+func escape(o PtrOpt) *u32 {
+	var local u32
+	match o {
+		PSome(x) if x == &local -> return x
+		other if other is PNone -> return &global
+		_ -> return &local
+	}
+}
+
+func closeTop(c Conn, n u32) {
+	match (c, n) {
+		(k, One) -> {
+			_ = k.Close()
+		}
+		_ -> {}
+	}
+	_ = c.Close()
+}
+
+func down(n u32) u32 {
+	return match n {
+		Zero -> 0
+		m -> down(m - 1)
+	}
+}
+
+func shrink(n usize) usize decreases(n) {
+	return match n {
+		Zero -> 0
+		m if m > 10 -> shrink(n - 10)
+		_ -> shrink(n - 1)
+	}
+}
+
+func shadow(n u32, xs []u32) u32 {
+	var s u32 = 0
+	for i := usize(0); i < len(xs); i++ {
+		match xs[i] {
+			n if n > 5 -> s += n
+			One -> continue
+			_ -> s += n
+		}
+	}
+	return s
+}
+
+driver func main(io Stdio) error {
+	var x u32 = 1
+	_ = pickTop(&x, &x, 1)
+	_ = escape(PtrOpt.PNone)
+	_ = down(3)
+	_ = shrink(25)
+	var xs [3]u32
+	_ = shadow(4, xs[:])
+	global = x
+	return nil
+}

@@ -80,6 +80,52 @@ driver func main() error {
 				`return v \+ func\(\) uint32 \{ switch n \{ case uint32\(1\), uint32\(2\): return 10 default: return 20 \} \}\(\)`,
 			},
 		},
+		{
+			// v0.2: constant patterns (folded ==, enum constants as tag
+			// tests) and top-level / tuple-element bindings assigned from
+			// the scrutinee temporaries.
+			name: "const-patterns-and-bindings",
+			src: `package main
+
+type Col enum {
+	Red
+	Green
+}
+
+type Op enum {
+	Builtin(u8, u32)
+	Paint(Col)
+}
+
+const BFPanic u8 = 7
+const Def = Col.Red
+
+func f(o Op, n u32) u32 {
+	r := match o {
+		Builtin(BFPanic, k) -> k
+		Paint(Def) -> 1
+		_ -> 0
+	}
+	return r + match (n, r) {
+		(x, 0) | (0, x) -> x
+		(x, y) if x > y -> x
+		_ -> 2
+	}
+}
+
+driver func main() error {
+	if f(Op.Paint(Col.Red), 1) == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+`,
+			patterns: []string{
+				`if o\._tag == 0 && o\._u8_0 == uint8\(7\) \{ k := o\._u32_0 return k \} else if o\._tag == 1 && o\._Col_0\._tag == 0 \{ return 1 \}`,
+				`_fc_t0 := n _fc_t1 := r if _fc_t1 == uint32\(0\) \|\| _fc_t0 == uint32\(0\) \{ var x uint32 if _fc_t1 == uint32\(0\) \{ x = _fc_t0 \} else \{ x = _fc_t1 \} return x`,
+				`\} else if func\(\) bool \{ x := _fc_t0 y := _fc_t1 return x > y \}\(\) \{ x := _fc_t0 return x \}`,
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

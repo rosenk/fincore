@@ -901,6 +901,11 @@ func wPatternBindings(p u32, x u32, depth usize) decreases(depth) {
 			wFlow(wDefine(p), x)
 		}
 	} else if k == NkCtorPattern || k == NkOrPattern {
+		if k == NkCtorPattern && na(p) == 0 && !nflag(p) {
+			// v0.2: a bare name at the top level or in a tuple element
+			// (a binding, or a variant or constant without a definition).
+			wFlow(wDefine(nb(p)), x)
+		}
 		n := l1len(p)
 		for i := usize(0); i < n; i++ {
 			wPatternBindings(l1at(p, i), x, depth-1)

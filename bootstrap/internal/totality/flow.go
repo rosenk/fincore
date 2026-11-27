@@ -247,6 +247,9 @@ func (w *walker) killPattern(p ast.Pattern, st *state) {
 	case *ast.Ident:
 		w.kill(w.c.info.SymbolOf(p), st)
 	case *ast.CtorPattern:
+		if p.Qual == nil && !p.HasParens {
+			w.killPattern(p.Name, st) // v0.2: top-level/tuple binding
+		}
 		for _, a := range p.Args {
 			w.killPattern(a, st)
 		}

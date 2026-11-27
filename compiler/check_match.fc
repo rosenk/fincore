@@ -256,12 +256,13 @@ func matchVal(p u32, v Val, depth usize) bool decreases(depth) {
 		if nvarEnum[usize(p)] != 0 {
 			return isVariant(v, nvarIdx[usize(p)])
 		}
-		return true
+		cs := patConst(p)
+		return cs == 0 || valsEqual(v, slotGet(cs))
 	}
 	if k == NkCtorPattern {
 		if nvarEnum[usize(p)] == 0 {
-			s := nval[usize(nb(p))]
-			return s != 0 && valsEqual(v, slotGet(s))
+			cs := patConst(p)
+			return cs == 0 || valsEqual(v, slotGet(cs))
 		}
 		if !isVariant(v, nvarIdx[usize(p)]) {
 			return false
@@ -336,10 +337,10 @@ func hasBindings(p u32, depth usize) bool decreases(depth) {
 	if depth == 0 || p == 0 {
 		return false
 	}
-	k := nkind(p)
-	if k == NkIdent {
-		return !isBlank(p) && nvarEnum[usize(p)] == 0
+	if isBindingPat(p) {
+		return true
 	}
+	k := nkind(p)
 	if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {
@@ -357,13 +358,12 @@ func invalidBindings(p u32, depth usize) decreases(depth) {
 	if depth == 0 || p == 0 {
 		return
 	}
+	s := patBindSym(p)
+	if s != 0 && syms.items[usize(s)].typ == 0 {
+		setSymType(s, TyInvalid)
+	}
 	k := nkind(p)
-	if k == NkIdent {
-		s := defs[usize(p)]
-		if s != 0 && syms.items[usize(s)].typ == 0 {
-			setSymType(s, TyInvalid)
-		}
-	} else if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
+	if k is NkCtorPattern | NkOrPattern | NkTuplePattern {
 		c := l1len(p)
 		for i := usize(0); i < c; i++ {
 			invalidBindings(l1at(p, i), depth-1)
@@ -411,7 +411,7 @@ func matchPatterns(m u32, x *Operand, isExpr bool, dp usize) bool decreases(dp) 
 		exh := required
 		for i := usize(0); i < n; i++ {
 			arm := l1at(m, i)
-			if nkind(na(arm)) == NkWildcardPattern && nd(arm) == 0 {
+			if catchAll(na(arm)) && nd(arm) == 0 {
 				exh = true
 			}
 		}
@@ -537,13 +537,11 @@ func pat(p u32, t u32, payload bool, dp usize) bool decreases(dp) {
 				return true
 			}
 		}
-		s := defs[usize(p)]
-		if s == 0 {
-			errAt(E2002, p, formatTo(mbuf[:], "cannot bind %v: an 'is' pattern can bind variables only in the condition of an if statement", NameRef(idName(p))))
-			return false
+		csym := uses[usize(p)]
+		if csym != 0 && symKind(csym) == SymConst {
+			return constPat(p, p, csym, t, false, dp-1)
 		}
-		pbPush(s, p, t)
-		return true
+		return bindPat(p, t)
 	}
 	if k == NkLiteralPattern {
 		x := exprValue(na(p), dp-1)
@@ -651,7 +649,126 @@ func orPat(p u32, t u32, payload bool, dp usize) bool decreases(dp) {
 	return valid
 }
 
-// ctorPat checks a variant or constant pattern `[Qual.]Name[(args)]`.
+// bindPat checks a binding (the bare identifier id) of type t.
+func bindPat(id u32, t u32) bool {
+	s := defs[usize(id)]
+	if s == 0 {
+		errAt(E2002, id, formatTo(mbuf[:], "cannot bind %v: an 'is' pattern can bind variables only in the condition of an if statement", NameRef(idName(id))))
+		return false
+	}
+	if isTupleT(t) {
+		errAt(E2002, id, formatTo(mbuf[:], "cannot bind %v to a tuple of type %v (use '_' or a tuple pattern)", NameRef(idName(id)), TypeRef(t)))
+		return false
+	}
+	pbPush(s, id, t)
+	return true
+}
+
+// constPat checks the constant pattern p (the constant sym, named by name)
+// against type t: the constant must be assignable to t. A constant of an
+// enum type must hold a variant without payload; p then counts as that
+// variant (nvarEnum/nvarIdx).
+func constPat(p u32, name u32, sym u32, t u32, parens bool, dp usize) bool decreases(dp) {
+	if dp == 0 {
+		tooDeep()
+		return false
+	}
+	if parens {
+		errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot have bindings", NameRef(symName(sym))))
+		return false
+	}
+	if isTupleT(t) {
+		errAt(E2002, p, formatTo(mbuf[:], "pattern %v does not match a tuple scrutinee of type %v", NameRef(symName(sym)), TypeRef(t)))
+		return false
+	}
+	x := symOperand(sym, name, dp-1)
+	x.expr = name
+	record(&x)
+	if isInvalidOp(&x) || !assignment(&x, t, Ctx.Pattern) {
+		return false
+	}
+	en := underlying(t)
+	if !isEnumT(en) {
+		return true
+	}
+	vi := usize(0)
+	match x.val {
+		Enum(ix, _, _) -> vi = usize(ix)
+		_ -> return false
+	}
+	if vi >= nvariants(en) {
+		return false
+	}
+	if variantPayN(en, vi) != 0 {
+		errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot be a pattern: its variant %v has a payload (match the variant instead)", NameRef(symName(sym)), NameRef(variantName(en, vi))))
+		return false
+	}
+	nvarEnum[usize(p)] = en
+	nvarIdx[usize(p)] = u32(vi)
+	ntype[usize(p)] = t
+	return true
+}
+
+// bareName returns the identifier of a bare pattern name: a payload Ident
+// or an unqualified CtorPattern without parentheses (a variant, constant
+// or binding; v0.2), else 0.
+func bareName(p u32) u32 {
+	if p == 0 {
+		return 0
+	}
+	k := nkind(p)
+	if k == NkIdent {
+		return p
+	}
+	if k == NkCtorPattern && na(p) == 0 && !nflag(p) {
+		return nb(p)
+	}
+	return 0
+}
+
+// patBindSym returns the symbol bound by a bare pattern name (see
+// bareName), or 0. A bare variant name may be bound too (to the value,
+// which is that variant); constants never are.
+func patBindSym(p u32) u32 {
+	id := bareName(p)
+	if id == 0 || isBlank(id) {
+		return 0
+	}
+	return defs[usize(id)]
+}
+
+// isBindingPat reports whether p is a binding that matches every value: a
+// bare name that is neither a variant nor a constant (checked patterns).
+func isBindingPat(p u32) bool {
+	return patBindSym(p) != 0 && nvarEnum[usize(p)] == 0
+}
+
+// patConst returns the value slot of a checked constant pattern that is
+// not an enum variant (a bare or qualified constant name), else 0.
+// Constants of enum type count as their variant (nvarEnum).
+func patConst(p u32) u32 {
+	if p == 0 || nvarEnum[usize(p)] != 0 {
+		return 0
+	}
+	k := nkind(p)
+	if k == NkIdent {
+		return nval[usize(p)]
+	}
+	if k == NkCtorPattern {
+		return nval[usize(nb(p))]
+	}
+	return 0
+}
+
+// catchAll reports whether a (checked) top-level pattern is '_' or a
+// binding (v0.2), which match every value.
+func catchAll(p u32) bool {
+	return nkind(p) == NkWildcardPattern || isBindingPat(p)
+}
+
+// ctorPat checks a variant, constant or binding pattern
+// `[Qual.]Name[(args)]` (a bare Name is a variant of t's enum, else a
+// constant, else a binding).
 func ctorPat(p u32, t u32, dp usize) bool decreases(dp) {
 	if dp == 0 {
 		tooDeep()
@@ -668,22 +785,11 @@ func ctorPat(p u32, t u32, dp usize) bool decreases(dp) {
 		_, isVar = variantByName(en, idName(name))
 	}
 	if sym != 0 && symKind(sym) == SymConst && !isVar {
-		if nflag(p) {
-			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot have bindings", NameRef(symName(sym))))
-			return false
-		}
-		if isEnum {
-			errAt(E2002, p, formatTo(mbuf[:], "constant %v cannot be a pattern for enum type %v", NameRef(symName(sym)), TypeRef(t)))
-			return false
-		}
-		if isTupleT(t) {
-			errAt(E2002, p, formatTo(mbuf[:], "pattern %v does not match a tuple scrutinee of type %v", NameRef(symName(sym)), TypeRef(t)))
-			return false
-		}
-		x := symOperand(sym, name, dp-1)
-		x.expr = name
-		record(&x)
-		return !isInvalidOp(&x) && assignment(&x, t, Ctx.Pattern)
+		return constPat(p, name, sym, t, nflag(p), dp-1)
+	}
+	if na(p) == 0 && !nflag(p) && !isVar {
+		ntype[usize(p)] = t
+		return bindPat(name, t)
 	}
 	nm := idName(name)
 	venum := u32(0)
@@ -740,6 +846,14 @@ func ctorPat(p u32, t u32, dp usize) bool decreases(dp) {
 	nvarEnum[usize(p)] = venum
 	nvarIdx[usize(p)] = u32(vi)
 	ntype[usize(p)] = t
+	if q == 0 && !nflag(p) {
+		// A name declared by the resolver for a bare variant is bound to
+		// the value (which is that variant).
+		bs := defs[usize(name)]
+		if bs != 0 && syms.items[usize(bs)].typ == 0 {
+			setSymType(bs, t)
+		}
+	}
 	c := l1len(p)
 	nargs := c
 	rest := false
@@ -919,17 +1033,17 @@ func uHead(p u32, t u32) (u8, usize, u32) {
 		return HWild, 0, 0
 	}
 	k := nkind(p)
-	if k == NkIdent {
+	if k == NkIdent || k == NkCtorPattern {
+		// A variant (or a constant of enum type), a constant, or a
+		// binding (a wildcard).
 		if nvarEnum[usize(p)] != 0 {
 			return HCtor, usize(nvarIdx[usize(p)]), 0
+		}
+		cs := patConst(p)
+		if cs != 0 {
+			return uLitHead(cs, t)
 		}
 		return HWild, 0, 0
-	}
-	if k == NkCtorPattern {
-		if nvarEnum[usize(p)] != 0 {
-			return HCtor, usize(nvarIdx[usize(p)]), 0
-		}
-		return uLitHead(nval[usize(nb(p))], t)
 	}
 	if k == NkLiteralPattern {
 		return uLitHead(nval[usize(na(p))], t)
@@ -1379,13 +1493,17 @@ func checkCoverage(m u32, t u32, isExpr bool) bool {
 		uColPush(t)
 	}
 	rows := usize(0) // rows of the earlier unguarded arms, at offset 0
-	wild := false
+	wild := u32(0)   // the unguarded catch-all arm's pattern ('_' or a binding)
 	n := l1len(m)
 	for i := usize(0); i < n; i++ {
 		arm := l1at(m, i)
 		pat := na(arm)
-		if wild {
-			errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the '_' arm"))
+		if wild != 0 {
+			if nkind(wild) == NkWildcardPattern {
+				errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the '_' arm"))
+			} else {
+				errAt(E2012, pat, formatTo(mbuf[:], "unreachable match arm: it follows the catch-all binding %v", NameRef(idName(bareName(wild)))))
+			}
 			continue
 		}
 		armRows := usize(0)
@@ -1403,8 +1521,8 @@ func checkCoverage(m u32, t u32, isExpr bool) bool {
 		}
 		if nd(arm) == 0 {
 			rows += armRows
-			if nkind(pat) == NkWildcardPattern {
-				wild = true
+			if catchAll(pat) {
+				wild = pat
 			}
 		} else {
 			uTop = rows * w
@@ -1487,6 +1605,13 @@ func reportUnreachable(alt u32, t u32) {
 				errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: variant %v is already covered", NameRef(variantName(nvarEnum[usize(alt)], usize(nvarIdx[usize(alt)])))))
 				return
 			}
+		} else if isBindingPat(alt) {
+			if isEnumT(underlying(t)) {
+				errAt(E2012, alt, formatTo(mbuf[:], "unreachable binding %v: all variants of %v are covered", NameRef(idName(nb(alt))), TypeRef(t)))
+			} else {
+				errAt(E2012, alt, formatTo(mbuf[:], "unreachable binding %v: all values of %v are covered", NameRef(idName(nb(alt))), TypeRef(t)))
+			}
+			return
 		} else {
 			errAt(E2012, alt, formatTo(mbuf[:], "unreachable pattern: duplicate case %v", Expr(nb(alt))))
 			return
@@ -1506,7 +1631,7 @@ func flatArgs(p u32) bool {
 		a := l1at(p, i)
 		k := nkind(a)
 		if k == NkIdent {
-			if nvarEnum[usize(a)] != 0 {
+			if nvarEnum[usize(a)] != 0 || patConst(a) != 0 {
 				return false
 			}
 		} else if k != NkRestPattern {

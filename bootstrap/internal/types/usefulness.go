@@ -20,7 +20,9 @@ import (
 // and every other type, whose literal domain is treated as infinite (a
 // column of literals is never complete). A tuple scrutinee contributes one
 // column per element. Or-patterns are expanded when they reach the head
-// column; `..` expands to wildcards; bindings are wildcards.
+// column; `..` expands to wildcards; bindings (also top-level and tuple
+// element bindings) are wildcards; constant patterns are literals of their
+// value (a constant of enum type is its variant).
 //
 // Witnesses of non-exhaustiveness are computed by the same recursion,
 // constructor by constructor in declaration order: a constructor present
@@ -93,15 +95,15 @@ func argTypes(t Type, c int) []Type {
 // head classifies the pattern p of a column of type t.
 func (u *usefulness) head(p ast.Pattern, t Type) (kind, ctor int, val Value) {
 	switch p := p.(type) {
-	case *ast.Ident:
+	case *ast.Ident, *ast.CtorPattern:
+		// A variant (or a constant of enum type), a constant, or a
+		// binding (a wildcard).
 		if v := u.info.VariantAt(p); v != nil {
 			return hCtor, v.Index, nil
 		}
-	case *ast.CtorPattern:
-		if v := u.info.VariantAt(p); v != nil {
-			return hCtor, v.Index, nil
+		if cv := u.info.PatConst(p); cv != nil {
+			return litHead(cv, t)
 		}
-		return litHead(u.info.ValueOf(p.Name), t)
 	case *ast.LiteralPattern:
 		return litHead(u.info.ValueOf(p.Lit), t)
 	case *ast.OrPattern:
