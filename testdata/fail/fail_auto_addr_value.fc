@@ -1,0 +1,20 @@
+// fail_auto_addr_value: x.M() with a pointer receiver takes &x implicitly
+// (v0.2), which needs an addressable x; a call result is not addressable.
+package main
+
+type Counter struct {
+	n u32
+}
+
+func (c *Counter) Inc() {
+	c.n++
+}
+
+func fresh() Counter {
+	return Counter{n: 1}
+}
+
+driver func main(io Stdio) error {
+	fresh().Inc() // ERROR E2002
+	return nil
+}

@@ -154,6 +154,13 @@ func (c *checker) collectRootFacts(rf *rootFacts, n ast.Node, lit *ast.FuncLit) 
 					rf.addr[s] = true
 				}
 			}
+		case *ast.CallExpr:
+			if ci := c.info.CallOf(n); ci != nil && ci.AutoAddr {
+				// x.M() with a pointer receiver takes &x (v0.2)
+				if s := c.storageRoot(ci.Recv); s != nil {
+					rf.addr[s] = true
+				}
+			}
 		case *ast.SliceExpr:
 			if _, ok := under(c.info.TypeOf(n.X)).(*types.Array); ok {
 				if s := c.storageRoot(n.X); s != nil {

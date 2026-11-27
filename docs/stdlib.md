@@ -52,11 +52,14 @@ tells `build` where the fincore Go module (the runtime) lives.
 
 ## Conventions
 
-- **Values, used through pointers.** Containers are Value structs: put
-  them in package-level `var`s (large capacities) or locals, and call
-  their pointer-receiver methods through an explicit pointer (decision
-  10): `vp := &v; vp.Push(x)`. A container nested in a struct field is
-  reached the same way: `kp := &m.keys; kp.Lookup(b)`.
+- **Values with pointer-receiver methods.** Containers are Value structs:
+  put them in package-level `var`s (large capacities) or locals, and call
+  their pointer-receiver methods directly on the variable, which takes
+  its address implicitly (decision 86): `v.Push(x)`, also for a container
+  nested in a struct field or array element: `m.keys.Lookup(b)`. The
+  operand must be addressable (a variable, a field or element of one, or
+  reached through a pointer); a call result is not
+  (`mk().Push(x)` is E2002).
 - **Explicit type arguments** for generic functions (decision 11):
   `sort.Sort[u32](xs, less)`.
 - **Overflow never panics.** An operation that does not fit reports it:
@@ -98,11 +101,10 @@ A vector of at most `N` elements stored inline; the zero value is empty.
 
 ```go
 var v vec.Vec[16, u32]
-vp := &v
-if !vp.Push(7) {
+if !v.Push(7) {
 	return ErrArenaFull
 }
-xs := vp.Slice()
+xs := v.Slice()
 ```
 
 ### `ListArena[NI usize, NS usize, T any]`
@@ -132,14 +134,13 @@ reserved: an empty run is `(0, 0)` and a non-empty run never starts at 0.
 ```go
 var lists vec.ListArena[1 << 20, 1 << 16, u32]
 
-la := &lists
-mark := la.Mark()
+mark := lists.Mark()
 for i := usize(0); i < n; i++ {
-	la.Push(child(i)) // may itself build and commit nested runs
+	lists.Push(child(i)) // may itself build and commit nested runs
 }
-start, count := la.Commit(mark)
+start, count := lists.Commit(mark)
 ...
-kids := la.Run(start, count)
+kids := lists.Run(start, count)
 ```
 
 ## std/maps
@@ -194,8 +195,7 @@ compiler/sema.fc's `names` (`intern`/`nameBytes`) is one.
 var names maps.Interner[131_072, 1 << 20, 65_536]
 
 func intern(b []byte) u32 {
-	np := &names
-	id, _ := np.Intern(b) // 0 when full; check np.Full() once at the end
+	id, _ := names.Intern(b) // 0 when full; check names.Full() once at the end
 	return id
 }
 ```
@@ -225,20 +225,19 @@ bounded probe loop:
 
 ```go
 func lookupOrAdd(scp u32, name u32) u32 {
-	tp := &symTab
-	s := tp.Start(maps.Mix(maps.HashU64(u64(scp)), u64(name)))
-	lim := tp.Cap()
+	s := symTab.Start(maps.Mix(maps.HashU64(u64(scp)), u64(name)))
+	lim := symTab.Cap()
 	for g := usize(0); g < lim; g++ {
-		id := tp.At(s)
+		id := symTab.At(s)
 		if id == 0 {
 			nid := newRecord(scp, name)
-			tp.Set(s, nid)
+			symTab.Set(s, nid)
 			return nid
 		}
 		if recs[id].scp == scp && recs[id].name == name {
 			return id
 		}
-		s = tp.Next(s)
+		s = symTab.Next(s)
 	}
 	return 0 // every bucket is taken
 }
@@ -290,20 +289,18 @@ sets the sticky `Truncated` flag; what was written before stays intact
 var out bytes.Builder[1 << 16]
 
 func report(name []byte, line u64) {
-	o := &out
-	o.WriteBytes(name)
-	o.WriteByte(':')
-	o.WriteUint(line)
-	o.WriteByte('\n')
+	out.WriteBytes(name)
+	out.WriteByte(':')
+	out.WriteUint(line)
+	out.WriteByte('\n')
 }
 
 driver func main(io Stdio) error {
-	report(strBytes("a.fc"), 3)
-	op := &out
-	if op.Truncated() {
+	report("a.fc", 3) // a constant string is an implicit []byte (decision 89)
+	if out.Truncated() {
 		return ErrArenaFull
 	}
-	return io.WriteStdout(op.Bytes())
+	return io.WriteStdout(out.Bytes())
 }
 ```
 

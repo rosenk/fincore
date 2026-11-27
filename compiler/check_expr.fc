@@ -214,6 +214,9 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 		return invalidOp(e)
 	}
 	t := x.typ
+	if op == OpAdd && isString(t) {
+		return concatExpr(e, &x, &y)
+	}
 	if op == OpLAnd || op == OpLOr {
 		if !isBoolean(t) {
 			errAtOp(E2002, e, formatTo(mbuf[:], "operator %s not defined on %v (type %v)", binOpString(op), Expr(na(e)), TypeRef(t)))
@@ -242,6 +245,28 @@ func binaryExpr(e u32, dp usize) Operand decreases(dp) {
 		return opConst(t, v)
 	}
 	return opMode(KValue, t)
+}
+
+// concatExpr checks `x + y` on strings (v0.2 ergonomics): both operands
+// must be constants and the result is a constant; there is no run-time
+// string building.
+func concatExpr(e u32, x *Operand, y *Operand) Operand {
+	nc := u32(0)
+	if x.mode != KConst {
+		nc = x.expr
+	} else if y.mode != KConst {
+		nc = y.expr
+	}
+	if nc != 0 || x.mode != KConst || y.mode != KConst {
+		errAtOp(E2002, e, formatTo(mbuf[:], "invalid operation: %v is not a constant (string concatenation is only allowed for constants)", Expr(nc)))
+		return invalidOp(e)
+	}
+	v, ok := binaryOpVal(OpAdd, x.val, y.val)
+	if !ok {
+		errAtOp(E2002, e, formatTo(mbuf[:], "constant evaluation: %s", (&errTxt).Bytes()))
+		return invalidOp(e)
+	}
+	return opConst(x.typ, v)
 }
 
 // matchTypes converts untyped operands to the other operand's type and
@@ -732,6 +757,7 @@ func selectorExpr(e u32, dp usize) Operand decreases(dp) {
 			r.recv = na(e)
 			r.recvType = x.typ
 			r.indirect = indirect
+			r.addressable = x.mode == KVar
 			return r
 		}
 	}
@@ -1111,14 +1137,20 @@ func methodCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 	}
 	m := fun.method
 	mr := meths.items[usize(m)]
+	recvType := fun.recvType
 	if mr.ptrRecv && !fun.indirect {
-		errAt(E2002, na(e), formatTo(mbuf[:], "cannot call pointer method %v on %v (type %v): no automatic &, use a pointer (p := &x; p.%v(...))", NameRef(mr.name), Expr(fun.recv), TypeRef(fun.recvType), NameRef(mr.name)))
-		useArgs(e, 0, dp-1)
-		return invalidOp(e)
+		// v0.2 ergonomics: x.M() means (&x).M() for an addressable x.
+		if !fun.addressable {
+			errAt(E2002, na(e), formatTo(mbuf[:], "cannot call pointer method %v on %v (type %v): value is not addressable", NameRef(mr.name), Expr(fun.recv), TypeRef(fun.recvType)))
+			useArgs(e, 0, dp-1)
+			return invalidOp(e)
+		}
+		callTab.items[usize(ci)].autoAddr = true
+		recvType = mkPointer(fun.recvType)
 	}
 	callTab.items[usize(ci)].method = m
 	callTab.items[usize(ci)].recv = fun.recv
-	callTab.items[usize(ci)].recvType = fun.recvType
+	callTab.items[usize(ci)].recvType = recvType
 	if mr.builtin != BMNone {
 		return builtinMethodCall(e, m, ci, dp-1)
 	}
@@ -1129,7 +1161,7 @@ func methodCall(e u32, fun *Operand, ci u32, dp usize) Operand decreases(dp) {
 		useArgs(e, 0, dp-1)
 		return invalidOp(e)
 	}
-	base, _ := derefType(fun.recvType)
+	base, _ := derefType(recvType)
 	if isNamedT(base) && namedOrigin(base) != 0 && mr.rtpN > 0 {
 		bs, bn := namedArgList(base)
 		sig = subst(sig, mr.rtpS, mr.rtpN, bs, bn, SemaDepth)
@@ -1386,6 +1418,12 @@ func builtinCall(e u32, sym u32, ci u32, dp usize) Operand decreases(dp) {
 		s := exprValue(l1at(e, 1), dp-1)
 		if isInvalidOp(&d) || isInvalidOp(&s) {
 			return invalidOp(e)
+		}
+		if basicKind(s.typ) == BkUntypedString && isByteSliceT(d.typ) {
+			// v0.2: copy(dst, "...") copies from an implicit strBytes
+			if !convertUntyped(&s, mkSlice(TyU8)) {
+				return invalidOp(e)
+			}
 		}
 		du := underlying(d.typ)
 		su := underlying(s.typ)

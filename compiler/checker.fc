@@ -31,7 +31,10 @@ type Operand struct {
 	method   u32 // method selections (mode KFunc)
 	recv     u32
 	recvType u32
-	vEnum    u32 // KVariantCtor: underlying Enum TypeID
+	// addressable: the receiver operand is addressable (KVar), so a
+	// pointer-receiver method may be called on it (auto-&, v0.2)
+	addressable bool
+	vEnum       u32 // KVariantCtor: underlying Enum TypeID
 	vIndex   u32 //   and variant index
 }
 
@@ -486,6 +489,19 @@ func convertUntypedDp(x *Operand, t u32, dp usize) bool decreases(dp) {
 		ok = isBoolean(t)
 	} else if k == BkUntypedString {
 		ok = isString(t)
+		if !ok && isByteSliceT(t) && x.expr != 0 {
+			// v0.2 ergonomics: a constant string used as a []byte is an
+			// implicit strBytes (a fresh copy). The constant itself is
+			// typed string; the node is marked in nbytes.
+			if !convertUntypedDp(x, TyString, dp-1) {
+				return false
+			}
+			nbytes[usize(x.expr)] = true
+			x.mode = KValue
+			x.typ = t
+			x.val = Val.None
+			return true
+		}
 	}
 	if isTypeParamT(t) {
 		ok = false

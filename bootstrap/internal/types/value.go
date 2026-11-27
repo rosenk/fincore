@@ -370,6 +370,13 @@ func BinaryOp(op ast.BinaryOp, x, y Value) (Value, error) {
 		}
 		return a || b, nil
 	}
+	if op == ast.OpAdd {
+		if a, ok := x.(StringVal); ok {
+			if b, ok := y.(StringVal); ok {
+				return a + b, nil // constant string concatenation (v0.2)
+			}
+		}
+	}
 	a, ok1 := x.(IntVal)
 	b, ok2 := y.(IntVal)
 	if !ok1 || !ok2 {

@@ -18,6 +18,9 @@ type operand struct {
 	recv     ast.Expr
 	recvType Type
 	indirect bool
+	// addressable: the receiver operand is addressable (KindVar), so a
+	// pointer-receiver method may be called on it (auto-&, v0.2)
+	addressable bool
 	// KindVariantCtor
 	variant *Variant
 }
@@ -206,6 +209,17 @@ func (c *Checker) convertUntyped(x *operand, t Type) bool {
 		ok = IsBoolean(t)
 	case UntypedString:
 		ok = IsString(t)
+		if !ok && IsByteSlice(t) && x.expr != nil {
+			// v0.2 ergonomics: a constant string used as a []byte is an
+			// implicit strBytes (a fresh copy). The constant itself is
+			// typed string; the node is marked in Info.ImplicitBytes.
+			if !c.convertUntyped(x, Typ[String]) {
+				return false
+			}
+			c.info.ImplicitBytes[x.expr.ID()] = true
+			x.mode, x.typ, x.val = KindValue, t, nil
+			return true
+		}
 	}
 	if _, isTP := t.(*TypeParam); isTP {
 		ok = false
@@ -412,6 +426,9 @@ func (c *Checker) binary(e *ast.BinaryExpr) operand {
 		return invalidOp(e)
 	}
 	t := x.typ
+	if e.Op == ast.OpAdd && IsString(t) {
+		return c.concat(e, x, y)
+	}
 	switch e.Op {
 	case ast.OpLAnd, ast.OpLOr:
 		if !IsBoolean(t) {
@@ -443,6 +460,24 @@ func (c *Checker) binary(e *ast.BinaryExpr) operand {
 		return operand{mode: KindConst, typ: t, val: v}
 	}
 	return operand{mode: KindValue, typ: t}
+}
+
+// concat checks `x + y` on strings (v0.2 ergonomics): both operands must
+// be constants and the result is a constant; there is no run-time string
+// building.
+func (c *Checker) concat(e *ast.BinaryExpr, x, y operand) operand {
+	for _, o := range []operand{x, y} {
+		if o.mode != KindConst {
+			c.errorf(diag.E2002, e.OpPos, "invalid operation: %s is not a constant (string concatenation is only allowed for constants)", exprString(o.expr))
+			return invalidOp(e)
+		}
+	}
+	v, err := BinaryOp(e.Op, x.val, y.val)
+	if err != nil {
+		c.errorf(diag.E2002, e.OpPos, "constant evaluation: %v", err)
+		return invalidOp(e)
+	}
+	return operand{mode: KindConst, typ: x.typ, val: v}
 }
 
 // matchTypes converts untyped operands to the other operand's type and
@@ -844,7 +879,7 @@ func (c *Checker) selector(e *ast.SelectorExpr) operand {
 	if n, ok := t.(*Named); ok {
 		if m := c.lookupMethod(n, e.Sel.Name); m != nil {
 			c.info.Selections[e.ID()] = &Selection{Kind: SelMethod, Recv: x.typ, Indirect: indirect && !m.PtrRecv, Method: m}
-			return operand{mode: KindFunc, typ: Typ[Invalid], method: m, recv: e.X, recvType: x.typ, indirect: indirect}
+			return operand{mode: KindFunc, typ: Typ[Invalid], method: m, recv: e.X, recvType: x.typ, indirect: indirect, addressable: x.mode == KindVar}
 		}
 	}
 	c.errorf(diag.E2001, e.Sel.Range, "%s.%s undefined (type %s has no field or method %s)", exprString(e.X), e.Sel.Name, x.typ, e.Sel.Name)

@@ -41,6 +41,11 @@ type Info struct {
 	// Values holds the constant value of constant expressions (and of
 	// comptime calls folded at compile time), by NodeID.
 	Values []Value
+	// ImplicitBytes marks, by NodeID, constant string expressions used
+	// where a []byte is required (v0.2 ergonomics). Their Types entry is
+	// string and their Values entry the string; the value of the
+	// expression is a fresh []byte copy, like strBytes(e).
+	ImplicitBytes []bool
 
 	// Calls describes every CallExpr, by NodeID.
 	Calls []*Call
@@ -110,6 +115,16 @@ func (in *Info) ValueOf(n ast.Node) Value {
 		return in.Values[id]
 	}
 	return nil
+}
+
+// IsImplicitBytes reports whether e is a constant string expression that is
+// implicitly converted to a fresh []byte (see Info.ImplicitBytes).
+func (in *Info) IsImplicitBytes(n ast.Node) bool {
+	if n == nil {
+		return false
+	}
+	id := int(n.ID())
+	return id < len(in.ImplicitBytes) && in.ImplicitBytes[id]
 }
 
 // SymbolOf returns the symbol an identifier defines or refers to (nil for
@@ -307,6 +322,11 @@ type Call struct {
 	// For pointer-receiver methods RecvType is *T.
 	Recv     ast.Expr
 	RecvType Type
+	// AutoAddr (v0.2 ergonomics): a pointer-receiver method called on an
+	// addressable operand x of type T; the call means (&x).M(...). Recv is
+	// x and RecvType is *T. Later passes treat Recv like the operand of an
+	// explicit &.
+	AutoAddr bool
 	// TypeArgs are the type arguments: explicit ones of a generic function
 	// instantiation, the receiver's type arguments for methods of generic
 	// types, or the inferred [N, T] / [T] of Scope.AcquireSlot / ReleaseSlot

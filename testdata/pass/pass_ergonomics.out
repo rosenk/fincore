@@ -1,0 +1,13 @@
+ergo: local=5
+ergo: fields=212
+ergo: slice=7
+ergo: self=6
+ergo: vec=331
+abcd
+a!
+implicit bytes ok
+ergo: copy=6
+ergo: |
+Msg!msg!
+invalid main signature: x (want driver func main(<capabilities>) error)
+ergo: start done

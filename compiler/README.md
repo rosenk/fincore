@@ -422,8 +422,10 @@ function; overflow is reported as capacity exceeded.
   "Recursion and scratch stacks"). Recursion between driver functions
   (`visitPackage` / `loadImport`) is not totality-checked.
 - Methods with pointer receivers are always called through a pointer
-  variable (decision 10). For globals this means `eb := &errBuf;
-  eb.putStr(...)`.
+  (`eb := &errBuf; eb.putStr(...)`, `(&errTxt).Bytes()`), and byte
+  strings are built with `strBytes("...")`: v0.2's auto-& (decision 86),
+  implicit `[]byte` (89) and constant `+` (91) are not used yet, so that
+  compilers older than them can still build compiler/ (decision 93).
 - No results are discarded silently: `_ = f()` is used where needed.
 
 ## Where finc0's future checker may struggle

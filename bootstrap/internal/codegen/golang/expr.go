@@ -95,28 +95,11 @@ func (f *fnCtx) expr(e ast.Expr) string {
 	typed := f.typedLits
 	f.typedLits = false // only applies to the top-level expression
 	if v := f.constValue(e); v != nil {
-		if _, ok := v.(types.TupleVal); ok {
-			f.g.fail(e, "multi-value constant in single-value context")
+		if f.g.info.IsImplicitBytes(e) {
+			// a constant string used as []byte (v0.2): a fresh copy
+			return "[]byte(" + f.constExpr(e, v, false) + ")"
 		}
-		if lit, ok := e.(*ast.BasicLit); ok {
-			return f.basicLit(lit, v, typed)
-		}
-		if ref := f.constRef(e, typed); ref != "" {
-			return ref
-		}
-		if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
-			if ci := f.g.info.CallOf(c); ci != nil && ci.Kind == types.CallConversion {
-				if ref := f.constRef(unparen(c.Args[0]), false); ref != "" {
-					return f.convType(c, ci.Conv) + "(" + ref + ")"
-				}
-			}
-		}
-		if p, ok := e.(*ast.ParenExpr); ok {
-			if lit, ok := unparen(p).(*ast.BasicLit); ok && !typed {
-				return f.basicLit(lit, v, false)
-			}
-		}
-		return f.composite(f.g.value(e, v, f.typeOf(e), f.env))
+		return f.constExpr(e, v, typed)
 	}
 	switch e := e.(type) {
 	case *ast.Ident:
@@ -160,6 +143,32 @@ func (f *fnCtx) expr(e ast.Expr) string {
 	}
 	f.g.fail(e, "unsupported expression %T", e)
 	return ""
+}
+
+// constExpr renders the constant expression e with value v.
+func (f *fnCtx) constExpr(e ast.Expr, v types.Value, typed bool) string {
+	if _, ok := v.(types.TupleVal); ok {
+		f.g.fail(e, "multi-value constant in single-value context")
+	}
+	if lit, ok := e.(*ast.BasicLit); ok {
+		return f.basicLit(lit, v, typed)
+	}
+	if ref := f.constRef(e, typed); ref != "" {
+		return ref
+	}
+	if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
+		if ci := f.g.info.CallOf(c); ci != nil && ci.Kind == types.CallConversion {
+			if ref := f.constRef(unparen(c.Args[0]), false); ref != "" {
+				return f.convType(c, ci.Conv) + "(" + ref + ")"
+			}
+		}
+	}
+	if p, ok := e.(*ast.ParenExpr); ok {
+		if lit, ok := unparen(p).(*ast.BasicLit); ok && !typed {
+			return f.basicLit(lit, v, false)
+		}
+	}
+	return f.composite(f.g.value(e, v, f.typeOf(e), f.env))
 }
 
 // basicLit renders a literal, keeping the source spelling where Go

@@ -248,8 +248,10 @@ driver func main(io Stdio) error {
 
 driver func main(io Stdio) error {
 	var b [8]byte
+	s := "abc"
 	_ = formatTo(b, "x") // ERROR E2002
-	_ = formatTo("abc", "%d", 1) // ERROR E2002
+	_ = formatTo(s, "%d", 1) // ERROR E2002
+	_ = formatTo("abc", "%d", 1) // a constant string is an implicit []byte (v0.2)
 	return nil
 }
 `},

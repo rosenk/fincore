@@ -34,6 +34,52 @@ func cgComposite(mark usize) {
 	}
 }
 
+// constExpr writes the constant expression e with value v.
+func cgConstExpr(e u32, v Val, typed bool, dp usize) decreases(dp) {
+	if dp == 0 {
+		cgFail(e, "expression too deep")
+		return
+	}
+	k := nkind(e)
+	if isTupleVal(v) {
+		cgFail(e, "multi-value constant in single-value context")
+		return
+	}
+	if k == NkBasicLit {
+		cgBasicLit(e, v, typed, dp-1)
+		return
+	}
+	cs := cgConstRefSym(e)
+	if cs != 0 {
+		cgWConstRef(e, cs, typed, dp-1)
+		return
+	}
+	if k == NkCallExpr && l1len(e) == 1 {
+		c := ncall[usize(e)]
+		if c != 0 && callTab.items[usize(c)].kind == CallConversion {
+			a0 := cgUnparenNode(l1at(e, 0))
+			rs := cgConstRefSym(a0)
+			if rs != 0 {
+				cgConvType(e, callTab.items[usize(c)].conv, dp-1)
+				cgWc('(')
+				cgWConstRef(a0, rs, false, dp-1)
+				cgWc(')')
+				return
+			}
+		}
+	}
+	if k == NkParenExpr {
+		inner := cgUnparenNode(e)
+		if nkind(inner) == NkBasicLit && !typed {
+			cgBasicLit(inner, v, false, dp-1)
+			return
+		}
+	}
+	p := cgWmark()
+	cgValue(e, v, ntype[usize(e)], dp-1)
+	cgComposite(p)
+}
+
 // expr writes an expression.
 func cgExpr(e u32, dp usize) decreases(dp) {
 	if dp == 0 {
@@ -46,43 +92,14 @@ func cgExpr(e u32, dp usize) decreases(dp) {
 	vs := cgConstValueSlot(e)
 	if vs != 0 {
 		v := slotGet(vs)
-		if isTupleVal(v) {
-			cgFail(e, "multi-value constant in single-value context")
+		if nbytes[usize(e)] {
+			// a constant string used as []byte (v0.2): a fresh copy
+			cgW("[]byte(")
+			cgConstExpr(e, v, false, dp-1)
+			cgWc(')')
 			return
 		}
-		if k == NkBasicLit {
-			cgBasicLit(e, v, typed, dp-1)
-			return
-		}
-		cs := cgConstRefSym(e)
-		if cs != 0 {
-			cgWConstRef(e, cs, typed, dp-1)
-			return
-		}
-		if k == NkCallExpr && l1len(e) == 1 {
-			c := ncall[usize(e)]
-			if c != 0 && callTab.items[usize(c)].kind == CallConversion {
-				a0 := cgUnparenNode(l1at(e, 0))
-				rs := cgConstRefSym(a0)
-				if rs != 0 {
-					cgConvType(e, callTab.items[usize(c)].conv, dp-1)
-					cgWc('(')
-					cgWConstRef(a0, rs, false, dp-1)
-					cgWc(')')
-					return
-				}
-			}
-		}
-		if k == NkParenExpr {
-			inner := cgUnparenNode(e)
-			if nkind(inner) == NkBasicLit && !typed {
-				cgBasicLit(inner, v, false, dp-1)
-				return
-			}
-		}
-		p := cgWmark()
-		cgValue(e, v, ntype[usize(e)], dp-1)
-		cgComposite(p)
+		cgConstExpr(e, v, typed, dp-1)
 		return
 	}
 	if k == NkIdent {

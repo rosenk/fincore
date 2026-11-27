@@ -810,3 +810,93 @@ func f(b bool) *u32 {
 }`, "E3002@5"},
 	})
 }
+
+// v0.2 ergonomics: x.M() with a pointer receiver means (&x).M(); the
+// implicit & is checked exactly like an explicit one.
+func TestAutoAddr(t *testing.T) {
+	runCases(t, []tcase{
+		{"call on local ok", `
+type C struct { n u32 }
+func (c *C) Inc() { c.n++ }
+func f() u32 {
+	var c C
+	c.Inc()
+	return c.n
+}`, ""},
+		{"return implicitly addressed local", `
+type C struct { n u32 }
+func (c *C) Self() *C { return c }
+func f() *C {
+	var c C
+	return c.Self()
+}`, "E3002@6"},
+		{"return explicitly addressed local", `
+type C struct { n u32 }
+func (c *C) Self() *C { return c }
+func f() *C {
+	var c C
+	return (&c).Self()
+}`, "E3002@6"},
+		{"store implicitly addressed local through param", `
+type C struct { n u32 }
+func (c *C) Self() *C { return c }
+type H struct { p *C }
+func f(h *H) {
+	var c C
+	h.p = c.Self()
+}`, "E3002@7"},
+		{"implicit & of a global ok", `
+type C struct { n u32 }
+func (c *C) Self() *C { return c }
+var g C
+func f() *C {
+	return g.Self()
+}`, ""},
+		{"implicit & of a param field ok", `
+type C struct { n u32 }
+func (c *C) Self() *C { return c }
+type H struct { c C }
+func f(h *H) *C {
+	return h.c.Self()
+}`, ""},
+		{"implicit & of a slice element ok", `
+type C struct { n u32 }
+func (c *C) Self() *C { return c }
+func f(s []C) *C {
+	return s[0].Self()
+}`, ""},
+		{"implicit & of a local array element", `
+type C struct { n u32 }
+func (c *C) Self() *C { return c }
+func f() *C {
+	var a [2]C
+	return a[1].Self()
+}`, "E3002@6"},
+		{"slice returned through implicit & of local", `
+type B struct { buf [8]u8 }
+func (b *B) View() []u8 { return b.buf[:] }
+func f() []u8 {
+	var b B
+	return b.View()
+}`, "E3002@6"},
+		{"implicit & keeps local content conservative", `
+type P struct { s []u8 }
+func (p *P) Touch() { }
+var g [4]u8
+func f() []u8 {
+	var buf [4]u8
+	p := P{s: g[:]}
+	p.Touch()
+	p.s = buf[:]
+	return p.s
+}`, "E3002@10"},
+		{"constant string as bytes may be returned", `
+func f() []byte {
+	return "abc"
+}
+func g() []byte {
+	var b []byte = "xyz"
+	return b
+}`, ""},
+	})
+}

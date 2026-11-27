@@ -1,0 +1,173 @@
+// pass_ergonomics: v0.2 ergonomics — auto-& for pointer-receiver calls on
+// addressable operands (locals, fields, array and slice elements, globals,
+// derefs, generic std containers), constant strings used as []byte
+// (arguments, assignment, return, struct fields, copy), and constant
+// string concatenation (const declarations and formatTo formats).
+package main
+
+import (
+	"std/bytes"
+	"std/vec"
+)
+
+const Prefix = "ergo: "
+const MainSig = "want driver func main(<capabilities>) error"
+const Banner = Prefix + "start"
+
+type Counter struct {
+	n u32
+}
+
+func (c *Counter) Inc() {
+	c.n++
+}
+
+func (c *Counter) Add(k u32) u32 {
+	c.n += k
+	return c.n
+}
+
+func (c Counter) Get() u32 {
+	return c.n
+}
+
+func (c *Counter) Self() *Counter {
+	return c
+}
+
+type Pair struct {
+	left  Counter
+	right Counter
+	cells [3]Counter
+}
+
+type Msg struct {
+	text []byte
+	len  usize
+}
+
+var global Counter
+var gvec vec.Vec[4, u32]
+
+func greeting() []byte {
+	return "hello"
+}
+
+func mkMsg() Msg {
+	return Msg{text: "msg!", len: 4}
+}
+
+func startsGo(b []byte) bool {
+	return bytes.HasPrefix(b, "go ")
+}
+
+driver func say(io Stdio, label string, v u64) error {
+	var buf [96]byte
+	n := formatTo(buf[:], Prefix + "%s=%d\n", label, v)
+	return io.WriteStdout(buf[:n])
+}
+
+driver func main(io Stdio) error {
+	// auto-& on a local
+	var c Counter
+	c.Inc()
+	c.Inc()
+	_ = c.Add(3)
+	if err := say(io, "local", u64(c.Get())); err != nil {
+		return err
+	}
+
+	// fields, array elements of a local struct, through a pointer
+	var p Pair
+	p.left.Inc()
+	p.cells[1].Inc()
+	p.cells[1].Inc()
+	pp := &p
+	pp.right.Inc()
+	pp.cells[2].Inc()
+	(*pp).left.Inc()
+	if err := say(io, "fields", u64(p.left.Get()*100+p.right.Get()*10+p.cells[1].Get())); err != nil {
+		return err
+	}
+
+	// slice elements and globals
+	var arr [3]Counter
+	s := arr[:]
+	for i := usize(0); i < 3; i++ {
+		s[i].Inc()
+		arr[i].Inc()
+	}
+	global.Inc()
+	if err := say(io, "slice", u64(arr[0].Get()+arr[1].Get()+arr[2].Get()+global.Get())); err != nil {
+		return err
+	}
+
+	// the receiver pointer of an auto-& call
+	q := c.Self()
+	q.Inc()
+	if err := say(io, "self", u64(c.Get())); err != nil {
+		return err
+	}
+
+	// generic std containers
+	var v vec.Vec[3, u32]
+	for i := u32(1); i < 6; i++ {
+		_ = v.Push(i)
+	}
+	x, _ := v.At(2)
+	_ = gvec.Push(7)
+	if err := say(io, "vec", u64(v.Len())*100+u64(x)*10+u64(gvec.Len())); err != nil {
+		return err
+	}
+	var b bytes.Builder[32]
+	b.WriteString("ab")
+	b.WriteBytes("cd\n")
+	if err := io.WriteStdout(b.Bytes()); err != nil {
+		return err
+	}
+	b.Truncate(1)
+	b.WriteBytes("!\n")
+	if err := io.WriteStdout(b.Bytes()); err != nil {
+		return err
+	}
+
+	// constant strings as []byte
+	var line []byte = "go build"
+	if startsGo(line) && !startsGo("gopher") && bytes.Equal(greeting(), "hello") && bytesEqual("x", "x") {
+		if err := io.WriteStdout("implicit bytes ok\n"); err != nil {
+			return err
+		}
+	}
+	m := mkMsg()
+	m.text[0] = 'M'
+	m2 := mkMsg()
+	var dst [8]byte
+	k := copy(dst[:], Prefix)
+	if err := say(io, "copy", u64(k)); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(dst[:k]); err != nil {
+		return err
+	}
+	if err := io.WriteStdout("|\n"); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(m.text); err != nil {
+		return err
+	}
+	if err := io.WriteStdout(m2.text); err != nil {
+		return err
+	}
+	if err := io.WriteStdout("\n"); err != nil {
+		return err
+	}
+
+	// constant string concatenation
+	var out [128]byte
+	n := formatTo(out[:], "invalid main signature: %s (" + MainSig + ")\n", "x")
+	if err := io.WriteStdout(out[:n]); err != nil {
+		return err
+	}
+	n = formatTo(out[:], "%s\n", Banner + " " + "done")
+	return io.WriteStdout(out[:n])
+}

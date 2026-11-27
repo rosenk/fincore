@@ -188,6 +188,16 @@ func vStr(b []byte) Val {
 	return Val.Str(strAlloc(b), u32(len(b)))
 }
 
+// strConcat is the string value x + y: both copied to the end of the
+// string pool, so the result is contiguous.
+func strConcat(x Val, y Val) Val {
+	a := strOf(x)
+	b := strOf(y)
+	st := strAlloc(a)
+	_ = strAlloc(b)
+	return Val.Str(st, u32(len(a)+len(b)))
+}
+
 // sliceOver is a slice of all n slots of the array at st.
 func sliceOver(st u32, n usize) Val {
 	return Val.Slice(st, 0, u32(n), u64(n))
@@ -966,6 +976,9 @@ func binaryOpVal(op u8, x Val, y Val) (Val, bool) {
 			return vBool(a && b), true
 		}
 		return vBool(a || b), true
+	}
+	if op == OpAdd && isStrVal(x) && isStrVal(y) {
+		return strConcat(x, y), true // constant string concatenation (v0.2)
 	}
 	if !isIntVal(x) || !isIntVal(y) {
 		opNotDefined(op, x, y, true)

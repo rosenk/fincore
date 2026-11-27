@@ -186,12 +186,18 @@ func (c *Checker) arguments(e *ast.CallExpr, params []Type, variadic bool, name 
 
 func (c *Checker) methodCall(e *ast.CallExpr, fun operand, ci *Call) operand {
 	m := fun.method
+	recvType := fun.recvType
 	if m.PtrRecv && !fun.indirect {
-		c.errorf(diag.E2002, e.Fun.Span(), "cannot call pointer method %s on %s (type %s): no automatic &, use a pointer (p := &x; p.%s(...))", m.Name, exprString(fun.recv), fun.recvType, m.Name)
-		c.useArgs(e)
-		return invalidOp(e)
+		// v0.2 ergonomics: x.M() means (&x).M() for an addressable x.
+		if !fun.addressable {
+			c.errorf(diag.E2002, e.Fun.Span(), "cannot call pointer method %s on %s (type %s): value is not addressable", m.Name, exprString(fun.recv), fun.recvType)
+			c.useArgs(e)
+			return invalidOp(e)
+		}
+		ci.AutoAddr = true
+		recvType = &Pointer{Elem: fun.recvType}
 	}
-	ci.Method, ci.Recv, ci.RecvType = m, fun.recv, fun.recvType
+	ci.Method, ci.Recv, ci.RecvType = m, fun.recv, recvType
 	if m.Builtin != BMNone {
 		return c.builtinMethodCall(e, m, ci)
 	}
@@ -201,7 +207,7 @@ func (c *Checker) methodCall(e *ast.CallExpr, fun operand, ci *Call) operand {
 		c.useArgs(e)
 		return invalidOp(e)
 	}
-	base, _ := Deref(fun.recvType)
+	base, _ := Deref(recvType)
 	if n, ok := base.(*Named); ok && n.Origin != nil && len(m.RecvTypeParams) > 0 {
 		sig = c.subst(sig, bindings(m.RecvTypeParams, n.TypeArgs)).(*Signature)
 		ci.TypeArgs = n.TypeArgs
@@ -370,6 +376,12 @@ func (c *Checker) builtinCall(e *ast.CallExpr, sym *resolve.Symbol, ci *Call) op
 		s := c.exprValue(e.Args[1])
 		if d.invalid() || s.invalid() {
 			return invalidOp(e)
+		}
+		if basicKind(s.typ) == UntypedString && IsByteSlice(d.typ) {
+			// v0.2: copy(dst, "...") copies from an implicit strBytes
+			if !c.convertUntyped(&s, bytesT) {
+				return invalidOp(e)
+			}
 		}
 		ds, ok1 := d.typ.Underlying().(*Slice)
 		ss, ok2 := s.typ.Underlying().(*Slice)

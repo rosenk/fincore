@@ -1,0 +1,29 @@
+// fail_auto_addr_escape: c.Self() takes &c implicitly (v0.2), so its result
+// points to the local c (depth 1); storing it into memory reached through
+// the parameter h (caller level) is a scope escape, exactly as with an
+// explicit (&c).Self().
+package main
+
+type Counter struct {
+	n u32
+}
+
+func (c *Counter) Self() *Counter {
+	return c
+}
+
+type Holder struct {
+	p *Counter
+}
+
+func keep(h *Holder) {
+	var c Counter
+	h.p = c.Self() // ERROR E3002
+}
+
+driver func main(io Stdio) error {
+	var c Counter
+	h := Holder{p: &c}
+	keep(&h)
+	return nil
+}

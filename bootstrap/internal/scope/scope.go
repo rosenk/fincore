@@ -410,7 +410,9 @@ func (c *checker) callOrigin(e *ast.CallExpr) origin {
 		}
 		return o
 	case types.CallMethod, types.CallBuiltinMeth:
-		if ci.Recv != nil && c.tracked(c.info.TypeOf(ci.Recv)) {
+		if ci.AutoAddr {
+			o = c.storage(ci.Recv) // x.M() means (&x).M() (v0.2)
+		} else if ci.Recv != nil && c.tracked(c.info.TypeOf(ci.Recv)) {
 			o = c.origin(ci.Recv)
 		}
 	case types.CallValue:
@@ -670,6 +672,13 @@ func (w *walker) expr(e ast.Expr) {
 			w.expr(f.Value)
 		}
 	case *ast.CallExpr:
+		if w.collect {
+			if ci := c.info.CallOf(e); ci != nil && ci.AutoAddr {
+				if r := c.rootVar(ci.Recv); r != nil {
+					c.fn.addr[r] = true // implicit & of the receiver (v0.2)
+				}
+			}
+		}
 		w.expr(e.Fun)
 		for _, a := range e.Args {
 			w.expr(a)

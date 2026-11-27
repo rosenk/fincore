@@ -1,0 +1,78 @@
+// ergonomics_scope: v0.2 auto-& under the scope and totality checkers —
+// an implicitly addressed local escaping (stored, returned) and a loop
+// bound made unstable by an implicit &.
+package main
+
+type Cell struct {
+	n u32
+}
+
+func (c *Cell) Inc() {
+	c.n++
+}
+
+func (c *Cell) Self() *Cell {
+	return c
+}
+
+func (c Cell) Get() u32 {
+	return c.n
+}
+
+type Holder struct {
+	p *Cell
+}
+
+func store(h *Holder) {
+	var c Cell
+	h.p = c.Self()
+}
+
+func leak() *Cell {
+	var c Cell
+	return c.Self()
+}
+
+func leakElem() *Cell {
+	var cs [2]Cell
+	return cs[1].Self()
+}
+
+func okParam(p *Cell, cs []Cell) *Cell {
+	if p.Self().n == 0 {
+		return cs[0].Self()
+	}
+	return p.Self()
+}
+
+func loop() u32 {
+	var c Cell
+	c.n = 4
+	s := u32(0)
+	for i := u32(0); i < c.n; i++ {
+		c.Inc()
+		s += c.Get()
+	}
+	return s
+}
+
+func loopCopy() u32 {
+	var c Cell
+	c.n = 4
+	lim := c.n
+	s := u32(0)
+	for i := u32(0); i < lim; i++ {
+		c.Inc()
+		s += c.Get()
+	}
+	return s
+}
+
+func fresh() []byte {
+	var b []byte = "fresh"
+	return b
+}
+
+driver func main(io Stdio) error {
+	return io.WriteStdout(fresh())
+}

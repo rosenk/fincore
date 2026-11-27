@@ -236,3 +236,76 @@ comptime func Lift() Code 1 {
 		})
 	}
 }
+
+// v0.2 ergonomics at compile time: auto-& calls, constant strings as
+// []byte (fresh copies) and constant string concatenation.
+func TestErgonomics(t *testing.T) {
+	src := `package main
+const P = "ab"
+const Q = P + "cd"
+const R string = Q + "!"
+type Counter struct {
+	n u32
+	cs [2]u32
+}
+func (c *Counter) Inc() {
+	c.n++
+}
+func (c *Counter) Bump(i usize) {
+	c.cs[i] += 10
+}
+type Box struct {
+	c Counter
+}
+comptime func Count(k u32) u32 {
+	var c Counter
+	var b Box
+	var arr [3]Counter
+	s := arr[:]
+	for i := u32(0); i < k; i++ {
+		c.Inc()
+		b.c.Inc()
+		s[1].Inc()
+	}
+	arr[2].Bump(1)
+	return c.n*1000 + b.c.n*100 + arr[1].n*10 + arr[2].cs[1]
+}
+comptime func Fresh() u8 {
+	var a []byte = "xy"
+	b := pick("xy")
+	a[0] = 'z'
+	return a[0] + b[0]
+}
+func pick(b []byte) []byte {
+	return b
+}
+comptime func Concat() usize {
+	return len(Q + "ef")
+}
+comptime func Copy() u8 {
+	var d [4]u8
+	n := copy(d[:], "hey")
+	return d[n-1]
+}
+const N = Count(3)
+const F = Fresh()
+const L = Concat()
+const C = Copy()
+`
+	info, d := check(t, src, comptime.New(0))
+	if len(d) > 0 {
+		t.Fatal(d)
+	}
+	for name, want := range map[string]string{
+		"Q": `"abcd"`,
+		"R": `"abcd!"`,
+		"N": "3340",
+		"F": "242", // 'z' + 'x'
+		"L": "6",
+		"C": "121", // 'y'
+	} {
+		if got := constVal(t, info, name).String(); got != want {
+			t.Errorf("%s = %s, want %s", name, got, want)
+		}
+	}
+}

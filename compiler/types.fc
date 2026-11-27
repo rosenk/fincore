@@ -1740,6 +1740,7 @@ type Call struct {
 	resourceCtor bool
 	consumesRecv bool
 	consumesArg0 bool // ConsumesArgs == [0]
+	autoAddr     bool // x.M() on an addressable x means (&x).M() (v0.2); recvType is *T
 	callee       u32  // function/method symbol, or the builtin's universe symbol
 	method       u32
 	recv         u32 // receiver expression node
@@ -1807,6 +1808,7 @@ var ninst [MaxNodes]u32    // InstanceOf
 var nvarEnum [MaxNodes]u32 // VariantOf (CtorPattern): underlying Enum TypeID
 var nvarIdx [MaxNodes]u32  //   and variant index
 var nfunc [MaxNodes]u32    // FuncDecl/FuncLit -> FuncInfo
+var nbytes [MaxNodes]bool  // ImplicitBytes: a constant string used as []byte (v0.2)
 
 // funcOfSym returns the FuncInfo of a function or method symbol.
 func funcOfSym(s u32) u32 {

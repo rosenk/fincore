@@ -496,6 +496,11 @@ func (in *interp) lookupCell(sym *resolve.Symbol, id *ast.Ident) *cell {
 }
 
 func (in *interp) eval(e ast.Expr) types.Value {
+	if in.info.IsImplicitBytes(e) {
+		// a constant string used as []byte: a fresh copy (v0.2)
+		s, _ := in.info.ValueOf(e).(types.StringVal)
+		return byteSliceVal([]byte(s))
+	}
 	if v := in.info.ValueOf(e); v != nil {
 		return v // constant, or a comptime call folded by the checker
 	}
@@ -783,7 +788,9 @@ func (in *interp) callExpr(e *ast.CallExpr) types.Value {
 		return in.call(ci.Callee, nil, in.args(e), e)
 	case types.CallMethod:
 		var recv types.Value
-		if _, ok := ci.RecvType.(*types.Pointer); ok && ci.Method.PtrRecv {
+		if ci.AutoAddr {
+			recv = ptrVal{in.lvalue(ci.Recv)} // x.M() means (&x).M() (v0.2)
+		} else if _, ok := ci.RecvType.(*types.Pointer); ok && ci.Method.PtrRecv {
 			recv = in.eval(ci.Recv)
 		} else {
 			recv = in.eval(ci.Recv)
@@ -807,6 +814,15 @@ func (in *interp) callExpr(e *ast.CallExpr) types.Value {
 	return nil
 }
 
+// byteSliceVal is a fresh []u8 value holding b.
+func byteSliceVal(b []byte) types.SliceVal {
+	a := &types.ArrayVal{Elems: make([]types.Value, len(b))}
+	for i, c := range b {
+		a.Elems[i] = types.MakeUint(uint64(c))
+	}
+	return types.SliceVal{Arr: a, Lo: 0, Hi: len(b)}
+}
+
 func (in *interp) builtin(e *ast.CallExpr, ci *types.Call) types.Value {
 	args := in.args(e)
 	bytesOf := func(v types.Value) []byte {
@@ -823,13 +839,7 @@ func (in *interp) builtin(e *ast.CallExpr, ci *types.Call) types.Value {
 		}
 		return out
 	}
-	byteSlice := func(b []byte) types.SliceVal {
-		a := &types.ArrayVal{Elems: make([]types.Value, len(b))}
-		for i, c := range b {
-			a.Elems[i] = types.MakeUint(uint64(c))
-		}
-		return types.SliceVal{Arr: a, Lo: 0, Hi: len(b)}
-	}
+	byteSlice := byteSliceVal
 	switch ci.Builtin {
 	case resolve.FLen, resolve.FCap:
 		x := args[0]

@@ -1,0 +1,14 @@
+// fail_string_concat_nonconst: `+` on strings is constant folding only
+// (v0.2); with a non-constant operand it is E2002 (no run-time string
+// building).
+package main
+
+const Prefix = "error: "
+
+func label(name string) string {
+	return Prefix + name // ERROR E2002
+}
+
+driver func main(io Stdio) error {
+	return io.WriteStdout(strBytes(label("x")))
+}

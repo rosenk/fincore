@@ -63,7 +63,20 @@ func TestNegative(t *testing.T) {
 		{"const overflow", "package main\nfunc f() u8 {\n\treturn 300\n}\n", "E2002@3"},
 		{"string concat", "package main\nfunc f(a string) string {\n\treturn a + a\n}\n", "E2002@3"},
 		{"no new vars", "package main\nfunc f() {\n\tx := 1\n\tx := 2\n\t_ = x\n}\n", "E2002@4"},
-		{"ptr method on value", "package main\ntype A struct { n u32 }\nfunc (a *A) Inc() { a.n++ }\nfunc f() {\n\tvar a A\n\ta.Inc()\n}\n", "E2002@6"},
+		{"ptr method on value", "package main\ntype A struct { n u32 }\nfunc (a *A) Inc() { a.n++ }\nfunc mk() A { return A{} }\nfunc f() {\n\tmk().Inc()\n}\n", "E2002@6"},
+		{"ptr method on field of value", "package main\ntype A struct { n u32 }\ntype B struct { a A }\nfunc (a *A) Inc() { a.n++ }\nfunc mk() B { return B{} }\nfunc f() {\n\tmk().a.Inc()\n}\n", "E2002@7"},
+		{"ptr method on const", "package main\ntype A struct { n u32 }\nfunc (a *A) Inc() { a.n++ }\nconst C = A{n: 1}\nfunc f() {\n\tC.Inc()\n}\n", "E2002@6"},
+		{"ptr method on array of value", "package main\ntype A struct { n u32 }\nfunc (a *A) Inc() { a.n++ }\nfunc mk() [2]A { var z [2]A\n return z }\nfunc f() {\n\tmk()[0].Inc()\n}\n", "E2002@7"},
+		{"ptr method value", "package main\ntype A struct { n u32 }\nfunc (a *A) Inc() { a.n++ }\nfunc f() {\n\tvar a A\n\tg := a.Inc\n\t_ = g\n}\n", "E2002@6"},
+		{"string concat var", "package main\nconst P = \"p\"\nfunc f(a string) string {\n\treturn P + a\n}\n", "E2002@4"},
+		{"string concat typed var", "package main\nfunc f() string {\n\tvar a string = \"x\"\n\treturn \"y\" + a\n}\n", "E2002@4"},
+		{"string concat mixed", "package main\nconst P = \"p\"\nconst Q = P + 1\n", "E2002@3"},
+		{"string concat comptime param", "package main\ncomptime func J(a string, b string) string {\n\treturn a + b\n}\nconst X = J(\"a\", \"b\")\n", "E2002@3"},
+		{"typed string as bytes", "package main\nfunc g(b []byte) usize { return len(b) }\nfunc f() usize {\n\ts := \"abc\"\n\treturn g(s)\n}\n", "E2002@5"},
+		{"typed const as bytes", "package main\nconst S string = \"abc\"\nfunc g(b []byte) usize { return len(b) }\nfunc f() usize {\n\treturn g(S)\n}\n", "E2002@5"},
+		{"string const not comparable to bytes", "package main\nfunc f(b []byte) bool {\n\treturn b == \"x\"\n}\n", "E2002@3"},
+		{"string const to named byte elem", "package main\ntype Sig u8\nfunc f() []Sig {\n\treturn \"x\"\n}\n", "E2002@4"},
+		{"string const to type param", "package main\nfunc id[T any](x T) T { return x }\nfunc f() []byte {\n\treturn id(\"x\")\n}\n", "E2002@4"},
 		{"generic needs args", "package main\nfunc id[T any](x T) T { return x }\nfunc f() u32 {\n\treturn id(1)\n}\n", "E2002@4"},
 		{"arity call", "package main\nfunc g(a u32) u32 { return a }\nfunc f() u32 {\n\treturn g(1, 2)\n}\n", "E2003@4"},
 		{"arity return", "package main\nfunc f() (u32, bool) {\n\treturn 1\n}\n", "E2003@3"},
@@ -170,6 +183,57 @@ func f(s S) u32 {
 driver func f() u32 {
 	driver for {
 	}
+}`,
+		"ergonomics": `package main
+type Name string
+const A = "a"
+const B string = A + "b"
+const C Name = "c" + "d"
+const D = C + Name(B)
+type Bytes []u8
+type V[T any] struct {
+	items [4]T
+	n     usize
+}
+func (v *V[T]) Push(x T) {
+	if v.n < 4 {
+		v.items[v.n] = x
+		v.n++
+	}
+}
+func (v V[T]) Len() usize {
+	return v.n
+}
+func id[T any](x T) T {
+	return x
+}
+type Rec struct {
+	b []byte
+	v V[[]byte]
+}
+func (r *Rec) Set(b []byte) {
+	r.b = b
+}
+func take(b Bytes) usize {
+	return len(b)
+}
+func f(p *Rec, rs []Rec) usize {
+	var v V[[]byte]
+	v.Push("x")
+	var r Rec
+	r.v.Push(A + "y")
+	r.Set("z")
+	p.Set("w")
+	p.v.Push("q")
+	rs[0].Set("s")
+	(*p).Set("t")
+	var arr [2]Rec
+	arr[1].Set(A)
+	b := id[[]byte]("u")
+	s := id[string]("u" + A)
+	var w []byte
+	w = "w"
+	return v.Len() + p.v.Len() + len(b) + len(s) + len(w) + take("bytes") + take(Bytes("conv"))
 }`,
 		"capabilities": `package main
 driver func main(fs FS, env Env, io Stdio, ex Exec, c Clock, n Net, s Signals) error {

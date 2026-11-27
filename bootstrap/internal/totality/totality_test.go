@@ -868,3 +868,73 @@ func f(k u32) u32 {
 }`},
 	})
 }
+
+// v0.2 ergonomics: x.M() with a pointer receiver takes &x, exactly like an
+// explicit (&x).M(): the local becomes unstable for loop invariance.
+func TestAutoAddrTotality(t *testing.T) {
+	runAll(t, []tcase{
+		{"local bound through implicit &", `
+type Arena struct {
+	items [16]u32
+	len   usize
+}
+func (a *Arena) Pop() {
+	a.len = a.len - 1
+}
+func f() {
+	var a Arena
+	a.len = 4
+	for i := usize(0); i < a.len; i++ { // ERROR E4002
+		a.Pop()
+	}
+}`},
+		{"local bound through explicit &", `
+type Arena struct {
+	items [16]u32
+	len   usize
+}
+func (a *Arena) Pop() {
+	a.len = a.len - 1
+}
+func f() {
+	var a Arena
+	a.len = 4
+	for i := usize(0); i < a.len; i++ { // ERROR E4002
+		(&a).Pop()
+	}
+}`},
+		{"copied bound with implicit &", `
+type Arena struct {
+	items [16]u32
+	len   usize
+}
+func (a *Arena) Pop() {
+	a.len = a.len - 1
+}
+func f() {
+	var a Arena
+	a.len = 4
+	n := a.len
+	for i := usize(0); i < n; i++ {
+		a.Pop()
+	}
+}`},
+		{"value receiver keeps the bound stable", `
+type Arena struct {
+	items [16]u32
+	len   usize
+}
+func (a Arena) Peek() u32 {
+	return a.items[0]
+}
+func f() u32 {
+	var a Arena
+	a.len = 4
+	s := u32(0)
+	for i := usize(0); i < a.len; i++ {
+		s += a.Peek()
+	}
+	return s
+}`},
+	})
+}

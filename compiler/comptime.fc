@@ -919,6 +919,10 @@ func ieval(e u32, dp usize) Val decreases(dp) {
 		failSilent()
 		return z
 	}
+	if nbytes[usize(e)] {
+		// a constant string used as []byte: a fresh copy (v0.2)
+		return byteSliceVal(strOf(slotGet(nval[usize(e)])))
+	}
 	if nval[usize(e)] != 0 {
 		return slotGet(nval[usize(e)])
 	}
@@ -1411,7 +1415,18 @@ func icallExpr(e u32, dp usize) Val decreases(dp) {
 		return r
 	}
 	if c.kind == CallMethod {
-		recv := ieval(c.recv, dp-1)
+		var recv Val
+		if c.autoAddr {
+			// x.M() means (&x).M() (v0.2)
+			r := ilvalue(c.recv, dp-1)
+			if ifail {
+				return z
+			}
+			markAddr(c.recv, r)
+			recv = Val.Ptr(r)
+		} else {
+			recv = ieval(c.recv, dp-1)
+		}
 		if ifail {
 			return z
 		}

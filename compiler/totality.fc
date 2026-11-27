@@ -377,6 +377,15 @@ func computeRootFacts() {
 					symAddr[usize(s)] = true
 				}
 			}
+		} else if k == NkCallExpr {
+			ci := ncall[usize(x)]
+			if ci != 0 && callTab.items[usize(ci)].autoAddr {
+				// x.M() with a pointer receiver takes &x (v0.2)
+				s := storageRoot(callTab.items[usize(ci)].recv)
+				if s != 0 {
+					symAddr[usize(s)] = true
+				}
+			}
 		} else if k == NkAssignStmt {
 			lit := tlit[usize(x)]
 			if lit != 0 {

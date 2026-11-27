@@ -476,6 +476,13 @@ func IsBoolean(t Type) bool { k := basicKind(t); return k == Bool || k == Untype
 // IsString reports whether t's underlying type is string (typed or untyped).
 func IsString(t Type) bool { k := basicKind(t); return k == String || k == UntypedString }
 
+// IsByteSlice reports whether t's underlying type is []u8 (the targets of
+// implicit constant-string conversions, v0.2).
+func IsByteSlice(t Type) bool {
+	s, ok := t.Underlying().(*Slice)
+	return ok && Identical(s.Elem, Typ[U8])
+}
+
 // IntInfo returns the bit width and signedness of an integer type
 // (usize and int are 64-bit). ok is false for non-integer and untyped types.
 func IntInfo(t Type) (bits int, signed bool, ok bool) {

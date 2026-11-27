@@ -1,0 +1,8 @@
+// fail_string_as_bytes: only untyped constant strings convert implicitly
+// to []byte (v0.2); a typed string value still needs strBytes.
+package main
+
+driver func main(io Stdio) error {
+	msg := "hello\n"
+	return io.WriteStdout(msg) // ERROR E2002
+}
