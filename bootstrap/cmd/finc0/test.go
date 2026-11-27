@@ -26,9 +26,11 @@ import (
 //   - other tests are pass tests: `build [FLAGS]` must succeed; unless
 //     the header says `// BUILD-ONLY`, the program is run with no
 //     arguments, must exit 0 and its stdout must equal <name>.out;
-//   - a test whose header says `// SINCE: vX.Y` with X.Y newer than
-//     LangVersion is skipped and counted in the summary
-//     ("N skipped (needs vX.Y)", the newest version needed).
+//   - a test that requires a language version newer than LangVersion
+//     is skipped and counted in the summary ("N skipped (needs vX.Y)",
+//     the newest version needed). The required version is the highest
+//     `// SINCE: vX.Y` of the test's import closure (requiredVersion;
+//     the rule of scripts/langver, documented in testdata/README.md).
 
 var (
 	testErrorMarkerRE = regexp.MustCompile(`//\s*ERROR\s+(E\d{4})\b`)
@@ -38,7 +40,7 @@ var (
 type testCase struct {
 	name   string // display name (path relative to the given dir)
 	src    string // file or directory passed to check/build
-	header string // file carrying the directives
+	header string // file carrying the FLAGS/BUILD-ONLY directives
 	files  []string
 	out    string // expected stdout file (pass tests)
 }
@@ -46,7 +48,6 @@ type testCase struct {
 type testHeader struct {
 	flags     []string
 	buildOnly bool
-	since     string // `// SINCE:` value ("v0.3"), "" if absent
 }
 
 // langVersion is a FinCore language version X.Y.
@@ -58,33 +59,225 @@ func (v langVersion) less(w langVersion) bool {
 
 func (v langVersion) String() string { return fmt.Sprintf("v%d.%d", v.major, v.minor) }
 
-// parseLangVersion parses "X.Y" (with an optional leading "v").
+// parseLangVersion parses "X.Y" (with an optional leading "v"); X and Y
+// are 1 to 4 decimal digits.
 func parseLangVersion(s string) (langVersion, bool) {
 	s = strings.TrimPrefix(s, "v")
 	a, b, ok := strings.Cut(s, ".")
-	if !ok {
+	x, ok1 := versionDigits(a)
+	y, ok2 := versionDigits(b)
+	if !ok || !ok1 || !ok2 {
 		return langVersion{}, false
 	}
-	x, err1 := strconv.ParseUint(a, 10, 16)
-	y, err2 := strconv.ParseUint(b, 10, 16)
-	if err1 != nil || err2 != nil {
-		return langVersion{}, false
-	}
-	return langVersion{int(x), int(y)}, true
+	return langVersion{x, y}, true
 }
 
-// sinceSkip reports whether a test with header h needs a newer language
-// version than finc0's; bad is set for a malformed `// SINCE:` value.
-func sinceSkip(h testHeader) (need langVersion, skip bool, bad bool) {
-	if h.since == "" {
-		return langVersion{}, false, false
+func versionDigits(s string) (int, bool) {
+	if len(s) == 0 || len(s) > 4 {
+		return 0, false
 	}
-	need, ok := parseLangVersion(h.since)
-	if !ok || !strings.HasPrefix(h.since, "v") {
-		return langVersion{}, false, true
+	v := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		v = v*10 + int(s[i]-'0')
 	}
-	cur, _ := parseLangVersion(LangVersion)
-	return need, cur.less(need), false
+	return v, true
+}
+
+// ---------------------------------------------------------------------------
+// Required language version. Keep identical to scripts/langver and
+// compiler/build.fc; the rule is documented in testdata/README.md.
+
+// space is the white space of the SINCE and import scans (ASCII).
+const space = " \t\n\v\f\r"
+
+// fileSince returns the value of the first `// SINCE:` line of the leading
+// comment block of src (the trimmed lines that are empty or start with
+// `//`, up to the first other line).
+func fileSince(src string) (val string, ok bool) {
+	for _, line := range strings.Split(src, "\n") {
+		line = strings.Trim(line, space)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "//") {
+			break
+		}
+		if rest, found := strings.CutPrefix(line, "// SINCE:"); found {
+			return strings.Trim(rest, space), true
+		}
+	}
+	return "", false
+}
+
+// stripComments replaces each `//` and `/* */` comment by a space (a
+// block comment keeps its newlines); string literals are not recognized.
+func stripComments(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch {
+		case s[i] == '/' && i+1 < len(s) && s[i+1] == '/':
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			b.WriteByte(' ')
+			if i < len(s) {
+				b.WriteByte('\n')
+			}
+		case s[i] == '/' && i+1 < len(s) && s[i+1] == '*':
+			b.WriteByte(' ')
+			i += 2
+			for i < len(s) && !(s[i] == '*' && i+1 < len(s) && s[i+1] == '/') {
+				if s[i] == '\n' {
+					b.WriteByte('\n')
+				}
+				i++
+			}
+			i++ // now at the '/' of "*/" (or past the end)
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+// startsWord reports whether t starts with kw followed by the end, white
+// space, `(` or `"`.
+func startsWord(t, kw string) bool {
+	if !strings.HasPrefix(t, kw) {
+		return false
+	}
+	if len(t) == len(kw) {
+		return true
+	}
+	c := t[len(kw)]
+	return strings.IndexByte(space, c) >= 0 || c == '(' || c == '"'
+}
+
+// importSpecPath parses `[name] "path"` (t is trimmed).
+func importSpecPath(t string) (string, bool) {
+	q := strings.IndexByte(t, '"')
+	if q < 0 || strings.ContainsAny(strings.TrimRight(t[:q], space), space) {
+		return "", false
+	}
+	end := strings.IndexByte(t[q+1:], '"')
+	if end < 0 {
+		return "", false
+	}
+	return t[q+1 : q+1+end], true
+}
+
+// scanImports returns the import paths of src (the textual scan of
+// testdata/README.md): comments removed, lines trimmed, empty lines
+// skipped; `package ...` lines skipped; a line `import (` opens a block
+// of one spec per line up to a line starting with `)`; `import [name]
+// "p"`; any other line is the first declaration and ends the scan.
+func scanImports(src string) []string {
+	var out []string
+	inBlock := false
+	for _, line := range strings.Split(stripComments(src), "\n") {
+		t := strings.Trim(line, space)
+		switch {
+		case t == "":
+		case inBlock:
+			if strings.HasPrefix(t, ")") {
+				inBlock = false
+			} else if p, ok := importSpecPath(t); ok {
+				out = append(out, p)
+			}
+		case startsWord(t, "package"):
+		case startsWord(t, "import"):
+			r := strings.Trim(t[len("import"):], space)
+			if r == "(" {
+				inBlock = true
+			} else if p, ok := importSpecPath(r); ok {
+				out = append(out, p)
+			}
+		default:
+			return out
+		}
+	}
+	return out
+}
+
+// validImportPath is the compiler's import path check (resolve/load.go).
+func validImportPath(ip string) bool {
+	return ip != "" && !strings.HasPrefix(ip, "/") && !strings.Contains(ip, "\\") &&
+		!strings.HasPrefix(ip, "..") && ip == filepath.ToSlash(filepath.Clean(ip))
+}
+
+// requiredVersion returns the language version the test input src (a
+// file or a package directory) requires: the highest SINCE of its own
+// package (the file, or every .fc file directly in the directory) and,
+// transitively, of every package it imports. Valid import paths resolve
+// like the compiler's: against the working directory (the module root),
+// std/... against $FINCROOT when it is set. Imports that are not
+// directories are ignored; a visited package (keyed by its directory) is
+// not read again. A malformed directive is an error naming its file.
+func requiredVersion(src string) (need langVersion, ok bool, err error) {
+	fincRoot := os.Getenv("FINCROOT")
+	visited := map[string]bool{}
+	var queue []string
+	read := func(file string) error {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		if val, has := fileSince(string(data)); has {
+			v, good := parseLangVersion(val)
+			if !good || !strings.HasPrefix(val, "v") {
+				return fmt.Errorf("%s: bad // SINCE: %q (want vX.Y)", file, val)
+			}
+			if !ok || need.less(v) {
+				need, ok = v, true
+			}
+		}
+		for _, ip := range scanImports(string(data)) {
+			if !validImportPath(ip) {
+				continue
+			}
+			d := filepath.FromSlash(ip)
+			if fincRoot != "" && (ip == "std" || strings.HasPrefix(ip, "std/")) {
+				d = filepath.Join(fincRoot, d)
+			}
+			if !visited[d] {
+				visited[d] = true
+				queue = append(queue, d)
+			}
+		}
+		return nil
+	}
+	readPkg := func(dir string) error {
+		ents, err := os.ReadDir(dir) // sorted by name
+		if err != nil {
+			return err
+		}
+		for _, e := range ents {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".fc") {
+				continue
+			}
+			if err := read(filepath.Join(dir, e.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if isDir(src) {
+		err = readPkg(src)
+	} else {
+		err = read(src)
+	}
+	for i := 0; err == nil && i < len(queue); i++ {
+		if isDir(queue[i]) {
+			err = readPkg(queue[i])
+		}
+	}
+	if err != nil {
+		return langVersion{}, false, err
+	}
+	return need, ok, nil
 }
 
 func runTest(env *Env, args []string) int {
@@ -217,9 +410,6 @@ func readTestHeader(path string) (testHeader, error) {
 		if line == "// BUILD-ONLY" {
 			h.buildOnly = true
 		}
-		if rest, ok := strings.CutPrefix(line, "// SINCE:"); ok {
-			h.since = strings.TrimSpace(rest)
-		}
 	}
 	return h, sc.Err()
 }
@@ -253,11 +443,11 @@ func runTestCase(tc *testCase, work string, idx int) (kind, msg string, need lan
 	if err != nil {
 		return "?", err.Error(), need
 	}
-	need, skip, bad := sinceSkip(h)
-	if bad {
-		return "?", fmt.Sprintf("bad // SINCE: %q (want vX.Y)", h.since), need
+	need, ok, err := requiredVersion(tc.src)
+	if err != nil {
+		return "?", err.Error(), need
 	}
-	if skip {
+	if cur, _ := parseLangVersion(LangVersion); ok && cur.less(need) {
 		return "skip", "", need
 	}
 	want, err := expectedDiags(tc.files)

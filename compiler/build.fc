@@ -788,37 +788,283 @@ var hFlags [MaxExecArgs]string
 var nhFlags usize
 var hBuildOnly bool
 
-// `// SINCE: vX.Y` of the current test: hSince is set when present,
-// hSinceBad when the value is not vX.Y.
-var hSince bool
-var hSinceBad bool
-var hSinceMaj u64
-var hSinceMin u64
+// ---------------------------------------------------------------------------
+// Required language version of a test (testdata/README.md, "SINCE"; keep
+// identical to scripts/langver and finc0's bootstrap/cmd/finc0/test.go):
+// the highest `// SINCE: vX.Y` of the test's own files and, transitively,
+// of every package they import. Import paths resolve like loadImport's
+// (local paths against the working directory, std/... against $FINCROOT
+// when set); paths that are invalid or not directories are skipped, and
+// a package directory is read once (rqDirs is the visited set and the
+// work queue). Capacities: MaxSincePkgs packages, MaxFiles files per
+// package, TestBufBytes per file; exceeding one fails the test.
 
-// parseSince parses the value of a `// SINCE:` directive (vX.Y).
-func parseSince(v []byte) {
-	hSince = true
+const MaxSincePkgs = 256
+
+var rqDirs [MaxSincePkgs]string
+var nRqDirs usize
+var rqNames [MaxFiles]string
+var rqHave bool
+var rqMaj u64
+var rqMin u64
+
+// parseVersion parses vX.Y (X and Y: 1 to 4 decimal digits).
+func parseVersion(v []byte) (u64, u64, bool) {
 	n := len(v)
-	hSinceBad = true
 	if n < 4 || v[0] != 'v' {
-		return
+		return 0, 0, false
 	}
 	x, e1 := parseDigits(v, 1, 5)
-	if e1 == 1 || e1 >= n || v[e1] != '.' {
-		return
+	if e1 == 1 || e1 > 5 || e1 >= n || v[e1] != '.' {
+		return 0, 0, false
 	}
 	y, e2 := parseDigits(v, e1+1, 5)
-	if e2 == e1+1 || e2 != n {
-		return
+	if e2 == e1+1 || e2 > e1+5 || e2 != n {
+		return 0, 0, false
 	}
-	hSinceMaj = x
-	hSinceMin = y
-	hSinceBad = false
+	return x, y, true
 }
 
 // sinceNewer reports whether version maj.min is newer than LangVersion.
 func sinceNewer(maj u64, min u64) bool {
 	return maj > LangMajor || maj == LangMajor && min > LangMinor
+}
+
+// rqFail sets the failure message of the SINCE scan (mbuf[:k]).
+func rqFail(k usize) bool {
+	tmpBuf.Reset()
+	tmpBuf.WriteBytes(mbuf[:k])
+	return false
+}
+
+// stripComments copies src to dst with each `//` and `/* */` comment
+// replaced by a space (a block comment keeps its newlines; string
+// literals are not recognized) and returns the length, at most len(src).
+func stripComments(src []byte, dst []byte) usize {
+	n := len(src)
+	k := usize(0)
+	i := usize(0)
+	for g := usize(0); g < n; g++ {
+		if i >= n {
+			break
+		}
+		c := src[i]
+		if c == '/' && i+1 < n && src[i+1] == '/' {
+			dst[k] = ' '
+			k++
+			for h := usize(0); h < n; h++ {
+				if i >= n || src[i] == '\n' {
+					break
+				}
+				i++
+			}
+		} else if c == '/' && i+1 < n && src[i+1] == '*' {
+			dst[k] = ' '
+			k++
+			i += 2
+			for h := usize(0); h < n; h++ {
+				if i >= n || src[i] == '*' && i+1 < n && src[i+1] == '/' {
+					break
+				}
+				if src[i] == '\n' {
+					dst[k] = '\n'
+					k++
+				}
+				i++
+			}
+			i += 2
+		} else {
+			dst[k] = c
+			k++
+			i++
+		}
+	}
+	return k
+}
+
+// startsWord reports whether t starts with kw followed by the end, white
+// space, `(` or `"`.
+func startsWord(t []byte, kw string) bool {
+	if !cgBytesHasPrefix(t, kw) {
+		return false
+	}
+	n := len(strBytes(kw))
+	if len(t) == n {
+		return true
+	}
+	c := t[n]
+	return bytes.IsSpace(c) || c == '(' || c == '"'
+}
+
+// rqQueue queues the package directory of import path ip unless it is
+// invalid or already queued; false on overflow (message in tmpBuf).
+func rqQueue(ip []byte) bool {
+	if !validImportPath(ip) {
+		return true
+	}
+	dir := bytesToStr(ip)
+	if len(fincRoot) > 0 && isStdImport(ip) {
+		dir = joinPath(fincRoot, dir)
+		if len(dir) == 0 {
+			return rqFail(formatTo(mbuf[:], "SINCE scan: import path %v too long", Quoted(ip)))
+		}
+	}
+	nd := nRqDirs
+	for p := usize(0); p < nd; p++ {
+		if strEq(rqDirs[p], dir) {
+			return true
+		}
+	}
+	if nd >= MaxSincePkgs {
+		return rqFail(formatTo(mbuf[:], "SINCE scan: more than %d imported packages (MaxSincePkgs)", nd))
+	}
+	rqDirs[nd] = dir
+	nRqDirs = nd + 1
+	return true
+}
+
+// rqSpec queues the path of an import spec `[name] "path"` (t trimmed);
+// other text is ignored.
+func rqSpec(t []byte) bool {
+	q := bytes.IndexByte(t, '"')
+	if q < 0 {
+		return true
+	}
+	pre := bytes.TrimSpace(t[:usize(q)])
+	np := len(pre)
+	for k := usize(0); k < np; k++ {
+		if bytes.IsSpace(pre[k]) {
+			return true
+		}
+	}
+	rest := t[usize(q)+1:]
+	e := bytes.IndexByte(rest, '"')
+	if e < 0 {
+		return true
+	}
+	return rqQueue(rest[:usize(e)])
+}
+
+// rqImports queues the imports of a comment-free source: lines are
+// trimmed and empty ones skipped; `package ...` is skipped; `import (`
+// opens a block of one spec per line up to a line starting with `)`;
+// `import [name] "path"`; any other line ends the scan.
+func rqImports(s []byte) bool {
+	n := len(s)
+	inBlock := false
+	ls := usize(0)
+	lim := n + 1
+	for i := usize(0); i < lim; i++ {
+		if i < n && s[i] != '\n' {
+			continue
+		}
+		t := bytes.TrimSpace(s[ls:i])
+		ls = i + 1
+		if len(t) > 0 {
+			if inBlock {
+				if t[0] == ')' {
+					inBlock = false
+				} else if !rqSpec(t) {
+					return false
+				}
+			} else if startsWord(t, "import") {
+				r := bytes.TrimSpace(t[6:])
+				if cgBytesIs(r, "(") {
+					inBlock = true
+				} else if !rqSpec(r) {
+					return false
+				}
+			} else if !startsWord(t, "package") {
+				return true
+			}
+		}
+		if i == n {
+			break
+		}
+	}
+	return true
+}
+
+// rqFile reads one file of the closure: the first `// SINCE:` line of its
+// leading comment block (trimmed lines that are empty or start with
+// `//`), then its imports. false on failure (message in tmpBuf).
+driver func rqFile(fs FS, file string) bool {
+	n, err := fs.ReadFileInto(file, testBuf[:])
+	if err == ErrArenaFull {
+		return rqFail(formatTo(mbuf[:], "%s: too large for the SINCE scan (more than %d bytes)", file, TestBufBytes))
+	}
+	if err != nil {
+		return rqFail(formatTo(mbuf[:], "cannot read %s", file))
+	}
+	data := testBuf[:n]
+	ls := usize(0)
+	lim := n + 1
+	for i := usize(0); i < lim; i++ {
+		if i < n && data[i] != '\n' {
+			continue
+		}
+		t := bytes.TrimSpace(data[ls:i])
+		ls = i + 1
+		if len(t) > 0 {
+			if !cgBytesHasPrefix(t, "//") {
+				break
+			}
+			if cgBytesHasPrefix(t, "// SINCE:") {
+				val := bytes.TrimSpace(t[9:])
+				maj, mnr, ok := parseVersion(val)
+				if !ok {
+					return rqFail(formatTo(mbuf[:], "%s: bad // SINCE: %v (want vX.Y)", file, Quoted(val)))
+				}
+				if !rqHave || maj > rqMaj || maj == rqMaj && mnr > rqMin {
+					rqHave = true
+					rqMaj = maj
+					rqMin = mnr
+				}
+				break
+			}
+		}
+		if i == n {
+			break
+		}
+	}
+	m := stripComments(data, testBuf2[:])
+	return rqImports(testBuf2[:m])
+}
+
+// requiredVersion computes the version the current test requires (rqHave,
+// rqMaj, rqMin) from its files fileNames[:nf] and their import closure;
+// false on failure (message in tmpBuf).
+driver func requiredVersion(fs FS, nf usize) bool {
+	rqHave = false
+	rqMaj = 0
+	rqMin = 0
+	nRqDirs = 0
+	for f := usize(0); f < nf; f++ {
+		if !rqFile(fs, fileNames[f]) {
+			return false
+		}
+	}
+	for p := usize(0); p < MaxSincePkgs; p++ {
+		if p >= nRqDirs {
+			break
+		}
+		dir := rqDirs[p]
+		if fs.IsDir(dir) {
+			cnt, err := fs.ListSourceFiles(dir, rqNames[:])
+			if err == ErrArenaFull {
+				return rqFail(formatTo(mbuf[:], "%s: more than %d .fc files (SINCE scan)", dir, MaxFiles))
+			}
+			if err != nil {
+				return rqFail(formatTo(mbuf[:], "cannot list %s", dir))
+			}
+			for k := usize(0); k < cnt; k++ {
+				if !rqFile(fs, joinPath(dir, rqNames[k])) {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func parseDigits(b []byte, i usize, max usize) (u64, usize) {
@@ -882,13 +1128,11 @@ func scanMarkers(base string, lineNo u64, line []byte) {
 	}
 }
 
-// readHeader reads the directives of a test's first file and the ERROR
-// markers of all its files.
+// readHeader reads the FLAGS/BUILD-ONLY directives of a test's first file
+// and the ERROR markers of all its files (SINCE: requiredVersion).
 driver func readHeader(fs FS, nfiles usize) error {
 	nhFlags = 0
 	hBuildOnly = false
-	hSince = false
-	hSinceBad = false
 	nWant = 0
 	for f := usize(0); f < nfiles; f++ {
 		path := fileNames[f]
@@ -939,8 +1183,6 @@ driver func readHeader(fs FS, nfiles usize) error {
 					}
 				} else if cgBytesIs(tl, "// BUILD-ONLY") {
 					hBuildOnly = true
-				} else if cgBytesHasPrefix(tl, "// SINCE:") {
-					parseSince(bytes.TrimSpace(tl[9:]))
 				}
 			}
 			scanMarkers(base, lineNo, line)
@@ -1236,18 +1478,16 @@ driver func runTest(fs FS, env Env, io Stdio, exec Exec) error {
 			kind = "?"
 			tmpBuf.Reset()
 			tmpBuf.WriteString("cannot read test sources")
-		} else if hSince && hSinceBad {
+		} else if !requiredVersion(fs, nf) {
 			kind = "?"
-			tmpBuf.Reset()
-			tmpBuf.WriteString("bad // SINCE: directive (want vX.Y)")
-		} else if hSince && sinceNewer(hSinceMaj, hSinceMin) {
+		} else if rqHave && sinceNewer(rqMaj, rqMin) {
 			skipped++
-			if hSinceMaj > needMaj || hSinceMaj == needMaj && hSinceMin > needMin {
-				needMaj = hSinceMaj
-				needMin = hSinceMin
+			if rqMaj > needMaj || rqMaj == needMaj && rqMin > needMin {
+				needMaj = rqMaj
+				needMin = rqMin
 			}
 			if verbose {
-				k := formatTo(mbuf[:], "skip %s (needs v%d.%d)\n", tName[i], hSinceMaj, hSinceMin)
+				k := formatTo(mbuf[:], "skip %s (needs v%d.%d)\n", tName[i], rqMaj, rqMin)
 				if err := io.WriteStdout(mbuf[:k]); err != nil {
 					_ = fs.RemoveAll(work)
 					return err

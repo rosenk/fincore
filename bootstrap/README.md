@@ -43,8 +43,8 @@ The `finc0 vs finc1` differential targets (`make diff-parse`, `diff-check*`,
 `diff-build`, `diff-build-vet`) remain as **regression checks of the frozen
 v0.2 subset**: finc1 must still treat v0.2 programs exactly like finc0.
 Once `compiler/` implements v0.3 features, these targets run only on
-v0.2 inputs: a corpus file (or any .fc file of a package directory) that
-needs a newer version says so in its leading comment block,
+v0.2 inputs. A source file that needs a newer version says so in its
+leading comment block,
 
 ```go
 // SINCE: v0.3
@@ -52,12 +52,20 @@ needs a newer version says so in its leading comment block,
 package main
 ```
 
-and scripts/diffcheck, scripts/diffbuild and `make diff-parse`
-(scripts/sincefilter) skip it. The parser of the directive is
-`scripts/langver` (`langver.Finc0` is `v0.2`). When `compiler/` itself
+and an input (a file or a package directory) needs the highest version of
+its import closure: every .fc file of its own package and, transitively,
+every local or std package it imports (resolved from the module root, std
+through `$FINCROOT` when set; the exact rule and import scan are in
+testdata/README.md, "SINCE"). scripts/diffcheck, scripts/diffbuild and
+`make diff-parse` (scripts/sincefilter) skip inputs newer than v0.2;
+they run from the module root. The rule is implemented by
+`scripts/langver` (`langver.Finc0` is `v0.2`) and, identically, by
+`finc0 test` (`requiredVersion` in cmd/finc0/test.go: tooling, allowed
+under the freeze) and by compiler/'s `finc test`. When `compiler/` itself
 starts *using* a v0.3 feature (after a seed bump, below), put `// SINCE:
 v0.3` at the top of the file that uses it, so the differential skips
-compiler/ and its mutants.
+compiler/ and its mutants; a v0.3 std package that compiler/ imports
+makes compiler/ need v0.3 as well, without a marker in compiler/.
 
 ## The seed (`bootstrap/SEED`)
 

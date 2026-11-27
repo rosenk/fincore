@@ -121,10 +121,64 @@ func TestTestSince(t *testing.T) {
 	if v, ok := parseLangVersion("v9.9"); !ok || !(langVersion{0, 2}).less(v) || v.String() != "v9.9" {
 		t.Fatal(v, ok)
 	}
-	for _, bad := range []string{"", "v", "v1", "v1.", "v.1", "v1.x", "v1.2.3", "v-1.2"} {
+	for _, bad := range []string{"", "v", "v1", "v1.", "v.1", "v1.x", "v1.2.3", "v-1.2", "v+1.2", "v12345.0", "v1.2 x"} {
 		if _, ok := parseLangVersion(bad); ok {
 			t.Errorf("parseLangVersion(%q) ok", bad)
 		}
+	}
+}
+
+// TestTestSinceClosure checks that a test requires the highest SINCE of
+// its import closure: every file of its package and, transitively, the
+// local and std packages it imports (testdata/README.md). The temporary
+// directory is the module root (the working directory).
+func TestTestSinceClosure(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("FINCROOT", "fr")
+	fut := "// SINCE: v9.9\npackage lib\n\nnot v0.2 syntax\n"
+	// directive in a non-first file
+	writeFile(t, filepath.Join(dir, "pass", "second", "a.fc"), "package main\n\nnot v0.2 syntax\n")
+	writeFile(t, filepath.Join(dir, "pass", "second", "b.fc"), "// SINCE: v9.9\npackage main\n")
+	// in an imported subpackage
+	writeFile(t, filepath.Join(dir, "pass", "sub", "main.fc"), "package main\n\nimport \"pass/sub/lib\"\n\nnot v0.2 syntax\n")
+	writeFile(t, filepath.Join(dir, "pass", "sub", "lib", "lib.fc"), fut)
+	// in a std package through FINCROOT (the module root's std/fut has none)
+	writeFile(t, filepath.Join(dir, "pass", "stdimp.fc"), "package main\n\nimport \"std/fut\"\n\nnot v0.2 syntax\n")
+	writeFile(t, filepath.Join(dir, "fr", "std", "fut", "f.fc"), fut)
+	writeFile(t, filepath.Join(dir, "std", "fut", "f.fc"), "package fut\n")
+	// a cycle, reached transitively
+	writeFile(t, filepath.Join(dir, "pass", "cyc.fc"), "package main\n\nimport \"lib/a\"\n")
+	writeFile(t, filepath.Join(dir, "lib", "a", "a.fc"), "package a\n\nimport \"lib/b\"\n")
+	writeFile(t, filepath.Join(dir, "lib", "b", "b.fc"), "// SINCE: v9.9\npackage b\n\nimport \"lib/a\"\n")
+	// an import block (names, comments)
+	writeFile(t, filepath.Join(dir, "pass", "blk.fc"), "package main\n\nimport (\n\t\"lib/none\" // ignored\n\t/* \"lib/x\" */\n\tf \"lib/fut\"\n)\n\nnot v0.2 syntax\n")
+	writeFile(t, filepath.Join(dir, "lib", "fut", "f.fc"), fut)
+	// imports that are not directories, or after a declaration, are not
+	// followed: these tests run.
+	writeFile(t, filepath.Join(dir, "fail", "nodir.fc"), "package main\n\nimport \"missing\" // ERROR E2001\nimport \"fail/late.fc\" // ERROR E2001\n")
+	writeFile(t, filepath.Join(dir, "fail", "late.fc"), "package main\n\nvar g u32 = 1\n\nimport \"lib/fut\" // ERROR E1001\n")
+	code, out, errs := run("test", "-v", dir)
+	if code != ExitOK || !strings.Contains(out, "7 tests, 2 passed, 0 failed, 5 skipped (needs v9.9)") {
+		t.Fatalf("test: %d %q %q", code, out, errs)
+	}
+	for _, n := range []string{"second", "sub", "stdimp.fc", "cyc.fc", "blk.fc"} {
+		if !strings.Contains(out, n+" (needs v9.9)") {
+			t.Errorf("%s not skipped:\n%s", n, out)
+		}
+	}
+	// Without FINCROOT, std/fut is the module root's (no directive).
+	t.Setenv("FINCROOT", "")
+	if code, out, _ = run("test", filepath.Join(dir, "pass")); !strings.Contains(out, "5 tests, 0 passed, 1 failed, 4 skipped") ||
+		!strings.Contains(out, "stdimp.fc") {
+		t.Fatalf("no FINCROOT: %d %q", code, out)
+	}
+	// A malformed directive in an imported package fails the test, naming
+	// the file.
+	writeFile(t, filepath.Join(dir, "lib", "fut", "f.fc"), "// SINCE: 9.9\npackage lib\n")
+	code, out, _ = run("test", filepath.Join(dir, "pass"))
+	if code != ExitError || !strings.Contains(out, filepath.Join("lib", "fut", "f.fc")+`: bad // SINCE: "9.9"`) {
+		t.Fatalf("bad since in an import: %d %q", code, out)
 	}
 }
 

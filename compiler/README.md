@@ -403,7 +403,9 @@ below is the subset in use today, all of it v0.2.
 Once compiler/ uses a v0.3 feature, mark the file that uses it with
 `// SINCE: v0.3` in its leading comment block so that the finc0-vs-finc1
 differential (`make diff-*`, a regression check of the v0.2 subset)
-skips compiler/ and its mutants.
+skips compiler/ and its mutants. (A marker in a std package compiler/
+imports counts as well: an input needs the highest SINCE of its import
+closure, testdata/README.md.)
 
 - Only `func` (total) and `driver func`; no `comptime`, generics,
   closures, `defer` or `scope`. Sum types (enums with payloads, `match`

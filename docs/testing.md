@@ -40,6 +40,15 @@ Each runner (`finc0 test`, `finc1 test`, the Go runner in
 current compiler must pass all of it (`finc2 test testdata` in
 `make bootstrap`).
 
+A test needs the highest `SINCE` of its import closure: every `.fc` file
+of its package and, transitively, every local or std package it imports
+(resolved from the module root, std through `$FINCROOT` when set). The
+directive may therefore sit in any file of a directory test or in an
+imported package, and a test that only imports a std package using v0.3
+needs no marker of its own. The three runners and the diff tools
+(`scripts/langver`) implement this one rule identically; the exact rule
+and the textual import scan are in testdata/README.md ("SINCE").
+
 ### 2. Regression comparison with the previous release (`make diff-prev`)
 
 `scripts/diffprev` runs the current compiler (`bin/finc1`) and the previous
