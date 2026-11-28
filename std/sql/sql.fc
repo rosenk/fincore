@@ -1,0 +1,414 @@
+// Package sql provides zero-GC, allocation-free SQL primitives (typed Param
+// sum types, zero-copy streaming Row views, bounded RowBuf, Result, and DBError).
+package sql
+
+import "std/strings"
+
+const (
+	MaxCols       usize = 64
+	MaxRowBytes   usize = 16384
+	MaxColNameBuf usize = 2048
+)
+
+// Param is a strongly-typed SQL query parameter (zero reflection, zero boxing).
+type Param enum {
+	Null
+	Bool(bool)
+	Int(i64)
+	Uint(u64)
+	Text(string)
+}
+
+func Null() Param {
+	return Param.Null()
+}
+
+func Bool(v bool) Param {
+	return Param.Bool(v)
+}
+
+func Int(v i64) Param {
+	return Param.Int(v)
+}
+
+func Uint(v u64) Param {
+	return Param.Uint(v)
+}
+
+func Text(v string) Param {
+	return Param.Text(v)
+}
+
+const emptyParamArr = [0]Param{}
+
+// NoParams returns an empty parameter slice for parameterless queries.
+func NoParams() const []Param {
+	return emptyParamArr[:]
+}
+
+// ColDesc describes one column returned by a query (from RowDescription).
+type ColDesc struct {
+	NameOff u16
+	NameLen u16
+	TypeOID u32
+}
+
+// ColSpan locates a single column value within a raw DataRow payload buffer.
+type ColSpan struct {
+	Off    u32
+	Len    u32
+	IsNull bool
+}
+
+// Schema holds the column metadata for the active result set in a bounded buffer.
+type Schema struct {
+	Cols    [MaxCols]ColDesc
+	NumCols u16
+	NameBuf [MaxColNameBuf]byte
+	NameLen usize
+}
+
+func (s *Schema) Reset() {
+	s.NumCols = 0
+	s.NameLen = 0
+}
+
+func (s *Schema) AddCol(name const []byte, typeOID u32) {
+	if usize(s.NumCols) >= MaxCols {
+		return
+	}
+	off := s.NameLen
+	n := len(name)
+	if off+n > MaxColNameBuf {
+		n = MaxColNameBuf - off
+	}
+	for i := usize(0); i < n; i++ {
+		s.NameBuf[off+i] = name[i]
+	}
+	s.Cols[s.NumCols] = ColDesc{
+		NameOff: u16(off),
+		NameLen: u16(n),
+		TypeOID: typeOID,
+	}
+	s.NameLen = off + n
+	s.NumCols++
+}
+
+func (s const *Schema) ColName(i u16) const []byte {
+	if i >= s.NumCols {
+		return s.NameBuf[:0]
+	}
+	c := s.Cols[i]
+	lo := usize(c.NameOff)
+	return s.NameBuf[lo : lo+usize(c.NameLen)]
+}
+
+func (s const *Schema) ColOID(i u16) u32 {
+	if i >= s.NumCols {
+		return 0
+	}
+	return s.Cols[i].TypeOID
+}
+
+func (s const *Schema) FindCol(name string) (u16, bool) {
+	target := strView(name)
+	for i := u16(0); i < s.NumCols; i++ {
+		c := s.Cols[i]
+		lo := usize(c.NameOff)
+		if strings.EqualFold(s.NameBuf[lo:lo+usize(c.NameLen)], target) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// Row is a zero-copy view of a single SQL result row backed directly by the
+// driver's wire buffer. Column slices are valid for the duration of the row callback.
+type Row struct {
+	schema  const *Schema
+	data    const []byte
+	spans   [MaxCols]ColSpan
+	numCols u16
+}
+
+// NewRow constructs a zero-copy Row view (used by SQL drivers such as std/pg).
+func NewRow(schema const *Schema, data const []byte, spans [MaxCols]ColSpan, numCols u16) Row {
+	return Row{
+		schema:  schema,
+		data:    data,
+		spans:   spans,
+		numCols: numCols,
+	}
+}
+
+func (r const *Row) ColCount() u16 {
+	return r.numCols
+}
+
+func (r const *Row) ColName(i u16) const []byte {
+	return r.schema.ColName(i)
+}
+
+func (r const *Row) ColOID(i u16) u32 {
+	return r.schema.ColOID(i)
+}
+
+func (r const *Row) FindCol(name string) (u16, bool) {
+	return r.schema.FindCol(name)
+}
+
+func (r const *Row) IsNull(i u16) bool {
+	if i >= r.numCols {
+		return true
+	}
+	return r.spans[i].IsNull
+}
+
+// Bytes returns the raw bytes of column i, or (empty, false) if NULL or out of range.
+func (r const *Row) Bytes(i u16) (const []byte, bool) {
+	if i >= r.numCols || r.spans[i].IsNull {
+		return r.data[:0], false
+	}
+	lo := usize(r.spans[i].Off)
+	hi := lo + usize(r.spans[i].Len)
+	if hi > len(r.data) {
+		return r.data[:0], false
+	}
+	return r.data[lo:hi], true
+}
+
+// Text returns the text representation of column i, or (empty, false) if NULL.
+func (r const *Row) Text(i u16) (const []byte, bool) {
+	return r.Bytes(i)
+}
+
+// Int parses column i as a signed 64-bit integer. Returns (0, false) on NULL or parse error.
+func (r const *Row) Int(i u16) (i64, bool) {
+	raw, ok := r.Bytes(i)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseInt(raw)
+}
+
+// Uint parses column i as an unsigned 64-bit integer. Returns (0, false) on NULL or parse error.
+func (r const *Row) Uint(i u16) (u64, bool) {
+	raw, ok := r.Bytes(i)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseUint(raw)
+}
+
+// Bool parses a SQL/PostgreSQL boolean column ("t"/"true"/"1" or "f"/"false"/"0").
+func (r const *Row) Bool(i u16) (bool, bool) {
+	raw, ok := r.Bytes(i)
+	if !ok || len(raw) == 0 {
+		return false, false
+	}
+	if len(raw) == 1 {
+		if raw[0] == 't' || raw[0] == 'T' || raw[0] == '1' {
+			return true, true
+		}
+		if raw[0] == 'f' || raw[0] == 'F' || raw[0] == '0' {
+			return false, true
+		}
+	}
+	if strings.EqualFoldStr(raw, "true") {
+		return true, true
+	}
+	if strings.EqualFoldStr(raw, "false") {
+		return false, true
+	}
+	return false, false
+}
+
+func (r const *Row) TextByName(name string) (const []byte, bool) {
+	idx, ok := r.FindCol(name)
+	if !ok {
+		return r.data[:0], false
+	}
+	return r.Text(idx)
+}
+
+func (r const *Row) IntByName(name string) (i64, bool) {
+	idx, ok := r.FindCol(name)
+	if !ok {
+		return 0, false
+	}
+	return r.Int(idx)
+}
+
+func (r const *Row) BoolByName(name string) (bool, bool) {
+	idx, ok := r.FindCol(name)
+	if !ok {
+		return false, false
+	}
+	return r.Bool(idx)
+}
+
+// RowBuf owns a single row's bytes in a stack-allocated buffer (used by QueryRow).
+type RowBuf struct {
+	Schema  Schema
+	Data    [MaxRowBytes]byte
+	DataLen usize
+	Spans   [MaxCols]ColSpan
+	NumCols u16
+}
+
+func (rb *RowBuf) Reset() {
+	rb.Schema.Reset()
+	rb.DataLen = 0
+	rb.NumCols = 0
+}
+
+func (rb const *RowBuf) ColCount() u16 {
+	return rb.NumCols
+}
+
+func (rb const *RowBuf) IsNull(i u16) bool {
+	if i >= rb.NumCols {
+		return true
+	}
+	return rb.Spans[i].IsNull
+}
+
+func (rb const *RowBuf) Text(i u16) (const []byte, bool) {
+	if i >= rb.NumCols || rb.Spans[i].IsNull {
+		return rb.Data[:0], false
+	}
+	lo := usize(rb.Spans[i].Off)
+	hi := lo + usize(rb.Spans[i].Len)
+	if hi > rb.DataLen {
+		return rb.Data[:0], false
+	}
+	return rb.Data[lo:hi], true
+}
+
+func (rb const *RowBuf) Int(i u16) (i64, bool) {
+	raw, ok := rb.Text(i)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseInt(raw)
+}
+
+func (rb const *RowBuf) Uint(i u16) (u64, bool) {
+	raw, ok := rb.Text(i)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseUint(raw)
+}
+
+func (rb const *RowBuf) Bool(i u16) (bool, bool) {
+	raw, ok := rb.Text(i)
+	if !ok || len(raw) == 0 {
+		return false, false
+	}
+	if len(raw) == 1 {
+		if raw[0] == 't' || raw[0] == 'T' || raw[0] == '1' {
+			return true, true
+		}
+		if raw[0] == 'f' || raw[0] == 'F' || raw[0] == '0' {
+			return false, true
+		}
+	}
+	if strings.EqualFoldStr(raw, "true") {
+		return true, true
+	}
+	if strings.EqualFoldStr(raw, "false") {
+		return false, true
+	}
+	return false, false
+}
+
+func (rb const *RowBuf) TextByName(name string) (const []byte, bool) {
+	idx, ok := rb.Schema.FindCol(name)
+	if !ok {
+		return rb.Data[:0], false
+	}
+	return rb.Text(idx)
+}
+
+func (rb const *RowBuf) IntByName(name string) (i64, bool) {
+	idx, ok := rb.Schema.FindCol(name)
+	if !ok {
+		return 0, false
+	}
+	return rb.Int(idx)
+}
+
+// Result summarizes an executed SQL statement (RowsAffected + raw command tag).
+type Result struct {
+	RowsAffected u64
+	Tag          [32]byte
+	TagLen       usize
+}
+
+func (r const *Result) TagBytes() const []byte {
+	return r.Tag[:r.TagLen]
+}
+
+// ParseCommandTag parses a PostgreSQL CommandComplete tag (e.g. "INSERT 0 1",
+// "UPDATE 3", "DELETE 2", "SELECT 10") into a Result.
+func ParseCommandTag(tag const []byte) Result {
+	var res Result
+	n := len(tag)
+	if n > len(res.Tag) {
+		n = len(res.Tag)
+	}
+	for i := usize(0); i < n; i++ {
+		res.Tag[i] = tag[i]
+	}
+	res.TagLen = n
+	// Last space-separated token is the affected row count when numeric.
+	lastSp := usize(0)
+	foundSp := false
+	for i := usize(0); i < len(tag); i++ {
+		if tag[i] == ' ' {
+			lastSp = i
+			foundSp = true
+		}
+	}
+	if foundSp && lastSp+1 < len(tag) {
+		if cnt, ok := strings.ParseUint(tag[lastSp+1:]); ok {
+			res.RowsAffected = cnt
+		}
+	}
+	return res
+}
+
+// DBError captures a structured server error (PostgreSQL SQLSTATE + severity + message).
+type DBError struct {
+	HasErr   bool
+	Severity [16]byte
+	SevLen   usize
+	Code     [5]byte
+	CodeLen  usize
+	Message  [256]byte
+	MsgLen   usize
+}
+
+func (e *DBError) Clear() {
+	e.HasErr = false
+	e.SevLen = 0
+	e.CodeLen = 0
+	e.MsgLen = 0
+}
+
+func (e const *DBError) CodeBytes() const []byte {
+	return e.Code[:e.CodeLen]
+}
+
+func (e const *DBError) CodeIs(sqlstate string) bool {
+	return e.HasErr && strings.EqualStr(e.Code[:e.CodeLen], sqlstate)
+}
+
+func (e const *DBError) MsgBytes() const []byte {
+	return e.Message[:e.MsgLen]
+}
+
+func (e const *DBError) SeverityBytes() const []byte {
+	return e.Severity[:e.SevLen]
+}

@@ -1,0 +1,654 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/crypto/sha256"
+	"std/encoding/base64"
+	"std/pg"
+	"std/sql"
+	"std/strings"
+)
+
+// ---------------------------------------------------------------------------
+// Minimal wire helpers for the in-process PostgreSQL v3.0 test server
+
+func wPutBE16(dst []byte, off usize, v u16) {
+	dst[off] = byte((v >> 8) & 0xff)
+	dst[off+1] = byte(v & 0xff)
+}
+
+func wPutBE32(dst []byte, off usize, v u32) {
+	dst[off] = byte((v >> 24) & 0xff)
+	dst[off+1] = byte((v >> 16) & 0xff)
+	dst[off+2] = byte((v >> 8) & 0xff)
+	dst[off+3] = byte(v & 0xff)
+}
+
+func wGetBE16(b const []byte, off usize) u16 {
+	return (u16(b[off]) << 8) | u16(b[off+1])
+}
+
+func wGetBE32(b const []byte, off usize) u32 {
+	return (u32(b[off]) << 24) | (u32(b[off+1]) << 16) | (u32(b[off+2]) << 8) | u32(b[off+3])
+}
+
+func wAppend(dst []byte, pos usize, src const []byte) usize {
+	for i := usize(0); i < len(src); i++ {
+		dst[pos+i] = src[i]
+	}
+	return pos + len(src)
+}
+
+func wAppendStr(dst []byte, pos usize, s string) usize {
+	return wAppend(dst, pos, strView(s))
+}
+
+func srvWriteAll(ctx Context, conn Conn, data []byte) error {
+	for rem := data; len(rem) > 0; {
+		n, err := conn.Write(ctx, rem)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+	return nil
+}
+
+driver func srvReadExact(ctx Context, conn *Conn, dst []byte) error {
+	got := usize(0)
+	driver for {
+		if got >= len(dst) {
+			return nil
+		}
+		n, err := (*conn).Read(ctx, dst[got:])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrEOF
+		}
+		got += n
+	}
+}
+
+func srvHMAC(key const []byte, msg const []byte) [32]byte {
+	var kb [64]byte
+	kn := len(key)
+	if kn > 64 {
+		kn = 64
+	}
+	for i := usize(0); i < kn; i++ {
+		kb[i] = key[i]
+	}
+	var ip [64]byte
+	var op [64]byte
+	for i := usize(0); i < 64; i++ {
+		ip[i] = kb[i] ^ 0x36
+		op[i] = kb[i] ^ 0x5c
+	}
+	h1 := sha256.New()
+	h1.Write(ip[:])
+	h1.Write(msg)
+	s1 := h1.Sum()
+	h2 := sha256.New()
+	h2.Write(op[:])
+	h2.Write(s1[:])
+	return h2.Sum()
+}
+
+func srvPBKDF2(pass const []byte, salt const []byte, iter u32) [32]byte {
+	var s1 [64]byte
+	sl := len(salt)
+	for i := usize(0); i < sl; i++ {
+		s1[i] = salt[i]
+	}
+	s1[sl+3] = 1
+	u := srvHMAC(pass, s1[:sl+4])
+	out := u
+	for i := u32(1); i < iter; i++ {
+		u = srvHMAC(pass, u[:])
+		for j := usize(0); j < 32; j++ {
+			out[j] ^= u[j]
+		}
+	}
+	return out
+}
+
+func sendMsg(ctx Context, conn Conn, mtype byte, payload []byte) error {
+	var hdr [5]byte
+	hdr[0] = mtype
+	wPutBE32(hdr[:], 1, u32(4+len(payload)))
+	if err := srvWriteAll(ctx, conn, hdr[:]); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		return srvWriteAll(ctx, conn, payload)
+	}
+	return nil
+}
+
+func sendReady(ctx Context, conn Conn, st byte) error {
+	var p [1]byte
+	p[0] = st
+	return sendMsg(ctx, conn, 'Z', p[:])
+}
+
+func sendCmdComplete(ctx Context, conn Conn, tag string) error {
+	var p [64]byte
+	n := wAppendStr(p[:], 0, tag)
+	p[n] = 0
+	return sendMsg(ctx, conn, 'C', p[:n+1])
+}
+
+func sendUsersRowDesc(ctx Context, conn Conn) error {
+	// 4 columns: id (OID 23), name (OID 25), active (OID 16), bio (OID 25)
+	var p [256]byte
+	wPutBE16(p[:], 0, 4)
+	pos := usize(2)
+	names := [4]string{"id", "name", "active", "bio"}
+	oids := [4]u32{23, 25, 16, 25}
+	for i := usize(0); i < 4; i++ {
+		pos = wAppendStr(p[:], pos, names[i])
+		p[pos] = 0
+		pos++
+		// tableOID(4), colAttr(2), typeOID(4), typeSize(2), typeMod(4), formatCode(2)
+		wPutBE32(p[:], pos, 16384)
+		wPutBE16(p[:], pos+4, u16(i+1))
+		wPutBE32(p[:], pos+6, oids[i])
+		wPutBE16(p[:], pos+10, 0xffff)
+		wPutBE32(p[:], pos+12, 0xffffffff)
+		wPutBE16(p[:], pos+16, 0)
+		pos += 18
+	}
+	return sendMsg(ctx, conn, 'T', p[:pos])
+}
+
+func sendUserRow(ctx Context, conn Conn, id string, name string, active string, hasBio bool, bio string) error {
+	var p [256]byte
+	wPutBE16(p[:], 0, 4)
+	pos := usize(2)
+
+	wPutBE32(p[:], pos, u32(len(id)))
+	pos += 4
+	pos = wAppendStr(p[:], pos, id)
+
+	wPutBE32(p[:], pos, u32(len(name)))
+	pos += 4
+	pos = wAppendStr(p[:], pos, name)
+
+	wPutBE32(p[:], pos, u32(len(active)))
+	pos += 4
+	pos = wAppendStr(p[:], pos, active)
+
+	if !hasBio {
+		wPutBE32(p[:], pos, 0xffffffff)
+		pos += 4
+	} else {
+		wPutBE32(p[:], pos, u32(len(bio)))
+		pos += 4
+		pos = wAppendStr(p[:], pos, bio)
+	}
+	return sendMsg(ctx, conn, 'D', p[:pos])
+}
+
+// ---------------------------------------------------------------------------
+// Mock PostgreSQL v3.0 Server (verifies SCRAM-SHA-256 + Extended Query + Tx + Terminate)
+
+driver func servePG(
+	ctx Context,
+	ln Listener,
+	scramOk *Atomic[u64],
+	md5Ok *Atomic[u64],
+	txCommits *Atomic[u64],
+	txRollbacks *Atomic[u64],
+	termSeen *Atomic[u64],
+) {
+	defer ln.Close()
+
+	// Serve 2 connections: #1 uses SCRAM-SHA-256, #2 uses MD5 auth!
+	for connIdx := u32(0); connIdx < 2; connIdx++ {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		handlePGConn(ctx, conn, connIdx, scramOk, md5Ok, txCommits, txRollbacks, termSeen)
+	}
+}
+
+driver func handlePGConn(
+	ctx Context,
+	conn Conn,
+	connIdx u32,
+	scramOk *Atomic[u64],
+	md5Ok *Atomic[u64],
+	txCommits *Atomic[u64],
+	txRollbacks *Atomic[u64],
+	termSeen *Atomic[u64],
+) {
+	defer conn.Close()
+
+	// 1. Read StartupMessage
+	var shdr [8]byte
+	if err := srvReadExact(ctx, &conn, shdr[:]); err != nil {
+		return
+	}
+	slen := usize(wGetBE32(shdr[:], 0))
+	if slen < 8 || slen > 1024 {
+		return
+	}
+	var sbody [1024]byte
+	if err := srvReadExact(ctx, &conn, sbody[:slen-8]); err != nil {
+		return
+	}
+
+	// 2. Authenticate: conn 0 = SCRAM-SHA-256, conn 1 = MD5
+	if connIdx == 0 {
+		// Send AuthenticationSASL (10) offering "SCRAM-SHA-256\0\0"
+		var saslP [32]byte
+		wPutBE32(saslP[:], 0, 10)
+		sp := wAppendStr(saslP[:], 4, "SCRAM-SHA-256")
+		saslP[sp] = 0
+		saslP[sp+1] = 0
+		if err := sendMsg(ctx, conn, 'R', saslP[:sp+2]); err != nil {
+			return
+		}
+		// Read SASLInitialResponse ('p')
+		var mhdr [5]byte
+		if err := srvReadExact(ctx, &conn, mhdr[:]); err != nil || mhdr[0] != 'p' {
+			return
+		}
+		mlen := usize(wGetBE32(mhdr[:], 1)) - 4
+		var mp [512]byte
+		if err := srvReadExact(ctx, &conn, mp[:mlen]); err != nil {
+			return
+		}
+		// Skip "SCRAM-SHA-256\0" (14 bytes) + 4-byte len -> client-first ("n,,n=...,r=...")
+		cFirst := mp[18:mlen]
+		cFirstBare := cFirst[3:] // strip "n,,"
+		// Extract client nonce after ",r="
+		rPos, rOk := strings.Index(cFirstBare, strView(",r="))
+		if !rOk {
+			return
+		}
+		cNonce := cFirstBare[rPos+3:]
+
+		// Build server-first: "r=<cNonce>SRVNONCE42,s=<b64(salt)>,i=4096"
+		salt := strView("fincore-pg-salt!")
+		var saltB64 [32]byte
+		sbLen, _ := base64.Encode(saltB64[:], salt)
+		var sFirst [192]byte
+		sfp := wAppendStr(sFirst[:], 0, "r=")
+		sfp = wAppend(sFirst[:], sfp, cNonce)
+		sfp = wAppendStr(sFirst[:], sfp, "SRVNONCE42,s=")
+		sfp = wAppend(sFirst[:], sfp, saltB64[:sbLen])
+		sfp = wAppendStr(sFirst[:], sfp, ",i=4096")
+
+		var contP [200]byte
+		wPutBE32(contP[:], 0, 11)
+		cp := wAppend(contP[:], 4, sFirst[:sfp])
+		if err := sendMsg(ctx, conn, 'R', contP[:cp]); err != nil {
+			return
+		}
+
+		// Read SASLResponse ('p'): "c=biws,r=<fullNonce>,p=<b64Proof>"
+		if err := srvReadExact(ctx, &conn, mhdr[:]); err != nil || mhdr[0] != 'p' {
+			return
+		}
+		mlen2 := usize(wGetBE32(mhdr[:], 1)) - 4
+		var mp2 [512]byte
+		if err := srvReadExact(ctx, &conn, mp2[:mlen2]); err != nil {
+			return
+		}
+		cFinal := mp2[:mlen2]
+		pIdx, pOk := strings.Index(cFinal, strView(",p="))
+		if !pOk {
+			return
+		}
+		cFinalNoProof := cFinal[:pIdx]
+		var gotProof [64]byte
+		gpLen, gpErr := base64.Decode(gotProof[:], cFinal[pIdx+3:])
+		if gpErr != nil || gpLen != 32 {
+			return
+		}
+
+		// Compute expected ClientProof & ServerSignature using password "s3cr3t!"
+		salted := srvPBKDF2(strView("s3cr3t!"), salt, 4096)
+		cKey := srvHMAC(salted[:], strView("Client Key"))
+		stored := sha256.Sum256(cKey[:])
+		sKey := srvHMAC(salted[:], strView("Server Key"))
+
+		var authMsg [640]byte
+		amp := wAppend(authMsg[:], 0, cFirstBare)
+		amp = wAppendStr(authMsg[:], amp, ",")
+		amp = wAppend(authMsg[:], amp, sFirst[:sfp])
+		amp = wAppendStr(authMsg[:], amp, ",")
+		amp = wAppend(authMsg[:], amp, cFinalNoProof)
+
+		cSig := srvHMAC(stored[:], authMsg[:amp])
+		var wantProof [32]byte
+		for i := usize(0); i < 32; i++ {
+			wantProof[i] = cKey[i] ^ cSig[i]
+		}
+		if !strings.Equal(gotProof[:32], wantProof[:]) {
+			return
+		}
+		_ = scramOk.Add(1)
+
+		// Send AuthenticationSASLFinal (12) with "v=<b64(ServerSignature)>"
+		sSig := srvHMAC(sKey[:], authMsg[:amp])
+		var sigB64 [64]byte
+		sgLen, _ := base64.Encode(sigB64[:], sSig[:])
+		var finP [96]byte
+		wPutBE32(finP[:], 0, 12)
+		fp := wAppendStr(finP[:], 4, "v=")
+		fp = wAppend(finP[:], fp, sigB64[:sgLen])
+		if err := sendMsg(ctx, conn, 'R', finP[:fp]); err != nil {
+			return
+		}
+	} else {
+		// Connection #2: AuthenticationMD5Password (type 5) with salt {0x11, 0x22, 0x33, 0x44}
+		var md5Req [8]byte
+		wPutBE32(md5Req[:], 0, 5)
+		md5Req[4] = 0x11
+		md5Req[5] = 0x22
+		md5Req[6] = 0x33
+		md5Req[7] = 0x44
+		if err := sendMsg(ctx, conn, 'R', md5Req[:]); err != nil {
+			return
+		}
+		var mhdr [5]byte
+		if err := srvReadExact(ctx, &conn, mhdr[:]); err != nil || mhdr[0] != 'p' {
+			return
+		}
+		mlen := usize(wGetBE32(mhdr[:], 1)) - 4
+		var mp [64]byte
+		if err := srvReadExact(ctx, &conn, mp[:mlen]); err != nil {
+			return
+		}
+		// Must be "md5" + 32 hex chars + '\0' (36 bytes)
+		if mlen == 36 && mp[0] == 'm' && mp[1] == 'd' && mp[2] == '5' && mp[35] == 0 {
+			_ = md5Ok.Add(1)
+		}
+	}
+
+	// Send AuthenticationOk (0), BackendKeyData ('K'), ReadyForQuery ('Z' 'I')
+	var okP [4]byte
+	wPutBE32(okP[:], 0, 0)
+	_ = sendMsg(ctx, conn, 'R', okP[:])
+	var bkP [8]byte
+	wPutBE32(bkP[:], 0, 4242)
+	wPutBE32(bkP[:], 4, 9999)
+	_ = sendMsg(ctx, conn, 'K', bkP[:])
+	_ = sendReady(ctx, conn, 'I')
+
+	// 3. Command loop
+	var txState byte = 'I'
+	var curQuery [256]byte
+	var curQueryLen usize = 0
+	var lastParam0 [64]byte
+	var lastParam0Len usize = 0
+	var lastParamCount u16 = 0
+
+	driver for {
+		var hdr [5]byte
+		if err := srvReadExact(ctx, &conn, hdr[:]); err != nil {
+			return
+		}
+		mtype := hdr[0]
+		mlen := usize(wGetBE32(hdr[:], 1)) - 4
+		var buf [1024]byte
+		if mlen > 0 {
+			if mlen > len(buf) {
+				return
+			}
+			if err := srvReadExact(ctx, &conn, buf[:mlen]); err != nil {
+				return
+			}
+		}
+
+		if mtype == 'X' {
+			_ = termSeen.Add(1)
+			return
+		}
+		if mtype == 'Q' {
+			q := buf[:mlen]
+			if len(q) > 0 && q[len(q)-1] == 0 {
+				q = q[:len(q)-1]
+			}
+			if len(q) == 0 {
+				var empty [0]byte
+				_ = sendMsg(ctx, conn, 'I', empty[:])
+			} else if strings.EqualStr(q, "BEGIN") {
+				txState = 'T'
+				_ = sendCmdComplete(ctx, conn, "BEGIN")
+			} else if strings.EqualStr(q, "COMMIT") {
+				txState = 'I'
+				_ = txCommits.Add(1)
+				_ = sendCmdComplete(ctx, conn, "COMMIT")
+			} else if strings.EqualStr(q, "ROLLBACK") {
+				txState = 'I'
+				_ = txRollbacks.Add(1)
+				_ = sendCmdComplete(ctx, conn, "ROLLBACK")
+			} else {
+				_ = sendCmdComplete(ctx, conn, "OK")
+			}
+			_ = sendReady(ctx, conn, txState)
+		} else if mtype == 'P' {
+			// Skip stmtName '\0' (1 byte), copy query up to '\0'
+			qEnd := usize(1)
+			for j := usize(1); j < mlen; j++ {
+				if buf[j] == 0 {
+					qEnd = j
+					break
+				}
+			}
+			curQueryLen = wAppend(curQuery[:], 0, buf[1:qEnd])
+			var empty [0]byte
+			_ = sendMsg(ctx, conn, '1', empty[:])
+		} else if mtype == 'B' {
+			// Skip portal '\0', stmt '\0', paramFmtCount(2) -> paramCount(2)
+			pos := usize(4)
+			lastParamCount = wGetBE16(buf[:], pos)
+			pos += 2
+			lastParam0Len = 0
+			if lastParamCount > 0 {
+				p0Len := wGetBE32(buf[:], pos)
+				pos += 4
+				if p0Len != 0xffffffff && usize(p0Len) <= len(lastParam0) {
+					lastParam0Len = wAppend(lastParam0[:], 0, buf[pos:pos+usize(p0Len)])
+				}
+			}
+			var empty [0]byte
+			_ = sendMsg(ctx, conn, '2', empty[:])
+		} else if mtype == 'D' {
+			q := curQuery[:curQueryLen]
+			if strings.HasPrefix(q, strView("SELECT")) {
+				_ = sendUsersRowDesc(ctx, conn)
+			} else {
+				var empty [0]byte
+				_ = sendMsg(ctx, conn, 'n', empty[:])
+			}
+		} else if mtype == 'E' {
+			q := curQuery[:curQueryLen]
+			if strings.ContainsStr(q, "DUPLICATE") {
+				// ErrorResponse ('E'): S=ERROR, C=23505, M=duplicate key value
+				var ep [128]byte
+				epos := usize(0)
+				ep[epos] = 'S'
+				epos++
+				epos = wAppendStr(ep[:], epos, "ERROR")
+				ep[epos] = 0
+				epos++
+				ep[epos] = 'C'
+				epos++
+				epos = wAppendStr(ep[:], epos, "23505")
+				ep[epos] = 0
+				epos++
+				ep[epos] = 'M'
+				epos++
+				epos = wAppendStr(ep[:], epos, "duplicate key value")
+				ep[epos] = 0
+				epos++
+				ep[epos] = 0
+				epos++
+				_ = sendMsg(ctx, conn, 'E', ep[:epos])
+			} else if strings.HasPrefix(q, strView("INSERT")) {
+				if lastParamCount == 4 && strings.EqualStr(lastParam0[:lastParam0Len], "1") {
+					_ = sendCmdComplete(ctx, conn, "INSERT 0 1")
+				} else {
+					_ = sendCmdComplete(ctx, conn, "INSERT 0 0")
+				}
+			} else if strings.ContainsStr(q, "WHERE id = $1") {
+				if strings.EqualStr(lastParam0[:lastParam0Len], "1") {
+					_ = sendUserRow(ctx, conn, "1", "Alice", "t", false, "")
+					_ = sendCmdComplete(ctx, conn, "SELECT 1")
+				} else {
+					_ = sendCmdComplete(ctx, conn, "SELECT 0")
+				}
+			} else if strings.HasPrefix(q, strView("SELECT")) {
+				_ = sendUserRow(ctx, conn, "1", "Alice", "t", false, "")
+				_ = sendUserRow(ctx, conn, "2", "Bob", "f", true, "systems")
+				_ = sendUserRow(ctx, conn, "3", "Carol", "t", true, "fincore")
+				_ = sendCmdComplete(ctx, conn, "SELECT 3")
+			}
+		} else if mtype == 'S' {
+			_ = sendReady(ctx, conn, txState)
+		}
+	}
+}
+
+driver func main(io Stdio, net Net) error {
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr()
+
+	srvCtx, stopSrv := NewContext()
+	defer stopSrv()
+
+	var scramOk Atomic[u64]
+	var md5Ok Atomic[u64]
+	var txCommits Atomic[u64]
+	var txRollbacks Atomic[u64]
+	var termSeen Atomic[u64]
+
+	var pidOk bool = false
+	var pingOk bool = false
+	var insertOk bool = false
+	var queryOk bool = false
+	var queryRowOk bool = false
+	var noRowOk bool = false
+	var errCodeOk bool = false
+
+	scope bg := NewFiberScope(2, 16) {
+		_ = bg.Spawn(srvCtx, driver func() {
+			servePG(srvCtx, ln, &scramOk, &md5Ok, &txCommits, &txRollbacks, &termSeen)
+		})
+
+		cCtx, cancelC := NewContext()
+		defer cancelC()
+
+		// Session 1: SCRAM-SHA-256 auth + Ping + WithTx(Commit/Rollback) + Query(early stop) + QueryRow + ErrorResponse
+		cfg1 := pg.Config{
+			Addr:     addr,
+			User:     "postgres",
+			Password: "s3cr3t!",
+			Database: "fincore_db",
+		}
+		oerr1 := pg.Open(cCtx, net, cfg1, driver func(db *pg.Client) error {
+			pidOk = db.BackendPID() == 4242 && db.TxStatus() == 'I'
+			pingOk = db.Ping(cCtx) == nil
+
+			// Scoped transaction: COMMIT path
+			txErr1 := db.WithTx(cCtx, driver func(tx *pg.Tx) error {
+				params := [4]sql.Param{
+					sql.Int(1),
+					sql.Text("Alice"),
+					sql.Bool(true),
+					sql.Null(),
+				}
+				res, ierr := tx.Exec(cCtx, "INSERT INTO users (id, name, active, bio) VALUES ($1, $2, $3, $4)", params[:])
+				if ierr == nil && res.RowsAffected == 1 {
+					insertOk = true
+				}
+				return ierr
+			})
+			if txErr1 != nil {
+				return txErr1
+			}
+
+			// Scoped transaction: automatic ROLLBACK path on error
+			_ = db.WithTx(cCtx, driver func(tx *pg.Tx) error {
+				_ = tx
+				return ErrParse
+			})
+
+			// Zero-copy streaming Query with early stop after 2 of 3 rows (auto-drains row 3!)
+			var seenRows u32 = 0
+			var row1Ok bool = false
+			var row2Ok bool = false
+			pSel := [1]sql.Param{sql.Int(1)}
+			qRes, qErr := db.Query(cCtx, "SELECT id, name, active, bio FROM users WHERE id >= $1", pSel[:], func(r const *sql.Row) bool {
+				seenRows++
+				id, okI := r.Int(0)
+				name, okN := r.TextByName("name")
+				act, okA := r.Bool(2)
+				bio, okB := r.Text(3)
+				if seenRows == 1 {
+					row1Ok = okI && id == 1 && okN && strings.EqualStr(name, "Alice") && okA && act && !okB && r.IsNull(3)
+					return true
+				}
+				if seenRows == 2 {
+					row2Ok = okI && id == 2 && okN && strings.EqualStr(name, "Bob") && okA && !act && okB && strings.EqualStr(bio, "systems")
+					return false // early stop! Client still drains cleanly to ReadyForQuery!
+				}
+				return true
+			})
+			queryOk = qErr == nil && seenRows == 2 && qRes.RowsAffected == 3 && row1Ok && row2Ok
+
+			// QueryRow: found case
+			var rb sql.RowBuf
+			pOne := [1]sql.Param{sql.Int(1)}
+			found1, fErr1 := db.QueryRow(cCtx, "SELECT id, name, active, bio FROM users WHERE id = $1", pOne[:], &rb)
+			if fErr1 == nil && found1 {
+				id, okI := rb.Int(0)
+				name, okN := rb.TextByName("name")
+				queryRowOk = okI && id == 1 && okN && strings.EqualStr(name, "Alice") && rb.IsNull(3)
+			}
+
+			// QueryRow: 0-rows case (found == false, err == nil!)
+			pMissing := [1]sql.Param{sql.Int(999)}
+			found2, fErr2 := db.QueryRow(cCtx, "SELECT id, name, active, bio FROM users WHERE id = $1", pMissing[:], &rb)
+			noRowOk = fErr2 == nil && !found2
+
+			// Structured PostgreSQL ErrorResponse (SQLSTATE 23505)
+			_, derr := db.Exec(cCtx, "INSERT DUPLICATE", sql.NoParams())
+			errCodeOk = derr != nil && db.HasError() &&
+				db.LastError().CodeIs("23505") &&
+				strings.EqualStr(db.LastError().MsgBytes(), "duplicate key value")
+
+			return nil
+		})
+		_ = oerr1
+
+		// Session 2: MD5 authentication
+		oerr2 := pg.Open(cCtx, net, cfg1, driver func(db *pg.Client) error {
+			return db.Ping(cCtx)
+		})
+		_ = oerr2
+
+		bg.Wait()
+		stopSrv()
+	}
+
+	var out [256]byte
+	n := formatTo(out[:], "auth=%d,%d pg=%v,%v,%v,%v,%v,%v,%v tx=%d,%d term=%d\n",
+		scramOk.Load(), md5Ok.Load(),
+		pidOk, pingOk, insertOk, queryOk, queryRowOk, noRowOk, errCodeOk,
+		txCommits.Load(), txRollbacks.Load(), termSeen.Load())
+	return io.WriteStdout(out[:n])
+}

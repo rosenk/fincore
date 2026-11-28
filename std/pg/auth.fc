@@ -1,0 +1,401 @@
+// PostgreSQL authentication primitives:
+// - SCRAM-SHA-256 (RFC 5802 / RFC 7677: HMAC-SHA-256 + PBKDF2-HMAC-SHA-256)
+// - MD5 password auth (RFC 1321)
+// 100% Layer-2 total, zero heap allocation.
+package pg
+
+import (
+	"std/crypto/sha256"
+	"std/encoding/base64"
+	"std/encoding/hex"
+	"std/strings"
+)
+
+// ---------------------------------------------------------------------------
+// HMAC-SHA-256 & PBKDF2-HMAC-SHA-256 (RFC 2104 / RFC 2898)
+
+func hmacSHA256(key const []byte, msg const []byte) [32]byte {
+	var kBlock [64]byte
+	if len(key) > 64 {
+		kh := sha256.Sum256(key)
+		for i := usize(0); i < 32; i++ {
+			kBlock[i] = kh[i]
+		}
+	} else {
+		for i := usize(0); i < len(key); i++ {
+			kBlock[i] = key[i]
+		}
+	}
+
+	var ipad [64]byte
+	var opad [64]byte
+	for i := usize(0); i < 64; i++ {
+		ipad[i] = kBlock[i] ^ 0x36
+		opad[i] = kBlock[i] ^ 0x5c
+	}
+
+	inner := sha256.New()
+	inner.Write(ipad[:])
+	inner.Write(msg)
+	inSum := inner.Sum()
+
+	outer := sha256.New()
+	outer.Write(opad[:])
+	outer.Write(inSum[:])
+	return outer.Sum()
+}
+
+// pbkdf2SHA256 computes a 32-byte DK (single block, INT_32_BE(1)) for SCRAM-SHA-256.
+// Bounded at 65536 iterations for Layer-2 totality (PostgreSQL default is 4096).
+func pbkdf2SHA256(password const []byte, salt const []byte, iterations u32) ([32]byte, bool) {
+	var out [32]byte
+	if iterations == 0 || iterations > 65536 || len(salt) > 128 {
+		return out, false
+	}
+	var salt1 [132]byte
+	sl := len(salt)
+	for i := usize(0); i < sl; i++ {
+		salt1[i] = salt[i]
+	}
+	salt1[sl] = 0
+	salt1[sl+1] = 0
+	salt1[sl+2] = 0
+	salt1[sl+3] = 1
+
+	u := hmacSHA256(password, salt1[:sl+4])
+	for i := usize(0); i < 32; i++ {
+		out[i] = u[i]
+	}
+	for it := u32(1); it < iterations; it++ {
+		u = hmacSHA256(password, u[:])
+		for i := usize(0); i < 32; i++ {
+			out[i] ^= u[i]
+		}
+	}
+	return out, true
+}
+
+// ---------------------------------------------------------------------------
+// SCRAM-SHA-256 Client State Machine (RFC 5802 / RFC 7677)
+
+type scramState struct {
+	nonce     [24]byte
+	nonceLen  usize
+	cFirstB   [160]byte
+	cFirstLen usize
+	serverSig [32]byte
+}
+
+func appendConstBytes(dst []byte, pos usize, src const []byte) usize {
+	n := len(src)
+	if pos+n > len(dst) {
+		n = len(dst) - pos
+	}
+	for i := usize(0); i < n; i++ {
+		dst[pos+i] = src[i]
+	}
+	return pos + n
+}
+
+func appendStr(dst []byte, pos usize, s string) usize {
+	return appendConstBytes(dst, pos, strView(s))
+}
+
+// generateNonce produces a printable base64 client nonce from a seed value.
+func generateNonce(seed u64, dst []byte) usize {
+	var raw [16]byte
+	x := seed ^ 0x9e3779b97f4a7c15
+	for i := usize(0); i < 16; i++ {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		raw[i] = byte(x & 0xff)
+	}
+	n, err := base64.Encode(dst, raw[:])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func (st *scramState) buildClientFirst(user const []byte, seed u64, out []byte) usize {
+	st.nonceLen = generateNonce(seed, st.nonce[:])
+	// client-first-message-bare = "n=<user>,r=<nonce>"
+	p := usize(0)
+	p = appendStr(st.cFirstB[:], p, "n=")
+	p = appendConstBytes(st.cFirstB[:], p, user)
+	p = appendStr(st.cFirstB[:], p, ",r=")
+	p = appendConstBytes(st.cFirstB[:], p, st.nonce[:st.nonceLen])
+	st.cFirstLen = p
+
+	// gs2-header ("n,,") + client-first-message-bare
+	q := usize(0)
+	q = appendStr(out, q, "n,,")
+	q = appendConstBytes(out, q, st.cFirstB[:st.cFirstLen])
+	return q
+}
+
+func (st *scramState) processServerFirst(password const []byte, serverFirst const []byte, out []byte) (usize, error) {
+	// Parse "r=<fullNonce>,s=<b64Salt>,i=<iter>"
+	var rStart usize = 0
+	var rEnd usize = 0
+	hasR := false
+	var sStart usize = 0
+	var sEnd usize = 0
+	hasS := false
+	var iter u32 = 0
+	hasI := false
+
+	pos := usize(0)
+	n := len(serverFirst)
+	for part := usize(0); part < 8; part++ {
+		if pos >= n {
+			break
+		}
+		end := n
+		for j := pos; j < n; j++ {
+			if serverFirst[j] == ',' {
+				end = j
+				break
+			}
+		}
+		if end > pos+2 && serverFirst[pos+1] == '=' {
+			k := serverFirst[pos]
+			vs := pos + 2
+			if k == 'r' {
+				rStart = vs
+				rEnd = end
+				hasR = true
+			} else if k == 's' {
+				sStart = vs
+				sEnd = end
+				hasS = true
+			} else if k == 'i' {
+				if iv, ok := strings.ParseUint(serverFirst[vs:end]); ok && iv > 0 && iv <= 65536 {
+					iter = u32(iv)
+					hasI = true
+				}
+			}
+		}
+		pos = end + 1
+	}
+
+	if !hasR || !hasS || !hasI {
+		return 0, ErrParse
+	}
+	fullNonce := serverFirst[rStart:rEnd]
+	// Server nonce MUST start with our client nonce (RFC 5802 §5.1).
+	if !strings.HasPrefix(fullNonce, st.nonce[:st.nonceLen]) {
+		return 0, ErrParse
+	}
+
+	var saltBuf [128]byte
+	saltLen, serr := base64.Decode(saltBuf[:], serverFirst[sStart:sEnd])
+	if serr != nil {
+		return 0, ErrParse
+	}
+
+	saltedPass, pok := pbkdf2SHA256(password, saltBuf[:saltLen], iter)
+	if !pok {
+		return 0, ErrParse
+	}
+
+	clientKey := hmacSHA256(saltedPass[:], strView("Client Key"))
+	storedKey := sha256.Sum256(clientKey[:])
+	serverKey := hmacSHA256(saltedPass[:], strView("Server Key"))
+
+	// client-final-message-without-proof = "c=biws,r=<fullNonce>"
+	var cFinalNoProof [160]byte
+	cfLen := usize(0)
+	cfLen = appendStr(cFinalNoProof[:], cfLen, "c=biws,r=")
+	cfLen = appendConstBytes(cFinalNoProof[:], cfLen, fullNonce)
+
+	// AuthMessage = client-first-message-bare + "," + server-first-message + "," + client-final-without-proof
+	var authMsg [640]byte
+	amLen := usize(0)
+	amLen = appendConstBytes(authMsg[:], amLen, st.cFirstB[:st.cFirstLen])
+	amLen = appendStr(authMsg[:], amLen, ",")
+	amLen = appendConstBytes(authMsg[:], amLen, serverFirst)
+	amLen = appendStr(authMsg[:], amLen, ",")
+	amLen = appendConstBytes(authMsg[:], amLen, cFinalNoProof[:cfLen])
+
+	clientSig := hmacSHA256(storedKey[:], authMsg[:amLen])
+	var clientProof [32]byte
+	for i := usize(0); i < 32; i++ {
+		clientProof[i] = clientKey[i] ^ clientSig[i]
+	}
+
+	// Expected ServerSignature for ServerFinal mutual authentication!
+	st.serverSig = hmacSHA256(serverKey[:], authMsg[:amLen])
+
+	var proofB64 [64]byte
+	pbLen, perr := base64.Encode(proofB64[:], clientProof[:])
+	if perr != nil {
+		return 0, ErrParse
+	}
+
+	q := usize(0)
+	q = appendConstBytes(out, q, cFinalNoProof[:cfLen])
+	q = appendStr(out, q, ",p=")
+	q = appendConstBytes(out, q, proofB64[:pbLen])
+	return q, nil
+}
+
+func (st const *scramState) verifyServerFinal(serverFinal const []byte) bool {
+	if len(serverFinal) < 3 || serverFinal[0] != 'v' || serverFinal[1] != '=' {
+		return false
+	}
+	var got [64]byte
+	n, err := base64.Decode(got[:], serverFinal[2:])
+	if err != nil || n != 32 {
+		return false
+	}
+	// Constant-time compare of 32-byte server signature.
+	var diff u8 = 0
+	for i := usize(0); i < 32; i++ {
+		diff |= got[i] ^ st.serverSig[i]
+	}
+	return diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// RFC 1321 MD5 (for legacy PostgreSQL AuthenticationMD5Password)
+
+const md5K = [64]u32{
+	0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+	0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+	0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+	0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+	0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+	0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+	0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+	0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+	0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+	0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+	0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+	0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+	0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+	0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+	0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+	0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+}
+
+const md5S = [64]u32{
+	7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+	5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+	4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+	6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+}
+
+func rotl32(x u32, n u32) u32 {
+	return (x << n) | (x >> (32 - n))
+}
+
+func readLE32(b const []byte, off usize) u32 {
+	return u32(b[off]) | (u32(b[off+1]) << 8) | (u32(b[off+2]) << 16) | (u32(b[off+3]) << 24)
+}
+
+func writeLE32(dst []byte, off usize, v u32) {
+	dst[off] = byte(v & 0xff)
+	dst[off+1] = byte((v >> 8) & 0xff)
+	dst[off+2] = byte((v >> 16) & 0xff)
+	dst[off+3] = byte((v >> 24) & 0xff)
+}
+
+func md5Sum(data const []byte) [16]byte {
+	var a0 u32 = 0x67452301
+	var b0 u32 = 0xefcdab89
+	var c0 u32 = 0x98badcfe
+	var d0 u32 = 0x10325476
+
+	// Copy + pad into bounded buffer (auth inputs are <= 256 bytes).
+	var buf [384]byte
+	n := len(data)
+	if n > 256 {
+		n = 256
+	}
+	for i := usize(0); i < n; i++ {
+		buf[i] = data[i]
+	}
+	buf[n] = 0x80
+	rem := (n + 1) % 64
+	padZeros := usize(0)
+	if rem <= 56 {
+		padZeros = 56 - rem
+	} else {
+		padZeros = 120 - rem
+	}
+	totalLen := n + 1 + padZeros
+	bitLen := u64(n) * 8
+	writeLE32(buf[:], totalLen, u32(bitLen&0xffffffff))
+	writeLE32(buf[:], totalLen+4, u32(bitLen>>32))
+	totalLen += 8
+
+	blocks := totalLen / 64
+	for bi := usize(0); bi < blocks; bi++ {
+		off := bi * 64
+		var m [16]u32
+		for j := usize(0); j < 16; j++ {
+			m[j] = readLE32(buf[:], off+j*4)
+		}
+		a := a0
+		b := b0
+		c := c0
+		d := d0
+		for i := usize(0); i < 64; i++ {
+			var f u32 = 0
+			var g usize = 0
+			if i < 16 {
+				f = (b & c) | ((^b) & d)
+				g = i
+			} else if i < 32 {
+				f = (d & b) | ((^d) & c)
+				g = (5*i + 1) & 15
+			} else if i < 48 {
+				f = b ^ c ^ d
+				g = (3*i + 5) & 15
+			} else {
+				f = c ^ (b | (^d))
+				g = (7 * i) & 15
+			}
+			f = f + a + md5K[i] + m[g]
+			a = d
+			d = c
+			c = b
+			b = b + rotl32(f, md5S[i])
+		}
+		a0 += a
+		b0 += b
+		c0 += c
+		d0 += d
+	}
+
+	var out [16]byte
+	writeLE32(out[:], 0, a0)
+	writeLE32(out[:], 4, b0)
+	writeLE32(out[:], 8, c0)
+	writeLE32(out[:], 12, d0)
+	return out
+}
+
+// md5AuthPassword computes PostgreSQL's "md5" + hex(md5(hex(md5(pass+user)) + salt)).
+func md5AuthPassword(user const []byte, pass const []byte, salt [4]byte, out []byte) usize {
+	var pu [256]byte
+	pl := appendConstBytes(pu[:], 0, pass)
+	pl = appendConstBytes(pu[:], pl, user)
+	d1 := md5Sum(pu[:pl])
+
+	var h1Salt [36]byte
+	_, _ = hex.Encode(h1Salt[:32], d1[:])
+	h1Salt[32] = salt[0]
+	h1Salt[33] = salt[1]
+	h1Salt[34] = salt[2]
+	h1Salt[35] = salt[3]
+	d2 := md5Sum(h1Salt[:])
+
+	out[0] = 'm'
+	out[1] = 'd'
+	out[2] = '5'
+	_, _ = hex.Encode(out[3:35], d2[:])
+	return 35
+}

@@ -98,6 +98,8 @@ scope conns := NewFiberScope(4, 4096) {
 | `std/path` | Zero-allocation path manipulation |
 | `std/json` | Bounded `json.Builder[N]` encoder + zero-copy `GetString`/`GetInt`/`GetUint`/`GetBool` |
 | `std/http` | Zero-GC M:N `epoll` HTTP/1.1 Keep-Alive server (`http.Server`) + HTTP/1.1 client (`http.Get`, `http.Post`, `http.Do`) |
+| `std/sql` | Driver-agnostic zero-GC SQL core (`Param` enum, zero-copy `Row`, `RowBuf`, `Result`, `DBError` SQLSTATE) |
+| `std/pg` | Pure-FinCore PostgreSQL v3.0 wire-protocol driver (`SCRAM-SHA-256`/MD5/cleartext/trust, pipelined Extended Query, scoped `Open` & `WithTx`) |
 | `std/encoding/hex` | Zero-alloc hexadecimal `Encode` / `Decode` (`EncodedLen`, `DecodedLen`) |
 | `std/encoding/base64` | Zero-alloc RFC 4648 base64 `Encode` / `Decode` (`EncodedLen`, `DecodedLen`) |
 | `std/crypto/sha256` | Layer-2 total FIPS 180-4 SHA-256 (`Sum256` one-shot + streaming `Hasher`) |
