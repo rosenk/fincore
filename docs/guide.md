@@ -97,7 +97,7 @@ scope conns := NewFiberScope(4, 4096) {
 | `std/sort` | Total in-place sorting |
 | `std/path` | Zero-allocation path manipulation |
 | `std/json` | Bounded `json.Builder[N]` encoder + zero-copy `GetString`/`GetInt`/`GetUint`/`GetBool` |
-| `std/http` | Zero-GC M:N `epoll` HTTP/1.1 Keep-Alive server (`http.Server`) + HTTP/1.1 client (`http.Get`, `http.Post`, `http.Do`) |
+| `std/http` | Zero-GC M:N `epoll` HTTP/1.1 Keep-Alive server (`http.Server`), live SSE streaming (`ServeStream`, `SSEStream`), and client (`http.Get`, `http.Post`, `http.Do`, `http.SubscribeSSE`) |
 | `std/sql` | Driver-agnostic zero-GC SQL core (`Param` enum, zero-copy `Row`, `RowBuf`, `Result`, `DBError` SQLSTATE) |
 | `std/pg` | Pure-FinCore PostgreSQL v3.0 wire-protocol driver (`SCRAM-SHA-256`/MD5/cleartext/trust, pipelined Extended Query, scoped `Open` & `WithTx`) |
 | `std/encoding/hex` | Zero-alloc hexadecimal `Encode` / `Decode` (`EncodedLen`, `DecodedLen`) |

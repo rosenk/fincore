@@ -1,0 +1,627 @@
+// Server-Sent Events (SSE, WHATWG EventSource / HTTP/1.1 chunked streaming)
+// for both http.Server (ServeStream / StreamWriter / SSEStream) and
+// http.Client (SubscribeSSE / SSEEvent) — 100% zero-GC, zero heap allocation.
+package http
+
+import "std/strings"
+
+const MaxSSEFrame usize = 8192
+
+func writeAllPtr(ctx Context, conn *Conn, data []byte) error {
+	for rem := data; len(rem) > 0; {
+		n, err := (*conn).Write(ctx, rem)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+	return nil
+}
+
+func sseAppend(dst []byte, pos usize, src const []byte) usize {
+	n := len(src)
+	if pos+n > len(dst) {
+		n = len(dst) - pos
+	}
+	for i := usize(0); i < n; i++ {
+		dst[pos+i] = src[i]
+	}
+	return pos + n
+}
+
+func sseAppendStr(dst []byte, pos usize, s string) usize {
+	return sseAppend(dst, pos, strView(s))
+}
+
+// ---------------------------------------------------------------------------
+// Server-Side SSE (StreamWriter + SSEStream)
+
+// SSEStream writes Server-Sent Events directly to the client socket as
+// flushed HTTP/1.1 chunked frames (zero heap allocation).
+type SSEStream struct {
+	conn     *Conn
+	ctx      Context
+	finished *bool
+}
+
+func (s *SSEStream) writeChunk(frame const []byte) error {
+	if len(frame) == 0 {
+		return nil
+	}
+	var wire [MaxSSEFrame + 32]byte
+	// HTTP/1.1 chunk header: "<hexLen>\r\n" + payload + "\r\n"
+	p := formatTo(wire[:], "%x\r\n", len(frame))
+	if p+len(frame)+2 > len(wire) {
+		return ErrArenaFull
+	}
+	p = sseAppend(wire[:], p, frame)
+	wire[p] = '\r'
+	wire[p+1] = '\n'
+	p += 2
+	return writeAllPtr(s.ctx, s.conn, wire[:p])
+}
+
+func buildSSEDataLines(dst []byte, pos usize, data const []byte) usize {
+	// Per WHATWG EventSource spec, split multiline data on '\n' into separate "data: " lines.
+	n := len(data)
+	lineStart := usize(0)
+	for i := usize(0); i < n; i++ {
+		if data[i] == '\n' {
+			lineEnd := i
+			if lineEnd > lineStart && data[lineEnd-1] == '\r' {
+				lineEnd--
+			}
+			pos = sseAppendStr(dst, pos, "data: ")
+			pos = sseAppend(dst, pos, data[lineStart:lineEnd])
+			pos = sseAppendStr(dst, pos, "\n")
+			lineStart = i + 1
+		}
+	}
+	lineEnd := n
+	if lineEnd > lineStart && data[lineEnd-1] == '\r' {
+		lineEnd--
+	}
+	pos = sseAppendStr(dst, pos, "data: ")
+	pos = sseAppend(dst, pos, data[lineStart:lineEnd])
+	pos = sseAppendStr(dst, pos, "\n")
+	return pos
+}
+
+// SendID flushes an SSE event with optional id, optional event name, and data payload.
+func (s *SSEStream) SendID(id string, event string, data const []byte) error {
+	if *s.finished {
+		return ErrClosed
+	}
+	var frame [MaxSSEFrame]byte
+	p := usize(0)
+	if len(id) > 0 {
+		p = sseAppendStr(frame[:], p, "id: ")
+		p = sseAppendStr(frame[:], p, id)
+		p = sseAppendStr(frame[:], p, "\n")
+	}
+	if len(event) > 0 {
+		p = sseAppendStr(frame[:], p, "event: ")
+		p = sseAppendStr(frame[:], p, event)
+		p = sseAppendStr(frame[:], p, "\n")
+	}
+	p = buildSSEDataLines(frame[:], p, data)
+	p = sseAppendStr(frame[:], p, "\n")
+	return s.writeChunk(frame[:p])
+}
+
+// Send flushes a named SSE event (`event: <name>\ndata: ...\n\n`).
+func (s *SSEStream) Send(event string, data const []byte) error {
+	return s.SendID("", event, data)
+}
+
+// SendText flushes a named SSE event with a string payload.
+func (s *SSEStream) SendText(event string, text string) error {
+	return s.SendID("", event, strView(text))
+}
+
+// SendData flushes an unnamed SSE data event (`data: ...\n\n`).
+func (s *SSEStream) SendData(data const []byte) error {
+	return s.SendID("", "", data)
+}
+
+// SetRetry sends a reconnection-time directive (`retry: <ms>\n\n`).
+func (s *SSEStream) SetRetry(ms u64) error {
+	if *s.finished {
+		return ErrClosed
+	}
+	var frame [64]byte
+	p := formatTo(frame[:], "retry: %d\n\n", ms)
+	return s.writeChunk(frame[:p])
+}
+
+// Comment sends an SSE comment line (`: <text>\n\n`), ideal for keep-alive heartbeats.
+func (s *SSEStream) Comment(text string) error {
+	if *s.finished {
+		return ErrClosed
+	}
+	var frame [256]byte
+	p := sseAppendStr(frame[:], 0, ": ")
+	p = sseAppendStr(frame[:], p, text)
+	p = sseAppendStr(frame[:], p, "\n\n")
+	return s.writeChunk(frame[:p])
+}
+
+// Finish writes the HTTP/1.1 chunked stream terminator (`0\r\n\r\n`).
+func (s *SSEStream) Finish() error {
+	if *s.finished {
+		return nil
+	}
+	*s.finished = true
+	var end [5]byte
+	end[0] = '0'
+	end[1] = '\r'
+	end[2] = '\n'
+	end[3] = '\r'
+	end[4] = '\n'
+	return writeAllPtr(s.ctx, s.conn, end[:])
+}
+
+// StreamWriter supports both standard buffered HTTP/1.1 responses and live
+// SSE streaming (via StartSSE) in a single ServeStream handler.
+type StreamWriter struct {
+	rw       *ResponseWriter
+	conn     *Conn
+	ctx      Context
+	streamed bool
+	finished bool
+}
+
+func (sw *StreamWriter) SetHeader(name string, val string) {
+	sw.rw.SetHeader(name, val)
+}
+
+func (sw *StreamWriter) WriteBytes(status u16, contentType string, body const []byte) {
+	sw.rw.WriteBytes(status, contentType, body)
+}
+
+func (sw *StreamWriter) WriteText(status u16, body string) {
+	sw.rw.WriteText(status, body)
+}
+
+func (sw *StreamWriter) WriteJSON(status u16, body const []byte) {
+	sw.rw.WriteJSON(status, body)
+}
+
+func (sw *StreamWriter) WriteStatus(status u16) {
+	sw.rw.WriteStatus(status)
+}
+
+// StartSSE sends HTTP/1.1 200 OK headers for `text/event-stream` with
+// `Transfer-Encoding: chunked` and returns a live SSEStream.
+func (sw *StreamWriter) StartSSE() (SSEStream, error) {
+	var hdr [1536]byte
+	p := sseAppendStr(hdr[:], 0,
+		"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nX-Accel-Buffering: no\r\n")
+	if sw.rw.headLen > 0 && p+sw.rw.headLen+2 <= len(hdr) {
+		p = sseAppend(hdr[:], p, sw.rw.headBuf[:sw.rw.headLen])
+	}
+	hdr[p] = '\r'
+	hdr[p+1] = '\n'
+	p += 2
+
+	sw.streamed = true
+	sw.finished = false
+	err := writeAllPtr(sw.ctx, sw.conn, hdr[:p])
+	return SSEStream{conn: sw.conn, ctx: sw.ctx, finished: &sw.finished}, err
+}
+
+driver func serveConnStream(
+	drainCtx Context,
+	hardCtx Context,
+	conn Conn,
+	idleTimeout u64,
+	handler driver func(Context, const *Request, *StreamWriter),
+	totalReqs *Atomic[u64],
+) {
+	defer conn.Close()
+	var req Request
+	var rw ResponseWriter
+	req.bufLen = 0
+
+	driver for !drainCtx.Done() {
+		consumed, complete, ok := ParseRequest(&req)
+		if !ok {
+			rw.reset()
+			rw.WriteText(StatusBadRequest, "bad request\n")
+			_ = sendResponse(hardCtx, conn, &rw, false)
+			return
+		}
+		if !complete {
+			readCtx := hardCtx.WithTimeout(idleTimeout)
+			n, err := conn.Read(readCtx, req.buf[req.bufLen:])
+			if err != nil || n == 0 {
+				return
+			}
+			req.bufLen += n
+			continue
+		}
+
+		rw.reset()
+		sw := StreamWriter{rw: &rw, conn: &conn, ctx: hardCtx, streamed: false, finished: false}
+		handler(drainCtx, &req, &sw)
+		_ = totalReqs.Add(1)
+
+		if sw.streamed {
+			if !sw.finished {
+				sse := SSEStream{conn: &conn, ctx: hardCtx, finished: &sw.finished}
+				_ = sse.Finish()
+			}
+			return
+		}
+
+		keep := req.keepAlive && !drainCtx.Done()
+		if err := sendResponse(hardCtx, conn, &rw, keep); err != nil {
+			return
+		}
+		if !keep {
+			return
+		}
+		rem := req.bufLen - consumed
+		if rem > 0 {
+			for i := usize(0); i < rem; i++ {
+				req.buf[i] = req.buf[consumed+i]
+			}
+		}
+		req.bufLen = rem
+	}
+}
+
+// ServeStream serves HTTP/1.1 connections using a driver handler that supports
+// both normal buffered responses and live Server-Sent Events (StartSSE).
+driver func (s *Server) ServeStream(
+	drainCtx Context,
+	ln Listener,
+	handler driver func(Context, const *Request, *StreamWriter),
+) error {
+	defer ln.Close()
+	workers := s.Workers
+	if workers == 0 {
+		workers = 4
+	}
+	maxConns := s.MaxConns
+	if maxConns == 0 {
+		maxConns = 1024
+	}
+	idleTimeout := s.IdleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = 30 * Second
+	}
+	drainHorizon := s.DrainHorizon
+	if drainHorizon == 0 {
+		drainHorizon = 5 * Second
+	}
+
+	hardCtx, cancelHard := NewContext()
+	defer cancelHard()
+
+	reqCounter := &s.TotalRequests
+
+	scope conns := NewFiberScope(workers, maxConns) {
+		driver for {
+			if err := conns.Ready(drainCtx); err != nil {
+				break
+			}
+			conn, err := ln.Accept(drainCtx)
+			if err != nil {
+				if drainCtx.Done() {
+					break
+				}
+				continue
+			}
+			if err := conns.Spawn(drainCtx, driver func() {
+				serveConnStream(drainCtx, hardCtx, conn, idleTimeout, handler, reqCounter)
+			}); err != nil {
+				break
+			}
+		}
+		if !conns.WaitTimeout(drainHorizon) {
+			cancelHard()
+			conns.Wait()
+		}
+	}
+	return nil
+}
+
+// ListenAndServeStream binds s.Addr, wires SIGINT/SIGTERM graceful shutdown,
+// and serves HTTP/1.1 + Server-Sent Events.
+driver func (s *Server) ListenAndServeStream(
+	net Net,
+	sig Signals,
+	handler driver func(Context, const *Request, *StreamWriter),
+) error {
+	ln, err := net.ListenTCP(s.Addr)
+	if err != nil {
+		return err
+	}
+
+	drainCtx, stopSignals := sig.NotifyContext(SIGINT, SIGTERM)
+	defer stopSignals()
+
+	return s.ServeStream(drainCtx, ln, handler)
+}
+
+// ---------------------------------------------------------------------------
+// Client-Side SSE Subscriber (SSEEvent + SubscribeSSE)
+
+// SSEEvent holds one parsed Server-Sent Event in a bounded stack buffer.
+type SSEEvent struct {
+	ID       [128]byte
+	IDLen    usize
+	Event    [128]byte
+	EventLen usize
+	Data     [4096]byte
+	DataLen  usize
+	RetryMs  u64
+	HasRetry bool
+	hasData  bool
+}
+
+func (e *SSEEvent) reset() {
+	e.EventLen = 0
+	e.DataLen = 0
+	e.RetryMs = 0
+	e.HasRetry = false
+	e.hasData = false
+	// Per WHATWG spec, last event ID persists across events unless overwritten.
+}
+
+func (e const *SSEEvent) EventBytes() const []byte {
+	if e.EventLen == 0 {
+		return strView("message")
+	}
+	return e.Event[:e.EventLen]
+}
+
+func (e const *SSEEvent) EventIs(name string) bool {
+	return strings.EqualStr(e.EventBytes(), name)
+}
+
+func (e const *SSEEvent) DataBytes() const []byte {
+	return e.Data[:e.DataLen]
+}
+
+func (e const *SSEEvent) IDBytes() const []byte {
+	return e.ID[:e.IDLen]
+}
+
+func parseHexUint(b const []byte) (usize, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	var v usize = 0
+	got := false
+	for i := usize(0); i < len(b); i++ {
+		c := b[i]
+		if c == ';' || c == ' ' || c == '\t' {
+			break
+		}
+		var d usize = 0
+		if c >= '0' && c <= '9' {
+			d = usize(c - '0')
+		} else if c >= 'a' && c <= 'f' {
+			d = usize(c-'a') + 10
+		} else if c >= 'A' && c <= 'F' {
+			d = usize(c-'A') + 10
+		} else {
+			return 0, false
+		}
+		v = v*16 + d
+		got = true
+	}
+	return v, got
+}
+
+func processSSELine(line const []byte, ev *SSEEvent, onEvent func(const *SSEEvent) bool) bool {
+	if len(line) == 0 {
+		if ev.hasData || ev.HasRetry {
+			keep := onEvent(ev)
+			ev.reset()
+			return keep
+		}
+		return true
+	}
+	// Comment line (`: ...`)
+	if line[0] == ':' {
+		return true
+	}
+	var field const []byte
+	var val const []byte
+	if colon, ok := strings.IndexByte(line, ':'); ok {
+		field = line[:colon]
+		vs := colon + 1
+		if vs < len(line) && line[vs] == ' ' {
+			vs++
+		}
+		val = line[vs:]
+	} else {
+		field = line
+		val = line[:0]
+	}
+
+	if strings.EqualStr(field, "data") {
+		if ev.hasData && ev.DataLen < len(ev.Data) {
+			ev.Data[ev.DataLen] = '\n'
+			ev.DataLen++
+		}
+		ev.DataLen = sseAppend(ev.Data[:], ev.DataLen, val)
+		ev.hasData = true
+	} else if strings.EqualStr(field, "event") {
+		ev.EventLen = sseAppend(ev.Event[:], 0, val)
+	} else if strings.EqualStr(field, "id") {
+		ev.IDLen = sseAppend(ev.ID[:], 0, val)
+	} else if strings.EqualStr(field, "retry") {
+		if ms, ok := strings.ParseUint(val); ok {
+			ev.RetryMs = ms
+			ev.HasRetry = true
+		}
+	}
+	return true
+}
+
+func feedSSEBytes(
+	lineBuf []byte,
+	lineLen *usize,
+	chunk const []byte,
+	ev *SSEEvent,
+	onEvent func(const *SSEEvent) bool,
+) bool {
+	for i := usize(0); i < len(chunk); i++ {
+		c := chunk[i]
+		if c == '\n' {
+			ln := *lineLen
+			if ln > 0 && lineBuf[ln-1] == '\r' {
+				ln--
+			}
+			*lineLen = 0
+			if !processSSELine(lineBuf[:ln], ev, onEvent) {
+				return false
+			}
+		} else {
+			idx := *lineLen
+			if idx < len(lineBuf) {
+				lineBuf[idx] = c
+				*lineLen = idx + 1
+			}
+		}
+	}
+	return true
+}
+
+// SubscribeSSE connects to an HTTP/1.1 Server-Sent Events endpoint and invokes
+// onEvent for each received event until the stream ends, ctx is cancelled, or
+// onEvent returns false.
+driver func SubscribeSSE(
+	ctx Context,
+	net Net,
+	addr string,
+	path string,
+	onEvent func(const *SSEEvent) bool,
+) error {
+	conn, err := net.DialTCP(ctx, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var reqHdr [1024]byte
+	hn := formatTo(reqHdr[:], "GET %s HTTP/1.1\r\nHost: %s\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+		path, addr)
+	if err := writeAll(ctx, conn, reqHdr[:hn]); err != nil {
+		return err
+	}
+
+	var rbuf [MaxRespBuf]byte
+	var rLen usize = 0
+	var hdrEnd usize = 0
+	driver for {
+		if idx, found := strings.Index(rbuf[:rLen], strView("\r\n\r\n")); found {
+			hdrEnd = idx
+			break
+		}
+		if rLen >= MaxRespBuf {
+			return ErrArenaFull
+		}
+		n, rerr := conn.Read(ctx, rbuf[rLen:])
+		if rerr != nil || n == 0 {
+			return ErrParse
+		}
+		rLen += n
+	}
+
+	headers := rbuf[:hdrEnd]
+	if !strings.ContainsStr(headers, " 200 ") {
+		return ErrIO
+	}
+	isChunked := strings.ContainsStr(headers, "chunked") || strings.ContainsStr(headers, "Chunked")
+
+	// Shift remaining bytes after headers to front of rbuf.
+	bodyStart := hdrEnd + 4
+	rem := rLen - bodyStart
+	for i := usize(0); i < rem; i++ {
+		rbuf[i] = rbuf[bodyStart+i]
+	}
+	rLen = rem
+
+	var lineBuf [4096]byte
+	var lineLen usize = 0
+	var ev SSEEvent
+	ev.reset()
+
+	if !isChunked {
+		if rLen > 0 {
+			if !feedSSEBytes(lineBuf[:], &lineLen, rbuf[:rLen], &ev, onEvent) {
+				return nil
+			}
+		}
+		driver for {
+			n, rerr := conn.Read(ctx, rbuf[:])
+			if rerr == ErrEOF || n == 0 {
+				return nil
+			}
+			if rerr != nil {
+				return rerr
+			}
+			if !feedSSEBytes(lineBuf[:], &lineLen, rbuf[:n], &ev, onEvent) {
+				return nil
+			}
+		}
+	}
+
+	// Incremental HTTP/1.1 chunked decoder -> SSE frame parser
+	driver for {
+		crlf, hasCRLF := strings.Index(rbuf[:rLen], strView("\r\n"))
+		if !hasCRLF {
+			if rLen >= MaxRespBuf {
+				return ErrArenaFull
+			}
+			n, rerr := conn.Read(ctx, rbuf[rLen:])
+			if rerr == ErrEOF || n == 0 {
+				return nil
+			}
+			if rerr != nil {
+				return rerr
+			}
+			rLen += n
+			continue
+		}
+		chunkSize, okHex := parseHexUint(rbuf[:crlf])
+		if !okHex {
+			return ErrParse
+		}
+		if chunkSize == 0 {
+			return nil
+		}
+		need := crlf + 2 + chunkSize + 2
+		if need > MaxRespBuf {
+			return ErrArenaFull
+		}
+		if rLen < need {
+			n, rerr := conn.Read(ctx, rbuf[rLen:])
+			if rerr == ErrEOF || n == 0 {
+				return nil
+			}
+			if rerr != nil {
+				return rerr
+			}
+			rLen += n
+			continue
+		}
+		chunkData := rbuf[crlf+2 : crlf+2+chunkSize]
+		if !feedSSEBytes(lineBuf[:], &lineLen, chunkData, &ev, onEvent) {
+			return nil
+		}
+		left := rLen - need
+		for i := usize(0); i < left; i++ {
+			rbuf[i] = rbuf[need+i]
+		}
+		rLen = left
+	}
+}

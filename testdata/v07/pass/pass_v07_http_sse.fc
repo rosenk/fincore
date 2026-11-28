@@ -1,0 +1,99 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/http"
+	"std/strings"
+)
+
+driver func sseAppHandler(ctx Context, req const *http.Request, sw *http.StreamWriter) {
+	_ = ctx
+	if req.MethodIs("GET") && req.PathIs("/health") {
+		sw.WriteText(http.StatusOK, "ok")
+		return
+	}
+	if req.MethodIs("GET") && req.PathIs("/events") {
+		sw.SetHeader("Access-Control-Allow-Origin", "*")
+		sse, err := sw.StartSSE()
+		if err != nil {
+			return
+		}
+		_ = sse.Comment("heartbeat")
+		_ = sse.SetRetry(1500)
+		_ = sse.SendID("1", "greeting", strView("hello sse"))
+		_ = sse.Send("multi", strView("line1\nline2"))
+		_ = sse.SendData(strView("default-event"))
+		_ = sse.Finish()
+		return
+	}
+	sw.WriteText(http.StatusNotFound, "not found")
+}
+
+driver func main(io Stdio, net Net) error {
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr()
+
+	srvCtx, stopSrv := NewContext()
+	defer stopSrv()
+
+	var srv http.Server
+	srv.Workers = 2
+	srv.MaxConns = 16
+	srvPtr := &srv
+
+	var healthOk bool = false
+	var evCount u32 = 0
+	var retryOk bool = false
+	var ev1Ok bool = false
+	var ev2Ok bool = false
+	var ev3Ok bool = false
+
+	scope bg := NewFiberScope(2, 16) {
+		_ = bg.Spawn(srvCtx, driver func() {
+			_ = srvPtr.ServeStream(srvCtx, ln, sseAppHandler)
+		})
+
+		cCtx, cancelC := NewContext()
+		defer cancelC()
+
+		// 1. Normal buffered HTTP/1.1 endpoint works alongside SSE on the same server!
+		var hResp http.ClientResponse
+		if herr := http.Get(cCtx, net, addr, "/health", &hResp); herr == nil {
+			healthOk = hResp.StatusCode == http.StatusOK && strings.EqualStr(hResp.Body(), "ok")
+		}
+
+		// 2. Subscribe to SSE stream (/events) and verify retry, named, multiline, and default events!
+		serr := http.SubscribeSSE(cCtx, net, addr, "/events", func(ev const *http.SSEEvent) bool {
+			if ev.HasRetry {
+				retryOk = ev.RetryMs == 1500
+				return true
+			}
+			evCount++
+			if evCount == 1 {
+				ev1Ok = ev.EventIs("greeting") &&
+					strings.EqualStr(ev.IDBytes(), "1") &&
+					strings.EqualStr(ev.DataBytes(), "hello sse")
+			} else if evCount == 2 {
+				ev2Ok = ev.EventIs("multi") &&
+					strings.EqualStr(ev.IDBytes(), "1") && // WHATWG: ID persists!
+					strings.EqualStr(ev.DataBytes(), "line1\nline2")
+			} else if evCount == 3 {
+				ev3Ok = ev.EventIs("message") &&
+					strings.EqualStr(ev.DataBytes(), "default-event")
+			}
+			return true
+		})
+		_ = serr
+
+		stopSrv()
+		bg.Wait()
+	}
+
+	var out [128]byte
+	n := formatTo(out[:], "health=%v retry=%v events=%d,%v,%v,%v\n",
+		healthOk, retryOk, evCount, ev1Ok, ev2Ok, ev3Ok)
+	return io.WriteStdout(out[:n])
+}
