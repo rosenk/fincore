@@ -1,0 +1,88 @@
+// FinCore v0.5 "FinCore Eio" TCP Echo Server:
+//   - M:N epoll Fiber Scheduler (NewFiberScope) — thousands of direct-style
+//     connections multiplexed onto 4 OS worker threads
+//   - ZERO Slot boilerplate, ZERO ConnPool, ZERO async/await, ZERO GC, ZERO libc
+//   - Built-in backpressure (conns.Ready + conns.Spawn), graceful drain,
+//     and lock-free Atomic[u64] metrics!
+package main
+
+const (
+	Workers      = 4
+	MaxConns     = 4096
+	BufSize      = 4096
+	IdleTimeout  = 30 * Second
+	DrainHorizon = 5 * Second
+)
+
+func writeAll(ctx Context, conn Conn, data []byte) error {
+	for rem := data; len(rem) > 0; {
+		n, err := conn.Write(ctx, rem)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+	return nil
+}
+
+driver func handleConn(drainCtx Context, hardCtx Context, conn Conn, active *Atomic[u64]) {
+	defer conn.Close()
+	_ = active.Add(1)
+	var buf [BufSize]byte
+
+	driver for !drainCtx.Done() {
+		n, err := conn.Read(hardCtx.WithTimeout(IdleTimeout), buf[:])
+		if err != nil {
+			return
+		}
+		if err := writeAll(hardCtx, conn, buf[:n]); err != nil {
+			return
+		}
+	}
+	_ = conn.CloseWrite()
+}
+
+driver func main(net Net, sig Signals) error {
+	ln, err := net.ListenTCP("0.0.0.0:8080")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	drainCtx, stopSignals := sig.NotifyContext(SIGINT, SIGTERM)
+	defer stopSignals()
+
+	hardCtx, cancelHard := NewContext()
+	defer cancelHard()
+
+	var totalConns Atomic[u64]
+
+	scope conns := NewFiberScope(Workers, MaxConns) {
+		driver for {
+			if err := conns.Ready(drainCtx); err != nil {
+				break
+			}
+			conn, err := ln.Accept(drainCtx)
+			if err != nil {
+				if drainCtx.Done() {
+					break
+				}
+				continue
+			}
+			if err := conns.Spawn(drainCtx, driver func() {
+				handleConn(drainCtx, hardCtx, conn, &totalConns)
+			}); err != nil {
+				break
+			}
+		}
+
+		if !conns.WaitTimeout(DrainHorizon) {
+			cancelHard()
+			conns.Wait()
+		}
+	}
+	return nil
+}

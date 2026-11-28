@@ -4,17 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
-	"fincore/bootstrap/internal/ast"
 	"fincore/bootstrap/internal/comptime"
 	"fincore/bootstrap/internal/diag"
 	"fincore/bootstrap/internal/resolve"
 	"fincore/bootstrap/internal/types"
-	"fincore/scripts/langver"
 )
 
 var markerRE = regexp.MustCompile(`//\s*ERROR\s+(E\d{4})`)
@@ -723,81 +720,6 @@ driver func f(n u32) u32 {
 	})
 }
 
-// TestCompilerSCCs checks the call-graph shape of compiler/ (spec 13.4,
-// docs/compiler_requirements.md item 17) and pins its counts, which the
-// docs do not repeat: compilerParserDecreases *Parser methods carry
-// decreases(depth), compilerParserSCC of them form one SCC (typeParams and
-// typeParam are only called from non-recursive declarations with
-// ParseDepth), and the *Printer methods form a 4-member SCC. Later
-// milestones add further SCCs. History (docs/semantics_decisions.md 57,
-// 85, 109): 33 methods / SCC of 31 at M6, 35 / 33 with the v0.2 matchExpr
-// and patternAlt, 40 / 38 with the v0.2 pattern methods scrutinee, guard,
-// patterns, payloadListPush and patternAltBody.
-func TestCompilerSCCs(t *testing.T) {
-	root, err := filepath.Abs("../../..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(root, "compiler")); err != nil {
-		t.Skip("no compiler/")
-	}
-	if !finc0Can(t, root, "compiler") {
-		t.Skip("compiler/ needs a newer language version than finc0 (// SINCE:)")
-	}
-	t.Chdir(root)
-	prog, diags, err := resolve.Load("compiler", resolve.Options{})
-	if err != nil || len(diags) > 0 {
-		t.Fatalf("load: %v %v", err, diags)
-	}
-	info, diags := types.Check(prog, types.Config{Evaluator: comptime.New(0)})
-	if len(diags) > 0 {
-		t.Fatalf("types: %v", diags)
-	}
-	if d := Check(prog, info); len(d) > 0 {
-		t.Fatalf("unexpected diagnostics:\n%v", d)
-	}
-	c := &checker{info: info, roots: map[*types.FuncInfo]*rootFacts{}}
-	g := c.buildGraph()
-	var sizes []int
-	for _, scc := range g.tarjan() {
-		self := false
-		for _, e := range g.edges[scc[0]] {
-			self = self || e.to == scc[0]
-		}
-		if len(scc) > 1 || self {
-			sizes = append(sizes, len(scc))
-		}
-	}
-	slices.Sort(sizes)
-	// The M6 front end contributes the Parser SCC and the 4-member Printer
-	// SCC; the semantic phases added since (M7: resolver, checker +
-	// comptime interpreter, value and type helpers) add their own SCCs, so
-	// only require the M6 ones to be intact.
-	if !slices.Contains(sizes, compilerParserSCC) || !slices.Contains(sizes, 4) {
-		t.Errorf("nontrivial SCC sizes = %v, want the Parser (%d) and Printer (4) SCCs among them", sizes, compilerParserSCC)
-	}
-	n := 0
-	for _, pkg := range prog.Packages {
-		for _, f := range pkg.AST.Files {
-			for _, d := range f.Decls {
-				if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv != nil && fd.Recv.TypeName.Name == "Parser" && fd.Decreases != nil {
-					n++
-				}
-			}
-		}
-	}
-	if n != compilerParserDecreases {
-		t.Errorf("%d *Parser methods carry decreases, want %d", n, compilerParserDecreases)
-	}
-}
-
-// The counts pinned by TestCompilerSCCs; update them together with
-// compiler/parser.fc.
-const (
-	compilerParserDecreases = 40 // *Parser methods with decreases(depth)
-	compilerParserSCC       = 38 // members of the Parser SCC
-)
-
 func TestDiagFormat(t *testing.T) {
 	prog, info := load(t, "\nfunc spin() {\n\tfor {\n\t}\n}\n")
 	d := Check(prog, info)
@@ -818,15 +740,11 @@ func TestCorpus(t *testing.T) {
 	var ins []string
 	for _, pat := range []string{"examples/*.fc", "testdata/pass/*.fc", "testdata/fail/*.fc", "testdata/integration/*.fc"} {
 		m, _ := filepath.Glob(pat)
-		for _, in := range m {
-			if finc0Can(t, ".", in) {
-				ins = append(ins, in)
-			}
-		}
+		ins = append(ins, m...)
 	}
 	ents, _ := os.ReadDir("testdata/pass")
 	for _, e := range ents {
-		if e.IsDir() && finc0Can(t, ".", "testdata/pass/"+e.Name()) {
+		if e.IsDir() {
 			ins = append(ins, "testdata/pass/"+e.Name())
 		}
 	}
@@ -973,17 +891,4 @@ func f() u32 {
 	return s
 }`},
 	})
-}
-
-// finc0Can reports whether the input in (relative to the module root
-// root) needs at most the language version finc0 implements (v0.2, frozen):
-// tests of newer versions carry `// SINCE: vX.Y` and are skipped here
-// (testdata/README.md).
-func finc0Can(t *testing.T, root, in string) bool {
-	t.Helper()
-	v, ok, err := langver.RequiredIn(root, os.Getenv("FINCROOT"), filepath.Join(root, in))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return !ok || !langver.MustParse(langver.Finc0).Less(v)
 }

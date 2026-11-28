@@ -1,0 +1,112 @@
+// pass_v01_native_core: exercises the v0.1 Native Core additions:
+// compound assignments (%=, &=, |=, ^=, <<=, >>=), unary bitwise ^,
+// fixed array literals [N]T{...}, Clock.Now(), Clock.Sleep(), and
+// loopback Net.ListenTCP + Net.DialTCP inside a structured Scope.
+package main
+
+type ClientSlot struct {
+	buf [16]byte
+	n   usize
+	err error
+}
+
+driver func main(io Stdio, clk Clock, net Net) error {
+	// 1. Compound assignments and unary bitwise complement
+	var x u32 = 29
+	x %= 10
+	x <<= 3
+	x |= 0x05
+	x &= 0x7f
+	x ^= 0x0f
+	x >>= 1
+	inv := ^u8(0x0f)
+
+	// 2. Fixed array literals (including partial zero-filled tail)
+	a := [4]u32{10, 20, 30, 40}
+	b := [4]u32{1, 2}
+	var sum u32
+	for i := usize(0); i < len(a); i++ {
+		sum += a[i] + b[i]
+	}
+
+	// 3. Clock.Now and interruptible Clock.Sleep (2ms)
+	ctx, cancel := NewContext()
+	defer cancel()
+	t0 := clk.Now()
+	if err := clk.Sleep(ctx, 2_000_000); err != nil {
+		return err
+	}
+	t1 := clk.Now()
+	clockOk := t1 >= t0
+
+	// 4. Loopback TCP ListenTCP + DialTCP inside structured Scope
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	addr := ln.Addr()
+
+	var pool [1]ClientSlot
+	scope s := NewScope(1) {
+		slot, err := s.AcquireSlot(ctx, &pool)
+		if err != nil {
+			return err
+		}
+		s.Go(slot, driver func(cs *ClientSlot) {
+			c, err := net.DialTCP(ctx, addr)
+			if err != nil {
+				cs.err = err
+				return
+			}
+			defer c.Close()
+			if err := writeAll(ctx, c, strBytes("hello")); err != nil {
+				cs.err = err
+				return
+			}
+			_ = c.CloseWrite()
+			n, rerr := c.Read(ctx, cs.buf[:])
+			if rerr != nil {
+				cs.err = rerr
+				return
+			}
+			cs.n = n
+		})
+		srvConn, aerr := ln.Accept(ctx)
+		if aerr != nil {
+			return aerr
+		}
+		defer srvConn.Close()
+		var sbuf [16]byte
+		n, rerr := srvConn.Read(ctx, sbuf[:])
+		if rerr != nil {
+			return rerr
+		}
+		if err := writeAll(ctx, srvConn, sbuf[:n]); err != nil {
+			return err
+		}
+		_ = srvConn.CloseWrite()
+		s.Wait()
+	}
+	if pool[0].err != nil {
+		return pool[0].err
+	}
+
+	var out [128]byte
+	n := formatTo(out[:], "x=%d inv=%d sum=%d clk=%v tcp=%s\n", x, inv, sum, clockOk, bytesToStr(pool[0].buf[:pool[0].n]))
+	return io.WriteStdout(out[:n])
+}
+
+func writeAll(ctx Context, c Conn, data []byte) error {
+	for rem := data; len(rem) > 0; {
+		n, err := c.Write(ctx, rem)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+	return nil
+}

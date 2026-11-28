@@ -537,9 +537,6 @@ func (p *Program) markStmt(s ast.Stmt) {
 			if lp, ok := a.Pattern.(*ast.LiteralPattern); ok {
 				p.markExpr(lp.Lit)
 			}
-			if a.Guard != nil {
-				p.markExpr(a.Guard)
-			}
 			if a.Expr != nil {
 				p.markExpr(a.Expr)
 			}

@@ -1,0 +1,11 @@
+// SINCE: v0.6
+package main
+
+func add[T Numeric](a T, b T) T {
+	return a + b
+}
+
+driver func main() error {
+	_ = add[string]("a", "b") // ERROR E2011
+	return nil
+}

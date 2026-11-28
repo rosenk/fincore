@@ -8,9 +8,9 @@ import (
 	"fincore/bootstrap/internal/resolve"
 )
 
-// v0.2 sum types and patterns: match statements and expressions, nested,
-// or-, tuple and rest patterns, guards, `is` expressions, exhaustiveness
-// and reachability (E2012, see usefulness.go). See docs/v0_2.md.
+// Flat sum-type and scalar pattern matching: match statements and single-value
+// match expressions, variant payload bindings, literals/constants, or-patterns,
+// and straightforward exhaustiveness/reachability checking (E2012).
 
 func (c *Checker) matchStmt(s *ast.MatchStmt) {
 	x := c.scrutinee(s.X)
@@ -25,44 +25,14 @@ func (c *Checker) matchStmt(s *ast.MatchStmt) {
 	}
 }
 
-// scrutinee checks the scrutinee of a match: an expression (untyped
-// constants get their default type) or a tuple of expressions (type
-// *Tuple, v0.2).
 func (c *Checker) scrutinee(e ast.Expr) operand {
-	te, ok := e.(*ast.TupleExpr)
-	if !ok {
-		x := c.exprValue(e)
-		if !x.invalid() && IsUntyped(x.typ) {
-			c.defaultType(&x, "match")
-		}
-		return x
+	x := c.exprValue(e)
+	if !x.invalid() && IsUntyped(x.typ) {
+		c.defaultType(&x, "match")
 	}
-	ts := make([]Type, len(te.Elems))
-	bad := false
-	for i, el := range te.Elems {
-		x := c.exprValue(el)
-		if !x.invalid() && IsUntyped(x.typ) {
-			c.defaultType(&x, "match")
-		}
-		if x.invalid() {
-			bad = true
-		}
-		ts[i] = x.typ
-	}
-	if bad {
-		return invalidOp(e)
-	}
-	x := operand{mode: KindValue, typ: &Tuple{Types: ts}, expr: e}
-	c.info.Types[e.ID()] = x.typ
-	c.info.Kinds[e.ID()] = KindValue
 	return x
 }
 
-// matchExpr checks a match expression. The arms' types must agree;
-// untyped constant arms take the type of the typed arms. If every arm is
-// untyped the result is untyped and is converted by its context (see
-// updateType). The result is constant if the scrutinee is constant and the
-// selected arm is a constant expression.
 func (c *Checker) matchExpr(e *ast.MatchExpr) operand {
 	x := c.scrutinee(e.X)
 	valid := c.matchPatterns(e, e.Range, x, e.Arms, true)
@@ -125,8 +95,6 @@ func isUntypedNumeric(t Type) bool {
 	return k == UntypedInt || k == UntypedChar
 }
 
-// convertMatchArms converts the untyped arms of a match expression whose
-// result was given type t by its context.
 func (c *Checker) convertMatchArms(e *ast.MatchExpr, t Type) {
 	for _, arm := range e.Arms {
 		id := arm.Expr.ID()
@@ -139,43 +107,24 @@ func (c *Checker) convertMatchArms(e *ast.MatchExpr, t Type) {
 	}
 }
 
-// selectArm returns the index of the arm selected by the constant
-// scrutinee value v (-1 if none, or if a guard on the way is not a
-// constant).
 func (c *Checker) selectArm(v Value, arms []*ast.MatchArm) int {
 	for i, arm := range arms {
-		if !MatchValue(c.info, arm.Pattern, v, nil) {
-			continue
-		}
-		if arm.Guard == nil {
-			return i
-		}
-		g, ok := c.info.ValueOf(arm.Guard).(BoolVal)
-		if !ok {
-			return -1
-		}
-		if g {
+		if MatchValue(c.info, arm.Pattern, v, nil) {
 			return i
 		}
 	}
 	return -1
 }
 
-// MatchValue reports whether the value v matches pattern p (checked by the
-// type checker); bind, if not nil, is called for the bindings of the
-// matching pattern (v0.2). Used for constant match expressions and by the
-// comptime interpreter.
+// MatchValue reports whether v matches checked pattern p, calling bind (if
+// non-nil) for any payload bindings.
 func MatchValue(info *Info, p ast.Pattern, v Value, bind func(sym *resolve.Symbol, v Value)) bool {
 	switch p := p.(type) {
-	case *ast.WildcardPattern, *ast.RestPattern:
+	case *ast.WildcardPattern:
 		return true
 	case *ast.Ident:
-		if vr := info.VariantAt(p); vr != nil {
-			ev, ok := v.(*EnumVal)
-			return ok && ev.Variant == vr.Index
-		}
-		if cv := info.PatConst(p); cv != nil {
-			return valueEq(v, cv)
+		if p.Name == "_" {
+			return true
 		}
 		if sym, _ := info.PatBinding(p); bind != nil && sym != nil {
 			bind(sym, v)
@@ -187,14 +136,8 @@ func MatchValue(info *Info, p ast.Pattern, v Value, bind func(sym *resolve.Symbo
 			if !ok || ev.Variant != vr.Index {
 				return false
 			}
-			if sym, _ := info.PatBinding(p); bind != nil && sym != nil {
-				bind(sym, v)
-			}
 			for i, a := range p.Args {
-				if _, ok := a.(*ast.RestPattern); ok {
-					continue
-				}
-				if !MatchValue(info, a, ev.Payload[PayloadIndex(p, i, len(ev.Payload))], bind) {
+				if !MatchValue(info, a, ev.Payload[i], bind) {
 					return false
 				}
 			}
@@ -203,10 +146,7 @@ func MatchValue(info *Info, p ast.Pattern, v Value, bind func(sym *resolve.Symbo
 		if cv := info.PatConst(p); cv != nil {
 			return valueEq(v, cv)
 		}
-		if sym, _ := info.PatBinding(p); bind != nil && sym != nil {
-			bind(sym, v)
-		}
-		return true
+		return false
 	case *ast.LiteralPattern:
 		return valueEq(v, info.ValueOf(p.Lit))
 	case *ast.OrPattern:
@@ -216,25 +156,6 @@ func MatchValue(info *Info, p ast.Pattern, v Value, bind func(sym *resolve.Symbo
 			}
 		}
 		return false
-	case *ast.TuplePattern:
-		tv, ok := v.(TupleVal)
-		if !ok || len(tv.Elems) != len(p.Elems) {
-			return false
-		}
-		for i, a := range p.Elems {
-			if !MatchValue(info, a, tv.Elems[i], bind) {
-				return false
-			}
-		}
-		return true
-	case *ast.AtPattern:
-		if !MatchValue(info, p.Pattern, v, bind) {
-			return false
-		}
-		if sym, _ := info.PatBinding(p.Name); bind != nil && sym != nil {
-			bind(sym, v)
-		}
-		return true
 	}
 	return false
 }
@@ -247,20 +168,6 @@ func valueEq(v, w Value) bool {
 	return err == nil && eq
 }
 
-// PayloadIndex returns the payload position matched by argument i of a
-// variant pattern with n payloads (v0.2: arguments after a `..` count from
-// the end). Argument i must not be the RestPattern itself.
-func PayloadIndex(p *ast.CtorPattern, i, n int) int {
-	for r, a := range p.Args {
-		if _, ok := a.(*ast.RestPattern); ok && r < i {
-			return n - (len(p.Args) - i)
-		}
-	}
-	return i
-}
-
-// patternAlts returns the alternatives of a pattern (itself unless it is
-// an or-pattern).
 func patternAlts(p ast.Pattern) []ast.Pattern {
 	if op, ok := p.(*ast.OrPattern); ok {
 		return op.Alts
@@ -268,38 +175,6 @@ func patternAlts(p ast.Pattern) []ast.Pattern {
 	return []ast.Pattern{p}
 }
 
-// isExpr checks `X is Pattern` (v0.2). Bindings are declared by the
-// resolver for every `is` (flow-scoped, decisions 118-125).
-func (c *Checker) isExpr(e *ast.IsExpr) operand {
-	x := c.exprValue(e.X)
-	if !x.invalid() && IsUntyped(x.typ) {
-		c.defaultType(&x, "match")
-	}
-	if x.invalid() {
-		c.invalidBindings(e.Pattern)
-		return invalidOp(e)
-	}
-	if !c.topPattern(e.Pattern, x.typ) {
-		return invalidOp(e)
-	}
-	if x.mode == KindConst && !hasBindings(c.info, e.Pattern) {
-		return operand{mode: KindConst, typ: Typ[UntypedBool], val: BoolVal(MatchValue(c.info, e.Pattern, x.val, nil))}
-	}
-	return operand{mode: KindValue, typ: Typ[Bool]}
-}
-
-// hasBindings reports whether a checked pattern binds a variable.
-func hasBindings(info *Info, p ast.Pattern) bool {
-	found := false
-	walkPattern(p, func(q ast.Pattern) {
-		if info.IsBindingPat(q) {
-			found = true
-		}
-	})
-	return found
-}
-
-// walkPattern calls f for p and every sub-pattern, in source order.
 func walkPattern(p ast.Pattern, f func(ast.Pattern)) {
 	f(p)
 	switch p := p.(type) {
@@ -311,29 +186,9 @@ func walkPattern(p ast.Pattern, f func(ast.Pattern)) {
 		for _, a := range p.Alts {
 			walkPattern(a, f)
 		}
-	case *ast.TuplePattern:
-		for _, a := range p.Elems {
-			walkPattern(a, f)
-		}
-	case *ast.AtPattern:
-		walkPattern(p.Name, f) // the binding, visited like a payload name
-		walkPattern(p.Pattern, f)
 	}
 }
 
-// stripAt returns the pattern under the `x @` prefixes of p (v0.2): for
-// usefulness and catch-all tests `x @ P` is exactly P.
-func stripAt(p ast.Pattern) ast.Pattern {
-	for {
-		at, ok := p.(*ast.AtPattern)
-		if !ok {
-			return p
-		}
-		p = at.Pattern
-	}
-}
-
-// invalidBindings gives every binding of p type Invalid (after an error).
 func (c *Checker) invalidBindings(p ast.Pattern) {
 	walkPattern(p, func(q ast.Pattern) {
 		if sym, _ := c.info.PatBinding(q); sym != nil && c.info.SymType(sym) == nil {
@@ -342,10 +197,6 @@ func (c *Checker) invalidBindings(p ast.Pattern) {
 	})
 }
 
-// matchPatterns checks the patterns and guards of a match on x and reports
-// E2012 for unreachable arms and non-exhaustive matches. It records
-// whether the match counts as exhaustive and reports whether every pattern
-// is valid. at is the span of the match (the `match` keyword).
 func (c *Checker) matchPatterns(m ast.Node, at diag.SourceSpan, x operand, arms []*ast.MatchArm, isExpr bool) bool {
 	valid := !x.invalid()
 	for _, arm := range arms {
@@ -354,28 +205,12 @@ func (c *Checker) matchPatterns(m ast.Node, at diag.SourceSpan, x operand, arms 
 		} else if !c.topPattern(arm.Pattern, x.typ) {
 			valid = false
 		}
-		if arm.Guard != nil {
-			g := c.exprValue(arm.Guard)
-			if !g.invalid() {
-				if !IsBoolean(g.typ) {
-					c.errorf(diag.E2002, arm.Guard.Span(), "non-boolean guard %s in match arm (type %s)", exprString(arm.Guard), g.typ)
-				} else if IsUntyped(g.typ) {
-					c.convertUntyped(&g, Typ[Bool])
-				}
-			}
-		}
 	}
-	required := false
-	if !x.invalid() {
-		switch x.typ.Underlying().(type) {
-		case *Enum, *Tuple:
-			required = true
-		}
-	}
+	_, isEnum := x.typ.Underlying().(*Enum)
 	if !valid {
-		exh := required
+		exh := isEnum
 		for _, arm := range arms {
-			if c.catchAll(arm.Pattern) && arm.Guard == nil {
+			if _, ok := arm.Pattern.(*ast.WildcardPattern); ok {
 				exh = true
 			}
 		}
@@ -383,43 +218,29 @@ func (c *Checker) matchPatterns(m ast.Node, at diag.SourceSpan, x operand, arms 
 		return false
 	}
 	exhaustive := c.checkCoverage(at, x.typ, arms, isExpr)
-	c.info.Exhaustive[m.ID()] = exhaustive || required
+	c.info.Exhaustive[m.ID()] = exhaustive || isEnum
 	return true
 }
 
-// ---------------------------------------------------------------------------
-// Pattern checking
-
-// binding is a variable bound by a pattern.
 type binding struct {
 	sym *resolve.Symbol
 	id  *ast.Ident
 	typ Type
 }
 
-// topPattern checks the pattern of an arm or `is` expression against the
-// scrutinee type t, then gives the bindings their types. It reports
-// whether the pattern is valid.
 func (c *Checker) topPattern(p ast.Pattern, t Type) bool {
 	var bs []binding
-	ok := c.pat(p, t, false, &bs)
+	ok := c.pat(p, t, &bs)
 	bs = c.uniqBindings(bs)
 	for _, b := range bs {
-		if t := c.info.SymType(b.sym); t == nil {
+		if c.info.SymType(b.sym) == nil {
 			c.setSymType(b.sym, b.typ)
-		} else if b.id != b.sym.Ident && !IsInvalid(t) && !IsInvalid(b.typ) && !Identical(b.typ, t) {
-			// v0.2: an `is` binding intersected with an earlier one of
-			// the same name (one symbol, see resolve.intersect).
-			c.errorf(diag.E2002, b.id.Range, "variable %s has type %s here but %s in the first is test that binds it", b.id.Name, b.typ, t)
-			ok = false
 		}
 	}
 	c.invalidBindings(p)
 	return ok
 }
 
-// uniqBindings reports variables bound twice (E2002) and returns the list
-// without duplicates.
 func (c *Checker) uniqBindings(bs []binding) []binding {
 	var out []binding
 	for _, b := range bs {
@@ -447,48 +268,13 @@ func findBinding(bs []binding, sym *resolve.Symbol) int {
 	return -1
 }
 
-// pat checks pattern p against type t and appends its bindings to out.
-// payload is set for payload positions of a variant pattern, where a bare
-// identifier is a binding or a variant of t's enum.
-func (c *Checker) pat(p ast.Pattern, t Type, payload bool, out *[]binding) bool {
-	en, isEnum := t.Underlying().(*Enum)
+func (c *Checker) pat(p ast.Pattern, t Type, out *[]binding) bool {
 	switch p := p.(type) {
 	case *ast.WildcardPattern:
 		return true
-	case *ast.RestPattern:
-		c.errorf(diag.E2002, p.Range, "'..' is only allowed in the payload list of a variant pattern")
-		return false
-	case *ast.Ident:
-		c.info.Types[p.ID()] = t
-		if p.Name == "_" {
-			return true
-		}
-		if isEnum {
-			if v := en.VariantByName(p.Name); v != nil {
-				if len(v.Payload) != 0 {
-					c.errorf(diag.E2003, p.Range, "variant %s has %d payload values, pattern binds 0", v.Name, len(v.Payload))
-					return false
-				}
-				c.info.Variants[p.ID()] = v
-				// A name declared by the resolver for it is bound to
-				// the payload (which is that variant).
-				if sym := c.prog.Defs[p.ID()]; sym != nil && c.info.SymType(sym) == nil {
-					c.setSymType(sym, t)
-				}
-				return true
-			}
-		}
-		if sym := c.prog.Uses[p.ID()]; sym != nil && sym.Kind == resolve.SymConst {
-			return c.constPat(p, p, sym, t, false)
-		}
-		return c.bindPat(p, t, out)
 	case *ast.LiteralPattern:
 		x := c.exprValue(p.Lit)
 		if x.invalid() {
-			return false
-		}
-		if _, ok := t.(*Tuple); ok {
-			c.errorf(diag.E2002, p.Range, "pattern %s does not match a tuple scrutinee of type %s", exprString(p.Lit), t)
 			return false
 		}
 		if !c.assignment(&x, t, "match pattern") {
@@ -502,40 +288,12 @@ func (c *Checker) pat(p ast.Pattern, t Type, payload bool, out *[]binding) bool 
 	case *ast.CtorPattern:
 		return c.ctorPat(p, t, out)
 	case *ast.OrPattern:
-		return c.orPat(p, t, payload, out)
-	case *ast.AtPattern:
-		// v0.2: the name binds the value at this position (declared by
-		// the resolver unless it was rejected there).
-		c.info.Types[p.Name.ID()] = t
-		valid := c.bindPat(p.Name, t, out)
-		if !c.pat(p.Pattern, t, payload, out) {
-			valid = false
-		}
-		return valid
-	case *ast.TuplePattern:
-		tt, ok := t.(*Tuple)
-		if !ok {
-			c.errorf(diag.E2002, p.Range, "tuple pattern %s does not match type %s", ast.Format(p), t)
-			return false
-		}
-		if len(tt.Types) != len(p.Elems) {
-			c.errorf(diag.E2003, p.Range, "tuple pattern has %d elements, scrutinee has %d", len(p.Elems), len(tt.Types))
-			return false
-		}
-		valid := true
-		for i, el := range p.Elems {
-			if !c.pat(el, tt.Types[i], false, out) {
-				valid = false
-			}
-		}
-		return valid
+		return c.orPat(p, t, out)
 	}
 	return true
 }
 
-// orPat checks an or-pattern: every alternative must bind the same
-// variables with identical types (v0.2).
-func (c *Checker) orPat(p *ast.OrPattern, t Type, payload bool, out *[]binding) bool {
+func (c *Checker) orPat(p *ast.OrPattern, t Type, out *[]binding) bool {
 	valid := true
 	var first []binding
 	haveFirst := false
@@ -545,13 +303,8 @@ func (c *Checker) orPat(p *ast.OrPattern, t Type, payload bool, out *[]binding) 
 			valid = false
 			continue
 		}
-		if id, ok := alt.(*ast.Ident); ok && id.Name == "_" {
-			c.errorf(diag.E2002, id.Range, "'_' cannot be an alternative of an or-pattern")
-			valid = false
-			continue
-		}
 		var bs []binding
-		if !c.pat(alt, t, payload, &bs) {
+		if !c.pat(alt, t, &bs) {
 			valid = false
 			continue
 		}
@@ -584,31 +337,9 @@ func (c *Checker) orPat(p *ast.OrPattern, t Type, payload bool, out *[]binding) 
 	return valid
 }
 
-// bindPat checks a binding (the bare identifier id) of type t.
-func (c *Checker) bindPat(id *ast.Ident, t Type, out *[]binding) bool {
-	sym := c.prog.Defs[id.ID()]
-	if sym == nil {
-		return false // not declared (every pattern binding is since decision 118)
-	}
-	if _, ok := t.(*Tuple); ok {
-		c.errorf(diag.E2002, id.Range, "cannot bind %s to a tuple of type %s (use '_' or a tuple pattern)", id.Name, t)
-		return false
-	}
-	*out = append(*out, binding{sym: sym, id: id, typ: t})
-	return true
-}
-
-// constPat checks the constant pattern p (the constant sym, named by name)
-// against type t: the constant must be assignable to t. A constant of an
-// enum type must hold a variant without payload; p then counts as that
-// variant (Info.Variants).
 func (c *Checker) constPat(p ast.Pattern, name *ast.Ident, sym *resolve.Symbol, t Type, parens bool) bool {
 	if parens {
 		c.errorf(diag.E2002, p.Span(), "constant %s cannot have bindings", sym.Name)
-		return false
-	}
-	if _, ok := t.(*Tuple); ok {
-		c.errorf(diag.E2002, p.Span(), "pattern %s does not match a tuple scrutinee of type %s", sym.Name, t)
 		return false
 	}
 	x := c.symOperand(sym, name)
@@ -635,20 +366,11 @@ func (c *Checker) constPat(p ast.Pattern, name *ast.Ident, sym *resolve.Symbol, 
 	return true
 }
 
-// ctorPat checks a variant, constant or binding pattern
-// `[Qual.]Name[(args)]` (a bare Name is a variant of t's enum, else a
-// constant, else a binding).
 func (c *Checker) ctorPat(p *ast.CtorPattern, t Type, out *[]binding) bool {
 	en, isEnum := t.Underlying().(*Enum)
-	// A constant pattern (pkg.Const or Const). An unqualified name that
-	// is a variant of the scrutinee's enum is that variant (v0.2).
 	isVariant := p.Qual == nil && isEnum && en.VariantByName(p.Name.Name) != nil
 	if sym := c.prog.Uses[p.Name.ID()]; sym != nil && sym.Kind == resolve.SymConst && !isVariant {
 		return c.constPat(p, p.Name, sym, t, p.HasParens)
-	}
-	if p.Qual == nil && !p.HasParens && !isVariant {
-		c.info.Types[p.ID()] = t
-		return c.bindPat(p.Name, t, out)
 	}
 	var v *Variant
 	switch {
@@ -672,9 +394,6 @@ func (c *Checker) ctorPat(p *ast.CtorPattern, t Type, out *[]binding) bool {
 			c.errorf(diag.E2002, p.Qual.Range, "%s is not an enum type", qt)
 			return false
 		}
-		// v0.2: a generic enum qualifies patterns on its instances
-		// (Option.Some(x) on an Option[u32]); the variant comes from
-		// the instance.
 		if tn, ok := t.(*Named); ok && tn.Origin != nil && tn.Origin == qt && isEnum {
 			qe = en
 		} else if !Identical(qt, t) {
@@ -698,186 +417,152 @@ func (c *Checker) ctorPat(p *ast.CtorPattern, t Type, out *[]binding) bool {
 	}
 	c.info.Variants[p.ID()] = v
 	c.info.Types[p.ID()] = t
-	if p.Qual == nil && !p.HasParens {
-		// A name declared by the resolver for a bare variant is bound to
-		// the value (which is that variant).
-		if sym := c.prog.Defs[p.Name.ID()]; sym != nil && c.info.SymType(sym) == nil {
-			c.setSymType(sym, t)
-		}
-	}
-	n, rest := len(p.Args), false
-	for _, a := range p.Args {
-		if r, ok := a.(*ast.RestPattern); ok {
-			if rest {
-				c.errorf(diag.E2002, r.Range, "at most one '..' is allowed in a payload list")
-				return false
-			}
-			n--
-			rest = true
-		}
-	}
-	if (!rest && n != len(v.Payload)) || (rest && n > len(v.Payload)) || (p.HasParens && len(v.Payload) == 0 && !rest) {
-		c.errorf(diag.E2003, p.Range, "variant %s has %d payload values, pattern binds %d", v.Name, len(v.Payload), n)
+	if len(p.Args) != len(v.Payload) || (p.HasParens && len(v.Payload) == 0) {
+		c.errorf(diag.E2003, p.Range, "variant %s has %d payload values, pattern binds %d", v.Name, len(v.Payload), len(p.Args))
 		return false
 	}
-	valid := true
 	for i, a := range p.Args {
-		if _, ok := a.(*ast.RestPattern); ok {
-			continue
-		}
-		if !c.pat(a, v.Payload[PayloadIndex(p, i, len(v.Payload))], true, out) {
-			valid = false
-		}
-	}
-	return valid
-}
-
-// ---------------------------------------------------------------------------
-// Reachability and exhaustiveness
-
-// checkCoverage reports unreachable arms and patterns and non-exhaustive
-// matches (E2012) with the usefulness algorithm of usefulness.go. It
-// reports whether the unguarded arms cover every value.
-func (c *Checker) checkCoverage(at diag.SourceSpan, t Type, arms []*ast.MatchArm, isExpr bool) bool {
-	u := &usefulness{info: c.info}
-	cols := []Type{t}
-	tt, isTuple := t.(*Tuple)
-	if isTuple {
-		cols = tt.Types
-	}
-	var rows [][]ast.Pattern
-	var wild ast.Pattern
-	for _, arm := range arms {
-		if wild != nil {
-			if _, ok := wild.(*ast.WildcardPattern); ok {
-				c.errorf(diag.E2012, arm.Pattern.Span(), "unreachable match arm: it follows the '_' arm")
-			} else {
-				c.errorf(diag.E2012, arm.Pattern.Span(), "unreachable match arm: it follows the catch-all binding %s", catchAllName(wild).Name)
-			}
-			continue
-		}
-		var armRows [][]ast.Pattern
-		for _, alt := range patternAlts(arm.Pattern) {
-			row := u.row(alt, len(cols), isTuple)
-			if !u.useful(append(rows[:len(rows):len(rows)], armRows...), row, cols, maxPatternDepth) {
-				c.reportUnreachable(alt, t)
-			}
-			armRows = append(armRows, row)
-		}
-		if arm.Guard == nil {
-			rows = append(rows, armRows...)
-			if c.catchAll(arm.Pattern) {
-				wild = arm.Pattern
-			}
-		}
-	}
-	ws := u.witnesses(rows, cols, !isTuple, maxWitnesses+1, maxPatternDepth)
-	if len(ws) == 0 {
-		return true
-	}
-	more := len(ws) > maxWitnesses
-	if more {
-		ws = ws[:maxWitnesses]
-	}
-	switch t.Underlying().(type) {
-	case *Enum, *Tuple:
-		parts := make([]string, len(ws))
-		for i, w := range ws {
-			parts[i] = u.render(w, cols, isTuple)
-		}
-		list := strings.Join(parts, ", ")
-		if more {
-			list += ", ..."
-		}
-		c.errorf(diag.E2012, at, "non-exhaustive match on %s: missing %s", t, list)
-	default:
-		if isExpr {
-			c.errorf(diag.E2012, at, "non-exhaustive match expression on %s: missing '_' arm", t)
-		}
-	}
-	return false
-}
-
-// catchAll reports whether a (checked) top-level pattern is '_' or a
-// binding (v0.2), which match every value.
-func (c *Checker) catchAll(p ast.Pattern) bool {
-	p = stripAt(p)
-	if _, ok := p.(*ast.WildcardPattern); ok {
-		return true
-	}
-	return c.info.IsBindingPat(p)
-}
-
-// catchAllName returns the name of a catch-all binding pattern: `x`, or
-// the outermost name of `x @ P`.
-func catchAllName(p ast.Pattern) *ast.Ident {
-	if at, ok := p.(*ast.AtPattern); ok {
-		return at.Name
-	}
-	return BareName(p)
-}
-
-// reportUnreachable reports an alternative that matches no value left by
-// the earlier arms.
-func (c *Checker) reportUnreachable(alt ast.Pattern, t Type) {
-	if at, ok := alt.(*ast.AtPattern); ok {
-		// v0.2: `x @ P` is reported as P, or as the binding x if P
-		// matches every value.
-		if !c.catchAll(at) {
-			c.reportUnreachable(stripAt(at), t)
-			return
-		}
-		if _, ok := t.Underlying().(*Enum); ok {
-			c.errorf(diag.E2012, at.Range, "unreachable binding %s: all variants of %s are covered", at.Name.Name, t)
-		} else {
-			c.errorf(diag.E2012, at.Range, "unreachable binding %s: all values of %s are covered", at.Name.Name, t)
-		}
-		return
-	}
-	switch p := alt.(type) {
-	case *ast.WildcardPattern:
-		if _, ok := t.Underlying().(*Enum); ok {
-			c.errorf(diag.E2012, p.Range, "unreachable '_' arm: all variants of %s are covered", t)
-		} else {
-			c.errorf(diag.E2012, p.Range, "unreachable '_' arm: all values of %s are covered", t)
-		}
-		return
-	case *ast.CtorPattern:
-		if v := c.info.VariantAt(p); v != nil {
-			if c.flatArgs(p.Args) {
-				c.errorf(diag.E2012, p.Range, "unreachable pattern: variant %s is already covered", v.Name)
-				return
-			}
-		} else if c.info.IsBindingPat(p) {
-			if _, ok := t.Underlying().(*Enum); ok {
-				c.errorf(diag.E2012, p.Range, "unreachable binding %s: all variants of %s are covered", p.Name.Name, t)
-			} else {
-				c.errorf(diag.E2012, p.Range, "unreachable binding %s: all values of %s are covered", p.Name.Name, t)
-			}
-			return
-		} else {
-			c.errorf(diag.E2012, p.Range, "unreachable pattern: duplicate case %s", exprString(p.Name))
-			return
-		}
-	case *ast.LiteralPattern:
-		c.errorf(diag.E2012, p.Range, "unreachable pattern: duplicate case %s", exprString(p.Lit))
-		return
-	}
-	c.errorf(diag.E2012, alt.Span(), "unreachable pattern: it is covered by earlier patterns")
-}
-
-// flatArgs reports whether payload patterns are all bindings, '_' or '..'.
-func (c *Checker) flatArgs(args []ast.Pattern) bool {
-	for _, a := range args {
-		switch a := a.(type) {
-		case *ast.Ident:
-			if c.info.VariantAt(a) != nil || c.info.PatConst(a) != nil {
-				return false
-			}
-		case *ast.RestPattern:
-		default:
+		id, ok := a.(*ast.Ident)
+		if !ok {
+			c.errorf(diag.E2002, a.Span(), "expected identifier in variant pattern")
 			return false
+		}
+		pt := v.Payload[i]
+		c.info.Types[id.ID()] = pt
+		if id.Name == "_" {
+			continue
+		}
+		if sym := c.prog.Defs[id.ID()]; sym != nil {
+			*out = append(*out, binding{sym: sym, id: id, typ: pt})
 		}
 	}
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// Flat reachability and exhaustiveness
+
+func (c *Checker) checkCoverage(at diag.SourceSpan, t Type, arms []*ast.MatchArm, isExpr bool) bool {
+	en, isEnum := t.Underlying().(*Enum)
+	isBool := IsBoolean(t)
+	var seenVar []bool
+	if isEnum {
+		seenVar = make([]bool, len(en.Variants))
+	}
+	var seenBool [2]bool
+	var seenVals []Value
+	hasWild := false
+
+	allCovered := func() bool {
+		if hasWild {
+			return true
+		}
+		if isEnum {
+			for _, s := range seenVar {
+				if !s {
+					return false
+				}
+			}
+			return true
+		}
+		if isBool {
+			return seenBool[0] && seenBool[1]
+		}
+		return false
+	}
+
+	for _, arm := range arms {
+		if hasWild {
+			c.errorf(diag.E2012, arm.Pattern.Span(), "unreachable match arm: it follows the '_' arm")
+			continue
+		}
+		for _, alt := range patternAlts(arm.Pattern) {
+			switch a := alt.(type) {
+			case *ast.WildcardPattern:
+				if allCovered() {
+					if isEnum {
+						c.errorf(diag.E2012, a.Range, "unreachable '_' arm: all variants of %s are covered", t)
+					} else {
+						c.errorf(diag.E2012, a.Range, "unreachable '_' arm: all values of %s are covered", t)
+					}
+				}
+				hasWild = true
+			case *ast.CtorPattern:
+				if v := c.info.VariantAt(a); v != nil && isEnum {
+					if seenVar[v.Index] {
+						c.errorf(diag.E2012, a.Range, "unreachable pattern: variant %s is already covered", v.Name)
+					}
+					seenVar[v.Index] = true
+				} else if cv := c.info.PatConst(a); cv != nil {
+					if isBool {
+						idx := 0
+						if b, ok := cv.(BoolVal); ok && bool(b) {
+							idx = 1
+						}
+						if seenBool[idx] {
+							c.errorf(diag.E2012, a.Range, "unreachable pattern: duplicate case %s", ast.Format(a))
+						}
+						seenBool[idx] = true
+					} else {
+						dup := false
+						for _, prev := range seenVals {
+							if valueEq(prev, cv) {
+								dup = true
+								break
+							}
+						}
+						if dup {
+							c.errorf(diag.E2012, a.Range, "unreachable pattern: duplicate case %s", ast.Format(a))
+						} else {
+							seenVals = append(seenVals, cv)
+						}
+					}
+				}
+			case *ast.LiteralPattern:
+				lv := c.info.ValueOf(a.Lit)
+				if lv == nil {
+					continue
+				}
+				if isBool {
+					idx := 0
+					if b, ok := lv.(BoolVal); ok && bool(b) {
+						idx = 1
+					}
+					if seenBool[idx] {
+						c.errorf(diag.E2012, a.Range, "unreachable pattern: duplicate case %s", ast.Format(a.Lit))
+					}
+					seenBool[idx] = true
+				} else {
+					dup := false
+					for _, prev := range seenVals {
+						if valueEq(prev, lv) {
+							dup = true
+							break
+						}
+					}
+					if dup {
+						c.errorf(diag.E2012, a.Range, "unreachable pattern: duplicate case %s", ast.Format(a.Lit))
+					} else {
+						seenVals = append(seenVals, lv)
+					}
+				}
+			}
+		}
+	}
+
+	if allCovered() {
+		return true
+	}
+	if isEnum {
+		var missing []string
+		for i, v := range en.Variants {
+			if !seenVar[i] {
+				missing = append(missing, v.Name)
+			}
+		}
+		c.errorf(diag.E2012, at, "non-exhaustive match on %s: missing %s", t, strings.Join(missing, ", "))
+	} else if isExpr {
+		c.errorf(diag.E2012, at, "non-exhaustive match expression on %s: missing '_' arm", t)
+	}
+	return false
 }

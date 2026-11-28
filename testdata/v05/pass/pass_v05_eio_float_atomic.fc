@@ -1,0 +1,145 @@
+// SINCE: v0.5
+package main
+
+func incAtomic(p *Atomic[u64], times u32) {
+	for i := u32(0); i < times; i++ {
+		_ = p.Add(1)
+	}
+}
+
+func computeCircle(r f64) f64 {
+	pi := 3.141592
+	return pi * r * r
+}
+
+driver func handleEcho(ctx Context, conn Conn, served *Atomic[u64]) {
+	defer conn.Close()
+	var buf [128]byte
+	n, err := conn.Read(ctx, buf[:])
+	if err != nil || n == 0 {
+		return
+	}
+	_, _ = conn.Write(ctx, buf[:n])
+	_ = served.Add(1)
+}
+
+driver func main(io Stdio, net Net, clock Clock) error {
+	// 1. SSE2 f64 & f32 arithmetic, unary minus, compound assign, comparisons, conversions
+	area := computeCircle(2.0)
+	var x f64 = 10.5
+	x -= 3.0
+	x *= 2.0
+	x /= 3.0 // 5.0
+	neg := -2.5
+	var f f32 = f32(1.25)
+	f += f32(0.75) // 2.0
+	fAs64 := f64(f)
+	iFromF := i64(area)
+	cmpOk := (x == 5.0) && (neg < 0.0) && (area > 12.5) && (fAs64 >= 2.0)
+
+	// 2. Lock-free Atomic[T] basic ops (Load, Store, Add, Swap, CompareAndSwap)
+	var a32 Atomic[u32]
+	a32.Store(10)
+	old32 := a32.Swap(25)
+	cas1 := a32.CompareAndSwap(20, 99) // false
+	cas2 := a32.CompareAndSwap(25, 40) // true
+	var flag Atomic[bool]
+	flag.Store(false)
+	casB := flag.CompareAndSwap(false, true)
+
+	// 3. M:N epoll FiberScope: 32 fibers over 4 OS threads + Atomic[u64] contention + FiberYield + Sleep
+	var total Atomic[u64]
+	ctx, cancel := NewContext()
+	defer cancel()
+
+	scope fs := NewFiberScope(4, 64) {
+		for w := u32(0); w < 32; w++ {
+			_ = fs.Spawn(ctx, driver func() {
+				incAtomic(&total, 500)
+				FiberYield()
+				_ = clock.Sleep(ctx, 2*Millisecond)
+				incAtomic(&total, 500)
+			})
+		}
+		fs.Wait()
+	}
+
+	// 4. Real TCP echo over M:N epoll FiberScope (ZERO Slot, ZERO ConnPool!)
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	addr := ln.Addr()
+
+	srvCtx, stopSrv := NewContext()
+	defer stopSrv()
+	var served Atomic[u64]
+	var clientOk Atomic[u64]
+
+	scope netScope := NewFiberScope(4, 128) {
+		// Accept loop runs as a fiber!
+		_ = netScope.Spawn(srvCtx, driver func() {
+			driver for {
+				if rerr := netScope.Ready(srvCtx); rerr != nil {
+					break
+				}
+				conn, aerr := ln.Accept(srvCtx)
+				if aerr != nil {
+					break
+				}
+				if serr := netScope.Spawn(srvCtx, driver func() {
+					handleEcho(srvCtx, conn, &served)
+				}); serr != nil {
+					break
+				}
+			}
+		})
+
+		// 16 concurrent TCP clients running as fibers!
+		scope clients := NewFiberScope(4, 32) {
+			for c := u32(0); c < 16; c++ {
+				_ = clients.Spawn(ctx, driver func() {
+					conn, derr := net.DialTCP(ctx, addr)
+					if derr != nil {
+						return
+					}
+					defer conn.Close()
+					msg := strBytes("ping-v05")
+					_, werr := conn.Write(ctx, msg)
+					if werr != nil {
+						return
+					}
+					var rbuf [32]byte
+					rn, rerr := conn.Read(ctx, rbuf[:])
+					if rerr == nil && bytesEqual(rbuf[:rn], msg) {
+						_ = clientOk.Add(1)
+					}
+				})
+			}
+			clients.Wait()
+		}
+
+		stopSrv()
+		netScope.Wait()
+	}
+
+	// 5. Thread-backed NewScope(4) also supports Spawn & Ready (Slot hidden!)
+	var thTotal Atomic[u64]
+	scope ts := NewScope(4) {
+		for k := u32(0); k < 8; k++ {
+			if rerr := ts.Ready(ctx); rerr == nil {
+				_ = ts.Spawn(ctx, driver func() {
+					_ = thTotal.Add(10)
+				})
+			}
+		}
+		ts.Wait()
+	}
+
+	var out [256]byte
+	n := formatTo(out[:], "f=%f x=%f neg=%f f32=%f i=%d cmp=%v a=%d,%d,%v,%v,%v,%v fib=%d tcp=%d,%d th=%d\n",
+		area, x, neg, fAs64, iFromF, cmpOk, old32, a32.Load(), cas1, cas2, casB, flag.Load(),
+		total.Load(), served.Load(), clientOk.Load(), thTotal.Load())
+	return io.WriteStdout(out[:n])
+}

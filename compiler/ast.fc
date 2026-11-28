@@ -1,1156 +1,212 @@
-// SINCE: v0.3
-// ast.fc — AST node kinds over the NodeArena, NodeID assignment, the
-// `--dump-ast` printer and the canonical source printer (finc0's
-// bootstrap/internal/ast: ast.go, walk.go, dump.go, print.go).
-//
-// Node layout. Every node kind names its children with the slots of
-// arena.fc's Node (a..f single children, l1/l2 lists) in the declaration
-// order of the corresponding finc0 Go struct; `layout` is the single source
-// of truth for that order. It drives post-order NodeID assignment (finc0's
-// ast.Children order) and the dump (finc0's reflection order), so both
-// match finc0 exactly. Scalar fields live in `flags` (Flag1/Flag2), `op`,
-// the text span (tOff/tLen) and `ival`:
-//
-//	File            Path=<file path>   a Package  l1 Imports  l2 Decls
-//	ImportDecl      Flag1 Grouped      l1 Specs
-//	ImportSpec      a Name?  b Path
-//	ConstDecl       Flag1 Grouped      l1 Specs
-//	ConstSpec       a Name  b Type?  c Value
-//	TypeDecl        a Name  b TypeParams?  Flag1 Alias  c Type
-//	VarDecl         a Name  b Type?  c Value?
-//	FuncDecl        op Modifier  a Recv?  b Name  c TypeParams?  d Sig  e Decreases?  f Body
-//	Receiver        a Name  Flag1 Pointer  b TypeName  l1 TypeParams
-//	TypeParamList   l1 Params
-//	TypeParam       l1 Names  a Constraint
-//	Signature       l1 Params  l2 Results  Flag1 ResultParen
-//	Param           l1 Names  Flag1 Variadic  a Type
-//	DecreasesClause a Measure
-//	NamedType       a Pkg?  b Name  l1 Args
-//	ArrayType       a Len  b Elem        SliceType/PointerType  a Elem
-//	StructType      l1 Fields            FieldDecl  l1 Names  a Type
-//	EnumType        l1 Variants          Variant    a Name  Flag1 HasParens  l1 Payload
-//	FuncType        Flag1 Driver  a Sig  CodeType a Level  ElType a Code  AnyType
-//	BlockStmt       l1 Stmts             DeclStmt   a Decl
-//	ShortVarDecl    l1 Names  l2 Values  AssignStmt l1 LHS  op Op  l2 RHS
-//	IncDecStmt      a X  Flag1 Inc       ExprStmt   a X
-//	IfStmt          a Init?  b Cond  c Then  d Else?
-//	MatchStmt       a X  l1 Arms         MatchArm   a Pattern  d Guard?  b Expr?  c Block?
-//	WildcardPattern                      CtorPattern a Qual?  b Name  Flag1 HasParens  l1 Args
-//	LiteralPattern  a Lit                OrPattern  l1 Alts  (v0.2)
-//	TuplePattern    l1 Elems             RestPattern  (v0.2)
-//	AtPattern       a Name  b Pattern  (v0.2)
-//	ForStmt         Flag1 Driver  Flag2 ThreeClause  a Init?  b Cond?  c Post?  d Decreases?  e Body
-//	ScopeStmt       a Name  b Value  c Body
-//	DeferStmt       a X   ReturnStmt l1 Results   BreakStmt   ContinueStmt
-//	Ident           text = Name
-//	BasicLit        op Kind  text = Raw  ival = Int  (Str decoded from Raw)
-//	BoolLit         Flag1 Value          NilLit
-//	BinaryExpr      op Op  a X  b Y  ival = OpPos (line<<32 | col)
-//	UnaryExpr       op Op  a X           ParenExpr  a X
-//	CallExpr        a Fun  l1 Args       IndexExpr  a X  l1 Indices
-//	SliceExpr       a X  b Lo?  c Hi?    SelectorExpr a X  b Sel
-//	FuncLit         Flag1 Driver  a Sig  b Body
-//	StructLit       a Type  l1 Fields    FieldInit  a Name  b Value
-//	TypeExpr        a Type
-//	MatchExpr       a X  l1 Arms  (v0.2; every arm has an Expr)
-//	TupleExpr       l1 Elems             IsExpr     a X  b Pattern  (v0.2)
 package main
+
+// Compact flat AST arena for FinCore v0.1 Native.
+// Every node is 32 bytes (5 u32 slots + kind/op/flags/fileID/off).
+// Variable-length child lists live in listPool (start, count).
+
+const (
+	MaxNodes    = 262144
+	MaxListPool = 524288
+	MaxU64Pool  = 65536
+)
 
 // Node kinds.
 const (
-	NkFile            = 1
-	NkImportDecl      = 2
-	NkImportSpec      = 3
-	NkConstDecl       = 4
-	NkConstSpec       = 5
-	NkTypeDecl        = 6
-	NkVarDecl         = 7
-	NkFuncDecl        = 8
-	NkReceiver        = 9
-	NkTypeParamList   = 10
-	NkTypeParam       = 11
-	NkSignature       = 12
-	NkParam           = 13
-	NkDecreasesClause = 14
+	NKNone u8 = 0
 
-	NkNamedType   = 20
-	NkArrayType   = 21
-	NkSliceType   = 22
-	NkPointerType = 23
-	NkStructType  = 24
-	NkFieldDecl   = 25
-	NkEnumType    = 26
-	NkVariant     = 27
-	NkFuncType    = 28
-	NkCodeType    = 29
-	NkElType      = 30
-	NkAnyType     = 31
+	// Top-level & declarations
+	NKFile       u8 = 1  // a=pkgNameStr, b=impStart, c=impCount, d=declStart, e=declCount
+	NKImport     u8 = 2  // a=aliasStr(0=none), b=pathStr
+	NKConstDecl  u8 = 3  // a=nameStr, b=typeNode(0=none), c=valExpr, d=iotaVal
+	NKVarDecl    u8 = 4  // a=nameStr, b=typeNode(0=none), c=valExpr(0=none)
+	NKTypeDecl   u8 = 5  // flags: bit0=alias; a=nameStr, b=tparamStart, c=tparamCount, d=typeNode
+	NKFuncDecl   u8 = 6  // op=effect(0=total,1=comptime,2=driver); a=nameStr, b=recvNode(0=none), c=sigNode, d=bodyBlock, e=decreasesExpr
+	NKRecv       u8 = 7  // flags: bit0=ptr; a=nameStr, b=recvTypeNameStr, c=tparamStart, d=tparamCount
+	NKFuncSig    u8 = 8  // a=tparamStart, b=tparamCount, c=paramStart, d=paramCount, e=retListNode(NKList)
+	NKParam      u8 = 9  // flags: bit0=variadic; a=nameStr(0=unnamed), b=typeNode
+	NKTypeParam  u8 = 10 // flags: bit0=isConst; a=nameStr, b=constTypeNode(0=any)
+	NKList       u8 = 11 // a=start, b=count
+	NKEffectDecl u8 = 12 // a=nameStr, b=tparamStart, c=tparamCount, d=opStart, e=opCount
+	NKEffectOp   u8 = 13 // a=opNameStr, b=sigNode (NKFuncSig)
 
-	NkBlockStmt       = 40
-	NkDeclStmt        = 41
-	NkShortVarDecl    = 42
-	NkAssignStmt      = 43
-	NkIncDecStmt      = 44
-	NkExprStmt        = 45
-	NkIfStmt          = 46
-	NkMatchStmt       = 47
-	NkMatchArm        = 48
-	NkWildcardPattern = 49
-	NkCtorPattern     = 50
-	NkLiteralPattern  = 51
-	NkForStmt         = 52
-	NkScopeStmt       = 53
-	NkDeferStmt       = 54
-	NkReturnStmt      = 55
-	NkBreakStmt       = 56
-	NkContinueStmt    = 57
+	// Types
+	NKTypeName   u8 = 20 // a=pkgStr(0=none), b=nameStr, c=targStart, d=targCount
+	NKTypeArray  u8 = 21 // a=lenExpr, b=elemType
+	NKTypeSlice  u8 = 22 // a=elemType
+	NKTypePtr    u8 = 23 // a=elemType
+	NKTypeStruct u8 = 24 // a=fieldStart, b=fieldCount (each NKField)
+	NKField      u8 = 25 // a=nameStr, b=typeNode
+	NKTypeEnum   u8 = 26 // a=varStart, b=varCount (each NKVariant)
+	NKVariant    u8 = 27 // a=nameStr, b=payloadStart, c=payloadCount
+	NKTypeFunc   u8 = 28 // op=effect(0=total,2=driver); a=paramStart, b=paramCount, c=retStart, d=retCount
+	NKTypeCode   u8 = 29 // a=levelU32
+	NKTypeEl     u8 = 30 // a=codeExpr
 
-	NkIdent        = 60
-	NkBasicLit     = 61
-	NkBoolLit      = 62
-	NkNilLit       = 63
-	NkBinaryExpr   = 64
-	NkUnaryExpr    = 65
-	NkParenExpr    = 66
-	NkCallExpr     = 67
-	NkIndexExpr    = 68
-	NkSliceExpr    = 69
-	NkSelectorExpr = 70
-	NkFuncLit      = 71
-	NkStructLit    = 72
-	NkFieldInit    = 73
-	NkTypeExpr     = 74
-	NkMatchExpr    = 75 // v0.2
-	NkOrPattern    = 76 // v0.2
-	NkTuplePattern = 77 // v0.2
-	NkRestPattern  = 78 // v0.2
-	NkTupleExpr    = 79 // v0.2
-	NkIsExpr       = 80 // v0.2
-	NkAtPattern    = 81 // v0.2
+	// Statements
+	NKBlock       u8 = 40 // a=stmtStart, b=stmtCount
+	NKExprStmt    u8 = 41 // a=expr
+	NKAssign      u8 = 42 // op=assignTokKind; a=lhsStart, b=lhsCount, c=rhsStart, d=rhsCount
+	NKShortDecl   u8 = 43 // a=lhsStart(NKIdent), b=lhsCount, c=rhsStart, d=rhsCount
+	NKIncDec      u8 = 44 // op=TKInc/TKDec; a=expr
+	NKIf          u8 = 45 // a=initStmt(0=none), b=condExpr, c=thenBlock, d=elseStmt(0=none)
+	NKFor         u8 = 46 // flags: bit0=driver; a=initStmt, b=condExpr, c=postStmt, d=bodyBlock
+	NKMatchStmt   u8 = 47 // a=scrutExpr, b=armStart, c=armCount
+	NKMatchArm    u8 = 48 // a=patNode, b=bodyNode(NKBlock or expr)
+	NKScope       u8 = 49 // a=nameStr, b=valExpr, c=bodyBlock
+	NKDefer       u8 = 50 // a=callExpr
+	NKReturn      u8 = 51 // a=resStart, b=resCount
+	NKBreak       u8 = 52
+	NKContinue    u8 = 53
+	NKDeclStmt    u8 = 54 // a=declNode (NKVarDecl / NKConstDecl / NKTypeDecl)
+	NKHandleStmt  u8 = 55 // flags: bit0=isBlockBody; a=bodyNode, b=armStart, c=armCount, d=effTypeNode(0=infer)
+	NKHandleArm   u8 = 56 // a=opNameStr, b=paramStart, c=paramCount, d=bodyNode(NKBlock or expr)
+
+	// Patterns
+	NKPatWild    u8 = 60 // _
+	NKPatLit     u8 = 61 // a=litExpr
+	NKPatCtor    u8 = 62 // a=nameExpr(Ident or Selector), b=bindStart, c=bindCount (NKIdent/NKPatWild)
+	NKPatOr      u8 = 63 // a=patStart, b=patCount
+
+	// Expressions
+	NKIdent      u8 = 70 // a=strID
+	NKIntLit     u8 = 71 // a=strID, b=u64PoolIdx
+	NKStrLit     u8 = 72 // a=strID (decoded)
+	NKCharLit    u8 = 73 // a=byteVal
+	NKBoolLit    u8 = 74 // a=0/1
+	NKNilLit     u8 = 75
+	NKUnary      u8 = 76 // op=tokKind; a=expr
+	NKBinary     u8 = 77 // op=tokKind; a=lhs, b=rhs
+	NKCall       u8 = 78 // a=funExpr, b=argStart, c=argCount
+	NKIndex      u8 = 79 // a=xExpr, b=idxStart, c=idxCount
+	NKSlice      u8 = 80 // flags: bit0=has3; a=xExpr, b=lo(0=none), c=hi(0=none), d=max(0=none)
+	NKSelector   u8 = 81 // a=xExpr, b=selStrID
+	NKStructLit  u8 = 82 // a=typeNode, b=fieldInitStart, c=fieldInitCount
+	NKFieldInit  u8 = 83 // a=nameStr, b=valExpr
+	NKArrayLit   u8 = 84 // a=typeNode(NKTypeArray), b=elemStart, c=elemCount
+	NKMatchExpr  u8 = 85 // a=scrutExpr, b=armStart, c=armCount
+	NKFuncLit    u8 = 86 // op=effect(0=total,2=driver); a=sigNode, b=bodyBlock
+	NKTypeExpr   u8 = 87 // a=typeNode (when type syntax appears in expr pos, e.g. T(x) or []byte(x))
+	NKHandleExpr u8 = 88 // flags: bit0=isBlockBody; a=bodyNode, b=armStart, c=armCount, d=effTypeNode(0=infer)
+	NKFloatLit   u8 = 89 // a=strID, b=u64PoolIdx (IEEE-754 f64 bit pattern)
 )
 
-// Node slots (see layout).
+// Effect modes (stored in Node.op for NKFuncDecl/NKFuncLit/NKTypeFunc).
 const (
-	SlotNone = 0
-	SlotA    = 1
-	SlotB    = 2
-	SlotC    = 3
-	SlotD    = 4
-	SlotE    = 5
-	SlotF    = 6
-	SlotL1   = 7
-	SlotL2   = 8
-
-	MaxSlots = 8
+	EffTotal    u8 = 0
+	EffComptime u8 = 1
+	EffDriver   u8 = 2
 )
 
-// Flag bits of Node.flags.
-const (
-	Flag1 = 1
-	Flag2 = 2
-)
-
-// Function modifiers (FuncDecl op).
-const (
-	ModNone     = 0
-	ModDriver   = 1
-	ModComptime = 2
-)
-
-// Literal kinds (BasicLit op).
-const (
-	LitInt    = 0
-	LitString = 1
-	LitChar   = 2
-)
-
-// Assignment operators (AssignStmt op).
-const (
-	AsgAssign = 0
-	AsgAdd    = 1
-	AsgSub    = 2
-	AsgMul    = 3
-	AsgQuo    = 4
-)
-
-// Binary operators (BinaryExpr op), in finc0 order.
-const (
-	OpLOr  = 0
-	OpLAnd = 1
-	OpEq   = 2
-	OpNe   = 3
-	OpLt   = 4
-	OpLe   = 5
-	OpGt   = 6
-	OpGe   = 7
-	OpAdd  = 8
-	OpSub  = 9
-	OpOr   = 10
-	OpXor  = 11
-	OpMul  = 12
-	OpDiv  = 13
-	OpRem  = 14
-	OpAnd  = 15
-	OpShl  = 16
-	OpShr  = 17
-)
-
-// Unary operators (UnaryExpr op).
-const (
-	OpNot   = 0
-	OpNeg   = 1
-	OpAddr  = 2
-	OpDeref = 3
-)
-
-func binOpString(op u8) string {
-	return match op {
-		OpLOr -> "||"
-		OpLAnd -> "&&"
-		OpEq -> "=="
-		OpNe -> "!="
-		OpLt -> "<"
-		OpLe -> "<="
-		OpGt -> ">"
-		OpGe -> ">="
-		OpAdd -> "+"
-		OpSub -> "-"
-		OpOr -> "|"
-		OpXor -> "^"
-		OpMul -> "*"
-		OpDiv -> "/"
-		OpRem -> "%"
-		OpAnd -> "&"
-		OpShl -> "<<"
-		_ -> ">>"
-	}
+type Node struct {
+	kind   u8
+	op     u8
+	flags  u16
+	fileID u32
+	off    u32
+	a      u32
+	b      u32
+	c      u32
+	d      u32
+	e      u32
 }
 
-// binOpPrec is the binding strength (1 = loosest) of a binary operator.
-func binOpPrec(op u8) u8 {
-	return match op {
-		OpLOr -> 1
-		OpLAnd -> 2
-		OpEq | OpNe -> 3
-		_ if op >= OpLt && op <= OpGe -> 4
-		_ if op >= OpAdd && op <= OpXor -> 5
-		_ -> 6
-	}
+var nodes [MaxNodes]Node
+var nodeCount u32
+var sigEffStart [MaxNodes]u32 // listPool start of `with E1, E2` effect type nodes on NKFuncSig
+var sigEffCount [MaxNodes]u32
+var paramWhere [MaxNodes]u32 // optional `where <predExpr>` node on NKParam (v0.4)
+var listPool [MaxListPool]u32
+var listUsed u32
+var u64Pool [MaxU64Pool]u64
+var u64Used u32
+
+func astInit() {
+	nodeCount = 1 // 0 = NKNone
+	nodes[0] = Node{}
+	listUsed = 0
+	u64Used = 0
 }
 
-func unaryOpString(op u8) string {
-	return match op {
-		OpNot -> "!"
-		OpNeg -> "-"
-		OpAddr -> "&"
-		_ -> "*"
+func newNode(kind u8, fileID u32, off u32) u32 {
+	if nodeCount >= MaxNodes {
+		return 0
 	}
+	id := nodeCount
+	nodeCount++
+	nodes[id] = Node{kind: kind, fileID: fileID, off: off}
+	sigEffStart[id] = 0
+	sigEffCount[id] = 0
+	paramWhere[id] = 0
+	return id
 }
 
-func assignOpString(op u8) string {
-	return match op {
-		AsgAdd -> "+="
-		AsgSub -> "-="
-		AsgMul -> "*="
-		AsgQuo -> "/="
-		_ -> "="
+func pushList(items []u32) (u32, u32) {
+	n := len(items)
+	if n == 0 {
+		return 0, 0
 	}
+	if usize(listUsed)+n > MaxListPool {
+		return 0, 0
+	}
+	start := listUsed
+	for i := usize(0); i < n; i++ {
+		listPool[usize(start)+i] = items[i]
+	}
+	listUsed += u32(n)
+	return start, u32(n)
 }
 
-func litKindString(op u8) string {
-	return match op {
-		LitString -> "string"
-		LitChar -> "char"
-		_ -> "int"
+func newU64(v u64) u32 {
+	if u64Used >= MaxU64Pool {
+		return 0
 	}
+	idx := u64Used
+	u64Used++
+	u64Pool[idx] = v
+	return idx
 }
 
-// kindName returns the finc0 Go type name of a node kind.
-func kindName(k u8) string {
-	return match k {
-		NkFile -> "File"
-		NkImportDecl -> "ImportDecl"
-		NkImportSpec -> "ImportSpec"
-		NkConstDecl -> "ConstDecl"
-		NkConstSpec -> "ConstSpec"
-		NkTypeDecl -> "TypeDecl"
-		NkVarDecl -> "VarDecl"
-		NkFuncDecl -> "FuncDecl"
-		NkReceiver -> "Receiver"
-		NkTypeParamList -> "TypeParamList"
-		NkTypeParam -> "TypeParam"
-		NkSignature -> "Signature"
-		NkParam -> "Param"
-		NkDecreasesClause -> "DecreasesClause"
-		NkNamedType -> "NamedType"
-		NkArrayType -> "ArrayType"
-		NkSliceType -> "SliceType"
-		NkPointerType -> "PointerType"
-		NkStructType -> "StructType"
-		NkFieldDecl -> "FieldDecl"
-		NkEnumType -> "EnumType"
-		NkVariant -> "Variant"
-		NkFuncType -> "FuncType"
-		NkCodeType -> "CodeType"
-		NkElType -> "ElType"
-		NkAnyType -> "AnyType"
-		NkBlockStmt -> "BlockStmt"
-		NkDeclStmt -> "DeclStmt"
-		NkShortVarDecl -> "ShortVarDecl"
-		NkAssignStmt -> "AssignStmt"
-		NkIncDecStmt -> "IncDecStmt"
-		NkExprStmt -> "ExprStmt"
-		NkIfStmt -> "IfStmt"
-		NkMatchStmt -> "MatchStmt"
-		NkMatchArm -> "MatchArm"
-		NkWildcardPattern -> "WildcardPattern"
-		NkCtorPattern -> "CtorPattern"
-		NkLiteralPattern -> "LiteralPattern"
-		NkForStmt -> "ForStmt"
-		NkScopeStmt -> "ScopeStmt"
-		NkDeferStmt -> "DeferStmt"
-		NkReturnStmt -> "ReturnStmt"
-		NkBreakStmt -> "BreakStmt"
-		NkContinueStmt -> "ContinueStmt"
-		NkIdent -> "Ident"
-		NkBasicLit -> "BasicLit"
-		NkBoolLit -> "BoolLit"
-		NkNilLit -> "NilLit"
-		NkBinaryExpr -> "BinaryExpr"
-		NkUnaryExpr -> "UnaryExpr"
-		NkParenExpr -> "ParenExpr"
-		NkCallExpr -> "CallExpr"
-		NkIndexExpr -> "IndexExpr"
-		NkSliceExpr -> "SliceExpr"
-		NkSelectorExpr -> "SelectorExpr"
-		NkFuncLit -> "FuncLit"
-		NkStructLit -> "StructLit"
-		NkFieldInit -> "FieldInit"
-		NkTypeExpr -> "TypeExpr"
-		NkMatchExpr -> "MatchExpr"
-		NkOrPattern -> "OrPattern"
-		NkTuplePattern -> "TuplePattern"
-		NkRestPattern -> "RestPattern"
-		NkTupleExpr -> "TupleExpr"
-		NkIsExpr -> "IsExpr"
-		NkAtPattern -> "AtPattern"
-		_ -> "Node?"
+// parseIntLit parses decimal, 0x, 0b, 0o integer literals with underscores.
+func parseIntLit(b []byte) (u64, bool) {
+	if len(b) == 0 {
+		return 0, false
 	}
-}
-
-// layout returns the slot and field name of the i-th node-valued field of a
-// node kind (SlotNone past the last one).
-func layout(k u8, i usize) (u8, string) {
-	match k {
-		NkFile -> return layout3(i, SlotA, "Package", SlotL1, "Imports", SlotL2, "Decls")
-		NkImportDecl | NkConstDecl -> return layout1(i, SlotL1, "Specs")
-		NkImportSpec -> return layout2(i, SlotA, "Name", SlotB, "Path")
-		NkConstSpec -> return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
-		NkTypeDecl -> return layout3(i, SlotA, "Name", SlotB, "TypeParams", SlotC, "Type")
-		NkVarDecl -> return layout3(i, SlotA, "Name", SlotB, "Type", SlotC, "Value")
-		NkFuncDecl -> {
-			if i < 3 {
-				return layout3(i, SlotA, "Recv", SlotB, "Name", SlotC, "TypeParams")
-			}
-			return layout3(i-3, SlotD, "Sig", SlotE, "Decreases", SlotF, "Body")
+	var base u64 = 10
+	i := usize(0)
+	if len(b) >= 2 && b[0] == '0' {
+		if b[1] == 'x' || b[1] == 'X' {
+			base = 16
+			i = 2
+		} else if b[1] == 'b' || b[1] == 'B' {
+			base = 2
+			i = 2
+		} else if b[1] == 'o' || b[1] == 'O' {
+			base = 8
+			i = 2
 		}
-		NkReceiver -> return layout3(i, SlotA, "Name", SlotB, "TypeName", SlotL1, "TypeParams")
-		NkTypeParamList -> return layout1(i, SlotL1, "Params")
-		NkTypeParam -> return layout2(i, SlotL1, "Names", SlotA, "Constraint")
-		NkSignature -> return layout2(i, SlotL1, "Params", SlotL2, "Results")
-		NkParam -> return layout2(i, SlotL1, "Names", SlotA, "Type")
-		NkDecreasesClause -> return layout1(i, SlotA, "Measure")
-		NkNamedType -> return layout3(i, SlotA, "Pkg", SlotB, "Name", SlotL1, "Args")
-		NkArrayType -> return layout2(i, SlotA, "Len", SlotB, "Elem")
-		NkSliceType | NkPointerType -> return layout1(i, SlotA, "Elem")
-		NkStructType -> return layout1(i, SlotL1, "Fields")
-		NkFieldDecl -> return layout2(i, SlotL1, "Names", SlotA, "Type")
-		NkEnumType -> return layout1(i, SlotL1, "Variants")
-		NkVariant -> return layout2(i, SlotA, "Name", SlotL1, "Payload")
-		NkFuncType -> return layout1(i, SlotA, "Sig")
-		NkCodeType -> return layout1(i, SlotA, "Level")
-		NkElType -> return layout1(i, SlotA, "Code")
-		NkBlockStmt -> return layout1(i, SlotL1, "Stmts")
-		NkDeclStmt -> return layout1(i, SlotA, "Decl")
-		NkShortVarDecl -> return layout2(i, SlotL1, "Names", SlotL2, "Values")
-		NkAssignStmt -> return layout2(i, SlotL1, "LHS", SlotL2, "RHS")
-		NkIncDecStmt | NkExprStmt | NkDeferStmt | NkParenExpr | NkUnaryExpr -> return layout1(i, SlotA, "X")
-		NkIfStmt -> {
-			if i < 2 {
-				return layout2(i, SlotA, "Init", SlotB, "Cond")
-			}
-			return layout2(i-2, SlotC, "Then", SlotD, "Else")
+	}
+	var v u64 = 0
+	digits := usize(0)
+	for ; i < len(b); i++ {
+		c := b[i]
+		if c == '_' {
+			continue
 		}
-		NkMatchStmt -> return layout2(i, SlotA, "X", SlotL1, "Arms")
-		NkMatchArm -> {
-			if i < 2 {
-				return layout2(i, SlotA, "Pattern", SlotD, "Guard")
-			}
-			return layout2(i-2, SlotB, "Expr", SlotC, "Block")
-		}
-		NkCtorPattern -> return layout3(i, SlotA, "Qual", SlotB, "Name", SlotL1, "Args")
-		NkLiteralPattern -> return layout1(i, SlotA, "Lit")
-		NkForStmt -> {
-			if i < 3 {
-				return layout3(i, SlotA, "Init", SlotB, "Cond", SlotC, "Post")
-			}
-			return layout2(i-3, SlotD, "Decreases", SlotE, "Body")
-		}
-		NkScopeStmt -> return layout3(i, SlotA, "Name", SlotB, "Value", SlotC, "Body")
-		NkReturnStmt -> return layout1(i, SlotL1, "Results")
-		NkBinaryExpr -> return layout2(i, SlotA, "X", SlotB, "Y")
-		NkCallExpr -> return layout2(i, SlotA, "Fun", SlotL1, "Args")
-		NkIndexExpr -> return layout2(i, SlotA, "X", SlotL1, "Indices")
-		NkSliceExpr -> return layout3(i, SlotA, "X", SlotB, "Lo", SlotC, "Hi")
-		NkSelectorExpr -> return layout2(i, SlotA, "X", SlotB, "Sel")
-		NkFuncLit -> return layout2(i, SlotA, "Sig", SlotB, "Body")
-		NkStructLit -> return layout2(i, SlotA, "Type", SlotL1, "Fields")
-		NkFieldInit -> return layout2(i, SlotA, "Name", SlotB, "Value")
-		NkTypeExpr -> return layout1(i, SlotA, "Type")
-		NkMatchExpr -> return layout2(i, SlotA, "X", SlotL1, "Arms")
-		NkOrPattern -> return layout1(i, SlotL1, "Alts")
-		NkTuplePattern | NkTupleExpr -> return layout1(i, SlotL1, "Elems")
-		NkIsExpr -> return layout2(i, SlotA, "X", SlotB, "Pattern")
-		NkAtPattern -> return layout2(i, SlotA, "Name", SlotB, "Pattern")
-		_ -> return SlotNone, ""
-	}
-}
-
-func layout1(i usize, s0 u8, n0 string) (u8, string) {
-	return match i {
-		0 -> s0, n0
-		_ -> SlotNone, ""
-	}
-}
-
-func layout2(i usize, s0 u8, n0 string, s1 u8, n1 string) (u8, string) {
-	return match i {
-		0 -> s0, n0
-		1 -> s1, n1
-		_ -> SlotNone, ""
-	}
-}
-
-func layout3(i usize, s0 u8, n0 string, s1 u8, n1 string, s2 u8, n2 string) (u8, string) {
-	return match i {
-		0 -> s0, n0
-		1 -> s1, n1
-		2 -> s2, n2
-		_ -> SlotNone, ""
-	}
-}
-
-// slotChild returns the single child stored in a slot (0 if none).
-func slotChild(n Node, slot u8) u32 {
-	return match slot {
-		SlotA -> n.a
-		SlotB -> n.b
-		SlotC -> n.c
-		SlotD -> n.d
-		SlotE -> n.e
-		SlotF -> n.f
-		_ -> 0
-	}
-}
-
-// slotList returns the (start, length) of the list stored in a list slot.
-func slotList(n Node, slot u8) (u32, u32) {
-	if slot == SlotL1 {
-		return n.l1s, n.l1n
-	}
-	if slot == SlotL2 {
-		return n.l2s, n.l2n
-	}
-	return 0, 0
-}
-
-func hasFlag(n Node, f u8) bool {
-	return n.flags&f != 0
-}
-
-// ---------------------------------------------------------------------------
-// NodeID assignment: dense post-order numbering in layout order, shared
-// across the files of a package (finc0's parser.assignIDs).
-
-// assignIDs numbers the subtree rooted at id. The tree depth never exceeds
-// the number of nodes, so depth = MaxNodes + 1 is always sufficient.
-func (na *NodeArena) assignIDs(id u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	if id == 0 {
-		return
-	}
-	n := na.items[usize(id)]
-	for i := usize(0); i < MaxSlots; i++ {
-		slot, _ := layout(n.kind, i)
-		if slot == SlotNone {
-			break
-		}
-		if slot >= SlotL1 {
-			start, cnt := slotList(n, slot)
-			m := usize(cnt)
-			for j := usize(0); j < m; j++ {
-				na.assignIDs(na.listItem(start, j), depth-1)
-			}
+		var d u64
+		if c >= '0' && c <= '9' {
+			d = u64(c - '0')
+		} else if c >= 'a' && c <= 'f' {
+			d = u64(c-'a') + 10
+		} else if c >= 'A' && c <= 'F' {
+			d = u64(c-'A') + 10
 		} else {
-			na.assignIDs(slotChild(n, slot), depth-1)
+			return 0, false
 		}
+		if d >= base {
+			return 0, false
+		}
+		v = v*base + d
+		digits++
 	}
-	na.lastID++
-	na.items[usize(id)].id = na.lastID
-}
-
-// ---------------------------------------------------------------------------
-// Dump (`parse --dump-ast`): byte-identical to finc0's ast.Dump. Each node
-// prints as `Kind #ID @line:col-line:col` plus its non-zero scalar fields,
-// followed by its node fields (empty and absent ones omitted).
-
-type Dumper struct {
-	na  *NodeArena
-	sa  *SourceArena // file paths
-	src []byte       // all source bytes (SourceArena.bytes)
-	out *OutBuf
-	tmp *OutBuf // scratch for decoded string literals
-}
-
-func (d *Dumper) text(n Node) []byte {
-	s := usize(n.tOff)
-	return d.src[s : s+usize(n.tLen)]
-}
-
-func (d *Dumper) flagScalar(n Node, f u8, name string) {
-	if hasFlag(n, f) {
-		d.out.WriteByte(' ')
-		d.out.WriteString(name)
-		d.out.WriteString("=true")
-	}
-}
-
-// scalars writes the header scalar fields of n in declaration order.
-func (d *Dumper) scalars(n Node) {
-	o := d.out
-	k := n.kind
-	if k == NkFile {
-		o.WriteString(" Path=")
-		putQuoted(o, strBytes(d.sa.files[usize(n.file)].path))
-	} else if k is NkImportDecl | NkConstDecl {
-		d.flagScalar(n, Flag1, "Grouped")
-	} else if k == NkTypeDecl {
-		d.flagScalar(n, Flag1, "Alias")
-	} else if k == NkFuncDecl {
-		if n.op == ModDriver {
-			o.WriteString(" Modifier=driver")
-		} else if n.op == ModComptime {
-			o.WriteString(" Modifier=comptime")
-		}
-	} else if k == NkReceiver {
-		d.flagScalar(n, Flag1, "Pointer")
-	} else if k == NkSignature {
-		d.flagScalar(n, Flag1, "ResultParen")
-	} else if k == NkParam {
-		d.flagScalar(n, Flag1, "Variadic")
-	} else if k is NkVariant | NkCtorPattern {
-		d.flagScalar(n, Flag1, "HasParens")
-	} else if k is NkFuncType | NkFuncLit {
-		d.flagScalar(n, Flag1, "Driver")
-	} else if k == NkAssignStmt {
-		o.WriteString(" Op=")
-		o.WriteString(assignOpString(n.op))
-	} else if k == NkIncDecStmt {
-		d.flagScalar(n, Flag1, "Inc")
-	} else if k == NkForStmt {
-		d.flagScalar(n, Flag1, "Driver")
-		d.flagScalar(n, Flag2, "ThreeClause")
-	} else if k == NkIdent {
-		o.WriteString(" Name=")
-		putQuoted(o, d.text(n))
-	} else if k == NkBasicLit {
-		o.WriteString(" Kind=")
-		o.WriteString(litKindString(n.op))
-		o.WriteString(" Raw=")
-		putQuoted(o, d.text(n))
-		if n.ival != 0 {
-			o.WriteString(" Int=")
-			o.WriteUint(n.ival)
-		}
-		if n.op == LitString && !stringLitEmpty(d.text(n)) {
-			t := d.tmp
-			t.Reset()
-			decodeStringLit(t, d.text(n))
-			o.WriteString(" Str=")
-			putQuoted(o, t.Bytes())
-		}
-	} else if k == NkBoolLit {
-		d.flagScalar(n, Flag1, "Value")
-	} else if k == NkBinaryExpr {
-		o.WriteString(" Op=")
-		o.WriteString(binOpString(n.op))
-	} else if k == NkUnaryExpr {
-		o.WriteString(" Op=")
-		o.WriteString(unaryOpString(n.op))
-	}
-}
-
-// dumpNode dumps the subtree rooted at id; the caller has already written any
-// "Field: " prefix on the current line.
-func (d *Dumper) dumpNode(id u32, indent usize, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	n := d.na.items[usize(id)]
-	o := d.out
-	o.WriteString(kindName(n.kind))
-	o.WriteString(" #")
-	o.WriteUint(u64(n.id))
-	o.WriteString(" @")
-	o.WriteUint(u64(n.sLine))
-	o.WriteByte(':')
-	o.WriteUint(u64(n.sCol))
-	o.WriteByte('-')
-	o.WriteUint(u64(n.eLine))
-	o.WriteByte(':')
-	o.WriteUint(u64(n.eCol))
-	d.scalars(n)
-	o.WriteByte('\n')
-	for i := usize(0); i < MaxSlots; i++ {
-		slot, name := layout(n.kind, i)
-		if slot == SlotNone {
-			break
-		}
-		if slot >= SlotL1 {
-			start, cnt := slotList(n, slot)
-			m := usize(cnt)
-			if m > 0 {
-				o.WriteRepeat(' ', 2*(indent+1))
-				o.WriteString(name)
-				o.WriteString(":\n")
-				for j := usize(0); j < m; j++ {
-					o.WriteRepeat(' ', 2*(indent+2))
-					o.WriteString("- ")
-					d.dumpNode(d.na.listItem(start, j), indent+2, depth-1)
-				}
-			}
-		} else {
-			c := slotChild(n, slot)
-			if c != 0 {
-				o.WriteRepeat(' ', 2*(indent+1))
-				o.WriteString(name)
-				o.WriteString(": ")
-				d.dumpNode(c, indent+1, depth-1)
-			}
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Printer: canonical FinCore source of a subtree (finc0's ast.Format, used
-// in parser messages such as "non-name a.b on left side of :=").
-
-type Printer struct {
-	na     *NodeArena
-	src    []byte // all source bytes (SourceArena.bytes)
-	out    *OutBuf
-	indent usize
-}
-
-func (pr *Printer) text(n Node) []byte {
-	s := usize(n.tOff)
-	return pr.src[s : s+usize(n.tLen)]
-}
-
-func (pr *Printer) nl() {
-	pr.out.WriteByte('\n')
-	pr.out.WriteRepeat('\t', pr.indent)
-}
-
-// name writes the text of an Ident node.
-func (pr *Printer) name(id u32) {
-	pr.out.WriteBytes(pr.text(pr.na.items[usize(id)]))
-}
-
-// names writes a comma-separated identifier list.
-func (pr *Printer) names(start u32, cnt u32) {
-	m := usize(cnt)
-	for i := usize(0); i < m; i++ {
-		if i > 0 {
-			pr.out.WriteString(", ")
-		}
-		pr.name(pr.na.listItem(start, i))
-	}
-}
-
-// printList prints the nodes of a list separated by sep; with lines set, each
-// element starts on a new line (nl) instead.
-func (pr *Printer) printList(start u32, cnt u32, sep string, lines bool, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	m := usize(cnt)
-	for i := usize(0); i < m; i++ {
-		if lines {
-			pr.nl()
-		} else if i > 0 {
-			pr.out.WriteString(sep)
-		}
-		pr.printNode(pr.na.listItem(start, i), depth-1)
-	}
-}
-
-// printNode prints the subtree rooted at id (nothing for id 0).
-func (pr *Printer) printNode(id u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	if id == 0 {
-		return
-	}
-	n := pr.na.items[usize(id)]
-	o := pr.out
-	k := n.kind
-	if k == NkFile {
-		o.WriteString("package ")
-		pr.name(n.a)
-		o.WriteString("\n")
-		m := usize(n.l1n)
-		for i := usize(0); i < m; i++ {
-			o.WriteString("\n")
-			pr.printNode(pr.na.listItem(n.l1s, i), depth-1)
-		}
-		m2 := usize(n.l2n)
-		for i := usize(0); i < m2; i++ {
-			o.WriteString("\n")
-			pr.printNode(pr.na.listItem(n.l2s, i), depth-1)
-			o.WriteString("\n")
-		}
-	} else if k is NkImportDecl | NkConstDecl {
-		if k == NkImportDecl {
-			o.WriteString("import ")
-		} else {
-			o.WriteString("const ")
-		}
-		if hasFlag(n, Flag1) {
-			o.WriteString("(")
-			pr.indent++
-			pr.printList(n.l1s, n.l1n, "", true, depth-1)
-			pr.indent--
-			pr.nl()
-			o.WriteString(")")
-		} else if n.l1n > 0 {
-			pr.printNode(pr.na.listItem(n.l1s, 0), depth-1)
-		}
-	} else if k == NkImportSpec {
-		if n.a != 0 {
-			pr.name(n.a)
-			o.WriteString(" ")
-		}
-		pr.printNode(n.b, depth-1)
-	} else if k == NkConstSpec {
-		pr.name(n.a)
-		if n.b != 0 {
-			o.WriteString(" ")
-			pr.printNode(n.b, depth-1)
-		}
-		o.WriteString(" = ")
-		pr.printNode(n.c, depth-1)
-	} else if k == NkTypeDecl {
-		o.WriteString("type ")
-		pr.name(n.a)
-		pr.printNode(n.b, depth-1)
-		if hasFlag(n, Flag1) {
-			o.WriteString(" =")
-		}
-		o.WriteString(" ")
-		pr.printNode(n.c, depth-1)
-	} else if k == NkVarDecl {
-		o.WriteString("var ")
-		pr.name(n.a)
-		if n.b != 0 {
-			o.WriteString(" ")
-			pr.printNode(n.b, depth-1)
-		}
-		if n.c != 0 {
-			o.WriteString(" = ")
-			pr.printNode(n.c, depth-1)
-		}
-	} else if k == NkFuncDecl {
-		if n.op == ModDriver {
-			o.WriteString("driver ")
-		} else if n.op == ModComptime {
-			o.WriteString("comptime ")
-		}
-		o.WriteString("func ")
-		if n.a != 0 {
-			pr.printNode(n.a, depth-1)
-			o.WriteString(" ")
-		}
-		pr.name(n.b)
-		pr.printNode(n.c, depth-1)
-		pr.printNode(n.d, depth-1)
-		if n.e != 0 {
-			o.WriteString(" ")
-			pr.printNode(n.e, depth-1)
-		}
-		o.WriteString(" ")
-		pr.printNode(n.f, depth-1)
-	} else if k == NkReceiver {
-		o.WriteString("(")
-		pr.name(n.a)
-		o.WriteString(" ")
-		if hasFlag(n, Flag1) {
-			o.WriteString("*")
-		}
-		pr.name(n.b)
-		if n.l1n > 0 {
-			o.WriteString("[")
-			pr.names(n.l1s, n.l1n)
-			o.WriteString("]")
-		}
-		o.WriteString(")")
-	} else if k == NkTypeParamList {
-		o.WriteString("[")
-		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.WriteString("]")
-	} else if k == NkTypeParam {
-		pr.names(n.l1s, n.l1n)
-		o.WriteString(" ")
-		pr.printNode(n.a, depth-1)
-	} else if k == NkSignature {
-		o.WriteString("(")
-		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.WriteString(")")
-		if n.l2n > 0 {
-			o.WriteString(" ")
-			paren := hasFlag(n, Flag1) || n.l2n > 1
-			if paren {
-				o.WriteString("(")
-			}
-			pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
-			if paren {
-				o.WriteString(")")
-			}
-		}
-	} else if k == NkParam {
-		pr.names(n.l1s, n.l1n)
-		o.WriteString(" ")
-		if hasFlag(n, Flag1) {
-			o.WriteString("...")
-		}
-		pr.printNode(n.a, depth-1)
-	} else if k == NkDecreasesClause {
-		o.WriteString("decreases(")
-		pr.printNode(n.a, depth-1)
-		o.WriteString(")")
-	} else {
-		pr.printTypeOrStmt(n, depth-1)
-	}
-}
-
-// printTypeOrStmt prints type and statement nodes.
-func (pr *Printer) printTypeOrStmt(n Node, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	o := pr.out
-	k := n.kind
-	if k == NkNamedType {
-		if n.a != 0 {
-			pr.name(n.a)
-			o.WriteString(".")
-		}
-		pr.name(n.b)
-		if n.l1n > 0 {
-			o.WriteString("[")
-			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-			o.WriteString("]")
-		}
-	} else if k == NkArrayType {
-		o.WriteString("[")
-		pr.printNode(n.a, depth-1)
-		o.WriteString("]")
-		pr.printNode(n.b, depth-1)
-	} else if k == NkSliceType {
-		o.WriteString("[]")
-		pr.printNode(n.a, depth-1)
-	} else if k == NkPointerType {
-		o.WriteString("*")
-		pr.printNode(n.a, depth-1)
-	} else if k is NkStructType | NkEnumType {
-		if k == NkStructType {
-			o.WriteString("struct {")
-		} else {
-			o.WriteString("enum {")
-		}
-		m := usize(n.l1n)
-		for i := usize(0); i < m; i++ {
-			if i > 0 {
-				o.WriteString(";")
-			}
-			o.WriteString(" ")
-			pr.printNode(pr.na.listItem(n.l1s, i), depth-1)
-		}
-		if m > 0 {
-			o.WriteString(" ")
-		}
-		o.WriteString("}")
-	} else if k == NkFieldDecl {
-		pr.names(n.l1s, n.l1n)
-		o.WriteString(" ")
-		pr.printNode(n.a, depth-1)
-	} else if k == NkVariant {
-		pr.name(n.a)
-		if hasFlag(n, Flag1) {
-			o.WriteString("(")
-			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-			o.WriteString(")")
-		}
-	} else if k == NkFuncType {
-		if hasFlag(n, Flag1) {
-			o.WriteString("driver ")
-		}
-		o.WriteString("func")
-		pr.printNode(n.a, depth-1)
-	} else if k == NkCodeType {
-		o.WriteString("Code ")
-		pr.printNode(n.a, depth-1)
-	} else if k == NkElType {
-		o.WriteString("El(")
-		pr.printNode(n.a, depth-1)
-		o.WriteString(")")
-	} else if k == NkAnyType {
-		o.WriteString("any")
-	} else if k == NkBlockStmt {
-		o.WriteString("{")
-		pr.indent++
-		pr.printList(n.l1s, n.l1n, "", true, depth-1)
-		pr.indent--
-		if n.l1n > 0 {
-			pr.nl()
-		}
-		o.WriteString("}")
-	} else if k is NkDeclStmt | NkExprStmt | NkLiteralPattern | NkTypeExpr {
-		pr.printNode(n.a, depth-1)
-	} else if k == NkShortVarDecl {
-		pr.names(n.l1s, n.l1n)
-		o.WriteString(" := ")
-		pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
-	} else if k == NkAssignStmt {
-		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.WriteString(" ")
-		o.WriteString(assignOpString(n.op))
-		o.WriteString(" ")
-		pr.printList(n.l2s, n.l2n, ", ", false, depth-1)
-	} else if k == NkIncDecStmt {
-		pr.printNode(n.a, depth-1)
-		if hasFlag(n, Flag1) {
-			o.WriteString("++")
-		} else {
-			o.WriteString("--")
-		}
-	} else if k == NkIfStmt {
-		o.WriteString("if ")
-		if n.a != 0 {
-			pr.printNode(n.a, depth-1)
-			o.WriteString("; ")
-		}
-		pr.printNode(n.b, depth-1)
-		o.WriteString(" ")
-		pr.printNode(n.c, depth-1)
-		if n.d != 0 {
-			o.WriteString(" else ")
-			pr.printNode(n.d, depth-1)
-		}
-	} else if k == NkMatchStmt {
-		o.WriteString("match ")
-		pr.printNode(n.a, depth-1)
-		o.WriteString(" {")
-		pr.indent++
-		pr.printList(n.l1s, n.l1n, "", true, depth-1)
-		pr.indent--
-		pr.nl()
-		o.WriteString("}")
-	} else if k == NkMatchArm {
-		pr.printNode(n.a, depth-1)
-		if n.d != 0 {
-			o.WriteString(" if ")
-			pr.printNode(n.d, depth-1)
-		}
-		o.WriteString(" -> ")
-		if n.c != 0 {
-			pr.printNode(n.c, depth-1)
-		} else {
-			pr.printNode(n.b, depth-1)
-		}
-	} else if k == NkOrPattern {
-		m := usize(n.l1n)
-		for i := usize(0); i < m; i++ {
-			if i > 0 {
-				o.WriteString(" | ")
-			}
-			a := pr.na.listItem(n.l1s, i)
-			if pr.na.items[usize(a)].kind == NkAtPattern {
-				o.WriteString("(")
-				pr.printNode(a, depth-1)
-				o.WriteString(")")
-			} else {
-				pr.printNode(a, depth-1)
-			}
-		}
-	} else if k == NkAtPattern {
-		pr.name(n.a)
-		o.WriteString(" @ ")
-		if pr.na.items[usize(n.b)].kind == NkOrPattern {
-			o.WriteString("(")
-			pr.printNode(n.b, depth-1)
-			o.WriteString(")")
-		} else {
-			pr.printNode(n.b, depth-1)
-		}
-	} else if k is NkTuplePattern | NkTupleExpr {
-		o.WriteString("(")
-		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.WriteString(")")
-	} else if k == NkRestPattern {
-		o.WriteString("..")
-	} else if k == NkIsExpr {
-		pr.printNode(n.a, depth-1)
-		o.WriteString(" is ")
-		pr.printNode(n.b, depth-1)
-	} else if k == NkMatchExpr {
-		// one line, so that diagnostics embedding it stay single-line
-		o.WriteString("match ")
-		pr.printNode(n.a, depth-1)
-		o.WriteString(" { ")
-		pr.printList(n.l1s, n.l1n, "; ", false, depth-1)
-		o.WriteString(" }")
-	} else if k == NkWildcardPattern {
-		o.WriteString("_")
-	} else if k == NkCtorPattern {
-		if n.a != 0 {
-			pr.name(n.a)
-			o.WriteString(".")
-		}
-		pr.name(n.b)
-		if hasFlag(n, Flag1) {
-			o.WriteString("(")
-			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-			o.WriteString(")")
-		}
-	} else if k == NkForStmt {
-		if hasFlag(n, Flag1) {
-			o.WriteString("driver ")
-		}
-		o.WriteString("for ")
-		if hasFlag(n, Flag2) {
-			pr.printNode(n.a, depth-1)
-			o.WriteString("; ")
-			pr.printNode(n.b, depth-1)
-			o.WriteString("; ")
-			pr.printNode(n.c, depth-1)
-			if n.c != 0 {
-				o.WriteString(" ")
-			}
-		} else if n.b != 0 {
-			pr.printNode(n.b, depth-1)
-			o.WriteString(" ")
-		}
-		if n.d != 0 {
-			pr.printNode(n.d, depth-1)
-			o.WriteString(" ")
-		}
-		pr.printNode(n.e, depth-1)
-	} else if k == NkScopeStmt {
-		o.WriteString("scope ")
-		pr.name(n.a)
-		o.WriteString(" := ")
-		pr.printNode(n.b, depth-1)
-		o.WriteString(" ")
-		pr.printNode(n.c, depth-1)
-	} else if k == NkDeferStmt {
-		o.WriteString("defer ")
-		pr.printNode(n.a, depth-1)
-	} else if k == NkReturnStmt {
-		o.WriteString("return")
-		if n.l1n > 0 {
-			o.WriteString(" ")
-			pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		}
-	} else if k == NkBreakStmt {
-		o.WriteString("break")
-	} else if k == NkContinueStmt {
-		o.WriteString("continue")
-	} else {
-		pr.printExpr(n, depth-1)
-	}
-}
-
-// printExpr prints expression nodes.
-func (pr *Printer) printExpr(n Node, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	o := pr.out
-	k := n.kind
-	if k is NkIdent | NkBasicLit {
-		o.WriteBytes(pr.text(n))
-	} else if k == NkBoolLit {
-		if hasFlag(n, Flag1) {
-			o.WriteString("true")
-		} else {
-			o.WriteString("false")
-		}
-	} else if k == NkNilLit {
-		o.WriteString("nil")
-	} else if k == NkBinaryExpr {
-		pr.printNode(n.a, depth-1)
-		o.WriteString(" ")
-		o.WriteString(binOpString(n.op))
-		o.WriteString(" ")
-		pr.printNode(n.b, depth-1)
-	} else if k == NkUnaryExpr {
-		o.WriteString(unaryOpString(n.op))
-		pr.printNode(n.a, depth-1)
-	} else if k == NkParenExpr {
-		o.WriteString("(")
-		pr.printNode(n.a, depth-1)
-		o.WriteString(")")
-	} else if k == NkCallExpr {
-		pr.printNode(n.a, depth-1)
-		o.WriteString("(")
-		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.WriteString(")")
-	} else if k == NkIndexExpr {
-		pr.printNode(n.a, depth-1)
-		o.WriteString("[")
-		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.WriteString("]")
-	} else if k == NkSliceExpr {
-		pr.printNode(n.a, depth-1)
-		o.WriteString("[")
-		pr.printNode(n.b, depth-1)
-		o.WriteString(":")
-		pr.printNode(n.c, depth-1)
-		o.WriteString("]")
-	} else if k == NkSelectorExpr {
-		pr.printNode(n.a, depth-1)
-		o.WriteString(".")
-		pr.name(n.b)
-	} else if k == NkFuncLit {
-		if hasFlag(n, Flag1) {
-			o.WriteString("driver ")
-		}
-		o.WriteString("func")
-		pr.printNode(n.a, depth-1)
-		o.WriteString(" ")
-		pr.printNode(n.b, depth-1)
-	} else if k == NkStructLit {
-		pr.printNode(n.a, depth-1)
-		o.WriteString("{")
-		pr.printList(n.l1s, n.l1n, ", ", false, depth-1)
-		o.WriteString("}")
-	} else if k == NkFieldInit {
-		pr.name(n.a)
-		o.WriteString(": ")
-		pr.printNode(n.b, depth-1)
-	}
+	return v, digits > 0
 }

@@ -1,0 +1,51 @@
+// FinCore v0.6 Showcase: Declarative Compiler Call-Graph & RBAC Analysis
+// using std/datalog (bounded stratified Datalog, zero GC, zero malloc, Layer-2 total)
+// + v0.6 Generic Constraints (Equal/Ordered/Numeric) + v0.3 Algebraic Effects (Emit).
+package main
+
+import "std/datalog"
+
+driver func main(io Stdio) error {
+	// 1. Declarative Call-Graph Analysis (Reachability, Dead Code, Mutual Recursion)
+	var defined datalog.Unary[16, string]
+	_ = defined.Insert("main")
+	_ = defined.Insert("parse")
+	_ = defined.Insert("evalExpr")
+	_ = defined.Insert("evalCall")
+	_ = defined.Insert("unusedHelper")
+
+	var entry datalog.Unary[16, string]
+	_ = entry.Insert("main")
+
+	var calls datalog.Binary[32, string, string]
+	_ = calls.Insert("main", "parse")
+	_ = calls.Insert("main", "evalExpr")
+	_ = calls.Insert("evalExpr", "evalCall")
+	_ = calls.Insert("evalCall", "evalExpr") // mutual recursion!
+
+	// Reachable(f) :- Entry(f) | Reachable(g), Calls(g, f)
+	var reachable datalog.Unary[16, string]
+	_ = datalog.ProjectReach[16, 32, string](&entry, &calls, &reachable)
+
+	// Dead(f) :- Defined(f), not Reachable(f)
+	var dead datalog.Unary[16, string]
+	datalog.AntiJoin[16, string](&defined, &reachable, &dead)
+
+	// Reaches(a, b) :- Calls+(a, b); Cyclic(f) :- Reaches(f, f)
+	var reaches datalog.Binary[32, string, string]
+	_ = datalog.TransitiveClosure[32, string](&calls, &reaches)
+	var cyclic datalog.Unary[16, string]
+	datalog.SelfLoops[32, 16, string](&reaches, &cyclic)
+
+	var buf [256]byte
+	pos := usize(0)
+	pos += formatTo(buf[pos:], "reachable=%d dead=", reachable.Len())
+	handle datalog.StreamUnary[16, string](&dead) with datalog.Emit[string] {
+		emit(name) -> {
+			pos += formatTo(buf[pos:], "%s", name)
+			resume()
+		}
+	}
+	pos += formatTo(buf[pos:], " cyclic=%d\n", cyclic.Len())
+	return io.WriteStdout(buf[:pos])
+}

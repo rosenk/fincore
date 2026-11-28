@@ -11,7 +11,6 @@ import (
 	"fincore/bootstrap/internal/ast"
 	"fincore/bootstrap/internal/diag"
 	"fincore/bootstrap/internal/types"
-	"fincore/scripts/langver"
 )
 
 // moduleRoot changes into the module root (local imports resolve against
@@ -33,13 +32,9 @@ func passInputs(t *testing.T) []string {
 		t.Fatal(err)
 	}
 	for _, e := range ents {
-		if (e.IsDir() || strings.HasSuffix(e.Name(), ".fc")) && finc0Can(t, ".", "testdata/pass/"+e.Name()) {
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".fc") {
 			ins = append(ins, "testdata/pass/"+e.Name())
 		}
-	}
-	// compiler/ uses v0.3 since the seed bump (its files say SINCE: v0.3).
-	if _, err := os.Stat("compiler"); err == nil && finc0Can(t, ".", "compiler") {
-		ins = append(ins, "compiler")
 	}
 	return ins
 }
@@ -250,17 +245,4 @@ func unmarked(t *testing.T, path string, diags diag.List) diag.List {
 		}
 	}
 	return out
-}
-
-// finc0Can reports whether the input in (relative to the module root
-// root) needs at most the language version finc0 implements (v0.2, frozen):
-// tests of newer versions carry `// SINCE: vX.Y` and are skipped here
-// (testdata/README.md).
-func finc0Can(t *testing.T, root, in string) bool {
-	t.Helper()
-	v, ok, err := langver.RequiredIn(root, os.Getenv("FINCROOT"), filepath.Join(root, in))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return !ok || !langver.MustParse(langver.Finc0).Less(v)
 }

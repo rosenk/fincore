@@ -1,0 +1,69 @@
+// FinCore v0.4 Showcase: Indexed Dependent Types, Where-Clause Bounds-Check
+// Elimination, Zero-Copy Const Views, and Bounded Scoped Arena Allocation.
+package main
+
+func concat[m usize, n usize, T any](a [m]T, b [n]T) [m + n]T {
+	var out [m + n]T
+	for i := usize(0); i < m; i++ {
+		out[i] = a[i]
+	}
+	for j := usize(0); j < n; j++ {
+		out[m+j] = b[j]
+	}
+	return out
+}
+
+// Statically proven in-bounds: emits ZERO runtime bounds checks!
+func dot[n usize](a *[n]u32, b *[n]u32) u32 {
+	var acc u32 = 0
+	for i := usize(0); i < n; i++ {
+		acc += a[i] * b[i]
+	}
+	return acc
+}
+
+func at[n usize, T any](a *[n]T, i usize where i < n) T {
+	return a[i]
+}
+
+// Zero-copy read-only view over string bytes — cannot mutate.
+func countBytes(view const []byte, target byte) u32 {
+	var n u32 = 0
+	for i := usize(0); i < len(view); i++ {
+		if view[i] == target {
+			n++
+		}
+	}
+	return n
+}
+
+driver func main(io Stdio) error {
+	left := [2]u32{3, 4}
+	right := [3]u32{5, 6, 7}
+	// [2 + 3]u32 == [3 + 2]u32 == [5]u32 via canonical dimension normalization
+	joined := concat[2, 3, u32](left, right)
+	weights := [5]u32{1, 2, 3, 4, 5}
+	dp := dot[5](&joined, &weights)
+
+	// Flow-sensitive proof discharges `where i < 5`
+	var pick u32 = 0
+	idx := usize(3)
+	if idx < 5 {
+		pick = at[5, u32](&joined, idx)
+	}
+
+	// Zero-copy strView -> const []byte
+	hdr := strView("fincore:v0.4:zero-gc:zero-libc")
+	colons := countBytes(hdr, ':')
+
+	// Bounded runtime Arena: O(1) bump alloc + deterministic O(1) munmap on scope exit
+	scope arena := NewArena(4096) {
+		buf, err := arena.AllocBytes(256)
+		if err != nil {
+			return err
+		}
+		n := formatTo(buf, "dot=%d pick=%d colons=%d arena_used=%d/%d\n",
+			dp, pick, colons, arena.Used(), arena.Cap())
+		return io.WriteStdout(buf[:n])
+	}
+}

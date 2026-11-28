@@ -1,3 +1,0 @@
-testdata/context/compound_assign_expr.fc:11:13: error[E1001]: compound assignment operator |= is not supported; write f.bits[i] = f.bits[i] | (b << 1)
-   11 |     f.bits[i] |= b << 1
-      |                ^

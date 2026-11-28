@@ -1,0 +1,529 @@
+package main
+
+// Lightweight, deterministic linear fact prover for FinCore v0.4
+// indexed dependent types (`where i < n`) and zero-overhead bounds check
+// elimination (`NFBoundsProven`). Zero SMT solver, O(k) deterministic checks.
+
+const (
+	MaxFacts  = 128
+	AtomNone  u8 = 0
+	AtomConst u8 = 1 // val = u64
+	AtomVar   u8 = 2 // sym = SymLocal / SymParam
+	AtomLen   u8 = 3 // sym = SymLocal / SymParam (len(s))
+	AtomDim   u8 = 4 // sym = DimExpr ID
+)
+
+type FactAtom struct {
+	kind u8
+	pad  u8
+	pad2 u16
+	sym  u32
+	val  u64
+}
+
+type Fact struct {
+	op  u8 // TKLss, TKLeq, TKGtr, TKGeq, TKEql, TKNeq
+	lhs FactAtom
+	rhs FactAtom
+}
+
+driver func atomEq(a FactAtom, b FactAtom) bool {
+	if a.kind == AtomNone || b.kind == AtomNone {
+		return false
+	}
+	if a.kind != b.kind {
+		if a.kind == AtomConst && b.kind == AtomDim {
+			return dimExprs[b.sym].kind == DimConst && dimExprs[b.sym].val == a.val
+		}
+		if a.kind == AtomDim && b.kind == AtomConst {
+			return dimExprs[a.sym].kind == DimConst && dimExprs[a.sym].val == b.val
+		}
+		return false
+	}
+	if a.kind == AtomConst {
+		return a.val == b.val
+	}
+	if a.kind == AtomDim {
+		return dimCmp(a.sym, b.sym) == 0
+	}
+	return a.sym == b.sym
+}
+
+func isAtomUnsigned(a FactAtom) bool {
+	if a.kind == AtomConst || a.kind == AtomLen || a.kind == AtomDim {
+		return true
+	}
+	if a.kind == AtomVar && a.sym != 0 {
+		return isUnsignedInt(syms[a.sym].typeID)
+	}
+	return false
+}
+
+func flipCmpOp(op u8) u8 {
+	if op == TKLss {
+		return TKGtr
+	}
+	if op == TKLeq {
+		return TKGeq
+	}
+	if op == TKGtr {
+		return TKLss
+	}
+	if op == TKGeq {
+		return TKLeq
+	}
+	return op
+}
+
+func negateCmpOp(op u8) u8 {
+	if op == TKLss {
+		return TKGeq
+	}
+	if op == TKLeq {
+		return TKGtr
+	}
+	if op == TKGtr {
+		return TKLeq
+	}
+	if op == TKGeq {
+		return TKLss
+	}
+	if op == TKEql {
+		return TKNeq
+	}
+	if op == TKNeq {
+		return TKEql
+	}
+	return 0
+}
+
+func (c *Checker) pushFact(lhs FactAtom, op u8, rhs FactAtom) {
+	if lhs.kind == AtomNone || rhs.kind == AtomNone || op == 0 {
+		return
+	}
+	// Normalize > and >= to < and <=
+	if op == TKGtr || op == TKGeq {
+		tmp := lhs
+		lhs = rhs
+		rhs = tmp
+		op = flipCmpOp(op)
+	}
+	if c.nFacts < MaxFacts {
+		c.facts[c.nFacts] = Fact{op: op, lhs: lhs, rhs: rhs}
+		c.nFacts++
+	}
+}
+
+driver func atomFromArrayType(arrTy u32) FactAtom {
+	u := under(arrTy)
+	if types[u].kind == TKindPtr {
+		u = under(types[u].a)
+	}
+	if types[u].kind != TKindArray {
+		return FactAtom{}
+	}
+	if types[u].b != 0 {
+		return FactAtom{kind: AtomDim, sym: types[u].b}
+	}
+	return FactAtom{kind: AtomConst, val: types[u].lenVal}
+}
+
+driver func (c *Checker) atomFromExpr(en u32) FactAtom {
+	if en == 0 {
+		return FactAtom{}
+	}
+	if nodeVal[en] != 0 && vals[nodeVal[en]].kind == VKInt && vals[nodeVal[en]].flags == 0 {
+		return FactAtom{kind: AtomConst, val: vals[nodeVal[en]].u64Val}
+	}
+	n := nodes[en]
+	if n.kind == NKIntLit {
+		return FactAtom{kind: AtomConst, val: u64Pool[n.b]}
+	}
+	if n.kind == NKIdent {
+		sym := nodeSym[en]
+		if sym == 0 {
+			if idx, ok := c.lookupLocal(n.a); ok {
+				sym = c.locals[idx].symID
+			} else if tps := lookupActiveTP(n.a); tps != 0 {
+				sym = tps
+			}
+		}
+		if sym != 0 {
+			if syms[sym].kind == SymTypeParam && syms[sym].flags != 0 {
+				return FactAtom{kind: AtomDim, sym: makeDimParam(sym)}
+			}
+			if syms[sym].kind == SymConst && syms[sym].valID != 0 && vals[syms[sym].valID].kind == VKInt && vals[syms[sym].valID].flags == 0 {
+				return FactAtom{kind: AtomConst, val: vals[syms[sym].valID].u64Val}
+			}
+			if syms[sym].kind == SymLocal || syms[sym].kind == SymParam {
+				return FactAtom{kind: AtomVar, sym: sym}
+			}
+		}
+		return FactAtom{}
+	}
+	if n.kind == NKCall && nodeCall[en] != 0 && calls[nodeCall[en]].kind == CKBuiltin && calls[nodeCall[en]].builtinID == BFLen && n.c == 1 {
+		arg := listPool[n.b]
+		at := nodeType[arg]
+		if at != 0 {
+			au := under(at)
+			if types[au].kind == TKindArray || (types[au].kind == TKindPtr && types[under(types[au].a)].kind == TKindArray) {
+				return atomFromArrayType(at)
+			}
+			if types[au].kind == TKindSlice && nodes[arg].kind == NKIdent && nodeSym[arg] != 0 {
+				return FactAtom{kind: AtomLen, sym: nodeSym[arg]}
+			}
+		}
+	}
+	if n.kind == NKBinary && (n.op == TKAdd || n.op == TKSub || n.op == TKMul) {
+		dimID, dimVal, ok := resolveDimExpr(c.pkgID, en)
+		if ok {
+			if dimID == 0 {
+				return FactAtom{kind: AtomConst, val: dimVal}
+			}
+			return FactAtom{kind: AtomDim, sym: dimID}
+		}
+	}
+	return FactAtom{}
+}
+
+driver func (c *Checker) pushFactFromCond(condNode u32, negate bool) {
+	if condNode == 0 {
+		return
+	}
+	n := nodes[condNode]
+	if n.kind == NKUnary && n.op == TKNot {
+		c.pushFactFromCond(n.a, !negate)
+		return
+	}
+	if n.kind == NKBinary {
+		if !negate && n.op == TKLAnd {
+			c.pushFactFromCond(n.a, false)
+			c.pushFactFromCond(n.b, false)
+			return
+		}
+		if negate && n.op == TKLOr {
+			c.pushFactFromCond(n.a, true)
+			c.pushFactFromCond(n.b, true)
+			return
+		}
+		if n.op == TKLss || n.op == TKLeq || n.op == TKGtr || n.op == TKGeq || n.op == TKEql || n.op == TKNeq {
+			op := n.op
+			if negate {
+				op = negateCmpOp(op)
+			}
+			la := c.atomFromExpr(n.a)
+			ra := c.atomFromExpr(n.b)
+			c.pushFact(la, op, ra)
+		}
+	}
+}
+
+driver func (c *Checker) proveDirect(lhs FactAtom, op u8, rhs FactAtom) bool {
+	if lhs.kind == AtomNone || rhs.kind == AtomNone {
+		return false
+	}
+	if op == TKGtr || op == TKGeq {
+		tmp := lhs
+		lhs = rhs
+		rhs = tmp
+		op = flipCmpOp(op)
+	}
+	// Constant arithmetic check
+	if lhs.kind == AtomConst && rhs.kind == AtomConst {
+		if op == TKLss {
+			return lhs.val < rhs.val
+		}
+		if op == TKLeq {
+			return lhs.val <= rhs.val
+		}
+		if op == TKEql {
+			return lhs.val == rhs.val
+		}
+		if op == TKNeq {
+			return lhs.val != rhs.val
+		}
+	}
+	// Reflexivity
+	if atomEq(lhs, rhs) {
+		return op == TKLeq || op == TKEql
+	}
+	// Unsigned non-negativity: 0 <= u
+	if op == TKLeq && lhs.kind == AtomConst && lhs.val == 0 && isAtomUnsigned(rhs) {
+		return true
+	}
+	// Direct match in active fact set (with weakening: < implies <= and !=; == implies <= in both directions)
+	nf := c.nFacts
+	for i := u32(0); i < nf; i++ {
+		f := c.facts[i]
+		if atomEq(f.lhs, lhs) && atomEq(f.rhs, rhs) {
+			if f.op == op {
+				return true
+			}
+			if f.op == TKLss && (op == TKLeq || op == TKNeq) {
+				return true
+			}
+			if f.op == TKEql && op == TKLeq {
+				return true
+			}
+		}
+		if f.op == TKEql && atomEq(f.lhs, rhs) && atomEq(f.rhs, lhs) {
+			if op == TKEql || op == TKLeq {
+				return true
+			}
+		}
+		if f.op == TKNeq && op == TKNeq && atomEq(f.lhs, rhs) && atomEq(f.rhs, lhs) {
+			return true
+		}
+		// Constant tightening: lhs < C1 and C1 <= C2 => lhs < C2
+		if op == TKLss && rhs.kind == AtomConst && f.rhs.kind == AtomConst && atomEq(f.lhs, lhs) {
+			if f.op == TKLss && f.rhs.val <= rhs.val {
+				return true
+			}
+			if (f.op == TKLeq || f.op == TKEql) && f.rhs.val < rhs.val {
+				return true
+			}
+		}
+		if op == TKLss && lhs.kind == AtomConst && f.lhs.kind == AtomConst && atomEq(f.rhs, rhs) {
+			if f.op == TKLss && lhs.val <= f.lhs.val {
+				return true
+			}
+			if (f.op == TKLeq || f.op == TKEql) && lhs.val < f.lhs.val {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+driver func (c *Checker) proveRel(lhs FactAtom, op u8, rhs FactAtom) bool {
+	if op == TKGtr || op == TKGeq {
+		tmp := lhs
+		lhs = rhs
+		rhs = tmp
+		op = flipCmpOp(op)
+	}
+	if c.proveDirect(lhs, op, rhs) {
+		return true
+	}
+	// 1-hop transitivity over active facts:
+	//   lhs < m && m <= rhs  => lhs < rhs
+	//   lhs <= m && m < rhs  => lhs < rhs
+	//   lhs <= m && m <= rhs => lhs <= rhs
+	//   lhs == m && m op rhs => lhs op rhs
+	nf := c.nFacts
+	for i := u32(0); i < nf; i++ {
+		f := c.facts[i]
+		if op == TKLss {
+			if atomEq(f.lhs, lhs) && f.op == TKLss && c.proveDirect(f.rhs, TKLeq, rhs) {
+				return true
+			}
+			if atomEq(f.lhs, lhs) && (f.op == TKLeq || f.op == TKEql) && c.proveDirect(f.rhs, TKLss, rhs) {
+				return true
+			}
+			if f.op == TKEql && atomEq(f.rhs, lhs) && c.proveDirect(f.lhs, TKLss, rhs) {
+				return true
+			}
+		} else if op == TKLeq {
+			if atomEq(f.lhs, lhs) && (f.op == TKLss || f.op == TKLeq || f.op == TKEql) && c.proveDirect(f.rhs, TKLeq, rhs) {
+				return true
+			}
+			if f.op == TKEql && atomEq(f.rhs, lhs) && c.proveDirect(f.lhs, TKLeq, rhs) {
+				return true
+			}
+		} else if op == TKEql {
+			if f.op == TKEql && atomEq(f.lhs, lhs) && c.proveDirect(f.rhs, TKEql, rhs) {
+				return true
+			}
+			if f.op == TKEql && atomEq(f.rhs, lhs) && c.proveDirect(f.lhs, TKEql, rhs) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkIndexBoundsProven checks whether `base[idx]` is statically proven in-bounds!
+driver func (c *Checker) checkIndexBoundsProven(baseExpr u32, baseTy u32, idxExpr u32) bool {
+	idxAtom := c.atomFromExpr(idxExpr)
+	if idxAtom.kind == AtomNone {
+		return false
+	}
+	if !c.proveRel(FactAtom{kind: AtomConst, val: 0}, TKLeq, idxAtom) {
+		return false
+	}
+	u := under(baseTy)
+	var boundAtom FactAtom
+	if types[u].kind == TKindArray || (types[u].kind == TKindPtr && types[under(types[u].a)].kind == TKindArray) {
+		boundAtom = atomFromArrayType(baseTy)
+	} else if types[u].kind == TKindSlice && nodes[baseExpr].kind == NKIdent && nodeSym[baseExpr] != 0 {
+		boundAtom = FactAtom{kind: AtomLen, sym: nodeSym[baseExpr]}
+	}
+	if boundAtom.kind == AtomNone {
+		return false
+	}
+	return c.proveRel(idxAtom, TKLss, boundAtom)
+}
+
+// substWhereAtom evaluates a callee's `where` clause atom by substituting
+// callee parameter names with call arguments and callee const type params with targs!
+driver func (c *Checker) substWhereAtom(en u32, callNode u32, fnDecl u32, tpSyms []u32, targs []u32) FactAtom {
+	if en == 0 {
+		return FactAtom{}
+	}
+	n := nodes[en]
+	if n.kind == NKIntLit {
+		return FactAtom{kind: AtomConst, val: u64Pool[n.b]}
+	}
+	if n.kind == NKIdent {
+		// 1. Check callee's const type parameters
+		nTP := len(tpSyms)
+		if len(targs) < nTP {
+			nTP = len(targs)
+		}
+		for i := usize(0); i < nTP; i++ {
+			if syms[tpSyms[i]].nameStr == n.a {
+				ta := types[targs[i]]
+				if ta.kind == TKindConstArg {
+					if ta.a != 0 {
+						return FactAtom{kind: AtomDim, sym: ta.a}
+					}
+					return FactAtom{kind: AtomConst, val: ta.lenVal}
+				}
+				if ta.kind == TKindTypeParam {
+					return FactAtom{kind: AtomDim, sym: makeDimParam(ta.a)}
+				}
+			}
+		}
+		// 2. Check callee's parameter names -> map to caller's argument expression!
+		sn := nodes[nodes[fnDecl].c]
+		cn := nodes[callNode]
+		nP := sn.d
+		if cn.c < nP {
+			nP = cn.c
+		}
+		for i := u32(0); i < nP; i++ {
+			pn := listPool[sn.c+i]
+			if nodes[pn].a == n.a {
+				return c.atomFromExpr(listPool[cn.b+i])
+			}
+		}
+		// 3. Package-level const
+		sym := lookupPkgOrUniverse(syms[nodeSym[fnDecl]].pkgID, n.a)
+		if sym != 0 && syms[sym].kind == SymConst && syms[sym].valID != 0 && vals[syms[sym].valID].kind == VKInt {
+			return FactAtom{kind: AtomConst, val: vals[syms[sym].valID].u64Val}
+		}
+		return FactAtom{}
+	}
+	if n.kind == NKCall && nodes[n.a].kind == NKIdent && n.c == 1 {
+		if sliceEq(strSlice(nodes[n.a].a), strBytes("len")) {
+			inner := listPool[n.b]
+			if nodes[inner].kind == NKIdent {
+				sn := nodes[nodes[fnDecl].c]
+				cn := nodes[callNode]
+				nP := sn.d
+				if cn.c < nP {
+					nP = cn.c
+				}
+				for i := u32(0); i < nP; i++ {
+					pn := listPool[sn.c+i]
+					if nodes[pn].a == nodes[inner].a {
+						arg := listPool[cn.b+i]
+						at := nodeType[arg]
+						if at != 0 {
+							au := under(at)
+							if types[au].kind == TKindArray || (types[au].kind == TKindPtr && types[under(types[au].a)].kind == TKindArray) {
+								return atomFromArrayType(at)
+							}
+							if types[au].kind == TKindSlice && nodes[arg].kind == NKIdent && nodeSym[arg] != 0 {
+								return FactAtom{kind: AtomLen, sym: nodeSym[arg]}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if n.kind == NKBinary && (n.op == TKAdd || n.op == TKSub || n.op == TKMul) {
+		la := c.substWhereAtom(n.a, callNode, fnDecl, tpSyms, targs)
+		ra := c.substWhereAtom(n.b, callNode, fnDecl, tpSyms, targs)
+		if la.kind == AtomConst && ra.kind == AtomConst {
+			if n.op == TKAdd {
+				return FactAtom{kind: AtomConst, val: la.val + ra.val}
+			}
+			if n.op == TKSub && la.val >= ra.val {
+				return FactAtom{kind: AtomConst, val: la.val - ra.val}
+			}
+			if n.op == TKMul {
+				return FactAtom{kind: AtomConst, val: la.val * ra.val}
+			}
+		}
+		var ld u32 = 0
+		if la.kind == AtomConst {
+			ld = makeDimConst(la.val)
+		} else if la.kind == AtomDim {
+			ld = la.sym
+		}
+		var rd u32 = 0
+		if ra.kind == AtomConst {
+			rd = makeDimConst(ra.val)
+		} else if ra.kind == AtomDim {
+			rd = ra.sym
+		}
+		if ld != 0 && rd != 0 {
+			var res u32 = 0
+			if n.op == TKAdd {
+				res = makeDimAdd(ld, rd)
+			} else if n.op == TKSub {
+				res = makeDimSub(ld, rd)
+			} else {
+				res = makeDimMul(ld, rd)
+			}
+			if dimExprs[res].kind == DimConst {
+				return FactAtom{kind: AtomConst, val: dimExprs[res].val}
+			}
+			return FactAtom{kind: AtomDim, sym: res}
+		}
+	}
+	return FactAtom{}
+}
+
+driver func (c *Checker) proveWhereClauseAtCall(whNode u32, callNode u32, fnDecl u32, tpSyms []u32, targs []u32) bool {
+	if whNode == 0 {
+		return true
+	}
+	n := nodes[whNode]
+	if n.kind == NKBinary && n.op == TKLAnd {
+		return c.proveWhereClauseAtCall(n.a, callNode, fnDecl, tpSyms, targs) &&
+			c.proveWhereClauseAtCall(n.b, callNode, fnDecl, tpSyms, targs)
+	}
+	if n.kind == NKBinary && (n.op == TKLss || n.op == TKLeq || n.op == TKGtr || n.op == TKGeq || n.op == TKEql || n.op == TKNeq) {
+		la := c.substWhereAtom(n.a, callNode, fnDecl, tpSyms, targs)
+		ra := c.substWhereAtom(n.b, callNode, fnDecl, tpSyms, targs)
+		return c.proveRel(la, n.op, ra)
+	}
+	return false
+}
+
+// isConstLValue reports whether assigning to lvalue `en` would mutate through a `const []T` or `const *T` view.
+driver func isConstLValue(en u32) bool {
+	if en == 0 {
+		return false
+	}
+	n := nodes[en]
+	if n.kind == NKIndex {
+		if isConstView(nodeType[n.a]) {
+			return true
+		}
+		return isConstLValue(n.a)
+	}
+	if n.kind == NKUnary && n.op == TKMul {
+		return isConstView(nodeType[n.a])
+	}
+	if n.kind == NKSelector {
+		if (nodeFlags[en] & NFIndirect) != 0 {
+			return isConstView(nodeType[n.a])
+		}
+		return isConstLValue(n.a)
+	}
+	return false
+}

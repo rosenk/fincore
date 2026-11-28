@@ -1,19 +1,11 @@
 // state_machine: the server side of an SMTP session as an explicit state
 // machine, replayed over a recorded transcript.
 //
-//	bin/finc1 run examples/state_machine.fc
+//	finc0 run examples/state_machine.fc
 //
-// The whole protocol is one function, step, whose body is a single match
-// over (state, command). The match has no catch-all `_` arm: every state
-// spells out its own fallback. So when the protocol grows, say a state
-// `Auth` after `Greeted`, the program stops compiling until the new state
-// has its transitions:
-//
-//	error[E2012]: non-exhaustive match on (State, Cmd): missing (Auth, _)
-//
-// Also shows: enums with payloads as states, or-patterns with bindings,
-// guards, bounded counters (MaxRcpt) instead of growing lists, `is` tests,
-// and a Format method that makes a State printable with %v.
+// Shows: enums with payloads as states, exhaustive match over states,
+// bounded counters (MaxRcpt) instead of growing lists, and a Format method
+// that makes a State printable with %v.
 package main
 
 import "std/bytes"
@@ -57,14 +49,21 @@ type Reply struct {
 	text string
 }
 
+func inData(s State) bool {
+	return match s {
+		Data(_, _) -> true
+		_ -> false
+	}
+}
+
 // parse classifies a line. In the Data state every line except "." is
 // body text, even one that reads "QUIT".
 func parse(s State, line []byte) Cmd {
-	if s is Data(..) {
-		return match bytesEqual(line, ".") {
-			true -> Cmd.Dot
-			false -> Cmd.Line
+	if inData(s) {
+		if bytesEqual(line, ".") {
+			return Cmd.Dot
 		}
+		return Cmd.Line
 	}
 	if bytes.HasPrefix(line, "HELO ") || bytes.HasPrefix(line, "EHLO ") {
 		return Cmd.Helo
@@ -87,27 +86,55 @@ func parse(s State, line []byte) Cmd {
 	return Cmd.Bad
 }
 
-// step is the protocol. Arms are tried in order; the guard on the RcptTo
-// arm falls through to the next arm when the recipient list is full.
+// step is the protocol: exhaustive over every State.
 func step(s State, c Cmd) (State, Reply) {
-	match (s, c) {
-		(Closed, _) -> return s, Reply{code: 421, text: "closing"}
-		(Data(n, l), Line) -> return State.Data(n, l+1), Reply{}
-		(Data(n, l), Dot) -> return State.Greeted, Reply{code: 250, text: "message queued"}
-		(Data(..), _) -> return s, Reply{code: 451, text: "internal error"} // parse never yields this
-		(Connected | Greeted, Helo) -> return State.Greeted, Reply{code: 250, text: "hello"}
-		(Connected, Quit) | (Greeted, Quit) | (Mail, Quit) | (Rcpt(_), Quit) ->
-			return State.Closed, Reply{code: 221, text: "bye"}
-		(Connected, _) -> return s, Reply{code: 503, text: "say HELO first"}
-		(Greeted, MailFrom) -> return State.Mail, Reply{code: 250, text: "sender ok"}
-		(Greeted | Mail | Rcpt(_), Rset) -> return State.Greeted, Reply{code: 250, text: "reset"}
-		(Greeted, _) -> return s, Reply{code: 503, text: "need MAIL FROM"}
-		(Mail, RcptTo) -> return State.Rcpt(1), Reply{code: 250, text: "recipient ok"}
-		(Mail, _) -> return s, Reply{code: 503, text: "need RCPT TO"}
-		(Rcpt(n), RcptTo) if n < MaxRcpt -> return State.Rcpt(n + 1), Reply{code: 250, text: "recipient ok"}
-		(Rcpt(_), RcptTo) -> return s, Reply{code: 452, text: "too many recipients"}
-		(Rcpt(n), DataCmd) -> return State.Data(n, 0), Reply{code: 354, text: "end data with ."}
-		(Rcpt(_), _) -> return s, Reply{code: 503, text: "need DATA"}
+	match s {
+		Closed -> return s, Reply{code: 421, text: "closing"}
+		Data(n, l) -> {
+			match c {
+				Line -> return State.Data(n, l+1), Reply{}
+				Dot -> return State.Greeted, Reply{code: 250, text: "message queued"}
+				_ -> return s, Reply{code: 451, text: "internal error"}
+			}
+		}
+		Connected -> {
+			match c {
+				Helo -> return State.Greeted, Reply{code: 250, text: "hello"}
+				Quit -> return State.Closed, Reply{code: 221, text: "bye"}
+				_ -> return s, Reply{code: 503, text: "say HELO first"}
+			}
+		}
+		Greeted -> {
+			match c {
+				Helo -> return State.Greeted, Reply{code: 250, text: "hello"}
+				MailFrom -> return State.Mail, Reply{code: 250, text: "sender ok"}
+				Rset -> return State.Greeted, Reply{code: 250, text: "reset"}
+				Quit -> return State.Closed, Reply{code: 221, text: "bye"}
+				_ -> return s, Reply{code: 503, text: "need MAIL FROM"}
+			}
+		}
+		Mail -> {
+			match c {
+				RcptTo -> return State.Rcpt(1), Reply{code: 250, text: "recipient ok"}
+				Rset -> return State.Greeted, Reply{code: 250, text: "reset"}
+				Quit -> return State.Closed, Reply{code: 221, text: "bye"}
+				_ -> return s, Reply{code: 503, text: "need RCPT TO"}
+			}
+		}
+		Rcpt(n) -> {
+			match c {
+				RcptTo -> {
+					if n < MaxRcpt {
+						return State.Rcpt(n + 1), Reply{code: 250, text: "recipient ok"}
+					}
+					return s, Reply{code: 452, text: "too many recipients"}
+				}
+				DataCmd -> return State.Data(n, 0), Reply{code: 354, text: "end data with ."}
+				Rset -> return State.Greeted, Reply{code: 250, text: "reset"}
+				Quit -> return State.Closed, Reply{code: 221, text: "bye"}
+				_ -> return s, Reply{code: 503, text: "need DATA"}
+			}
+		}
 	}
 }
 

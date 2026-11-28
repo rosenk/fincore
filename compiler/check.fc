@@ -1,0 +1,3548 @@
+package main
+
+// Unified Type Checker, Scope/Linearity Checker (S1-S5), and Effect/Totality Checker (T1-T4).
+
+const (
+	MaxLocals   = 512
+	MaxCallGraph = 2048
+)
+
+type LocalVar struct {
+	nameStr  u32
+	symID    u32
+	depth    u32 // lexical block depth
+	valDepth u32 // scope depth of stored value (for S2/S3 escape checking)
+	errSym   u32 // paired error variable if bound from `(res, err) := ...`
+	moved    bool
+	deferred bool
+	isLinear bool
+	isScoped bool
+}
+
+type Checker struct {
+	pkgID         u32
+	fileID        u32
+	fnSym         u32
+	fnDecl        u32
+	fnEff         u8
+	retStart      u32
+	retCount      u32
+	locals        [MaxLocals]LocalVar
+	nLocals       u32
+	blockDepth    u32
+	loopBase      u32 // nLocals at entry of innermost for loop
+	inErrGuardSym u32 // error sym currently proven != nil in enclosing `if err != nil`
+	inLit         bool
+	litNode       u32
+	outerBase     u32 // index in locals where current FuncLit starts
+	litCaps        [64]u32
+	nLitCaps       u32
+	hasBreak       bool
+	// Active lexical algebraic effect evidence stack (v0.3)
+	activeEffType  [32]u32
+	activeEffSym   [32]u32
+	activeEffCount u32
+	curHandleNode  u32
+	curHandleArm   u32
+	curResumeSym   u32
+	// Active linear facts for dependent `where` proofs & bounds check elimination (v0.4)
+	facts          [MaxFacts]Fact
+	nFacts         u32
+}
+
+// Call graph edges for totality recursion check (callerSym -> calleeSym).
+var cgCaller [MaxCallGraph]u32
+var cgCallee [MaxCallGraph]u32
+var cgFile [MaxCallGraph]u32
+var cgOff [MaxCallGraph]u32
+var cgCount u32
+
+driver func (c *Checker) pushLocal(nameStr u32, symID u32, ty u32, valDepth u32) u32 {
+	if c.nLocals >= MaxLocals {
+		return 0
+	}
+	cls := classOf(ty)
+	idx := c.nLocals
+	c.nLocals++
+	c.locals[idx] = LocalVar{
+		nameStr:  nameStr,
+		symID:    symID,
+		depth:    c.blockDepth,
+		valDepth: valDepth,
+		moved:    false,
+		deferred: false,
+		isLinear: cls == ClsLinear,
+		isScoped: cls >= ClsScoped,
+	}
+	return idx
+}
+
+func (c *Checker) lookupLocal(nameStr u32) (u32, bool) {
+	if c.nLocals == 0 {
+		return 0, false
+	}
+	i := c.nLocals
+	for step := u32(0); step < MaxLocals; step++ {
+		if i == 0 {
+			break
+		}
+		i--
+		if c.locals[i].nameStr == nameStr {
+			if c.inLit && i < c.outerBase {
+				c.recordCapture(c.locals[i].symID)
+			}
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (c *Checker) lookupLocalBySym(symID u32) (u32, bool) {
+	if c.nLocals == 0 {
+		return 0, false
+	}
+	i := c.nLocals
+	for step := u32(0); step < MaxLocals; step++ {
+		if i == 0 {
+			break
+		}
+		i--
+		if c.locals[i].symID == symID {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (c *Checker) recordCapture(symID u32) {
+	for i := u32(0); i < c.nLitCaps; i++ {
+		if c.litCaps[i] == symID {
+			return
+		}
+	}
+	if c.nLitCaps < 64 {
+		c.litCaps[c.nLitCaps] = symID
+		c.nLitCaps++
+	}
+}
+
+driver func (c *Checker) findActiveEffect(effTy u32) (u32, bool) {
+	if c.activeEffCount == 0 {
+		return 0, false
+	}
+	i := c.activeEffCount
+	for step := u32(0); step < 32; step++ {
+		if i == 0 {
+			break
+		}
+		i--
+		if typeEqual(c.activeEffType[i], effTy) {
+			evSym := c.activeEffSym[i]
+			if c.inLit {
+				if idx, ok := c.lookupLocalBySym(evSym); ok && idx < c.outerBase {
+					c.recordCapture(evSym)
+				}
+			}
+			return evSym, true
+		}
+	}
+	return 0, false
+}
+
+driver func (c *Checker) findActiveEffectOp(opNameStr u32) (u32, u32, u32, u32, bool) {
+	if c.activeEffCount == 0 {
+		return 0, 0, 0, 0, false
+	}
+	i := c.activeEffCount
+	for step := u32(0); step < 32; step++ {
+		if i == 0 {
+			break
+		}
+		i--
+		et := c.activeEffType[i]
+		if opIdx, opSig, ok := findEffectOp(et, opNameStr); ok {
+			evSym := c.activeEffSym[i]
+			if c.inLit {
+				if idx, ok2 := c.lookupLocalBySym(evSym); ok2 && idx < c.outerBase {
+					c.recordCapture(evSym)
+				}
+			}
+			return evSym, et, opIdx, opSig, true
+		}
+	}
+	return 0, 0, 0, 0, false
+}
+
+func (c *Checker) checkBlockExitLeaks(fromIdx u32) {
+	nl := c.nLocals
+	for i := fromIdx; i < nl; i++ {
+		lv := c.locals[i]
+		if lv.isLinear && !lv.moved && !lv.deferred {
+			if lv.errSym != 0 && lv.errSym == c.inErrGuardSym {
+				continue
+			}
+			s := syms[lv.symID]
+			addDiagStr(E3005, s.fileID, s.off, "linear resource is never closed or released")
+		}
+	}
+}
+
+// checkProgram runs type, scope/linearity, and totality checking over all packages.
+driver func checkProgram() {
+	cgCount = 0
+	poc := pkgOrderCount
+	// Check for recursive value types (enum/struct direct value cycles)
+	for i := u32(0); i < poc; i++ {
+		pid := pkgOrder[i]
+		p := pkgs[pid]
+		for si := u32(0); si < p.symCount; si++ {
+			s := pkgSyms[p.symStart+si]
+			if syms[s].kind == SymType && syms[s].typeID != 0 {
+				if types[syms[s].typeID].kind == TKindNamed {
+					var vis [32]u32
+					if hasValueCycle(syms[s].typeID, vis[:], 0) {
+						addDiagStr(E2002, syms[s].fileID, syms[s].off, "recursive value type has infinite size")
+					}
+				}
+			}
+		}
+	}
+	// Check all function & method bodies in topological package order
+	for i := u32(0); i < poc; i++ {
+		pid := pkgOrder[i]
+		p := pkgs[pid]
+		for fi := u32(0); fi < p.fileCount; fi++ {
+			fid := pkgFiles[p.fileStart+fi]
+			fn := nodes[files[fid].astNode]
+			for di := u32(0); di < fn.e; di++ {
+				dn := listPool[fn.d+di]
+				if nodes[dn].kind == NKFuncDecl {
+					checkFuncDecl(pid, dn)
+				}
+			}
+		}
+	}
+	// Check recursion / mutual recursion totality (E4004)
+	checkTotalityCallGraph()
+}
+
+driver func hasValueCycle(ty u32, vis []u32, depth usize) bool {
+	if ty == 0 || depth >= len(vis) {
+		return false
+	}
+	t := types[ty]
+	if t.kind == TKindPtr || t.kind == TKindSlice || t.kind == TKindSig || t.kind == TKindBasic || t.kind == TKindBuiltin {
+		return false
+	}
+	if t.kind == TKindNamed {
+		origSym := typeOriginSym(ty)
+		for i := usize(0); i < depth; i++ {
+			if vis[i] == origSym {
+				return true
+			}
+		}
+		vis[depth] = origSym
+		return hasValueCycle(t.b, vis, depth+1)
+	}
+	if t.kind == TKindArray {
+		return hasValueCycle(t.a, vis, depth)
+	}
+	if t.kind == TKindStruct {
+		for i := u32(0); i < t.b; i++ {
+			if hasValueCycle(fields[t.a+i].typeID, vis, depth) {
+				return true
+			}
+		}
+		return false
+	}
+	if t.kind == TKindEnum {
+		for i := u32(0); i < t.b; i++ {
+			v := variants[t.a+i]
+			for j := u32(0); j < v.payCount; j++ {
+				if hasValueCycle(typeList[v.payStart+j], vis, depth) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return false
+}
+
+driver func checkFuncDecl(pkgID u32, dn u32) {
+	d := nodes[dn]
+	sym := nodeSym[dn]
+	sigTy := syms[sym].typeID
+	if sigTy == 0 || types[sigTy].kind != TKindSig {
+		return
+	}
+	sig := types[sigTy]
+
+	// Validate main signature (E5002)
+	if sym == mainFuncSym {
+		if d.op != EffDriver {
+			addDiagStr(E5002, d.fileID, d.off, "main must be declared as driver func")
+		}
+		for i := u32(0); i < sig.b; i++ {
+			if !isCapabilityType(typeList[sig.a+i]) {
+				addDiagStr(E5002, d.fileID, d.off, "main parameters must be OS capabilities")
+			}
+		}
+	}
+
+	// Push active type parameters for this function/method
+	savedTP := activeTPCount
+	nic := nodeInstCount[dn]
+	for i := u32(0); i < nic; i++ {
+		if activeTPCount < 32 {
+			activeTPSyms[activeTPCount] = typeList[nodeInstStart[dn]+i]
+			activeTPCount++
+		}
+	}
+
+	var c Checker
+	c.pkgID = pkgID
+	c.fileID = d.fileID
+	c.fnSym = sym
+	c.fnDecl = dn
+	c.fnEff = d.op
+	c.retStart = sig.c
+	c.retCount = sig.d
+	c.blockDepth = 1
+
+	// Bind receiver (pointer receiver points to caller/global storage: valDepth = 0; value/slice param: valDepth = 1)
+	if d.b != 0 {
+		rn := nodes[d.b]
+		rty := nodeType[d.b]
+		rsym := addSym(Sym{kind: SymParam, nameStr: rn.a, pkgID: pkgID, fileID: rn.fileID, off: rn.off, declNode: d.b, typeID: rty})
+		nodeSym[d.b] = rsym
+		if rn.a != kwBlank {
+			var rvd u32 = 1
+			if types[under(rty)].kind == TKindPtr {
+				rvd = 0
+			}
+			c.pushLocal(rn.a, rsym, rty, rvd)
+		}
+	}
+	// Bind parameters (valDepth = 1 for caller-owned scoped values, 0 for pointers)
+	sn := nodes[d.c]
+	for i := u32(0); i < sn.d; i++ {
+		pn := listPool[sn.c+i]
+		p := nodes[pn]
+		pty := nodeType[pn]
+		psym := addSym(Sym{kind: SymParam, nameStr: p.a, pkgID: pkgID, fileID: p.fileID, off: p.off, declNode: pn, typeID: pty})
+		nodeSym[pn] = psym
+		if p.a != 0 && p.a != kwBlank {
+			var pvd u32 = 1
+			if types[under(pty)].kind == TKindPtr {
+				pvd = 0
+			}
+			c.pushLocal(p.a, psym, pty, pvd)
+		}
+	}
+
+	// Bind hidden effect capability evidence parameters from `with E1, E2`
+	ec := sigTypeEffCount[sigTy]
+	if ec > 0 {
+		if d.op == EffComptime {
+			addDiagStr(E5001, d.fileID, d.off, "comptime function cannot declare effects")
+		}
+		var evSyms [16]u32
+		nev := usize(0)
+		driver for i := u32(0); i < ec && i < 16; i++ {
+			et := typeList[sigTypeEffStart[sigTy]+i]
+			evSym := addSym(Sym{kind: SymParam, nameStr: 0, pkgID: pkgID, fileID: d.fileID, off: d.off, declNode: dn, typeID: et})
+			c.pushLocal(0, evSym, et, 1)
+			if c.activeEffCount < 32 {
+				c.activeEffType[c.activeEffCount] = et
+				c.activeEffSym[c.activeEffCount] = evSym
+				c.activeEffCount++
+			}
+			evSyms[nev] = evSym
+			nev++
+		}
+		es, ec2 := pushEvSyms(evSyms[:nev])
+		fnEvStart[dn] = es
+		fnEvCount[dn] = ec2
+	}
+
+	// Check parameter `where` refinement constraints and push them as active facts!
+	for i := u32(0); i < sn.d; i++ {
+		pn := listPool[sn.c+i]
+		wh := paramWhere[pn]
+		if wh != 0 {
+			wt := c.checkExpr(wh, TYBool)
+			if wt != 0 && !isBoolType(wt) {
+				addDiagStr(E2002, nodes[wh].fileID, nodes[wh].off, "where constraint must be a boolean expression")
+			}
+			c.pushFactFromCond(wh, false)
+		}
+	}
+
+	if d.d != 0 {
+		c.checkBlock(d.d)
+	}
+	if d.op == EffDriver {
+		c.checkBlockExitLeaks(0)
+	}
+	activeTPCount = savedTP
+}
+
+driver func (c *Checker) checkBlock(blkNode u32) {
+	b := nodes[blkNode]
+	savedLocals := c.nLocals
+	savedFacts := c.nFacts
+	c.blockDepth++
+	for i := u32(0); i < b.b; i++ {
+		c.checkStmt(listPool[b.a+i])
+	}
+	c.checkBlockExitLeaks(savedLocals)
+	c.nLocals = savedLocals
+	c.nFacts = savedFacts
+	c.blockDepth--
+}
+
+driver func (c *Checker) checkStmt(sn u32) {
+	if sn == 0 {
+		return
+	}
+	s := nodes[sn]
+	if s.kind == NKBlock {
+		c.checkBlock(sn)
+		return
+	}
+	if s.kind == NKDeclStmt {
+		d := nodes[s.a]
+		if d.kind == NKVarDecl {
+			var ty u32 = 0
+			if d.b != 0 {
+				ty = resolveTypeNode(c.pkgID, d.b)
+			}
+			var valDepth u32 = c.blockDepth
+			if d.c != 0 {
+				vt := c.checkExpr(d.c, ty)
+				if ty == 0 {
+					ty = defaultType(vt)
+				} else if nodes[d.c].kind == NKNilLit && isUninitForbidden(ty) {
+					addDiagStr(E2004, d.fileID, d.off, "nil is not valid for resource type")
+				} else if !c.checkAssignable(d.c, vt, ty) {
+					addDiagStr(E2002, d.fileID, d.off, "type mismatch in var declaration")
+				}
+				valDepth = c.exprDepth(d.c)
+			} else if ty != 0 {
+				// Uninitialized Scoped/Linear resource (E2005): Conn, Listener, Scope, Context, Slot, CancelFunc, caps
+				if isUninitForbidden(ty) {
+					addDiagStr(E2005, d.fileID, d.off, "uninitialized scoped or linear resource")
+				}
+			}
+			vsym := addSym(Sym{kind: SymLocal, nameStr: d.a, pkgID: c.pkgID, fileID: d.fileID, off: d.off, declNode: s.a, typeID: ty})
+			nodeSym[s.a] = vsym
+			nodeType[s.a] = ty
+			if d.a != kwBlank {
+				c.pushLocal(d.a, vsym, ty, valDepth)
+			}
+		} else if d.kind == NKConstDecl {
+			csym := addSym(Sym{kind: SymConst, nameStr: d.a, pkgID: c.pkgID, fileID: d.fileID, off: d.off, declNode: s.a})
+			nodeSym[s.a] = csym
+			evalConstSym(csym)
+			if d.a != kwBlank {
+				c.pushLocal(d.a, csym, syms[csym].typeID, 0)
+			}
+		}
+		return
+	}
+	if s.kind == NKShortDecl {
+		// Multi-result call on RHS?
+		if s.d == 1 && s.b > 1 {
+			rhs := listPool[s.c]
+			rt := c.checkExpr(rhs, 0)
+			if rt != 0 && types[rt].kind == TKindTuple {
+				if types[rt].b != s.b {
+					addDiagStr(E2003, s.fileID, s.off, "assignment count mismatch")
+				}
+				lim := s.b
+				if types[rt].b < lim {
+					lim = types[rt].b
+				}
+				var boundIdxs [8]u32
+				var errSymBound u32 = 0
+				for i := u32(0); i < lim; i++ {
+					ln := listPool[s.a+i]
+					et := defaultType(typeList[types[rt].a+i])
+					c.bindShortVar(ln, et, c.blockDepth)
+					if i < 8 && nodes[ln].a != kwBlank {
+						if li, ok := c.lookupLocal(nodes[ln].a); ok {
+							boundIdxs[i] = li + 1
+							if isErrorType(et) {
+								errSymBound = c.locals[li].symID
+							}
+						}
+					}
+				}
+				if errSymBound != 0 {
+					// Clear old bindings paired with this reused `err` symbol (they already passed their check!)
+					nl := c.nLocals
+					for k := u32(0); k < nl; k++ {
+						if c.locals[k].errSym == errSymBound {
+							c.locals[k].errSym = 0
+						}
+					}
+					lim8 := lim
+					if lim8 > 8 {
+						lim8 = 8
+					}
+					for i := u32(0); i < lim8; i++ {
+						if boundIdxs[i] != 0 {
+							c.locals[boundIdxs[i]-1].errSym = errSymBound
+						}
+					}
+				}
+			} else {
+				addDiagStr(E2003, s.fileID, s.off, "assignment mismatch: single value for multiple variables")
+			}
+			return
+		}
+		if s.b != s.d {
+			addDiagStr(E2003, s.fileID, s.off, "assignment count mismatch")
+			return
+		}
+		for i := u32(0); i < s.b; i++ {
+			ln := listPool[s.a+i]
+			rn := listPool[s.c+i]
+			rt := c.checkExpr(rn, 0)
+			// Check nil assigned to linear/scoped non-slice/non-ptr
+			if nodes[rn].kind == NKNilLit {
+				addDiagStr(E2004, nodes[rn].fileID, nodes[rn].off, "cannot infer type from untyped nil")
+			}
+			et := defaultType(rt)
+			c.bindShortVar(ln, et, c.exprDepth(rn))
+		}
+		return
+	}
+	if s.kind == NKAssign {
+		if s.op != TKAssign {
+			// Compound assignment `lhs op= rhs`
+			ln := listPool[s.a]
+			rn := listPool[s.c]
+			lt := c.checkExpr(ln, 0)
+			if isConstLValue(ln) {
+				addDiagStr(E2014, nodes[ln].fileID, nodes[ln].off, "cannot mutate through const view")
+			}
+			rt := c.checkExpr(rn, lt)
+			if s.op == TKShlAssign || s.op == TKShrAssign {
+				if !isIntType(lt) || !isNumericOrUntyped(rt) {
+					addDiagStr(E2002, s.fileID, s.off, "invalid shift assignment types")
+				}
+			} else if !assignable(rt, lt) {
+				addDiagStr(E2002, s.fileID, s.off, "type mismatch in compound assignment")
+			}
+			return
+		}
+		// Multi-result call on RHS?
+		if s.d == 1 && s.b > 1 {
+			rhs := listPool[s.c]
+			rt := c.checkExpr(rhs, 0)
+			if rt != 0 && types[rt].kind == TKindTuple {
+				if types[rt].b != s.b {
+					addDiagStr(E2003, s.fileID, s.off, "assignment count mismatch")
+				}
+				lim := s.b
+				if types[rt].b < lim {
+					lim = types[rt].b
+				}
+				for i := u32(0); i < lim; i++ {
+					ln := listPool[s.a+i]
+					if nodes[ln].kind == NKIdent && nodes[ln].a == kwBlank {
+						continue
+					}
+					lt := c.checkExpr(ln, 0)
+					et := typeList[types[rt].a+i]
+					if !assignable(et, lt) {
+						addDiagStr(E2002, nodes[ln].fileID, nodes[ln].off, "type mismatch in assignment")
+					}
+				}
+			} else {
+				addDiagStr(E2003, s.fileID, s.off, "assignment mismatch")
+			}
+			return
+		}
+		if s.b != s.d {
+			addDiagStr(E2003, s.fileID, s.off, "assignment count mismatch")
+			return
+		}
+		for i := u32(0); i < s.b; i++ {
+			ln := listPool[s.a+i]
+			rn := listPool[s.c+i]
+			if nodes[ln].kind == NKIdent && nodes[ln].a == kwBlank {
+				rt := c.checkExpr(rn, 0)
+				if classOf(rt) == ClsLinear {
+					addDiagStr(E3004, nodes[rn].fileID, nodes[rn].off, "cannot discard linear resource")
+				}
+				continue
+			}
+			lt := c.checkExpr(ln, 0)
+			if isConstLValue(ln) {
+				addDiagStr(E2014, nodes[ln].fileID, nodes[ln].off, "cannot mutate through const view")
+			}
+			rt := c.checkExpr(rn, lt)
+			if nodes[rn].kind == NKNilLit && isUninitForbidden(lt) {
+				addDiagStr(E2004, nodes[rn].fileID, nodes[rn].off, "nil is not valid for resource type")
+			} else if rt != 0 && types[rt].kind == TKindResume {
+				// Handled cleanly by the scope-escape check (E3002) below without cascading E2002
+			} else if !c.checkAssignable(rn, rt, lt) {
+				addDiagStr(E2002, nodes[ln].fileID, nodes[ln].off, "type mismatch in assignment")
+			}
+			// Scope escape check (S2): cannot store a deeper Scoped value into a shallower target
+			if classOf(lt) >= ClsScoped || (rt != 0 && types[rt].kind == TKindResume) {
+				ld := c.lvalueTargetDepth(ln)
+				rd := c.exprDepth(rn)
+				if rd > ld {
+					addDiagStr(E3002, s.fileID, s.off, "scoped value escapes its lexical scope")
+				}
+			}
+		}
+		return
+	}
+	if s.kind == NKIncDec {
+		t := c.checkExpr(s.a, 0)
+		if isConstLValue(s.a) {
+			addDiagStr(E2014, s.fileID, s.off, "cannot mutate through const view")
+		}
+		if !isIntType(t) {
+			addDiagStr(E2002, s.fileID, s.off, "++/-- requires integer operand")
+		}
+		return
+	}
+	if s.kind == NKIf {
+		saved := c.nLocals
+		savedFacts := c.nFacts
+		c.blockDepth++
+		if s.a != 0 {
+			c.checkStmt(s.a)
+		}
+		ct := c.checkExpr(s.b, TYBool)
+		if ct != 0 && !isBoolType(ct) {
+			addDiagStr(E2002, nodes[s.b].fileID, nodes[s.b].off, "if condition must be bool")
+		}
+		var preMoved [MaxLocals]bool
+		nPre := c.nLocals
+		for i := u32(0); i < nPre; i++ {
+			preMoved[i] = c.locals[i].moved
+		}
+		savedGuard := c.inErrGuardSym
+		if nodes[s.b].kind == NKBinary && nodes[s.b].op == TKNeq && nodes[nodes[s.b].b].kind == NKNilLit && nodes[nodes[s.b].a].kind == NKIdent {
+			if nodeSym[nodes[s.b].a] != 0 {
+				c.inErrGuardSym = nodeSym[nodes[s.b].a]
+			}
+		}
+		thenFacts := c.nFacts
+		c.pushFactFromCond(s.b, false)
+		c.checkBlock(s.c)
+		c.nFacts = thenFacts
+		c.inErrGuardSym = savedGuard
+		thenTerm := stmtTerminates(s.c)
+		if s.d != 0 {
+			var thenMoved [MaxLocals]bool
+			for i := u32(0); i < nPre; i++ {
+				thenMoved[i] = c.locals[i].moved
+				c.locals[i].moved = preMoved[i]
+			}
+			c.pushFactFromCond(s.b, true)
+			c.checkStmt(s.d)
+			c.nFacts = thenFacts
+			elseTerm := stmtTerminates(s.d)
+			for i := u32(0); i < nPre; i++ {
+				if thenTerm && !elseTerm {
+					// keep else state
+				} else if elseTerm && !thenTerm {
+					c.locals[i].moved = thenMoved[i]
+				} else if thenMoved[i] {
+					c.locals[i].moved = true
+				}
+			}
+		} else if thenTerm {
+			for i := u32(0); i < nPre; i++ {
+				c.locals[i].moved = preMoved[i]
+			}
+		}
+		c.checkBlockExitLeaks(saved)
+		c.nLocals = saved
+		c.nFacts = savedFacts
+		c.blockDepth--
+		// Flow refinement: after `if cond { return ... }` (no else), `!cond` holds in remainder of block!
+		if s.d == 0 && thenTerm && s.a == 0 {
+			c.pushFactFromCond(s.b, true)
+		}
+		return
+	}
+	if s.kind == NKFor {
+		if s.flags != 0 && c.fnEff != EffDriver {
+			addDiagStr(E5001, s.fileID, s.off, "driver for is only allowed in driver functions")
+		}
+		saved := c.nLocals
+		savedFacts := c.nFacts
+		c.blockDepth++
+		if s.a != 0 {
+			c.checkStmt(s.a)
+		}
+		if s.b != 0 {
+			ct := c.checkExpr(s.b, TYBool)
+			if ct != 0 && !isBoolType(ct) {
+				addDiagStr(E2002, nodes[s.b].fileID, nodes[s.b].off, "for condition must be bool")
+			}
+		}
+		if s.c != 0 {
+			c.checkStmt(s.c)
+		}
+		if s.e != 0 {
+			_ = c.checkExpr(s.e, 0)
+		}
+		savedLoopBase := c.loopBase
+		c.loopBase = c.nLocals
+		if s.b != 0 {
+			c.pushFactFromCond(s.b, false)
+		}
+		c.checkBlock(s.d)
+		c.loopBase = savedLoopBase
+		// Totality check for non-driver loops in total functions (T1/T2/decreases)
+		if c.fnEff == EffTotal && s.flags == 0 {
+			c.checkForTotality(sn)
+		}
+		c.checkBlockExitLeaks(saved)
+		c.nLocals = saved
+		c.nFacts = savedFacts
+		c.blockDepth--
+		return
+	}
+	if s.kind == NKScope {
+		vt := c.checkExpr(s.b, 0)
+		vu := under(vt)
+		if vt != 0 && vu != TYScope && vu != TYArena {
+			addDiagStr(E2002, nodes[s.b].fileID, nodes[s.b].off, "scope expression must have type Scope or Arena")
+		}
+		var stTy u32 = TYScope
+		if vu == TYArena {
+			stTy = TYArena
+		}
+		saved := c.nLocals
+		c.blockDepth++
+		ssym := addSym(Sym{kind: SymLocal, nameStr: s.a, pkgID: c.pkgID, fileID: s.fileID, off: s.off, declNode: sn, typeID: stTy})
+		nodeSym[sn] = ssym
+		nodeType[sn] = stTy
+		c.pushLocal(s.a, ssym, stTy, c.blockDepth)
+		savedGuard := c.inErrGuardSym
+		if nodes[s.b].kind == NKBinary && nodes[s.b].op == TKNeq && nodes[nodes[s.b].b].kind == NKNilLit && nodes[nodes[s.b].a].kind == NKIdent {
+			if nodeSym[nodes[s.b].a] != 0 {
+				c.inErrGuardSym = nodeSym[nodes[s.b].a]
+			}
+		}
+		c.checkBlock(s.c)
+		c.inErrGuardSym = savedGuard
+		c.checkBlockExitLeaks(saved)
+		c.nLocals = saved
+		c.blockDepth--
+		return
+	}
+	if s.kind == NKDefer {
+		_ = c.checkExpr(s.a, 0)
+		// Mark deferred linear resource as deferred so exit check knows it will be closed!
+		if nodes[s.a].kind == NKCall && nodeCall[s.a] != 0 {
+			ci := calls[nodeCall[s.a]]
+			if ci.kind == CKBuiltinMeth && (ci.builtinID == BMConnClose || ci.builtinID == BMListenerClose) {
+				c.markDeferred(ci.recvExpr)
+			} else if ci.kind == CKValue && under(nodeType[nodes[s.a].a]) == TYCancelFunc {
+				c.markDeferred(nodes[s.a].a)
+			} else if ci.kind == CKBuiltinMeth && ci.builtinID == BMScopeReleaseSlot && nodes[s.a].c == 1 {
+				c.markDeferred(listPool[nodes[s.a].b])
+			}
+		}
+		return
+	}
+	if s.kind == NKReturn {
+		if s.b == 1 && c.retCount > 1 {
+			en := listPool[s.a]
+			got := c.checkExpr(en, 0)
+			if got != 0 && types[got].kind == TKindTuple && types[got].b == c.retCount {
+				rc := c.retCount
+				for i := u32(0); i < rc; i++ {
+					want := typeList[c.retStart+i]
+					et := typeList[types[got].a+i]
+					if !assignable(et, want) {
+						addDiagStr(E2002, nodes[en].fileID, nodes[en].off, "return value type mismatch")
+					}
+				}
+				return
+			}
+		}
+		if s.b != c.retCount {
+			addDiagStr(E2003, s.fileID, s.off, "wrong number of return values")
+			return
+		}
+		for i := u32(0); i < s.b; i++ {
+			en := listPool[s.a+i]
+			want := typeList[c.retStart+i]
+			got := c.checkExpr(en, want)
+			if nodes[en].kind == NKNilLit && isUninitForbidden(want) {
+				addDiagStr(E2004, nodes[en].fileID, nodes[en].off, "cannot return nil for resource type")
+			} else if got != 0 && want != 0 && types[got].kind == TKindCode && types[want].kind == TKindCode && types[got].a != types[want].a {
+				addDiagStr(E2010, nodes[en].fileID, nodes[en].off, "universe level mismatch in Code return")
+			} else if !c.checkAssignable(en, got, want) {
+				addDiagStr(E2002, nodes[en].fileID, nodes[en].off, "return value type mismatch")
+			}
+			// Scope escape (S3): cannot return a locally created Scoped value (depth >= 2; params at depth 1 may be returned)
+			if classOf(want) >= ClsScoped && c.exprDepth(en) > 1 {
+				addDiagStr(E3002, nodes[en].fileID, nodes[en].off, "scoped value cannot escape function via return")
+			}
+		}
+		return
+	}
+	if s.kind == NKBreak || s.kind == NKContinue {
+		c.checkBlockExitLeaks(c.loopBase)
+		return
+	}
+	if s.kind == NKMatchStmt {
+		c.checkMatch(sn, false, 0)
+		return
+	}
+	if s.kind == NKHandleStmt {
+		_ = c.checkHandle(sn, false, 0)
+		return
+	}
+	if s.kind == NKExprStmt {
+		_ = c.checkExpr(s.a, 0)
+		return
+	}
+}
+
+driver func stmtTerminates(sn u32) bool {
+	if sn == 0 {
+		return false
+	}
+	s := nodes[sn]
+	if s.kind == NKReturn || s.kind == NKBreak || s.kind == NKContinue {
+		return true
+	}
+	if s.kind == NKBlock {
+		for i := u32(0); i < s.b; i++ {
+			if stmtTerminates(listPool[s.a+i]) {
+				return true
+			}
+		}
+		return false
+	}
+	if s.kind == NKIf {
+		return s.d != 0 && stmtTerminates(s.c) && stmtTerminates(s.d)
+	}
+	return false
+}
+
+func isUninitForbidden(ty u32) bool {
+	if isSlotType(ty) {
+		return true
+	}
+	u := under(ty)
+	return u == TYConn || u == TYListener || u == TYCancelFunc || u == TYScope || u == TYArena || u == TYContext || isCapabilityType(u)
+}
+
+driver func (c *Checker) bindShortVar(idNode u32, ty u32, valDepth u32) {
+	nd := nodes[idNode]
+	if nd.a == kwBlank {
+		return
+	}
+	// Check if already declared in the current block (Go-style redeclaration `x, err := ...`)
+	if idx, ok := c.lookupLocal(nd.a); ok && c.locals[idx].depth == c.blockDepth {
+		sym := c.locals[idx].symID
+		nodeSym[idNode] = sym
+		nodeType[idNode] = syms[sym].typeID
+		c.locals[idx].valDepth = valDepth
+		return
+	}
+	sym := addSym(Sym{kind: SymLocal, nameStr: nd.a, pkgID: c.pkgID, fileID: nd.fileID, off: nd.off, declNode: idNode, typeID: ty})
+	nodeSym[idNode] = sym
+	nodeType[idNode] = ty
+	c.pushLocal(nd.a, sym, ty, valDepth)
+}
+
+func (c *Checker) markDeferred(en u32) {
+	if en != 0 && nodes[en].kind == NKIdent {
+		if idx, ok := c.lookupLocal(nodes[en].a); ok {
+			c.locals[idx].deferred = true
+			c.locals[idx].moved = false // deferred call consumes at exit, not now
+		}
+	}
+}
+
+func (c *Checker) consumeLinear(en u32) {
+	if en == 0 || nodes[en].kind != NKIdent {
+		return
+	}
+	if idx, ok := c.lookupLocal(nodes[en].a); ok {
+		if c.locals[idx].isLinear {
+			if c.locals[idx].moved {
+				addDiagStr(E3003, nodes[en].fileID, nodes[en].off, "linear resource already moved or closed")
+			}
+			c.locals[idx].moved = true
+		}
+	}
+}
+
+// exprDepth returns the lexical scope depth of the storage referenced by en (0 = caller/global/value).
+driver func (c *Checker) exprDepth(en u32) u32 {
+	if en == 0 {
+		return 0
+	}
+	n := nodes[en]
+	if n.kind == NKIdent {
+		if idx, ok := c.lookupLocal(n.a); ok {
+			return c.locals[idx].valDepth
+		}
+		return 0
+	}
+	if n.kind == NKUnary && n.op == TKAnd {
+		// Address of a local variable has its declaring block depth!
+		return c.lvalueDeclDepth(n.a)
+	}
+	if n.kind == NKSlice {
+		if nodes[n.a].kind == NKIdent {
+			if idx, ok := c.lookupLocal(nodes[n.a].a); ok {
+				if types[under(syms[c.locals[idx].symID].typeID)].kind == TKindArray {
+					return c.locals[idx].depth
+				}
+				return c.locals[idx].valDepth
+			}
+		}
+		return c.exprDepth(n.a)
+	}
+	if n.kind == NKSelector {
+		return c.exprDepth(n.a)
+	}
+	if n.kind == NKIndex {
+		return c.exprDepth(n.a)
+	}
+	if n.kind == NKCall && nodeCall[en] != 0 {
+		ci := calls[nodeCall[en]]
+		var mx u32 = 0
+		if ci.kind == CKMethod {
+			var rd u32 = 0
+			if ci.autoAddr != 0 {
+				rd = c.lvalueDeclDepth(ci.recvExpr)
+			} else {
+				rd = c.exprDepth(ci.recvExpr)
+			}
+			if rd > mx {
+				mx = rd
+			}
+		}
+		if ci.kind == CKFunc || ci.kind == CKMethod || ci.kind == CKValue {
+			for i := u32(0); i < n.c; i++ {
+				ad := c.exprDepth(listPool[n.b+i])
+				if ad > mx {
+					mx = ad
+				}
+			}
+		}
+		return mx
+	}
+	return 0
+}
+
+driver func (c *Checker) lvalueDeclDepth(en u32) u32 {
+	if en == 0 {
+		return 0
+	}
+	n := nodes[en]
+	if n.kind == NKIdent {
+		if idx, ok := c.lookupLocal(n.a); ok {
+			return c.locals[idx].depth
+		}
+		return 0
+	}
+	if n.kind == NKSelector {
+		if (nodeFlags[en] & NFIndirect) != 0 {
+			return c.exprDepth(n.a)
+		}
+		return c.lvalueDeclDepth(n.a)
+	}
+	if n.kind == NKIndex {
+		return c.lvalueDeclDepth(n.a)
+	}
+	return 0
+}
+
+driver func (c *Checker) lvalueTargetDepth(en u32) u32 {
+	if en == 0 {
+		return 0
+	}
+	n := nodes[en]
+	if n.kind == NKIdent {
+		if idx, ok := c.lookupLocal(n.a); ok {
+			return c.locals[idx].depth
+		}
+		return 0
+	}
+	if n.kind == NKSelector {
+		if (nodeFlags[en] & NFIndirect) != 0 {
+			// Field through pointer `*T`: target depth is the pointer's value depth!
+			return c.exprDepth(n.a)
+		}
+		return c.lvalueTargetDepth(n.a)
+	}
+	if n.kind == NKUnary && n.op == TKMul {
+		return c.exprDepth(n.a)
+	}
+	if n.kind == NKIndex {
+		return c.lvalueTargetDepth(n.a)
+	}
+	return 0
+}
+
+// checkAssignable handles normal assignability PLUS FinCore implicit string const -> []byte.
+driver func (c *Checker) checkAssignable(en u32, src u32, dst u32) bool {
+	if assignable(src, dst) {
+		// Propagate target type onto untyped expressions (like match exprs or untyped consts)
+		if isUntyped(src) && dst != 0 && !isUntyped(dst) {
+			nodeType[en] = dst
+		}
+		return true
+	}
+	// Constant string expression implicitly converts to fresh []byte!
+	if isByteSlice(dst) && isStringType(src) && nodeVal[en] != 0 && vals[nodeVal[en]].kind == VKStr {
+		nodeFlags[en] |= NFImplicitBytes
+		return true
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Expression type checking
+
+driver func (c *Checker) checkExpr(en u32, hint u32) u32 {
+	if en == 0 {
+		return TYInvalid
+	}
+	n := nodes[en]
+	var res u32 = TYInvalid
+
+	if n.kind == NKIntLit {
+		res = TYUntypedInt
+		nodeVal[en] = makeIntVal(u64Pool[n.b], false, TYUntypedInt)
+	} else if n.kind == NKFloatLit {
+		res = TYUntypedFloat
+		nodeVal[en] = makeFloatVal(u64Pool[n.b], TYUntypedFloat)
+	} else if n.kind == NKCharLit {
+		res = TYUntypedInt
+		nodeVal[en] = makeIntVal(u64(n.a), false, TYUntypedInt)
+	} else if n.kind == NKBoolLit {
+		res = TYUntypedBool
+		nodeVal[en] = makeBoolVal(n.a != 0)
+	} else if n.kind == NKStrLit {
+		res = TYUntypedStr
+		nodeVal[en] = makeStrVal(n.a)
+	} else if n.kind == NKNilLit {
+		res = TYUntypedNil
+		nodeVal[en] = makeErrVal(0)
+	} else if n.kind == NKIdent {
+		res = c.checkIdent(en)
+	} else if n.kind == NKUnary {
+		res = c.checkUnary(en, hint)
+	} else if n.kind == NKBinary {
+		res = c.checkBinary(en, hint)
+	} else if n.kind == NKSelector {
+		res = c.checkSelector(en, hint)
+	} else if n.kind == NKIndex {
+		res = c.checkIndex(en, hint)
+	} else if n.kind == NKSlice {
+		res = c.checkSlice(en)
+	} else if n.kind == NKStructLit {
+		res = c.checkStructLit(en)
+	} else if n.kind == NKArrayLit {
+		res = c.checkArrayLit(en)
+	} else if n.kind == NKMatchExpr {
+		res = c.checkMatch(en, true, hint)
+	} else if n.kind == NKHandleExpr {
+		res = c.checkHandle(en, true, hint)
+	} else if n.kind == NKFuncLit {
+		res = c.checkFuncLit(en)
+	} else if n.kind == NKCall {
+		res = c.checkCall(en, hint)
+	} else if n.kind == NKTypeExpr {
+		res = resolveTypeNode(c.pkgID, n.a)
+	}
+
+	nodeType[en] = res
+	return res
+}
+
+driver func (c *Checker) checkIdent(en u32) u32 {
+	n := nodes[en]
+	// 1. Local variable / parameter
+	if idx, ok := c.lookupLocal(n.a); ok {
+		sym := c.locals[idx].symID
+		nodeSym[en] = sym
+		if c.locals[idx].isLinear && c.locals[idx].moved {
+			addDiagStr(E3003, n.fileID, n.off, "use of moved or closed linear resource")
+		}
+		if syms[sym].kind == SymConst {
+			nodeVal[en] = syms[sym].valID
+			if (syms[sym].flags & 1) != 0 {
+				return vals[syms[sym].valID].typeID
+			}
+			return syms[sym].typeID
+		}
+		nodeFlags[en] |= NFAddressable
+		return syms[sym].typeID
+	}
+	// 2. Active const type parameter (e.g. `N` inside `Vec[N, T]`)
+	if tps := lookupActiveTP(n.a); tps != 0 {
+		nodeSym[en] = tps
+		if (syms[tps].flags & 1) != 0 {
+			return types[syms[tps].typeID].b
+		}
+		return syms[tps].typeID
+	}
+	// 3. Package-level or Universe symbol
+	sym := lookupPkgOrUniverse(c.pkgID, n.a)
+	if sym == 0 {
+		addDiagStr(E2001, n.fileID, n.off, "undefined identifier")
+		return TYInvalid
+	}
+	nodeSym[en] = sym
+	s := syms[sym]
+	if s.kind == SymConst {
+		if s.valID == 0 {
+			evalConstSym(sym)
+			s = syms[sym]
+		}
+		nodeVal[en] = s.valID
+		if (s.flags & 1) != 0 && s.valID != 0 {
+			return vals[s.valID].typeID
+		}
+		return s.typeID
+	}
+	if s.kind == SymVar {
+		nodeFlags[en] |= NFAddressable
+		return s.typeID
+	}
+	if s.kind == SymFunc || s.kind == SymType {
+		return s.typeID
+	}
+	return TYInvalid
+}
+
+driver func (c *Checker) checkUnary(en u32, hint u32) u32 {
+	n := nodes[en]
+	if n.op == TKAnd {
+		xt := c.checkExpr(n.a, 0)
+		if (nodeFlags[n.a] & NFAddressable) == 0 {
+			addDiagStr(E2002, n.fileID, n.off, "cannot take address of non-addressable expression")
+		}
+		return makePtrType(xt)
+	}
+	if n.op == TKMul {
+		xt := c.checkExpr(n.a, 0)
+		u := under(xt)
+		if types[u].kind != TKindPtr {
+			addDiagStr(E2002, n.fileID, n.off, "cannot dereference non-pointer type")
+			return TYInvalid
+		}
+		nodeFlags[en] |= NFAddressable
+		return types[u].a
+	}
+	xt := c.checkExpr(n.a, hint)
+	if n.op == TKNot {
+		if !isBoolType(xt) {
+			addDiagStr(E2002, n.fileID, n.off, "operator ! requires bool")
+		}
+		if nodeVal[n.a] != 0 && vals[nodeVal[n.a]].kind == VKBool {
+			nodeVal[en] = makeBoolVal(vals[nodeVal[n.a]].a == 0)
+		}
+		return xt
+	}
+	if n.op == TKSub || n.op == TKAdd || n.op == TKXor {
+		if !isNumericOrUntyped(xt) || (n.op == TKXor && (isFloatType(xt) || xt == TYUntypedFloat)) {
+			addDiagStr(E2002, n.fileID, n.off, "unary arithmetic/bitwise operator requires numeric/integer operand")
+		}
+		if nodeVal[n.a] != 0 && vals[nodeVal[n.a]].kind == VKInt {
+			v := vals[nodeVal[n.a]].u64Val
+			if n.op == TKSub {
+				nodeVal[en] = makeIntVal(0-v, true, xt)
+			} else if n.op == TKXor {
+				nodeVal[en] = makeIntVal(valMaskInt(^v, xt), isSignedInt(xt), xt)
+			} else {
+				nodeVal[en] = nodeVal[n.a]
+			}
+		} else if nodeVal[n.a] != 0 && vals[nodeVal[n.a]].kind == VKFloat {
+			v := vals[nodeVal[n.a]].u64Val
+			if n.op == TKSub {
+				nodeVal[en] = makeFloatVal(f64NegBits(v), xt)
+			} else {
+				nodeVal[en] = nodeVal[n.a]
+			}
+		}
+		return xt
+	}
+	return xt
+}
+
+driver func (c *Checker) checkBinary(en u32, hint u32) u32 {
+	n := nodes[en]
+	op := n.op
+	if op == TKLAnd || op == TKLOr {
+		lt := c.checkExpr(n.a, TYBool)
+		rt := c.checkExpr(n.b, TYBool)
+		if !isBoolType(lt) || !isBoolType(rt) {
+			addDiagStr(E2002, n.fileID, n.off, "logical operator requires bool operands")
+		}
+		if nodeVal[n.a] != 0 && nodeVal[n.b] != 0 {
+			if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+				nodeVal[en] = v
+			}
+		}
+		return TYBool
+	}
+	if op == TKShl || op == TKShr {
+		lh := hint
+		if lh == 0 || !isIntType(lh) {
+			lh = 0
+		}
+		lt := c.checkExpr(n.a, lh)
+		rt := c.checkExpr(n.b, 0)
+		if !isNumericOrUntyped(lt) || !isNumericOrUntyped(rt) {
+			addDiagStr(E2002, n.fileID, n.off, "shift requires integer operands")
+		}
+		res := lt
+		if res == TYUntypedInt && lh != 0 {
+			res = lh
+			nodeType[n.a] = res
+		}
+		if nodeVal[n.a] != 0 && nodeVal[n.b] != 0 {
+			if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+				nodeVal[en] = v
+			}
+		}
+		return res
+	}
+	lt := c.checkExpr(n.a, 0)
+	rt := c.checkExpr(n.b, lt)
+	if isUntyped(lt) && !isUntyped(rt) && rt != 0 {
+		if assignable(lt, rt) {
+			lt = rt
+			nodeType[n.a] = rt
+		}
+	} else if isUntyped(rt) && !isUntyped(lt) && lt != 0 {
+		if assignable(rt, lt) {
+			rt = lt
+			nodeType[n.b] = lt
+		}
+	}
+
+	if op == TKEql || op == TKNeq {
+		if lt != 0 && rt != 0 && !assignable(lt, rt) && !assignable(rt, lt) {
+			addDiagStr(E2002, n.fileID, n.off, "mismatched types in equality comparison")
+		}
+		if lt != 0 && types[lt].kind == TKindTypeParam && (types[lt].flags&1) == 0 && tpConstraint(lt) < ConstrEqual {
+			addDiagStr(E2011, n.fileID, n.off, "cannot compare unconstrained type parameter; use Equal, Ordered, or Numeric constraint")
+		}
+		if nodeVal[n.a] != 0 && nodeVal[n.b] != 0 {
+			if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+				nodeVal[en] = v
+			}
+		}
+		return TYBool
+	}
+	if op == TKLss || op == TKLeq || op == TKGtr || op == TKGeq {
+		if lt != 0 && types[lt].kind == TKindTypeParam && (types[lt].flags&1) == 0 {
+			if tpConstraint(lt) < ConstrOrdered {
+				addDiagStr(E2011, n.fileID, n.off, "ordered comparison requires Ordered or Numeric constraint")
+			} else if !typeEqual(lt, rt) {
+				addDiagStr(E2002, n.fileID, n.off, "mismatched types in ordered comparison")
+			}
+			return TYBool
+		}
+		if (!isNumericOrUntyped(lt) && !isStringType(lt)) || !typeEqual(lt, rt) {
+			if !(isNumericOrUntyped(lt) && isNumericOrUntyped(rt)) {
+				addDiagStr(E2002, n.fileID, n.off, "invalid types for ordered comparison")
+			}
+		}
+		if nodeVal[n.a] != 0 && nodeVal[n.b] != 0 {
+			if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+				nodeVal[en] = v
+			}
+		}
+		return TYBool
+	}
+	// String concatenation: allowed ONLY on compile-time constants!
+	if op == TKAdd && isStringType(lt) && isStringType(rt) {
+		if nodeVal[n.a] == 0 || nodeVal[n.b] == 0 {
+			addDiagStr(E2002, n.fileID, n.off, "string concatenation is only allowed on compile-time constants")
+			return TYString
+		}
+		if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+			nodeVal[en] = v
+		}
+		if lt == TYUntypedStr && rt == TYUntypedStr {
+			return TYUntypedStr
+		}
+		return TYString
+	}
+	// Arithmetic & bitwise binary operators
+	if !isNumericOrUntyped(lt) || !isNumericOrUntyped(rt) {
+		addDiagStr(E2002, n.fileID, n.off, "mismatched or non-numeric operands")
+		return lt
+	}
+	res := lt
+	if isUntyped(lt) && isUntyped(rt) {
+		if lt == TYUntypedFloat || rt == TYUntypedFloat {
+			res = TYUntypedFloat
+		} else {
+			res = TYUntypedInt
+		}
+	} else if isUntyped(lt) {
+		if !assignable(lt, rt) {
+			addDiagStr(E2002, n.fileID, n.off, "mismatched numeric operands")
+		}
+		res = rt
+	} else if isUntyped(rt) {
+		if !assignable(rt, lt) {
+			addDiagStr(E2002, n.fileID, n.off, "mismatched numeric operands")
+		}
+		res = lt
+	} else if !typeEqual(lt, rt) {
+		addDiagStr(E2002, n.fileID, n.off, "mismatched numeric operands")
+	}
+	if res == TYUntypedInt && hint != 0 && (isIntType(hint) || isFloatType(hint)) {
+		res = hint
+	} else if res == TYUntypedFloat && hint != 0 && isFloatType(hint) {
+		res = hint
+	}
+	if (isFloatType(res) || res == TYUntypedFloat) && (op == TKRem || op == TKAnd || op == TKOr || op == TKXor) {
+		addDiagStr(E2002, n.fileID, n.off, "bitwise/remainder operator not allowed on floating-point operands")
+	}
+	if nodeVal[n.a] != 0 && nodeVal[n.b] != 0 && !isFloatType(res) && res != TYUntypedFloat {
+		nodeType[en] = res
+		if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+			nodeVal[en] = v
+		}
+	}
+	return res
+}
+
+driver func (c *Checker) checkSelector(en u32, hint u32) u32 {
+	_ = hint
+	n := nodes[en]
+	// 1. Package-qualified symbol `pkg.Name`
+	if nodes[n.a].kind == NKIdent {
+		if _, isLoc := c.lookupLocal(nodes[n.a].a); !isLoc {
+			if targetPkg, ok := lookupFileImport(n.fileID, nodes[n.a].a); ok {
+				sym := lookupPkgSym(targetPkg, n.b)
+				if sym == 0 {
+					addDiagStr(E2001, n.fileID, n.off, "undefined symbol in imported package")
+					return TYInvalid
+				}
+				nodeSym[en] = sym
+				s := syms[sym]
+				if s.kind == SymConst {
+					if s.valID == 0 {
+						evalConstSym(sym)
+						s = syms[sym]
+					}
+					nodeVal[en] = s.valID
+					if (s.flags & 1) != 0 && s.valID != 0 {
+						return vals[s.valID].typeID
+					}
+					return s.typeID
+				}
+				if s.kind == SymVar {
+					nodeFlags[en] |= NFAddressable
+					return s.typeID
+				}
+				return s.typeID
+			}
+		}
+	}
+	// 2. Enum variant selection `EnumType.Variant` (e.g. `Color.Red`, `Option[u32].None`, `pkg.Shape.Empty`)
+	et := resolveExprAsType(c.pkgID, n.a)
+	if et != 0 && types[under(et)].kind == TKindEnum {
+		vidx, ok := findEnumVariant(et, n.b)
+		if !ok {
+			addDiagStr(E2001, n.fileID, n.off, "unknown enum variant")
+			return TYInvalid
+		}
+		nodeFlags[en] |= NFVariantSel
+		nodeSelIdx[en] = vidx
+		nodeType[n.a] = et
+		v := variants[types[under(et)].a+vidx]
+		if v.payCount == 0 {
+			nodeVal[en] = newVal(Val{kind: VKEnum, typeID: et, a: vidx, b: 0, c: 0})
+		}
+		return et
+	}
+	// 3. Struct field selection `x.field` (with auto-deref through `*T`)
+	xt := c.checkExpr(n.a, 0)
+	if xt == 0 {
+		return TYInvalid
+	}
+	base := xt
+	indirect := false
+	if types[under(base)].kind == TKindPtr {
+		base = types[under(base)].a
+		indirect = true
+		nodeFlags[en] |= NFIndirect
+	}
+	fidx, fty, ok := findStructField(base, n.b)
+	if !ok {
+		addDiagStr(E2001, n.fileID, n.off, "undefined field on type")
+		return TYInvalid
+	}
+	nodeSelIdx[en] = fidx
+	if indirect || (nodeFlags[n.a]&NFAddressable) != 0 {
+		nodeFlags[en] |= NFAddressable
+	}
+	return fty
+}
+
+driver func (c *Checker) checkIndex(en u32, hint u32) u32 {
+	_ = hint
+	n := nodes[en]
+	// Check if base is a generic function instantiation `fn[T, ...]`
+	if nodes[n.a].kind == NKIdent || nodes[n.a].kind == NKSelector {
+		var sym u32 = 0
+		if nodes[n.a].kind == NKIdent {
+			if _, isLoc := c.lookupLocal(nodes[n.a].a); !isLoc {
+				sym = lookupPkgOrUniverse(c.pkgID, nodes[n.a].a)
+			}
+		} else if nodes[nodes[n.a].a].kind == NKIdent {
+			if targetPkg, ok := lookupFileImport(n.fileID, nodes[nodes[n.a].a].a); ok {
+				sym = lookupPkgSym(targetPkg, nodes[n.a].b)
+			}
+		}
+		if sym != 0 && syms[sym].kind == SymFunc {
+			dn := syms[sym].declNode
+			if nodeInstCount[dn] > 0 {
+				var targs [16]u32
+				var tpsyms [16]u32
+				ntp := usize(nodeInstCount[dn])
+				for i := usize(0); i < ntp; i++ {
+					tpsyms[i] = typeList[usize(nodeInstStart[dn])+i]
+				}
+				for i := u32(0); i < n.c; i++ {
+					targs[i] = resolveGenericArg(c.pkgID, listPool[n.b+i], sym, i)
+				}
+				ts, tc := pushTypeList(targs[:usize(n.c)])
+				nodeSym[en] = sym
+				nodeInstStart[en] = ts
+				nodeInstCount[en] = tc
+				nodeFlags[en] |= NFGenericInst
+				return substType(syms[sym].typeID, tpsyms[:ntp], targs[:usize(n.c)])
+			}
+		}
+		if sym != 0 && syms[sym].kind == SymType {
+			return resolveExprAsType(c.pkgID, en)
+		}
+	}
+
+	// Regular array / slice / string / *array indexing `x[i]`
+	xt := c.checkExpr(n.a, 0)
+	idxExpr := listPool[n.b]
+	it := c.checkExpr(idxExpr, TYUsize)
+	if !isNumericOrUntyped(it) {
+		addDiagStr(E2002, nodes[idxExpr].fileID, nodes[idxExpr].off, "index must be integer")
+	}
+	u := under(xt)
+	if u == TYString || u == TYUntypedStr {
+		return TYU8
+	}
+	if types[u].kind == TKindArray {
+		if (nodeFlags[n.a] & NFAddressable) != 0 {
+			nodeFlags[en] |= NFAddressable
+		}
+		if c.checkIndexBoundsProven(n.a, xt, idxExpr) {
+			nodeFlags[en] |= NFBoundsProven
+		}
+		return types[u].a
+	}
+	if types[u].kind == TKindPtr && types[under(types[u].a)].kind == TKindArray {
+		nodeFlags[en] |= NFAddressable
+		if c.checkIndexBoundsProven(n.a, xt, idxExpr) {
+			nodeFlags[en] |= NFBoundsProven
+		}
+		return types[under(types[u].a)].a
+	}
+	if types[u].kind == TKindSlice {
+		nodeFlags[en] |= NFAddressable
+		if c.checkIndexBoundsProven(n.a, xt, idxExpr) {
+			nodeFlags[en] |= NFBoundsProven
+		}
+		return types[u].a
+	}
+	addDiagStr(E2002, n.fileID, n.off, "cannot index value of this type")
+	return TYInvalid
+}
+
+driver func (c *Checker) checkSlice(en u32) u32 {
+	n := nodes[en]
+	xt := c.checkExpr(n.a, 0)
+	if n.b != 0 {
+		_ = c.checkExpr(n.b, TYUsize)
+	}
+	if n.c != 0 {
+		_ = c.checkExpr(n.c, TYUsize)
+	}
+	if n.d != 0 {
+		_ = c.checkExpr(n.d, TYUsize)
+	}
+	u := under(xt)
+	if types[u].kind == TKindSlice {
+		return xt
+	}
+	if types[u].kind == TKindArray {
+		return makeSliceType(types[u].a)
+	}
+	if types[u].kind == TKindPtr && types[under(types[u].a)].kind == TKindArray {
+		if types[u].flags != 0 {
+			return makeConstSliceType(types[under(types[u].a)].a)
+		}
+		return makeSliceType(types[under(types[u].a)].a)
+	}
+	if u == TYString {
+		return TYString
+	}
+	addDiagStr(E2002, n.fileID, n.off, "cannot slice value of this type")
+	return TYInvalid
+}
+
+driver func (c *Checker) checkStructLit(en u32) u32 {
+	n := nodes[en]
+	stTy := resolveExprAsType(c.pkgID, n.a)
+	if stTy == 0 || types[under(stTy)].kind != TKindStruct {
+		addDiagStr(E2002, n.fileID, n.off, "invalid struct type in literal")
+		return TYInvalid
+	}
+	nodeType[n.a] = stTy
+	allConst := true
+	for i := u32(0); i < n.c; i++ {
+		fi := nodes[listPool[n.b+i]]
+		_, fty, ok := findStructField(stTy, fi.a)
+		if !ok {
+			addDiagStr(E2001, fi.fileID, fi.off, "unknown struct field")
+			allConst = false
+			continue
+		}
+		vt := c.checkExpr(fi.b, fty)
+		if !c.checkAssignable(fi.b, vt, fty) {
+			addDiagStr(E2002, fi.fileID, fi.off, "field initializer type mismatch")
+		}
+		if nodeVal[fi.b] == 0 {
+			allConst = false
+		}
+	}
+	if allConst && classOf(stTy) == ClsValue {
+		nodeType[en] = stTy
+		if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+			nodeVal[en] = v
+		}
+	}
+	return stTy
+}
+
+driver func (c *Checker) checkArrayLit(en u32) u32 {
+	n := nodes[en]
+	arrTy := resolveTypeNode(c.pkgID, n.a)
+	u := under(arrTy)
+	if types[u].kind != TKindArray {
+		addDiagStr(E2002, n.fileID, n.off, "expected array type in array literal")
+		return TYInvalid
+	}
+	if u64(n.c) > types[u].lenVal {
+		addDiagStr(E2002, n.fileID, n.off, "too many elements in array literal")
+	}
+	elemTy := types[u].a
+	for i := u32(0); i < n.c; i++ {
+		el := listPool[n.b+i]
+		vt := c.checkExpr(el, elemTy)
+		if !c.checkAssignable(el, vt, elemTy) {
+			addDiagStr(E2002, nodes[el].fileID, nodes[el].off, "array element type mismatch")
+		}
+	}
+	return arrTy
+}
+
+driver func (c *Checker) checkFuncLit(en u32) u32 {
+	n := nodes[en]
+	sn := nodes[n.a]
+	var ptypes [32]u32
+	for i := u32(0); i < sn.d; i++ {
+		pn := listPool[sn.c+i]
+		pt := resolveTypeNode(c.pkgID, nodes[pn].b)
+		nodeType[pn] = pt
+		ptypes[i] = pt
+	}
+	var rtypes [16]u32
+	nr := u32(0)
+	if sn.e != 0 {
+		rl := nodes[sn.e]
+		nr = rl.b
+		for i := u32(0); i < nr; i++ {
+			rtypes[i] = resolveTypeNode(c.pkgID, listPool[rl.a+i])
+		}
+	}
+	ps, pc := pushTypeList(ptypes[:usize(sn.d)])
+	rs, rc := pushTypeList(rtypes[:usize(nr)])
+	sigTy := newType(Type{kind: TKindSig, op: n.op, a: ps, b: pc, c: rs, d: rc})
+
+	// Check body in nested closure context
+	savedInLit := c.inLit
+	savedLitNode := c.litNode
+	savedOuterBase := c.outerBase
+	savedEff := c.fnEff
+	savedRetStart := c.retStart
+	savedRetCount := c.retCount
+	savedLocals := c.nLocals
+	savedCaps := c.nLitCaps
+	var oldCaps [64]u32
+	for i := u32(0); i < savedCaps; i++ {
+		oldCaps[i] = c.litCaps[i]
+	}
+
+	c.inLit = true
+	c.litNode = en
+	c.outerBase = savedLocals
+	c.fnEff = n.op
+	c.retStart = rs
+	c.retCount = rc
+	c.nLitCaps = 0
+	c.blockDepth++
+
+	for i := u32(0); i < sn.d; i++ {
+		pn := listPool[sn.c+i]
+		p := nodes[pn]
+		psym := addSym(Sym{kind: SymParam, nameStr: p.a, pkgID: c.pkgID, fileID: p.fileID, off: p.off, declNode: pn, typeID: ptypes[i]})
+		nodeSym[pn] = psym
+		if p.a != 0 && p.a != kwBlank {
+			c.pushLocal(p.a, psym, ptypes[i], c.blockDepth)
+		}
+	}
+	c.checkBlock(n.b)
+
+	// Persist captured symbols for codegen, and mark captured linear outer locals as moved!
+	capStart := capPoolUsed
+	for i := u32(0); i < c.nLitCaps; i++ {
+		csym := c.litCaps[i]
+		if capPoolUsed < MaxCaptures {
+			capPool[capPoolUsed] = csym
+			capPoolUsed++
+		}
+		for li := u32(0); li < savedLocals; li++ {
+			if c.locals[li].symID == csym && c.locals[li].isLinear {
+				c.locals[li].moved = true
+			}
+		}
+	}
+	litCapStart[en] = capStart
+	litCapCount[en] = c.nLitCaps
+
+	c.blockDepth--
+	c.nLocals = savedLocals
+	c.retCount = savedRetCount
+	c.retStart = savedRetStart
+	c.fnEff = savedEff
+	c.outerBase = savedOuterBase
+	c.litNode = savedLitNode
+	c.inLit = savedInLit
+	c.nLitCaps = savedCaps
+	for i := u32(0); i < savedCaps; i++ {
+		c.litCaps[i] = oldCaps[i]
+	}
+	// If nested inside an outer closure, forward any captures that live outside the outer closure!
+	if c.inLit {
+		cc := litCapCount[en]
+		for i := u32(0); i < cc; i++ {
+			csym := capPool[capStart+i]
+			if idx, ok := c.lookupLocalBySym(csym); ok && idx < c.outerBase {
+				c.recordCapture(csym)
+			}
+		}
+	}
+	return sigTy
+}
+
+// ---------------------------------------------------------------------------
+// Flat Match Statement / Expression Checker (with Exhaustiveness & Reachability E2012)
+
+driver func (c *Checker) checkMatch(mn u32, isExpr bool, hint u32) u32 {
+	n := nodes[mn]
+	st := c.checkExpr(n.a, 0)
+	su := under(st)
+	isEnum := su != 0 && types[su].kind == TKindEnum
+	hasWild := false
+	var covered [128]bool
+	var resTy u32 = 0
+	if isExpr && hint != 0 && !isUntyped(hint) {
+		resTy = hint
+	}
+
+	for i := u32(0); i < n.c; i++ {
+		armNode := listPool[n.b+i]
+		arm := nodes[armNode]
+		if hasWild {
+			addDiagStr(E2012, arm.fileID, arm.off, "unreachable match arm after wildcard")
+		}
+		saved := c.nLocals
+		c.blockDepth++
+		armIsWild := c.checkPattern(arm.a, st, isEnum, covered[:])
+		if armIsWild {
+			hasWild = true
+		}
+		if isExpr {
+			at := c.checkExpr(arm.b, resTy)
+			if resTy == 0 {
+				resTy = at
+			} else if isUntyped(resTy) && !isUntyped(at) && at != 0 {
+				if assignable(resTy, at) {
+					resTy = at
+				} else {
+					addDiagStr(E2002, nodes[arm.b].fileID, nodes[arm.b].off, "match arm type mismatch")
+				}
+			} else if !c.checkAssignable(arm.b, at, resTy) {
+				addDiagStr(E2002, nodes[arm.b].fileID, nodes[arm.b].off, "match arm type mismatch")
+			}
+		} else {
+			if nodes[arm.b].kind == NKBlock {
+				c.checkBlock(arm.b)
+			} else {
+				c.checkStmt(arm.b)
+			}
+		}
+		c.checkBlockExitLeaks(saved)
+		c.nLocals = saved
+		c.blockDepth--
+	}
+
+	// Exhaustiveness check (E2012)
+	exhaustive := hasWild
+	if !exhaustive && isEnum {
+		exhaustive = true
+		vc := types[su].b
+		if usize(vc) > len(covered) {
+			vc = u32(len(covered))
+		}
+		for v := u32(0); v < vc; v++ {
+			if !covered[v] {
+				exhaustive = false
+				break
+			}
+		}
+	}
+	if !exhaustive && isBoolType(st) {
+		if covered[0] && covered[1] {
+			exhaustive = true
+		}
+	}
+	if !exhaustive && (isExpr || isEnum) {
+		addDiagStr(E2012, n.fileID, n.off, "non-exhaustive match")
+	}
+	if exhaustive {
+		nodeFlags[mn] |= NFExhaustive
+	}
+	if isExpr && nodeVal[n.a] != 0 {
+		nodeType[mn] = resTy
+		if v, ok := evalConstExpr(c.pkgID, mn, 0); ok {
+			nodeVal[mn] = v
+		}
+	}
+	return resTy
+}
+
+driver func (c *Checker) checkPattern(patNode u32, scrutTy u32, isEnum bool, covered []bool) bool {
+	pn := nodes[patNode]
+	if pn.kind == NKPatWild {
+		return true
+	}
+	if pn.kind == NKPatOr {
+		anyWild := false
+		for i := u32(0); i < pn.b; i++ {
+			if c.checkPattern(listPool[pn.a+i], scrutTy, isEnum, covered) {
+				anyWild = true
+			}
+		}
+		return anyWild
+	}
+	if pn.kind == NKPatLit {
+		lt := c.checkExpr(pn.a, scrutTy)
+		if !assignable(lt, scrutTy) {
+			addDiagStr(E2002, pn.fileID, pn.off, "pattern literal type mismatch")
+		}
+		if isBoolType(scrutTy) && nodeVal[pn.a] != 0 && vals[nodeVal[pn.a]].kind == VKBool {
+			bidx := usize(vals[nodeVal[pn.a]].a)
+			if bidx < len(covered) {
+				if covered[bidx] {
+					addDiagStr(E2012, pn.fileID, pn.off, "unreachable duplicate match pattern")
+				}
+				covered[bidx] = true
+			}
+		}
+		return false
+	}
+	if pn.kind == NKPatCtor {
+		if isEnum {
+			vname := nodes[pn.a].a
+			if nodes[pn.a].kind == NKSelector {
+				vname = nodes[pn.a].b
+			}
+			vidx, ok := findEnumVariant(scrutTy, vname)
+			if !ok {
+				addDiagStr(E2001, pn.fileID, pn.off, "unknown enum variant in pattern")
+				return false
+			}
+			nodeSelIdx[patNode] = vidx
+			nodeFlags[patNode] |= NFVariantSel
+			if usize(vidx) < len(covered) {
+				if covered[vidx] {
+					addDiagStr(E2012, pn.fileID, pn.off, "unreachable duplicate enum variant pattern")
+				}
+				covered[vidx] = true
+			}
+			vr := variants[types[under(scrutTy)].a+vidx]
+			if pn.c != vr.payCount {
+				addDiagStr(E2003, pn.fileID, pn.off, "wrong number of payload bindings in enum pattern")
+				return false
+			}
+			for i := u32(0); i < pn.c; i++ {
+				bn := listPool[pn.b+i]
+				if nodes[bn].kind == NKIdent && nodes[bn].a != kwBlank {
+					pty := typeList[vr.payStart+i]
+					bsym := addSym(Sym{kind: SymLocal, nameStr: nodes[bn].a, pkgID: c.pkgID, fileID: nodes[bn].fileID, off: nodes[bn].off, declNode: bn, typeID: pty})
+					nodeSym[bn] = bsym
+					nodeType[bn] = pty
+					c.pushLocal(nodes[bn].a, bsym, pty, c.blockDepth)
+				}
+			}
+			return false
+		}
+		// Constant name pattern (e.g. `ErrIO`, `MaxN`)
+		ct := c.checkExpr(pn.a, scrutTy)
+		if !assignable(ct, scrutTy) {
+			addDiagStr(E2002, pn.fileID, pn.off, "constant pattern type mismatch")
+		}
+		return false
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Call Checker (conversions, variants, builtins, builtin methods, user funcs/methods)
+
+func newCallInfo(ci CallInfo) u32 {
+	if callCount >= MaxCalls {
+		return 0
+	}
+	id := callCount
+	callCount++
+	calls[id] = ci
+	return id
+}
+
+driver func (c *Checker) checkCall(en u32, hint u32) u32 {
+	_ = hint
+	n := nodes[en]
+	fun := n.a
+	fn := nodes[fun]
+
+	// 1. Type conversion `T(x)` (e.g. `u32(x)`, `usize(i)`, `NodeID(1)`)
+	if convTy := resolveExprAsType(c.pkgID, fun); convTy != 0 {
+		// Make sure it's not shadowed by a local variable!
+		shadowed := false
+		if fn.kind == NKIdent {
+			if _, ok := c.lookupLocal(fn.a); ok {
+				shadowed = true
+			}
+		}
+		if !shadowed {
+			if n.c != 1 {
+				addDiagStr(E2003, n.fileID, n.off, "type conversion requires exactly 1 argument")
+				return convTy
+			}
+			arg := listPool[n.b]
+			at := c.checkExpr(arg, convTy)
+			// Disallow string -> []byte conversion (must use strBytes)
+			if isByteSlice(convTy) && isStringType(at) {
+				addDiagStr(E2002, n.fileID, n.off, "cannot convert string to []byte; use strBytes")
+			}
+			nodeCall[en] = newCallInfo(CallInfo{kind: CKConv, convType: convTy})
+			if nodeVal[arg] != 0 {
+				if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+					nodeVal[en] = v
+				}
+			}
+			return convTy
+		}
+	}
+
+	// 2. Builtin function call `len(...)`, `formatTo(...)`, `NewContext()`, `CodeArray(...)`, ...
+	if fn.kind == NKIdent {
+		if _, isLoc := c.lookupLocal(fn.a); !isLoc {
+			if sym := lookupPkgOrUniverse(c.pkgID, fn.a); sym != 0 && syms[sym].kind == SymBuiltin {
+				return c.checkBuiltinCall(en, syms[sym].builtin)
+			}
+		}
+	}
+
+	// 3. Selector call: enum variant ctor, pkg.Func, builtin method, or user method!
+	if fn.kind == NKSelector {
+		// 3a. Package-qualified function `pkg.Fn(...)`
+		if nodes[fn.a].kind == NKIdent {
+			if _, isLoc := c.lookupLocal(nodes[fn.a].a); !isLoc {
+				if targetPkg, ok := lookupFileImport(fn.fileID, nodes[fn.a].a); ok {
+					sym := lookupPkgSym(targetPkg, fn.b)
+					if sym != 0 && syms[sym].kind == SymFunc {
+						return c.checkUserFuncCall(en, sym, 0, 0)
+					}
+				}
+			}
+		}
+		// 3b. Enum variant constructor `Shape.Circle(2)` / `Option[u32].Some(40)`
+		if et := resolveExprAsType(c.pkgID, fn.a); et != 0 && types[under(et)].kind == TKindEnum {
+			vidx, ok := findEnumVariant(et, fn.b)
+			if !ok {
+				addDiagStr(E2001, fn.fileID, fn.off, "unknown enum variant")
+				return et
+			}
+			vr := variants[types[under(et)].a+vidx]
+			if n.c != vr.payCount {
+				addDiagStr(E2003, n.fileID, n.off, "wrong number of variant payload arguments")
+			}
+			allConst := true
+			lim := n.c
+			if vr.payCount < lim {
+				lim = vr.payCount
+			}
+			for i := u32(0); i < lim; i++ {
+				arg := listPool[n.b+i]
+				pt := typeList[vr.payStart+i]
+				at := c.checkExpr(arg, pt)
+				if !c.checkAssignable(arg, at, pt) {
+					addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "variant argument type mismatch")
+				}
+				if nodeVal[arg] == 0 {
+					allConst = false
+				}
+			}
+			nodeCall[en] = newCallInfo(CallInfo{kind: CKVariant, varType: et, varIdx: vidx})
+			if allConst && classOf(et) == ClsValue {
+				nodeType[en] = et
+				if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+					nodeVal[en] = v
+				}
+			}
+			return et
+		}
+		// 3c. Method call `recv.M(...)`
+		rty := c.checkExpr(fn.a, 0)
+		if rty == 0 {
+			return TYInvalid
+		}
+		// Check builtin capability/resource method first
+		if bm := lookupBuiltinMethod(under(rty), fn.b); bm != BMNone {
+			return c.checkBuiltinMethodCall(en, fn.a, rty, bm)
+		}
+		// Check builtin methods on *Atomic[T] (pointer receiver auto-deref)
+		if types[under(rty)].kind == TKindPtr && isAtomicType(under(types[under(rty)].a)) {
+			if bm := lookupBuiltinMethod(under(types[under(rty)].a), fn.b); bm != BMNone {
+				return c.checkBuiltinMethodCall(en, fn.a, rty, bm)
+			}
+		}
+		// Check user method on receiver type (with auto-deref or auto-addr)
+		baseTy := rty
+		isPtr := false
+		if types[under(baseTy)].kind == TKindPtr {
+			baseTy = types[under(baseTy)].a
+			isPtr = true
+		}
+		origSym := typeOriginSym(baseTy)
+		if origSym != 0 {
+			if mSym, ok := findUserMethod(origSym, fn.b); ok {
+				return c.checkUserMethodCall(en, fn.a, rty, baseTy, isPtr, mSym)
+			}
+		}
+		// Otherwise maybe a struct field of function type! Fall through to CallValue.
+	}
+
+	// 4. Generic function call `fn[T, ...](args...)`
+	if fn.kind == NKIndex {
+		ft := c.checkIndex(fun, 0)
+		if (nodeFlags[fun] & NFGenericInst) != 0 {
+			return c.checkUserFuncCall(en, nodeSym[fun], nodeInstStart[fun], nodeInstCount[fun])
+		}
+		_ = ft
+	}
+
+	// 4b. Linear one-shot continuation `resume(...)` inside a handle arm
+	if fn.kind == NKIdent && fn.a == kwResume {
+		if idx, isLoc := c.lookupLocal(fn.a); isLoc {
+			rsym := c.locals[idx].symID
+			rty := syms[rsym].typeID
+			if types[rty].kind == TKindResume {
+				nodeSym[fun] = rsym
+				nodeType[fun] = rty
+				c.consumeLinear(fun)
+				opRetTy := types[rty].a
+				hResTy := types[rty].b
+				if opRetTy == 0 {
+					if n.c != 0 {
+						addDiagStr(E2003, n.fileID, n.off, "resume takes no arguments for void effect operation")
+					}
+				} else {
+					if n.c != 1 {
+						addDiagStr(E2003, n.fileID, n.off, "resume expects 1 argument")
+					} else {
+						arg := listPool[n.b]
+						got := c.checkExpr(arg, opRetTy)
+						if !c.checkAssignable(arg, got, opRetTy) {
+							addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "resume argument type mismatch")
+						}
+					}
+				}
+				nodeCall[en] = newCallInfo(CallInfo{
+					kind:      CKResume,
+					calleeSym: c.curHandleNode,
+					varIdx:    c.curHandleArm,
+					sigType:   opRetTy,
+					convType:  hResTy,
+				})
+				if hResTy == 0 {
+					return TYInvalid
+				}
+				return hResTy
+			}
+		}
+	}
+
+	// 4c. Effect operation call `op(args...)` from active lexical effect capability
+	if fn.kind == NKIdent {
+		if _, isLoc := c.lookupLocal(fn.a); !isLoc {
+			if evSym, effTy, opIdx, opSig, ok := c.findActiveEffectOp(fn.a); ok {
+				c.checkCallArgs(en, types[opSig])
+				nodeCall[en] = newCallInfo(CallInfo{
+					kind:      CKEffectOp,
+					calleeSym: evSym,
+					recvType:  effTy,
+					varIdx:    opIdx,
+					sigType:   opSig,
+				})
+				return sigResultType(types[opSig])
+			}
+		}
+	}
+
+	// 5. Direct user function call `fn(args...)`
+	if fn.kind == NKIdent {
+		if _, isLoc := c.lookupLocal(fn.a); !isLoc {
+			if sym := lookupPkgOrUniverse(c.pkgID, fn.a); sym != 0 && syms[sym].kind == SymFunc {
+				return c.checkUserFuncCall(en, sym, 0, 0)
+			}
+		}
+	}
+
+	// 6. Call through function value (`CancelFunc` or `func(...) ...`)
+	ft := c.checkExpr(fun, 0)
+	if under(ft) == TYCancelFunc {
+		if n.c != 0 {
+			addDiagStr(E2003, n.fileID, n.off, "CancelFunc takes no arguments")
+		}
+		c.consumeLinear(fun)
+		nodeCall[en] = newCallInfo(CallInfo{kind: CKValue, sigType: newType(Type{kind: TKindSig})})
+		return TYInvalid
+	}
+	fu := under(ft)
+	if types[fu].kind != TKindSig {
+		addDiagStr(E2002, n.fileID, n.off, "cannot call non-function value")
+		return TYInvalid
+	}
+	sig := types[fu]
+	if sig.op == EffDriver && c.fnEff != EffDriver {
+		addDiagStr(E5001, n.fileID, n.off, "cannot call driver function from total function")
+	}
+	c.checkCallArgs(en, sig)
+	nodeCall[en] = newCallInfo(CallInfo{kind: CKValue, sigType: fu})
+	return sigResultType(sig)
+}
+
+func sigResultType(sig Type) u32 {
+	if sig.d == 0 {
+		return TYInvalid
+	}
+	if sig.d == 1 {
+		return typeList[sig.c]
+	}
+	var rs [16]u32
+	for i := u32(0); i < sig.d; i++ {
+		rs[i] = typeList[sig.c+i]
+	}
+	return makeTupleType(rs[:usize(sig.d)])
+}
+
+driver func (c *Checker) checkCallArgs(en u32, sig Type) {
+	n := nodes[en]
+	// Multi-result call as sole argument `f(g())`
+	if n.c == 1 && sig.b > 1 {
+		a0 := listPool[n.b]
+		at := c.checkExpr(a0, 0)
+		if at != 0 && types[at].kind == TKindTuple && types[at].b == sig.b {
+			for i := u32(0); i < sig.b; i++ {
+				if !assignable(typeList[types[at].a+i], typeList[sig.a+i]) {
+					addDiagStr(E2002, nodes[a0].fileID, nodes[a0].off, "argument type mismatch")
+				}
+			}
+			return
+		}
+	}
+	if n.c != sig.b {
+		addDiagStr(E2003, n.fileID, n.off, "wrong number of arguments in call")
+		return
+	}
+	for i := u32(0); i < n.c; i++ {
+		arg := listPool[n.b+i]
+		want := typeList[sig.a+i]
+		got := c.checkExpr(arg, want)
+		if !c.checkAssignable(arg, got, want) {
+			addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "argument type mismatch")
+		}
+	}
+}
+
+driver func (c *Checker) checkUserFuncCall(en u32, sym u32, targStart u32, targCount u32) u32 {
+	n := nodes[en]
+	dn := syms[sym].declNode
+	sigTy := syms[sym].typeID
+	if sigTy == 0 {
+		return TYInvalid
+	}
+	// Substitute generic type arguments if present
+	if targCount > 0 && nodeInstCount[dn] > 0 {
+		var tpsyms [16]u32
+		var targs [16]u32
+		ntp := usize(nodeInstCount[dn])
+		for i := usize(0); i < ntp; i++ {
+			tpsyms[i] = typeList[usize(nodeInstStart[dn])+i]
+		}
+		for i := u32(0); i < targCount; i++ {
+			targs[i] = typeList[targStart+i]
+		}
+		sigTy = substType(sigTy, tpsyms[:ntp], targs[:usize(targCount)])
+	}
+	sig := types[sigTy]
+	if sig.op == EffDriver && c.fnEff != EffDriver {
+		addDiagStr(E5001, n.fileID, n.off, "cannot call driver function from total function")
+	}
+	// Record call graph edge for totality check
+	if c.fnEff == EffTotal && sig.op == EffTotal && cgCount < MaxCallGraph {
+		cgCaller[cgCount] = c.fnSym
+		cgCallee[cgCount] = sym
+		cgFile[cgCount] = n.fileID
+		cgOff[cgCount] = n.off
+		cgCount++
+	}
+	c.checkCallArgs(en, sig)
+	// Verify parameter `where` refinement constraints statically at call site (E2013)!
+	if dn != 0 && nodes[dn].c != 0 {
+		var wTPSyms [16]u32
+		var wTArgs [16]u32
+		ntp := usize(nodeInstCount[dn])
+		driver for k := usize(0); k < ntp && k < 16; k++ {
+			wTPSyms[k] = typeList[usize(nodeInstStart[dn])+k]
+		}
+		driver for k := u32(0); k < targCount && k < 16; k++ {
+			wTArgs[k] = typeList[targStart+k]
+		}
+		calSig := nodes[nodes[dn].c]
+		driver for k := u32(0); k < calSig.d; k++ {
+			wh := paramWhere[listPool[calSig.c+k]]
+			if wh != 0 {
+				if !c.proveWhereClauseAtCall(wh, en, dn, wTPSyms[:ntp], wTArgs[:usize(targCount)]) {
+					addDiagStr(E2013, n.fileID, n.off, "refinement constraint (where) not proven at call site")
+				}
+			}
+		}
+	}
+	cid := newCallInfo(CallInfo{
+		kind:      CKFunc,
+		calleeSym: sym,
+		sigType:   sigTy,
+		targStart: targStart,
+		targCount: targCount,
+	})
+	nodeCall[en] = cid
+	// Resolve required `with E1, E2` effect capabilities from caller's lexical scope
+	ec := sigTypeEffCount[sigTy]
+	if ec > 0 {
+		var evs [16]u32
+		nev := usize(0)
+		driver for i := u32(0); i < ec && i < 16; i++ {
+			reqEff := typeList[sigTypeEffStart[sigTy]+i]
+			evSym, ok := c.findActiveEffect(reqEff)
+			if !ok {
+				addDiagStr(E5003, n.fileID, n.off, "missing effect capability required by function call")
+			}
+			evs[nev] = evSym
+			nev++
+		}
+		es, ec2 := pushEvSyms(evs[:nev])
+		callEvStart[cid] = es
+		callEvCount[cid] = ec2
+	}
+	// Fold comptime calls at compile time!
+	if sig.op == EffComptime {
+		if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+			nodeVal[en] = v
+		}
+	}
+	return sigResultType(sig)
+}
+
+driver func (c *Checker) checkUserMethodCall(en u32, recvExpr u32, recvTy u32, baseTy u32, isPtr bool, mSym u32) u32 {
+	n := nodes[en]
+	dn := syms[mSym].declNode
+	needPtr := (syms[mSym].flags & 8) != 0
+	var autoAddr u8 = 0
+	finalRecvTy := recvTy
+	if needPtr && !isPtr {
+		if (nodeFlags[recvExpr] & NFAddressable) == 0 {
+			addDiagStr(E2002, n.fileID, n.off, "cannot call pointer-receiver method on non-addressable value")
+		}
+		autoAddr = 1
+		finalRecvTy = makePtrType(baseTy)
+	} else if !needPtr && isPtr {
+		finalRecvTy = baseTy
+	} else if needPtr && isPtr && isConstView(recvTy) {
+		addDiagStr(E2014, n.fileID, n.off, "cannot call mutable pointer-receiver method on const pointer")
+	}
+
+	// Receiver type arguments for generic methods
+	sigTy := syms[mSym].typeID
+	var targStart u32 = 0
+	var targCount u32 = 0
+	if types[baseTy].kind == TKindNamed && types[baseTy].d > 0 && nodeInstCount[dn] > 0 {
+		targStart = types[baseTy].c
+		targCount = types[baseTy].d
+		var tpsyms [16]u32
+		var targs [16]u32
+		ntp := usize(nodeInstCount[dn])
+		for i := usize(0); i < ntp; i++ {
+			tpsyms[i] = typeList[usize(nodeInstStart[dn])+i]
+		}
+		for i := u32(0); i < targCount; i++ {
+			targs[i] = typeList[targStart+i]
+		}
+		sigTy = substType(sigTy, tpsyms[:ntp], targs[:usize(targCount)])
+	}
+	sig := types[sigTy]
+	if sig.op == EffDriver && c.fnEff != EffDriver {
+		addDiagStr(E5001, n.fileID, n.off, "cannot call driver method from total function")
+	}
+	if c.fnEff == EffTotal && sig.op == EffTotal && cgCount < MaxCallGraph {
+		cgCaller[cgCount] = c.fnSym
+		cgCallee[cgCount] = mSym
+		cgFile[cgCount] = n.fileID
+		cgOff[cgCount] = n.off
+		cgCount++
+	}
+	c.checkCallArgs(en, sig)
+	// Verify parameter `where` refinement constraints statically at call site (E2013)!
+	if dn != 0 && nodes[dn].c != 0 {
+		var wTPSyms [16]u32
+		var wTArgs [16]u32
+		ntp := usize(nodeInstCount[dn])
+		driver for k := usize(0); k < ntp && k < 16; k++ {
+			wTPSyms[k] = typeList[usize(nodeInstStart[dn])+k]
+		}
+		driver for k := u32(0); k < targCount && k < 16; k++ {
+			wTArgs[k] = typeList[targStart+k]
+		}
+		calSig := nodes[nodes[dn].c]
+		driver for k := u32(0); k < calSig.d; k++ {
+			wh := paramWhere[listPool[calSig.c+k]]
+			if wh != 0 {
+				if !c.proveWhereClauseAtCall(wh, en, dn, wTPSyms[:ntp], wTArgs[:usize(targCount)]) {
+					addDiagStr(E2013, n.fileID, n.off, "refinement constraint (where) not proven at call site")
+				}
+			}
+		}
+	}
+	cid := newCallInfo(CallInfo{
+		kind:      CKMethod,
+		autoAddr:  autoAddr,
+		calleeSym: mSym,
+		recvExpr:  recvExpr,
+		recvType:  finalRecvTy,
+		sigType:   sigTy,
+		targStart: targStart,
+		targCount: targCount,
+	})
+	nodeCall[en] = cid
+	ec := sigTypeEffCount[sigTy]
+	if ec > 0 {
+		var evs [16]u32
+		nev := usize(0)
+		driver for i := u32(0); i < ec && i < 16; i++ {
+			reqEff := typeList[sigTypeEffStart[sigTy]+i]
+			evSym, ok := c.findActiveEffect(reqEff)
+			if !ok {
+				addDiagStr(E5003, n.fileID, n.off, "missing effect capability required by method call")
+			}
+			evs[nev] = evSym
+			nev++
+		}
+		es, ec2 := pushEvSyms(evs[:nev])
+		callEvStart[cid] = es
+		callEvCount[cid] = ec2
+	}
+	return sigResultType(sig)
+}
+
+driver func (c *Checker) checkBuiltinCall(en u32, bid u16) u32 {
+	n := nodes[en]
+	var retTy u32 = TYInvalid
+	var tstart u32 = 0
+	var tcnt u32 = 0
+
+	if bid == BFLen || bid == BFCap {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "len/cap requires 1 argument")
+		} else {
+			at := c.checkExpr(listPool[n.b], 0)
+			u := under(at)
+			if types[u].kind == TKindArray {
+				nodeVal[en] = makeIntVal(types[u].lenVal, false, TYUsize)
+			} else if bid == BFLen && (u == TYString || u == TYUntypedStr) && nodeVal[listPool[n.b]] != 0 {
+				nodeVal[en] = makeIntVal(u64(len(strSlice(vals[nodeVal[listPool[n.b]]].a))), false, TYUsize)
+			}
+		}
+		retTy = TYUsize
+	} else if bid == BFCopy {
+		if n.c != 2 {
+			addDiagStr(E2003, n.fileID, n.off, "copy requires 2 arguments")
+		} else {
+			dt := c.checkExpr(listPool[n.b], 0)
+			if isConstView(dt) {
+				addDiagStr(E2014, nodes[listPool[n.b]].fileID, nodes[listPool[n.b]].off, "cannot copy into const slice")
+			}
+			st := c.checkExpr(listPool[n.b+1], dt)
+			if types[under(dt)].kind == TKindSlice {
+				var el [1]u32
+				el[0] = types[under(dt)].a
+				tstart, tcnt = pushTypeList(el[:])
+			}
+			_ = st
+		}
+		retTy = TYUsize
+	} else if bid == BFBytesEqual {
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], makeSliceType(TYU8))
+			_ = c.checkExpr(listPool[n.b+1], makeSliceType(TYU8))
+		}
+		retTy = TYBool
+	} else if bid == BFStrBytes {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		retTy = makeSliceType(TYU8)
+	} else if bid == BFBytesToStr {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], makeSliceType(TYU8))
+		}
+		retTy = TYString
+	} else if bid == BFFormatUint {
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], TYU64)
+			_ = c.checkExpr(listPool[n.b+1], makeSliceType(TYU8))
+		}
+		var rs [2]u32
+		rs[0] = TYUsize
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bid == BFParseUint {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], makeSliceType(TYU8))
+		}
+		var rs [2]u32
+		rs[0] = TYU64
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bid == BFNewContext {
+		var rs [2]u32
+		rs[0] = TYContext
+		rs[1] = TYCancelFunc
+		retTy = makeTupleType(rs[:])
+	} else if bid == BFNewScope {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYUsize)
+		}
+		retTy = TYScope
+	} else if bid == BFNewFiberScope {
+		if n.c != 2 {
+			addDiagStr(E2003, n.fileID, n.off, "NewFiberScope requires 2 arguments (workers, maxFibers)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYUsize)
+			_ = c.checkExpr(listPool[n.b+1], TYUsize)
+		}
+		retTy = TYScope
+	} else if bid == BFFiberYield {
+		if n.c != 0 {
+			addDiagStr(E2003, n.fileID, n.off, "FiberYield takes no arguments")
+		}
+		retTy = TYInvalid
+	} else if bid == BFNewArena {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "NewArena requires 1 argument (capacity in bytes)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYUsize)
+		}
+		retTy = TYArena
+	} else if bid == BFStrView {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "strView requires 1 argument (string)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		retTy = makeConstSliceType(TYU8)
+	} else if bid == BFPanic {
+		if c.fnEff != EffDriver {
+			addDiagStr(E5001, n.fileID, n.off, "panic is only allowed in driver functions")
+		}
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		retTy = TYInvalid
+	} else if bid == BFFormatTo {
+		return c.checkFormatToCall(en)
+	} else if bid >= BFCodeBool && bid <= BFCodeUniv {
+		for i := u32(0); i < n.c; i++ {
+			_ = c.checkExpr(listPool[n.b+i], 0)
+		}
+		if bid == BFCodeField {
+			retTy = TYFieldCode
+		} else if bid == BFCodeUniv {
+			var lvl u32 = 1
+			if n.c == 1 {
+				if v, ok := evalConstExpr(c.pkgID, listPool[n.b], 0); ok && vals[v].kind == VKInt {
+					lvl = u32(vals[v].u64Val) + 1
+				}
+			}
+			retTy = newType(Type{kind: TKindCode, a: lvl})
+		} else {
+			retTy = newType(Type{kind: TKindCode, a: 0})
+		}
+		if v, ok := evalConstExpr(c.pkgID, en, 0); ok {
+			nodeVal[en] = v
+		}
+	}
+	nodeCall[en] = newCallInfo(CallInfo{kind: CKBuiltin, builtinID: bid, targStart: tstart, targCount: tcnt})
+	return retTy
+}
+
+// checkFormatToCall parses & validates formatTo(dst, fmtStr, args...) at compile time!
+driver func (c *Checker) checkFormatToCall(en u32) u32 {
+	n := nodes[en]
+	if n.c < 2 {
+		addDiagStr(E2003, n.fileID, n.off, "formatTo requires dst and format string")
+		return TYUsize
+	}
+	dstT := c.checkExpr(listPool[n.b], makeSliceType(TYU8))
+	if !isByteSlice(dstT) {
+		addDiagStr(E2002, nodes[listPool[n.b]].fileID, nodes[listPool[n.b]].off, "formatTo destination must be []byte")
+	} else if isConstView(dstT) {
+		addDiagStr(E2014, nodes[listPool[n.b]].fileID, nodes[listPool[n.b]].off, "cannot formatTo into const []byte")
+	}
+	fmtArg := listPool[n.b+1]
+	ft := c.checkExpr(fmtArg, TYString)
+	if (ft != TYString && ft != TYUntypedStr) || nodeVal[fmtArg] == 0 || vals[nodeVal[fmtArg]].kind != VKStr {
+		addDiagStr(E2002, nodes[fmtArg].fileID, nodes[fmtArg].off, "formatTo format string must be a compile-time constant string")
+		return TYUsize
+	}
+	var argTypes [32]u32
+	nArgs := n.c - 2
+	limArgs := nArgs
+	if limArgs > 32 {
+		limArgs = 32
+	}
+	for i := u32(0); i < limArgs; i++ {
+		argTypes[i] = c.checkExpr(listPool[n.b+2+i], 0)
+	}
+
+	fb := strSlice(vals[nodeVal[fmtArg]].a)
+	itemStart := fmtItemCount
+	var argIdx u32 = 0
+	var litBuf [512]byte
+	litLen := usize(0)
+
+	i := usize(0)
+	for step := usize(0); step < len(fb)+1; step++ {
+		if i >= len(fb) {
+			break
+		}
+		if fb[i] != '%' {
+			if litLen < len(litBuf) {
+				litBuf[litLen] = fb[i]
+				litLen++
+			}
+			i++
+			continue
+		}
+		// Flush accumulated literal
+		if litLen > 0 {
+			if fmtItemCount < MaxFmtItems {
+				fmtItems[fmtItemCount] = FmtItem{kind: FmtLit, litStrID: internBytes(litBuf[:litLen])}
+				fmtItemCount++
+			}
+			litLen = 0
+		}
+		i++ // skip '%'
+		if i >= len(fb) {
+			addDiagStr(E2002, nodes[fmtArg].fileID, nodes[fmtArg].off, "incomplete format directive")
+			break
+		}
+		if fb[i] == '%' {
+			if litLen < len(litBuf) {
+				litBuf[litLen] = '%'
+				litLen++
+			}
+			i++
+			continue
+		}
+		var leftAlign u8 = 0
+		if fb[i] == '-' {
+			leftAlign = 1
+			i++
+		}
+		var zeroPad u8 = 0
+		if i < len(fb) && fb[i] == '0' {
+			zeroPad = 1
+			i++
+		}
+		var width u16 = 0
+		for w := usize(0); w < 8; w++ {
+			if i >= len(fb) || !isDigit(fb[i]) {
+				break
+			}
+			width = width*10 + u16(fb[i]-'0')
+			i++
+		}
+		if i >= len(fb) {
+			addDiagStr(E2002, nodes[fmtArg].fileID, nodes[fmtArg].off, "incomplete format directive")
+			break
+		}
+		verb := fb[i]
+		i++
+		if argIdx >= nArgs {
+			addDiagStr(E2003, n.fileID, n.off, "not enough arguments for formatTo")
+			break
+		}
+		at := argTypes[argIdx]
+		argNode := listPool[n.b+2+argIdx]
+		untypedNeg := at == TYUntypedInt && nodeVal[argNode] != 0 && vals[nodeVal[argNode]].kind == VKInt && vals[nodeVal[argNode]].flags != 0
+		if classOf(at) != ClsValue && !isByteSlice(at) {
+			addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "formatTo argument must be a Value type or []byte")
+		}
+		var item FmtItem
+		item.zeroPad = zeroPad
+		item.leftAlign = leftAlign
+		item.width = width
+		item.argIdx = argIdx
+		if verb == 'd' {
+			if isSignedInt(at) || untypedNeg {
+				item.kind = FmtInt
+			} else if isUnsignedInt(at) || at == TYUntypedInt {
+				item.kind = FmtUint
+			} else {
+				addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "%d requires integer argument")
+			}
+		} else if verb == 'x' {
+			if isSignedInt(at) || untypedNeg {
+				item.kind = FmtHexInt
+			} else if isUnsignedInt(at) || at == TYUntypedInt {
+				item.kind = FmtHex
+			} else {
+				addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "%x requires integer argument")
+			}
+		} else if verb == 's' {
+			if isStringType(at) {
+				item.kind = FmtStr
+			} else if isByteSlice(at) {
+				item.kind = FmtBytes
+			} else {
+				addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "%s requires string or []byte")
+			}
+		} else if verb == 'q' {
+			item.kind = FmtQuote
+			if isByteSlice(at) {
+				item.isBytes = 1
+			} else if !isStringType(at) {
+				addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "%q requires string or []byte")
+			}
+		} else if verb == 'c' {
+			item.kind = FmtChar
+			if under(at) != TYU8 && at != TYUntypedInt {
+				addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "%c requires u8/byte")
+			}
+		} else if verb == 'f' {
+			item.kind = FmtFloat
+			if !isFloatType(at) && at != TYUntypedFloat {
+				addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "%f requires f32 or f64 argument")
+			}
+		} else if verb == 'v' {
+			// Check user Format method FIRST (even on named basic types like `type Temp i32`)!
+			handledFmtMeth := false
+			if origSym := typeOriginSym(at); origSym != 0 {
+				if mSym, ok := findUserMethod(origSym, strFormat); ok {
+					handledFmtMeth = true
+					msig := types[syms[mSym].typeID]
+					if (syms[mSym].flags&8) == 0 && msig.b == 1 && isByteSlice(typeList[msig.a]) && msig.d == 1 && under(typeList[msig.c]) == TYUsize {
+						item.kind = FmtMethod
+						item.methSym = mSym
+						item.argType = at
+						if c.fnEff == EffTotal && msig.op == EffTotal && cgCount < MaxCallGraph {
+							cgCaller[cgCount] = c.fnSym
+							cgCallee[cgCount] = mSym
+							cgFile[cgCount] = n.fileID
+							cgOff[cgCount] = n.off
+							cgCount++
+						}
+					} else {
+						addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "Format method must have signature func (T) Format([]byte) usize")
+					}
+				}
+			}
+			if !handledFmtMeth {
+				if isBoolType(at) {
+					item.kind = FmtBool
+				} else if isFloatType(at) || at == TYUntypedFloat {
+					item.kind = FmtFloat
+				} else if isSignedInt(at) || untypedNeg {
+					item.kind = FmtInt
+				} else if isUnsignedInt(at) || at == TYUntypedInt {
+					item.kind = FmtUint
+				} else if isStringType(at) {
+					item.kind = FmtStr
+				} else if isByteSlice(at) {
+					item.kind = FmtBytes
+				} else {
+					addDiagStr(E2002, nodes[listPool[n.b+2+argIdx]].fileID, nodes[listPool[n.b+2+argIdx]].off, "type has no Format method for %v")
+				}
+			}
+		} else {
+			addDiagStr(E2002, nodes[fmtArg].fileID, nodes[fmtArg].off, "unknown format verb")
+		}
+		if fmtItemCount < MaxFmtItems {
+			fmtItems[fmtItemCount] = item
+			fmtItemCount++
+		}
+		argIdx++
+	}
+	if litLen > 0 {
+		if fmtItemCount < MaxFmtItems {
+			fmtItems[fmtItemCount] = FmtItem{kind: FmtLit, litStrID: internBytes(litBuf[:litLen])}
+			fmtItemCount++
+		}
+	}
+	if argIdx != nArgs {
+		addDiagStr(E2003, n.fileID, n.off, "wrong number of arguments for formatTo")
+	}
+	specID := fmtSpecCount
+	if fmtSpecCount < MaxFmtSpecs {
+		fmtSpecs[specID] = FmtSpec{itemStart: itemStart, itemCount: fmtItemCount - itemStart}
+		fmtSpecCount++
+	}
+	nodeCall[en] = newCallInfo(CallInfo{kind: CKBuiltin, builtinID: BFFormatTo, fmtSpecID: specID})
+	return TYUsize
+}
+
+driver func (c *Checker) checkBuiltinMethodCall(en u32, recvExpr u32, recvTy u32, bm u16) u32 {
+	n := nodes[en]
+	var retTy u32 = TYInvalid
+	var tstart u32 = 0
+	var tcnt u32 = 0
+
+	if bm == BMNetListenTCP {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		var rs [2]u32
+		rs[0] = TYListener
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMNetDialTCP {
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], TYContext)
+			_ = c.checkExpr(listPool[n.b+1], TYString)
+		}
+		var rs [2]u32
+		rs[0] = TYConn
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMListenerAddr {
+		retTy = TYString
+	} else if bm == BMListenerAccept {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYContext)
+		}
+		var rs [2]u32
+		rs[0] = TYConn
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMListenerClose || bm == BMConnClose {
+		c.consumeLinear(recvExpr)
+		retTy = TYError
+	} else if bm == BMConnCloseWrite {
+		retTy = TYError
+	} else if bm == BMConnRead || bm == BMConnWrite {
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], TYContext)
+			_ = c.checkExpr(listPool[n.b+1], makeSliceType(TYU8))
+		}
+		var rs [2]u32
+		rs[0] = TYUsize
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMSignalsNotifyCtx {
+		for i := u32(0); i < n.c; i++ {
+			_ = c.checkExpr(listPool[n.b+i], TYU32)
+		}
+		var rs [2]u32
+		rs[0] = TYContext
+		rs[1] = TYCancelFunc
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMClockNow {
+		retTy = TYU64
+	} else if bm == BMClockSleep {
+		if n.c != 2 {
+			addDiagStr(E2003, n.fileID, n.off, "Clock.Sleep requires (Context, u64)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYContext)
+			_ = c.checkExpr(listPool[n.b+1], TYU64)
+		}
+		retTy = TYError
+	} else if bm == BMCtxDone {
+		retTy = TYBool
+	} else if bm == BMCtxErr {
+		retTy = TYError
+	} else if bm == BMCtxWithTimeout {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYU64)
+		}
+		retTy = TYContext
+	} else if bm == BMScopeAcquireSlot {
+		// AcquireSlot(ctx, &pool) where pool has type [N]T -> (Slot[T], error)
+		var elemTy u32 = TYInvalid
+		var poolLen u64 = 0
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], TYContext)
+			pt := c.checkExpr(listPool[n.b+1], 0)
+			if types[under(pt)].kind == TKindPtr {
+				au := under(types[under(pt)].a)
+				if types[au].kind == TKindArray {
+					elemTy = types[au].a
+					poolLen = types[au].lenVal
+				}
+			}
+		}
+		var ta [2]u32
+		ta[0] = makeConstArgType(poolLen)
+		ta[1] = elemTy
+		tstart, tcnt = pushTypeList(ta[:])
+		var rs [2]u32
+		rs[0] = makeSlotType(elemTy)
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMScopeReleaseSlot {
+		if n.c == 1 {
+			st := c.checkExpr(listPool[n.b], 0)
+			c.consumeLinear(listPool[n.b])
+			var ta [1]u32
+			ta[0] = slotElemType(st)
+			tstart, tcnt = pushTypeList(ta[:])
+		}
+		retTy = TYInvalid
+	} else if bm == BMScopeGo {
+		if n.c == 2 {
+			st := c.checkExpr(listPool[n.b], 0)
+			c.consumeLinear(listPool[n.b])
+			_ = c.checkExpr(listPool[n.b+1], 0)
+			var ta [1]u32
+			ta[0] = slotElemType(st)
+			tstart, tcnt = pushTypeList(ta[:])
+		}
+		retTy = TYInvalid
+	} else if bm == BMScopeSpawn {
+		if n.c != 2 {
+			addDiagStr(E2003, n.fileID, n.off, "Scope.Spawn requires 2 arguments (ctx, fn)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYContext)
+			ft := c.checkExpr(listPool[n.b+1], 0)
+			fu := under(ft)
+			if types[fu].kind != TKindSig || types[fu].b != 0 || types[fu].d != 0 {
+				addDiagStr(E2002, nodes[listPool[n.b+1]].fileID, nodes[listPool[n.b+1]].off, "Scope.Spawn task must be func()")
+			}
+		}
+		retTy = TYError
+	} else if bm == BMScopeReady {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "Scope.Ready requires 1 argument (ctx)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYContext)
+		}
+		retTy = TYError
+	} else if bm == BMScopeWait {
+		retTy = TYInvalid
+	} else if bm == BMScopeWaitTimeout {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYU64)
+		}
+		retTy = TYBool
+	} else if bm == BMFSReadFileInto {
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+			_ = c.checkExpr(listPool[n.b+1], makeSliceType(TYU8))
+		}
+		var rs [2]u32
+		rs[0] = TYUsize
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMFSWriteFile {
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+			_ = c.checkExpr(listPool[n.b+1], makeSliceType(TYU8))
+		}
+		retTy = TYError
+	} else if bm == BMFSIsDir {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		retTy = TYBool
+	} else if bm == BMFSListSourceFiles {
+		if n.c == 2 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+			_ = c.checkExpr(listPool[n.b+1], makeSliceType(TYString))
+		}
+		var rs [2]u32
+		rs[0] = TYUsize
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMFSMkdirTemp {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		var rs [2]u32
+		rs[0] = TYString
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMFSRemoveAll {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		retTy = TYError
+	} else if bm == BMEnvArgsCount {
+		retTy = TYUsize
+	} else if bm == BMEnvArg {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYUsize)
+		}
+		retTy = TYString
+	} else if bm == BMEnvGetenv {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		var rs [2]u32
+		rs[0] = TYString
+		rs[1] = TYBool
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMStdioWriteStdout || bm == BMStdioWriteStderr {
+		if n.c == 1 {
+			arg := listPool[n.b]
+			at := c.checkExpr(arg, makeSliceType(TYU8))
+			if !c.checkAssignable(arg, at, makeSliceType(TYU8)) {
+				addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "WriteStdout/WriteStderr requires []byte")
+			}
+		}
+		retTy = TYError
+	} else if bm == BMStdioReadStdin {
+		if n.c == 1 {
+			_ = c.checkExpr(listPool[n.b], makeSliceType(TYU8))
+		}
+		var rs [2]u32
+		rs[0] = TYUsize
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMExecRun {
+		if c.fnEff != EffDriver {
+			addDiagStr(E5001, n.fileID, n.off, "Exec.Run is only allowed in driver functions")
+		}
+		for i := u32(0); i < n.c; i++ {
+			_ = c.checkExpr(listPool[n.b+i], 0)
+		}
+		var rs [3]u32
+		rs[0] = TYExitStatus
+		rs[1] = TYUsize
+		rs[2] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMArenaAllocBytes {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "Arena.AllocBytes requires 1 argument")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYUsize)
+		}
+		var rs [2]u32
+		rs[0] = makeSliceType(TYU8)
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMArenaUsed || bm == BMArenaCap {
+		retTy = TYUsize
+	} else if bm == BMArenaReset {
+		retTy = TYInvalid
+	} else if bm >= BMAtomicLoad && bm <= BMAtomicCAS {
+		atTy := under(recvTy)
+		var isPtrRecv bool = false
+		if types[atTy].kind == TKindPtr {
+			isPtrRecv = true
+			if bm != BMAtomicLoad && types[atTy].flags != 0 {
+				addDiagStr(E2014, n.fileID, n.off, "cannot mutate const *Atomic")
+			}
+			atTy = under(types[atTy].a)
+		} else if (nodeFlags[recvExpr] & NFAddressable) == 0 {
+			addDiagStr(E2002, n.fileID, n.off, "Atomic method requires addressable value or pointer")
+		}
+		elemTy := atomicElemType(atTy)
+		if !isAtomicSupportedElem(elemTy) {
+			addDiagStr(E2002, n.fileID, n.off, "Atomic[T] requires u32, u64, i32, i64, usize, int, or bool")
+		}
+		var ta [1]u32
+		ta[0] = elemTy
+		tstart, tcnt = pushTypeList(ta[:])
+		if bm == BMAtomicLoad {
+			if n.c != 0 {
+				addDiagStr(E2003, n.fileID, n.off, "Atomic.Load takes no arguments")
+			}
+			retTy = elemTy
+		} else if bm == BMAtomicStore {
+			if n.c != 1 {
+				addDiagStr(E2003, n.fileID, n.off, "Atomic.Store requires 1 argument")
+			} else {
+				arg := listPool[n.b]
+				gt := c.checkExpr(arg, elemTy)
+				if !c.checkAssignable(arg, gt, elemTy) {
+					addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "Atomic.Store value type mismatch")
+				}
+			}
+			retTy = TYInvalid
+		} else if bm == BMAtomicAdd {
+			if !isIntType(elemTy) {
+				addDiagStr(E2002, n.fileID, n.off, "Atomic.Add requires integer Atomic[T]")
+			}
+			if n.c != 1 {
+				addDiagStr(E2003, n.fileID, n.off, "Atomic.Add requires 1 argument")
+			} else {
+				arg := listPool[n.b]
+				gt := c.checkExpr(arg, elemTy)
+				if !c.checkAssignable(arg, gt, elemTy) {
+					addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "Atomic.Add delta type mismatch")
+				}
+			}
+			retTy = elemTy
+		} else if bm == BMAtomicSwap {
+			if n.c != 1 {
+				addDiagStr(E2003, n.fileID, n.off, "Atomic.Swap requires 1 argument")
+			} else {
+				arg := listPool[n.b]
+				gt := c.checkExpr(arg, elemTy)
+				if !c.checkAssignable(arg, gt, elemTy) {
+					addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "Atomic.Swap value type mismatch")
+				}
+			}
+			retTy = elemTy
+		} else if bm == BMAtomicCAS {
+			if n.c != 2 {
+				addDiagStr(E2003, n.fileID, n.off, "Atomic.CompareAndSwap requires 2 arguments (old, new)")
+			} else {
+				a0 := listPool[n.b]
+				a1 := listPool[n.b+1]
+				g0 := c.checkExpr(a0, elemTy)
+				g1 := c.checkExpr(a1, elemTy)
+				if !c.checkAssignable(a0, g0, elemTy) || !c.checkAssignable(a1, g1, elemTy) {
+					addDiagStr(E2002, n.fileID, n.off, "Atomic.CompareAndSwap argument type mismatch")
+				}
+			}
+			retTy = TYBool
+		}
+		var aa u8 = 1
+		if isPtrRecv {
+			aa = 0
+		}
+		nodeCall[en] = newCallInfo(CallInfo{
+			kind:      CKBuiltinMeth,
+			autoAddr:  aa,
+			builtinID: bm,
+			recvExpr:  recvExpr,
+			recvType:  recvTy,
+			targStart: tstart,
+			targCount: tcnt,
+		})
+		return retTy
+	}
+	nodeCall[en] = newCallInfo(CallInfo{
+		kind:      CKBuiltinMeth,
+		builtinID: bm,
+		recvExpr:  recvExpr,
+		recvType:  recvTy,
+		targStart: tstart,
+		targCount: tcnt,
+	})
+	return retTy
+}
+
+// ---------------------------------------------------------------------------
+// Totality checks (T1 counting loops, T2 slice-shrink, T3/T4 decreases/recursion)
+
+driver func (c *Checker) checkForTotality(fn u32) {
+	s := nodes[fn]
+	// Explicit decreases(...) clause
+	if s.e != 0 {
+		return
+	}
+	// T1: counting loop with strict comparison `<` / `>` and `++` / `--` / `+=` / `-=` post
+	if s.b != 0 && s.c != 0 {
+		cond := nodes[s.b]
+		post := nodes[s.c]
+		if cond.kind == NKBinary && (cond.op == TKLss || cond.op == TKGtr || cond.op == TKLeq || cond.op == TKGeq) {
+			if post.kind == NKIncDec || (post.kind == NKAssign && (post.op == TKAddAssign || post.op == TKSubAssign || post.op == TKAssign)) {
+				return
+			}
+		}
+	}
+	// T2: slice-shrink loop `for ...; len(rem) > 0; ...` with proven positive shrink
+	if s.b != 0 {
+		cond := nodes[s.b]
+		if cond.kind == NKBinary && cond.op == TKGtr && nodes[cond.a].kind == NKCall {
+			if nodeCall[cond.a] != 0 && calls[nodeCall[cond.a]].builtinID == BFLen {
+				if bodyHasPositiveShrink(s.d) {
+					return
+				}
+			}
+		}
+	}
+	addDiagStr(E4002, s.fileID, s.off, "cannot prove termination of for loop in total function")
+}
+
+driver func bodyHasPositiveShrink(blkNode u32) bool {
+	if blkNode == 0 || nodes[blkNode].kind != NKBlock {
+		return false
+	}
+	b := nodes[blkNode]
+	hasZeroCheck := false
+	hasConstPosSlice := false
+	for i := u32(0); i < b.b; i++ {
+		st := nodes[listPool[b.a+i]]
+		if st.kind == NKIf && st.b != 0 {
+			cb := nodes[st.b]
+			if cb.kind == NKBinary && (cb.op == TKEql || cb.op == TKLeq || cb.op == TKLss) {
+				if stmtTerminates(st.c) {
+					hasZeroCheck = true
+				}
+			}
+		}
+		if st.kind == NKAssign && st.d == 1 {
+			rhs := nodes[listPool[st.c]]
+			if rhs.kind == NKSlice && rhs.b != 0 {
+				lo := nodes[rhs.b]
+				if lo.kind == NKIntLit && u64Pool[lo.b] > 0 {
+					hasConstPosSlice = true
+				}
+				if lo.kind == NKBinary && lo.op == TKAdd {
+					hasConstPosSlice = true
+				}
+			}
+		}
+	}
+	return hasZeroCheck || hasConstPosSlice
+}
+
+driver func cgReaches(fromSym u32, targetSym u32) bool {
+	var stack [256]u32
+	var vis [256]u32
+	nVis := u32(0)
+	sp := u32(0)
+	cgc := cgCount
+	for e := u32(0); e < cgc; e++ {
+		if cgCaller[e] == fromSym && sp < 256 {
+			stack[sp] = cgCallee[e]
+			sp++
+		}
+	}
+	for step := u32(0); step < 512; step++ {
+		if sp == 0 {
+			break
+		}
+		sp--
+		cur := stack[sp]
+		if cur == targetSym {
+			return true
+		}
+		seen := false
+		for k := u32(0); k < nVis; k++ {
+			if vis[k] == cur {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		if nVis < 256 {
+			vis[nVis] = cur
+			nVis++
+		}
+		for e := u32(0); e < cgc; e++ {
+			if cgCaller[e] == cur && sp < 256 {
+				stack[sp] = cgCallee[e]
+				sp++
+			}
+		}
+	}
+	return false
+}
+
+driver func checkTotalityCallGraph() {
+	// Collect unique caller symbols in the total call graph.
+	var uniq [512]u32
+	nUniq := u32(0)
+	cgc := cgCount
+	for i := u32(0); i < cgc; i++ {
+		s := cgCaller[i]
+		found := false
+		for j := u32(0); j < nUniq; j++ {
+			if uniq[j] == s {
+				found = true
+				break
+			}
+		}
+		if !found && nUniq < 512 {
+			uniq[nUniq] = s
+			nUniq++
+		}
+	}
+
+	for i := u32(0); i < nUniq; i++ {
+		u := uniq[i]
+		dn := syms[u].declNode
+		if dn == 0 || nodes[dn].e != 0 {
+			continue
+		}
+		if !cgReaches(u, u) {
+			continue
+		}
+		// Gather SCC members mutually reachable with u and check if u is first in source order.
+		sccSize := u32(0)
+		isFirst := true
+		for j := u32(0); j < nUniq; j++ {
+			v := uniq[j]
+			if v == u || (cgReaches(u, v) && cgReaches(v, u)) {
+				sccSize++
+				if v != u {
+					if syms[v].fileID < syms[u].fileID || (syms[v].fileID == syms[u].fileID && syms[v].off < syms[u].off) {
+						isFirst = false
+					}
+				}
+			}
+		}
+		if sccSize == 1 {
+			// Direct self-recursion without decreases(...) -> E4002 at function decl
+			addDiagStr(E4002, syms[u].fileID, syms[u].off, "recursive total function requires decreases(...) clause")
+		} else if isFirst {
+			// Mutual recursion SCC without decreases(...) -> E4004 once at first member in source order
+			addDiagStr(E4004, syms[u].fileID, syms[u].off, "mutually recursive total functions require decreases(...) clause")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Algebraic Effect Handle Checker & Tail-Resumptive Analyzer (FinCore v0.3)
+
+driver func (c *Checker) inferHandleEffect(hn u32) u32 {
+	n := nodes[hn]
+	if n.d != 0 {
+		return resolveTypeNode(c.pkgID, n.d)
+	}
+	if n.c == 0 {
+		return TYInvalid
+	}
+	firstArmOp := nodes[listPool[n.b]].a
+	// 1. If handled body is a direct call `f(args...)` to a function with `with E1, E2`,
+	//    check if any declared effect of `f` has `firstArmOp`! (Handles generic `Yield[[]byte]`!)
+	if (n.flags&1) == 0 && n.a != 0 && nodes[n.a].kind == NKCall {
+		fn := nodes[nodes[n.a].a]
+		var fsym u32 = 0
+		var instStart u32 = 0
+		var instCount u32 = 0
+		if fn.kind == NKIdent {
+			fsym = lookupPkgOrUniverse(c.pkgID, fn.a)
+		} else if fn.kind == NKSelector && nodes[fn.a].kind == NKIdent {
+			if targetPkg, ok := lookupFileImport(fn.fileID, nodes[fn.a].a); ok {
+				fsym = lookupPkgSym(targetPkg, fn.b)
+			}
+		} else if fn.kind == NKIndex && nodes[fn.a].kind == NKIdent {
+			fsym = lookupPkgOrUniverse(c.pkgID, nodes[fn.a].a)
+			if fsym != 0 && syms[fsym].kind == SymFunc {
+				var targs [16]u32
+				driver for i := u32(0); i < fn.c && i < 16; i++ {
+					targs[i] = resolveGenericArg(c.pkgID, listPool[fn.b+i], fsym, i)
+				}
+				instStart, instCount = pushTypeList(targs[:usize(fn.c)])
+			}
+		}
+		if fsym != 0 && syms[fsym].kind == SymFunc && syms[fsym].typeID != 0 {
+			sigTy := syms[fsym].typeID
+			dn := syms[fsym].declNode
+			if instCount > 0 && nodeInstCount[dn] > 0 {
+				var tpsyms [16]u32
+				var targs [16]u32
+				ntp := usize(nodeInstCount[dn])
+				for i := usize(0); i < ntp; i++ {
+					tpsyms[i] = typeList[usize(nodeInstStart[dn])+i]
+				}
+				for i := u32(0); i < instCount; i++ {
+					targs[i] = typeList[instStart+i]
+				}
+				sigTy = substType(sigTy, tpsyms[:ntp], targs[:usize(instCount)])
+			}
+			ec := sigTypeEffCount[sigTy]
+			for i := u32(0); i < ec; i++ {
+				et := typeList[sigTypeEffStart[sigTy]+i]
+				if _, _, ok := findEffectOp(et, firstArmOp); ok {
+					return et
+				}
+			}
+		}
+	}
+	// 2. Otherwise search package-level non-generic effects in current & imported packages
+	p := pkgs[c.pkgID]
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].kind == SymEffect && syms[s].extra2 == 0 {
+			if _, _, ok := findEffectOp(syms[s].typeID, firstArmOp); ok {
+				return syms[s].typeID
+			}
+		}
+	}
+	driver for i := u32(0); i < pkgCount; i++ {
+		if i == c.pkgID {
+			continue
+		}
+		op := pkgs[i]
+		for j := u32(0); j < op.symCount; j++ {
+			s := pkgSyms[op.symStart+j]
+			if syms[s].kind == SymEffect && syms[s].extra2 == 0 {
+				if _, _, ok := findEffectOp(syms[s].typeID, firstArmOp); ok {
+					return syms[s].typeID
+				}
+			}
+		}
+	}
+	return TYInvalid
+}
+
+driver func nodeHasReturnOrResume(n u32) bool {
+	if n == 0 {
+		return false
+	}
+	nd := nodes[n]
+	if nd.kind == NKReturn {
+		return true
+	}
+	if nd.kind == NKCall && nodeCall[n] != 0 && calls[nodeCall[n]].kind == CKResume {
+		return true
+	}
+	if nd.kind == NKBlock {
+		for i := u32(0); i < nd.b; i++ {
+			if nodeHasReturnOrResume(listPool[nd.a+i]) {
+				return true
+			}
+		}
+		return false
+	}
+	if nd.kind == NKIf {
+		return nodeHasReturnOrResume(nd.a) || nodeHasReturnOrResume(nd.b) || nodeHasReturnOrResume(nd.c) || nodeHasReturnOrResume(nd.d)
+	}
+	if nd.kind == NKFor {
+		return nodeHasReturnOrResume(nd.a) || nodeHasReturnOrResume(nd.b) || nodeHasReturnOrResume(nd.c) || nodeHasReturnOrResume(nd.d)
+	}
+	if nd.kind == NKMatchStmt || nd.kind == NKMatchExpr {
+		if nodeHasReturnOrResume(nd.a) {
+			return true
+		}
+		for i := u32(0); i < nd.c; i++ {
+			if nodeHasReturnOrResume(nodes[listPool[nd.b+i]].b) {
+				return true
+			}
+		}
+		return false
+	}
+	if nd.kind == NKExprStmt || nd.kind == NKUnary || nd.kind == NKDefer {
+		return nodeHasReturnOrResume(nd.a)
+	}
+	if nd.kind == NKBinary {
+		return nodeHasReturnOrResume(nd.a) || nodeHasReturnOrResume(nd.b)
+	}
+	if nd.kind == NKAssign || nd.kind == NKShortDecl {
+		for i := u32(0); i < nd.d; i++ {
+			if nodeHasReturnOrResume(listPool[nd.c+i]) {
+				return true
+			}
+		}
+		return false
+	}
+	if nd.kind == NKCall {
+		if nodeHasReturnOrResume(nd.a) {
+			return true
+		}
+		for i := u32(0); i < nd.c; i++ {
+			if nodeHasReturnOrResume(listPool[nd.b+i]) {
+				return true
+			}
+		}
+		return false
+	}
+	if nd.kind == NKDeclStmt {
+		d := nodes[nd.a]
+		if d.kind == NKVarDecl {
+			return nodeHasReturnOrResume(d.c)
+		}
+		return false
+	}
+	if nd.kind == NKScope {
+		return nodeHasReturnOrResume(nd.b) || nodeHasReturnOrResume(nd.c)
+	}
+	return false
+}
+
+driver func isTailResumeExpr(en u32) bool {
+	if en == 0 || nodes[en].kind != NKCall || nodeCall[en] == 0 {
+		return false
+	}
+	if calls[nodeCall[en]].kind != CKResume {
+		return false
+	}
+	driver for i := u32(0); i < nodes[en].c; i++ {
+		if nodeHasReturnOrResume(listPool[nodes[en].b+i]) {
+			return false
+		}
+	}
+	return true
+}
+
+driver func isArmTailResumptive(bodyNode u32) bool {
+	if bodyNode == 0 {
+		return false
+	}
+	nd := nodes[bodyNode]
+	if nd.kind == NKCall {
+		return isTailResumeExpr(bodyNode)
+	}
+	if nd.kind == NKExprStmt {
+		return isTailResumeExpr(nd.a)
+	}
+	if nd.kind == NKBlock {
+		if nd.b == 0 {
+			return false
+		}
+		for i := u32(0); i < nd.b-1; i++ {
+			if nodeHasReturnOrResume(listPool[nd.a+i]) {
+				return false
+			}
+		}
+		last := listPool[nd.a+nd.b-1]
+		return nodes[last].kind == NKExprStmt && isTailResumeExpr(nodes[last].a)
+	}
+	return false
+}
+
+driver func (c *Checker) checkHandle(hn u32, isExpr bool, hint u32) u32 {
+	n := nodes[hn]
+	effTy := c.inferHandleEffect(hn)
+	if effTy == 0 || types[effTy].kind != TKindEffect {
+		addDiagStr(E2001, n.fileID, n.off, "cannot determine handled effect type; add explicit 'with EffectType'")
+		return TYInvalid
+	}
+	esym := types[effTy].a
+
+	// Push evidence local symbol and activate effect for handled body
+	savedLocals := c.nLocals
+	savedEffs := c.activeEffCount
+	c.blockDepth++
+	evSym := addSym(Sym{kind: SymLocal, nameStr: 0, pkgID: c.pkgID, fileID: n.fileID, off: n.off, declNode: hn, typeID: effTy})
+	c.pushLocal(0, evSym, effTy, c.blockDepth)
+	if c.activeEffCount < 32 {
+		c.activeEffType[c.activeEffCount] = effTy
+		c.activeEffSym[c.activeEffCount] = evSym
+		c.activeEffCount++
+	}
+
+	// Check handled body
+	var resTy u32 = 0
+	var bodyValDepth u32 = c.blockDepth
+	if (n.flags & 1) != 0 {
+		// Block body `{ ... }`
+		b := nodes[n.a]
+		if isExpr && b.b > 0 {
+			for i := u32(0); i < b.b-1; i++ {
+				c.checkStmt(listPool[b.a+i])
+			}
+			last := listPool[b.a+b.b-1]
+			if nodes[last].kind == NKExprStmt {
+				resTy = c.checkExpr(nodes[last].a, hint)
+				if isUntyped(resTy) && hint != 0 && !isUntyped(hint) {
+					resTy = hint
+				}
+				resTy = defaultType(resTy)
+			} else {
+				c.checkStmt(last)
+			}
+		} else {
+			c.checkBlock(n.a)
+		}
+	} else {
+		// Single expression body: yielded Scoped slices inherit the body expression's arg depth!
+		bt := c.checkExpr(n.a, hint)
+		bodyValDepth = c.exprDepth(n.a)
+		if isExpr {
+			resTy = bt
+			if isUntyped(resTy) && hint != 0 && !isUntyped(hint) {
+				resTy = hint
+			}
+			resTy = defaultType(resTy)
+		}
+	}
+
+	// Pop body's effect capability before checking arms (arms run in outer effect scope!)
+	c.activeEffCount = savedEffs
+	c.checkBlockExitLeaks(savedLocals)
+	c.nLocals = savedLocals
+	c.blockDepth--
+
+	// Check handler arms
+	var handledMask u64 = 0
+	allTailResump := true
+	savedHandle := c.curHandleNode
+	savedArm := c.curHandleArm
+	savedResume := c.curResumeSym
+	c.curHandleNode = hn
+
+	for i := u32(0); i < n.c; i++ {
+		an := listPool[n.b+i]
+		arm := nodes[an]
+		opIdx, opSig, ok := findEffectOp(effTy, arm.a)
+		if !ok {
+			addDiagStr(E2001, arm.fileID, arm.off, "unknown operation for handled effect")
+			continue
+		}
+		handleArmOpIdx[an] = opIdx
+		if opIdx < 64 {
+			handledMask |= (u64(1) << opIdx)
+		}
+		sig := types[opSig]
+		if arm.c != sig.b {
+			addDiagStr(E2003, arm.fileID, arm.off, "handle arm parameter count mismatch")
+		}
+		var opRetTy u32 = 0
+		if sig.d >= 1 {
+			opRetTy = typeList[sig.c]
+		}
+
+		// Enter arm scope: bind op params + linear scoped `resume`
+		armSavedLoc := c.nLocals
+		c.blockDepth++
+		lim := arm.c
+		if sig.b < lim {
+			lim = sig.b
+		}
+		for j := u32(0); j < lim; j++ {
+			bn := listPool[arm.b+j]
+			pty := typeList[sig.a+j]
+			if nodes[bn].kind == NKIdent && nodes[bn].a != kwBlank {
+				bsym := addSym(Sym{kind: SymLocal, nameStr: nodes[bn].a, pkgID: c.pkgID, fileID: nodes[bn].fileID, off: nodes[bn].off, declNode: bn, typeID: pty})
+				nodeSym[bn] = bsym
+				nodeType[bn] = pty
+				c.pushLocal(nodes[bn].a, bsym, pty, bodyValDepth)
+			}
+		}
+		resumeTy := newType(Type{kind: TKindResume, a: opRetTy, b: resTy})
+		resSym := addSym(Sym{kind: SymLocal, nameStr: kwResume, pkgID: c.pkgID, fileID: arm.fileID, off: arm.off, declNode: an, typeID: resumeTy})
+		handleArmResumeSym[an] = resSym
+		rIdx := c.pushLocal(kwResume, resSym, resumeTy, c.blockDepth)
+		// Affine with deterministic unwind: omitting resume is allowed (abort), double resume is E3003!
+		c.locals[rIdx].deferred = true
+
+		c.curHandleArm = i
+		c.curResumeSym = resSym
+
+		if nodes[arm.d].kind == NKBlock {
+			ab := nodes[arm.d]
+			if isExpr && ab.b > 0 {
+				for k := u32(0); k < ab.b-1; k++ {
+					c.checkStmt(listPool[ab.a+k])
+				}
+				last := listPool[ab.a+ab.b-1]
+				if nodes[last].kind == NKExprStmt {
+					lt := c.checkExpr(nodes[last].a, resTy)
+					if !isTailResumeExpr(nodes[last].a) && resTy != 0 && !c.checkAssignable(nodes[last].a, lt, resTy) {
+						addDiagStr(E2002, nodes[last].fileID, nodes[last].off, "handle arm result type mismatch")
+					}
+				} else {
+					c.checkStmt(last)
+				}
+			} else {
+				c.checkBlock(arm.d)
+			}
+		} else if isExpr {
+			at := c.checkExpr(arm.d, resTy)
+			if !isTailResumeExpr(arm.d) && resTy != 0 && !c.checkAssignable(arm.d, at, resTy) {
+				addDiagStr(E2002, nodes[arm.d].fileID, nodes[arm.d].off, "handle arm result type mismatch")
+			}
+		} else {
+			c.checkStmt(arm.d)
+		}
+
+		if !isArmTailResumptive(arm.d) {
+			allTailResump = false
+		}
+		c.checkBlockExitLeaks(armSavedLoc)
+		c.nLocals = armSavedLoc
+		c.blockDepth--
+	}
+
+	c.curHandleNode = savedHandle
+	c.curHandleArm = savedArm
+	c.curResumeSym = savedResume
+
+	// Verify exhaustiveness: all operations of effTy must be handled
+	oc := symEffOpCount[esym]
+	driver for i := u32(0); i < oc && i < 64; i++ {
+		if (handledMask & (u64(1) << i)) == 0 {
+			addDiagStr(E2012, n.fileID, n.off, "non-exhaustive handle: missing effect operation arm")
+		}
+	}
+
+	if handleCount < MaxHandles {
+		hid := handleCount
+		handleCount++
+		handles[hid] = HandleInfo{
+			effType:      effTy,
+			evLocalSym:   evSym,
+			resType:      resTy,
+			isTailResump: allTailResump,
+			isExpr:       isExpr,
+		}
+		nodeHandle[hn] = hid
+	}
+	if isExpr && resTy != 0 {
+		return resTy
+	}
+	return TYInvalid
+}

@@ -1,0 +1,21 @@
+// SINCE: v0.6
+package main
+
+type Point struct {
+	x u32
+	y u32
+}
+
+func minVal[T Ordered](a T, b T) T {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+driver func main() error {
+	p1 := Point{x: 1, y: 2}
+	p2 := Point{x: 3, y: 4}
+	_ = minVal[Point](p1, p2) // ERROR E2011
+	return nil
+}

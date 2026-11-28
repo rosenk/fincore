@@ -1,921 +1,1650 @@
-// codegen_expr.fc — the Go code generator, part 2: expressions and calls
-// (port of finc0's codegen/golang expr.go). Every function appends to gw
-// (see codegen.fc); the recursive ones belong to the codegen SCC and carry
-// decreases(dp).
 package main
 
-// constValueSlot returns the value slot of e if e is a constant expression
-// or a folded comptime call (fnCtx.constValue), else 0.
-func cgConstValueSlot(e u32) u32 {
-	if e == 0 {
-		return 0
-	}
-	v := nval[usize(e)]
-	if v == 0 {
-		return 0
-	}
-	if nmode[usize(e)] == KConst {
-		return v
-	}
-	if nkind(e) == NkCallExpr {
-		c := ncall[usize(e)]
-		if c != 0 && callTab.items[usize(c)].folded {
-			return v
-		}
-	}
-	return 0
-}
+// Expression code generation for FinCore Linux x86_64 backend:
+// memory/scalar helpers, emitAddr, emitScalar, emitExprTo, unary/binary ops,
+// structural equality, slicing, indexing, StructLit, ArrayLit, FuncLit.
 
-// composite wraps a composite literal written since mark in parentheses
-// inside statement headers (Go's `if x == T{} {` ambiguity).
-func cgComposite(mark usize) {
-	if cgHeader > 0 && cgWendsWith(mark, '}') {
-		cgWwrap(mark)
-	}
-}
-
-// constExpr writes the constant expression e with value v.
-func cgConstExpr(e u32, v Val, typed bool, dp usize) decreases(dp) {
-	if dp == 0 {
-		cgFail(e, "expression too deep")
+func (f *FnGen) emitZero(off i64, size u64) {
+	if size == 0 {
 		return
 	}
-	k := nkind(e)
-	if v is Tuple(..) {
-		cgFail(e, "multi-value constant in single-value context")
-		return
-	}
-	if k == NkBasicLit {
-		cgBasicLit(e, v, typed, dp-1)
-		return
-	}
-	cs := cgConstRefSym(e)
-	if cs != 0 {
-		cgWConstRef(e, cs, typed, dp-1)
-		return
-	}
-	if k == NkCallExpr && l1len(e) == 1 {
-		a0 := cgUnparenNode(l1at(e, 0))
-		rs := cgConstRefSym(a0)
-		if callKind(e) is Conversion(t) && rs != 0 {
-			cgConvType(e, t, dp-1)
-			cgWc('(')
-			cgWConstRef(a0, rs, false, dp-1)
-			cgWc(')')
-			return
-		}
-	}
-	if k == NkParenExpr {
-		inner := cgUnparenNode(e)
-		if nkind(inner) == NkBasicLit && !typed {
-			cgBasicLit(inner, v, false, dp-1)
-			return
-		}
-	}
-	p := cgWmark()
-	cgValue(e, v, ntype[usize(e)], dp-1)
-	cgComposite(p)
-}
-
-// expr writes an expression.
-func cgExpr(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		cgFail(e, "expression too deep")
-		return
-	}
-	typed := cgTyped
-	cgTyped = false
-	k := nkind(e)
-	vs := cgConstValueSlot(e)
-	if vs != 0 {
-		v := slotGet(vs)
-		if nbytes[usize(e)] {
-			// a constant string used as []byte (v0.2): a fresh copy
-			cgW("[]byte(")
-			cgConstExpr(e, v, false, dp-1)
-			cgWc(')')
-			return
-		}
-		cgConstExpr(e, v, typed, dp-1)
-		return
-	}
-	if k == NkIdent {
-		cgIdent(e, dp-1)
-	} else if k == NkParenExpr {
-		cgWc('(')
-		cgExpr(na(e), dp-1)
-		cgWc(')')
-	} else if k == NkBinaryExpr {
-		cgBinary(e, dp-1)
-	} else if k == NkUnaryExpr {
-		cgUnary(e, dp-1)
-	} else if k == NkCallExpr {
-		cgCall(e, dp-1)
-	} else if k == NkIndexExpr {
-		ii := ninst[usize(e)]
-		if ii != 0 && insts.items[usize(ii)].named == 0 {
-			cgFuncRef(e, cgCalleeSym(na(e)), insts.items[usize(ii)].argS, usize(insts.items[usize(ii)].argN), dp-1)
-			return
-		}
-		if l1len(e) != 1 {
-			cgFail(e, "unsupported index expression")
-			return
-		}
-		cgPrimary(na(e), dp-1)
-		cgWc('[')
-		cgExpr(l1at(e, 0), dp-1)
-		cgWc(']')
-	} else if k == NkSliceExpr {
-		cgPrimary(na(e), dp-1)
-		cgWc('[')
-		if nb(e) != 0 {
-			cgExpr(nb(e), dp-1)
-		}
-		cgWc(':')
-		if nc(e) != 0 {
-			cgExpr(nc(e), dp-1)
-		}
-		cgWc(']')
-	} else if k == NkSelectorExpr {
-		cgSelector(e, dp-1)
-	} else if k == NkFuncLit {
-		cgFuncLit(e, dp-1)
-	} else if k == NkStructLit {
-		cgStructLit(e, dp-1)
-	} else if k == NkMatchExpr {
-		cgMatchExpr(e, dp-1)
-	} else if k == NkIsExpr {
-		cgIsExpr(e, dp-1)
-	} else if k is NkBasicLit | NkBoolLit | NkNilLit {
-		cgFail(e, "literal without a recorded value")
-	} else {
-		cgFail(e, "unsupported expression")
-	}
-}
-
-// basicLit writes a literal, keeping the source spelling where Go accepts
-// it (fnCtx.basicLit).
-func cgBasicLit(lit u32, v Val, typed bool, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	t := ntype[usize(lit)]
-	op := nop(lit)
-	if op == LitString {
-		named := isNamedT(t)
-		if named {
-			cgGoType(lit, t, dp-1)
-			cgWc('(')
-		}
-		cgWQuoted(strOf(v))
-		if named {
-			cgWc(')')
-		}
-		return
-	}
-	raw := ntext(lit)
-	if op == LitChar {
-		if t == 0 || isUntyped(t) {
-			t = TyU8
-		}
-		if typed {
-			cgGoType(lit, t, dp-1)
-			cgWc('(')
-		}
-		plain := len(raw) == 3
-		nr := len(raw)
-		for i := usize(0); i < nr; i++ {
-			if raw[i] == '\\' {
-				plain = false
+	if size <= 64 {
+		var p u64 = 0
+		for step := u64(0); step < 8; step++ {
+			if p+8 > size {
+				break
 			}
+			em("    movq $0, ")
+			emI(off + i64(p))
+			em("(%rbp)\n")
+			p += 8
 		}
-		if plain {
-			cgWb(raw)
+		for step := u64(0); step < 8; step++ {
+			if p >= size {
+				break
+			}
+			em("    movb $0, ")
+			emI(off + i64(p))
+			em("(%rbp)\n")
+			p++
+		}
+		return
+	}
+	em("    leaq ")
+	emI(off)
+	em("(%rbp), %rdi\n    xorl %eax, %eax\n    movq $")
+	emU(size)
+	em(", %rcx\n    cld\n    rep stosb\n")
+}
+
+func (f *FnGen) emitCopyFrame(dstOff i64, srcOff i64, size u64) {
+	if size == 0 || dstOff == srcOff {
+		return
+	}
+	if size <= 64 {
+		var p u64 = 0
+		for step := u64(0); step < 8; step++ {
+			if p+8 > size {
+				break
+			}
+			em("    movq ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %rax\n    movq %rax, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p += 8
+		}
+		if p+4 <= size {
+			em("    movl ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %eax\n    movl %eax, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p += 4
+		}
+		for step := u64(0); step < 4; step++ {
+			if p >= size {
+				break
+			}
+			em("    movzbl ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %eax\n    movb %al, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p++
+		}
+		return
+	}
+	em("    leaq ")
+	emI(dstOff)
+	em("(%rbp), %rdi\n    leaq ")
+	emI(srcOff)
+	em("(%rbp), %rsi\n    movq $")
+	emU(size)
+	em(", %rcx\n    cld\n    rep movsb\n")
+}
+
+// Copies size bytes from srcOff(%rbp) to address in %rdi.
+func (f *FnGen) emitCopyFrameToReg(srcOff i64, size u64) {
+	if size == 0 {
+		return
+	}
+	if size <= 32 {
+		var p u64 = 0
+		for step := u64(0); step < 4; step++ {
+			if p+8 > size {
+				break
+			}
+			em("    movq ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %rax\n    movq %rax, ")
+			emU(p)
+			em("(%rdi)\n")
+			p += 8
+		}
+		if p+4 <= size {
+			em("    movl ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %eax\n    movl %eax, ")
+			emU(p)
+			em("(%rdi)\n")
+			p += 4
+		}
+		for step := u64(0); step < 4; step++ {
+			if p >= size {
+				break
+			}
+			em("    movzbl ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %eax\n    movb %al, ")
+			emU(p)
+			em("(%rdi)\n")
+			p++
+		}
+		return
+	}
+	em("    leaq ")
+	emI(srcOff)
+	em("(%rbp), %rsi\n    movq $")
+	emU(size)
+	em(", %rcx\n    cld\n    rep movsb\n")
+}
+
+// Copies size bytes from address in %rax to dstOff(%rbp).
+func (f *FnGen) emitCopyRegToFrame(dstOff i64, size u64) {
+	if size == 0 {
+		return
+	}
+	if size <= 32 {
+		var p u64 = 0
+		for step := u64(0); step < 4; step++ {
+			if p+8 > size {
+				break
+			}
+			em("    movq ")
+			emU(p)
+			em("(%rax), %rcx\n    movq %rcx, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p += 8
+		}
+		if p+4 <= size {
+			em("    movl ")
+			emU(p)
+			em("(%rax), %ecx\n    movl %ecx, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p += 4
+		}
+		for step := u64(0); step < 4; step++ {
+			if p >= size {
+				break
+			}
+			em("    movzbl ")
+			emU(p)
+			em("(%rax), %ecx\n    movb %cl, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p++
+		}
+		return
+	}
+	em("    movq %rax, %rsi\n    leaq ")
+	emI(dstOff)
+	em("(%rbp), %rdi\n    movq $")
+	emU(size)
+	em(", %rcx\n    cld\n    rep movsb\n")
+}
+
+driver func (f *FnGen) emitLoadScalarReg(reg string, ty u32) {
+	sz, _ := layoutOf(ty)
+	signed := isSignedInt(ty)
+	if sz == 1 {
+		if signed {
+			em("    movsbq (%")
 		} else {
-			cgWInt(v)
+			em("    movzbq (%")
 		}
-		if typed {
-			cgWc(')')
-		}
-		return
-	}
-	if t == 0 || cgIsUntypedOrInt(t) || !typed {
-		cgWb(raw)
-		return
-	}
-	cgGoType(lit, t, dp-1)
-	cgWf(formatTo(mbuf[:], "(%s)", raw))
-}
-
-// convType writes the type of a conversion T(x).
-func cgConvType(n u32, t u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	p := cgWmark()
-	cgGoType(n, t, dp-1)
-	if cgWhasPrefix(p, "*") || cgWhasPrefix(p, "func") {
-		cgWwrap(p)
-	}
-}
-
-// constRefSym returns the constant symbol referenced by e if e names a
-// constant declared as a Go constant (fnCtx.constRef != ""), else 0.
-func cgConstRefSym(e u32) u32 {
-	s := u32(0)
-	k := nkind(e)
-	if k == NkIdent {
-		s = uses[usize(e)]
-	} else if k == NkSelectorExpr {
-		s = uses[usize(nb(e))]
-	}
-	if s == 0 || symKind(s) != SymConst {
-		return 0
-	}
-	if !cgConstNameOK(s) {
-		return 0
-	}
-	return s
-}
-
-// wConstRef writes the reference to constant s; untyped constants get an
-// explicit type where typed asks for it.
-func cgWConstRef(e u32, s u32, typed bool, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	t := ntype[usize(e)]
-	if typed && syms.items[usize(s)].untyped && t != 0 && !cgIsUntypedOrInt(t) && !isUntyped(t) {
-		cgGoType(e, t, dp-1)
-		cgWc('(')
-		cgWConstName(s)
-		cgWc(')')
-		return
-	}
-	cgWConstName(s)
-}
-
-// typedConst writes a constant operand with an explicit Go type.
-func cgTypedConst(e u32, v Val, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	t := ntype[usize(e)]
-	if t == 0 || isUntyped(t) {
-		t = defaultOf(t)
-	}
-	if isIntVal(v) {
-		rs := cgConstRefSym(cgUnparenNode(e))
-		cgGoType(e, t, dp-1)
-		cgWc('(')
-		if rs != 0 {
-			cgWConstName(rs)
+		em(reg)
+		em("), %rax\n")
+	} else if sz == 2 {
+		if signed {
+			em("    movswq (%")
 		} else {
-			cgWInt(v)
+			em("    movzwq (%")
 		}
-		cgWc(')')
-		return
-	}
-	cgValue(e, v, t, dp-1)
-}
-
-// primary writes e so that it can be followed by a selector, index or
-// call suffix.
-func cgPrimary(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	p := cgWmark()
-	cgExpr(e, dp-1)
-	uk := nkind(cgUnparenNode(e))
-	if uk is NkUnaryExpr | NkBinaryExpr && nkind(e) != NkParenExpr {
-		cgWwrap(p)
-		return
-	}
-	if cgConstValueSlot(e) != 0 && cgWhasPrefix(p, "-") {
-		cgWwrap(p)
-	}
-}
-
-func cgIdent(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	s := uses[usize(e)]
-	if s == 0 {
-		s = defs[usize(e)]
-	}
-	if s == 0 {
-		if isBlank(e) {
-			cgW("_")
-			return
+		em(reg)
+		em("), %rax\n")
+	} else if sz == 4 {
+		if signed {
+			em("    movslq (%")
+			em(reg)
+			em("), %rax\n")
+		} else {
+			em("    movl (%")
+			em(reg)
+			em("), %eax\n")
 		}
-		cgFail(e, "unresolved identifier")
-		return
-	}
-	k := symKind(s)
-	if k is SymVar | SymFunc {
-		cgWSymName(s)
-		return
-	}
-	if k == SymTypeParam {
-		v, ok := cgEnvLookupSym(s)
-		if ok {
-			cgTypedConst(e, vIntU(v), dp-1)
-			return
-		}
-		cgFail(e, "unbound const parameter")
-		return
-	}
-	if k == SymConst {
-		cgFail(e, "constant without a recorded value")
-		return
-	}
-	cgFail(e, "identifier cannot be used as a value")
-}
-
-// goPrec is Go's binary operator precedence (5 binds tightest).
-func cgGoPrec(op u8) u8 {
-	if op == OpLOr {
-		return 1
-	}
-	if op == OpLAnd {
-		return 2
-	}
-	if op >= OpEq && op <= OpGe {
-		return 3
-	}
-	if op is OpAdd | OpSub | OpOr | OpXor {
-		return 4
-	}
-	return 5
-}
-
-func cgOperand(e u32, parent u8, right bool, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	p := cgWmark()
-	cgExpr(e, dp-1)
-	if nkind(e) == NkBinaryExpr && cgConstValueSlot(e) == 0 {
-		cp := cgGoPrec(nop(e))
-		pp := cgGoPrec(parent)
-		if cp < pp || (right && cp == pp) {
-			cgWwrap(p)
-		}
+	} else if sz == 8 {
+		em("    movq (%")
+		em(reg)
+		em("), %rax\n")
 	}
 }
 
-func cgBinary(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	op := nop(e)
-	x := na(e)
-	xv := cgConstValueSlot(x)
-	if op is OpShl | OpShr && xv != 0 {
-		cgTypedConst(x, slotGet(xv), dp-1)
+driver func (f *FnGen) emitStoreScalarReg(reg string, ty u32) {
+	sz, _ := layoutOf(ty)
+	if sz == 1 {
+		em("    movb %al, (%")
+	} else if sz == 2 {
+		em("    movw %ax, (%")
+	} else if sz == 4 {
+		em("    movl %eax, (%")
+	} else if sz == 8 {
+		em("    movq %rax, (%")
 	} else {
-		cgOperand(x, op, false, dp-1)
+		return
 	}
-	cgWc(' ')
-	cgW(binOpString(op))
-	cgWc(' ')
-	cgOperand(nb(e), op, true, dp-1)
+	em(reg)
+	em(")\n")
 }
 
-func cgUnary(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	cgW(unaryOpString(nop(e)))
-	x := na(e)
-	p := cgWmark()
-	cgExpr(x, dp-1)
-	uk := nkind(cgUnparenNode(x))
-	if uk is NkUnaryExpr | NkBinaryExpr && nkind(x) != NkParenExpr {
-		cgWwrap(p)
-	}
-	if cgWhasPrefix(p, "-") || cgWhasPrefix(p, "&") || cgWhasPrefix(p, "*") {
-		cgWwrap(p)
-	}
-}
-
-func cgSelector(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	sel := nb(e)
-	if uses[usize(sel)] != 0 {
-		// package-qualified name
-		cs := cgConstValueSlot(sel)
-		if cs != 0 {
-			p := cgWmark()
-			cgValue(e, slotGet(cs), ntype[usize(sel)], dp-1)
-			cgComposite(p)
-			return
-		}
-		cgIdent(sel, dp-1)
-		return
-	}
-	si := nsel[usize(e)]
-	if si == 0 {
-		cgFail(e, "unresolved selector")
-		return
-	}
-	r := selTab.items[usize(si)]
-	if r.kind == SelField {
-		cgPrimary(na(e), dp-1)
-		cgWc('.')
-		cgWFieldIdent(nameBytes(fieldName(r.ctype, usize(r.index))))
-		return
-	}
-	if r.kind == SelVariant {
-		cgFail(e, "enum variant with payload must be called")
-		return
-	}
-	cgFail(e, "method value is not supported")
-}
-
-func cgStructLit(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	t := ntype[usize(e)]
-	st := underlying(t)
-	if t == 0 || !isStructT(st) {
-		cgFail(e, "struct literal of non-struct type")
-		return
-	}
-	p := cgWmark()
-	cgWc('{')
-	n := l1len(e)
-	for i := usize(0); i < n; i++ {
-		fi := l1at(e, i)
-		idx, ok := fieldByName(st, idName(na(fi)))
-		if !ok {
-			cgFail(fi, "unknown field")
-			return
-		}
-		if i > 0 {
-			cgW(", ")
-		}
-		cgWFieldIdent(nameBytes(fieldName(st, idx)))
-		cgW(": ")
-		cgExpr(nb(fi), dp-1)
-	}
-	cgWc('}')
-	q := cgWmark()
-	cgGoType(e, t, dp-1)
-	cgWrotate(p, q)
-	cgComposite(p)
-}
-
-// funcLit writes a function literal with its own function context; the
-// temporary and label counters are shared with the enclosing function.
-func cgFuncLit(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	fi := nfunc[usize(e)]
-	if fi == 0 {
-		cgFail(e, "function literal without FuncInfo")
-		return
-	}
-	sFn := cgFn
-	sHeader := cgHeader
-	sTyped := cgTyped
-	sFrameBase := cgFrameBase
-	sPendBase := cgPendBase
-	cgFn = fi
-	cgHeader = 0
-	cgTyped = false
-	cgFrameBase = cgFrameTop
-	cgPendBase = cgPendTop
-	cgW("func")
-	cgSignature(fi, dp-1)
-	cgWc(' ')
-	cgBody(funcs.items[usize(fi)].body, dp-1)
-	cgFrameTop = cgFrameBase
-	cgPendTop = cgPendBase
-	cgFn = sFn
-	cgHeader = sHeader
-	cgTyped = sTyped
-	cgFrameBase = sFrameBase
-	cgPendBase = sPendBase
-}
-
-// signature writes `(p1 T1, p2 T2) (R1, R2)` for a function.
-func cgSignature(fi u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	f := funcs.items[usize(fi)]
-	n := f.decl
-	if n == 0 {
-		n = f.lit
-	}
-	s := f.sig
-	cgWc('(')
-	np := sigNParams(s)
-	for i := usize(0); i < np; i++ {
-		if i > 0 {
-			cgW(", ")
-		}
-		if i < usize(f.parN) {
-			cgWSymName(defs[usize(uat(f.parS, i))])
+driver func (f *FnGen) emitLoadScalarFromFrame(off i64, ty u32) {
+	sz, _ := layoutOf(ty)
+	signed := isSignedInt(ty)
+	if sz == 1 {
+		if signed {
+			em("    movsbq ")
 		} else {
-			cgW("_")
+			em("    movzbq ")
 		}
-		cgWc(' ')
-		if sigVariadic(s) && i == np-1 {
-			cgW("...")
+		emI(off)
+		em("(%rbp), %rax\n")
+	} else if sz == 2 {
+		if signed {
+			em("    movswq ")
+		} else {
+			em("    movzwq ")
 		}
-		cgGoType(n, sigParam(s, i), dp-1)
+		emI(off)
+		em("(%rbp), %rax\n")
+	} else if sz == 4 {
+		if signed {
+			em("    movslq ")
+			emI(off)
+			em("(%rbp), %rax\n")
+		} else {
+			em("    movl ")
+			emI(off)
+			em("(%rbp), %eax\n")
+		}
+	} else if sz == 8 {
+		em("    movq ")
+		emI(off)
+		em("(%rbp), %rax\n")
 	}
-	cgWc(')')
-	cgResults(n, s, dp-1)
+}
+
+driver func (f *FnGen) emitStoreScalarToFrame(off i64, ty u32) {
+	sz, _ := layoutOf(ty)
+	if sz == 1 {
+		em("    movb %al, ")
+	} else if sz == 2 {
+		em("    movw %ax, ")
+	} else if sz == 4 {
+		em("    movl %eax, ")
+	} else if sz == 8 {
+		em("    movq %rax, ")
+	} else {
+		return
+	}
+	emI(off)
+	em("(%rbp)\n")
+}
+
+driver func (f *FnGen) emitMaskScalar(ty u32) {
+	sz, _ := layoutOf(ty)
+	signed := isSignedInt(ty)
+	if sz == 1 {
+		if signed {
+			em("    movsbq %al, %rax\n")
+		} else {
+			em("    movzbq %al, %rax\n")
+		}
+	} else if sz == 2 {
+		if signed {
+			em("    movswq %ax, %rax\n")
+		} else {
+			em("    movzwq %ax, %rax\n")
+		}
+	} else if sz == 4 {
+		if signed {
+			em("    movslq %eax, %rax\n")
+		} else {
+			em("    movl %eax, %eax\n")
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
-// Calls
+// Address computation: puts address of lvalue en into %rax
 
-func cgCalleeSym(e u32) u32 {
-	x := e
-	for g := usize(0); g < MaxNodes; g++ {
-		x = cgUnparenNode(x)
-		k := nkind(x)
-		if k == NkIdent {
-			return uses[usize(x)]
+driver func (f *FnGen) emitAddr(en u32) {
+	n := nodes[en]
+	if n.kind == NKIdent {
+		sym := nodeSym[en]
+		if off, ok := f.findVarOff(sym); ok {
+			em("    leaq ")
+			emI(off)
+			em("(%rbp), %rax\n")
+			return
 		}
-		if k == NkSelectorExpr {
-			return uses[usize(nb(x))]
-		}
-		if k != NkIndexExpr {
-			return 0
-		}
-		x = na(x)
-	}
-	return 0
-}
-
-// funcRef writes a reference to a (possibly generic) declared function;
-// the type arguments are rendered before the (instance) name, as finc0
-// does.
-func cgFuncRef(n u32, sym u32, taS u32, taN usize, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	if sym == 0 {
-		cgFail(n, "unresolved function")
-		return
-	}
-	fi := funcOfSym(sym)
-	if fi == 0 || funcs.items[usize(fi)].tpN == 0 {
-		cgWSymName(sym)
-		return
-	}
-	tpS := funcs.items[usize(fi)].tpS
-	tpN := usize(funcs.items[usize(fi)].tpN)
-	if taN != tpN {
-		cgFail(n, "generic function needs type arguments")
-		return
-	}
-	p := cgWmark()
-	vmark := cgValTop
-	ntargs := usize(0)
-	nconst := usize(0)
-	for i := usize(0); i < tpN; i++ {
-		arg := tlist(taS, i)
-		if tpIsConst(tlist(tpS, i)) {
-			cgValPush(cgConstArg(n, arg))
-			nconst++
-		} else {
-			if ntargs == 0 {
-				cgWc('[')
+		if coff, ok := f.findCapOff(sym); ok {
+			em("    movq ")
+			emI(f.envSaveOff)
+			em("(%rbp), %rax\n")
+			if f.capByValue && !isAtomicType(syms[sym].typeID) {
+				em("    leaq ")
+				emI(coff)
+				em("(%rax), %rax\n")
 			} else {
-				cgW(", ")
+				em("    movq ")
+				emI(coff)
+				em("(%rax), %rax\n")
 			}
-			cgGoType(n, arg, dp-1)
-			ntargs++
+			return
+		}
+		if f.emitParentSymAddr(sym) {
+			return
+		}
+		if syms[sym].kind == SymVar {
+			em("    leaq ")
+			emitGlobalSymLabel(SecFnBody, sym)
+			em("(%rip), %rax\n")
+			return
+		}
+		return
+	}
+	if n.kind == NKSelector {
+		// Package-qualified global `pkg.Var`
+		if nodeSym[en] != 0 && syms[nodeSym[en]].kind == SymVar {
+			em("    leaq ")
+			emitGlobalSymLabel(SecFnBody, nodeSym[en])
+			em("(%rip), %rax\n")
+			return
+		}
+		xt := f.typeOf(n.a)
+		var stTy u32 = xt
+		if (nodeFlags[en] & NFIndirect) != 0 {
+			f.emitScalar(n.a, xt)
+			stTy = types[under(xt)].a
+		} else {
+			f.emitAddr(n.a)
+		}
+		foff := structFieldOffset(stTy, nodeSelIdx[en])
+		if foff != 0 {
+			em("    addq $")
+			emU(foff)
+			em(", %rax\n")
+		}
+		return
+	}
+	if n.kind == NKIndex {
+		xt := f.typeOf(n.a)
+		idxSlot := f.allocLocal(8, 8)
+		idxExpr := listPool[n.b]
+		f.emitScalar(idxExpr, f.typeOf(idxExpr))
+		em("    movq %rax, ")
+		emI(idxSlot)
+		em("(%rbp)\n")
+		u := under(xt)
+		if types[u].kind == TKindArray {
+			f.emitAddr(n.a)
+			em("    movq ")
+			emI(idxSlot)
+			em("(%rbp), %rcx\n")
+			if (nodeFlags[en] & NFBoundsProven) == 0 {
+				em("    cmpq $")
+				emU(types[u].lenVal)
+				em(", %rcx\n    jae _fc_rt_panic_bounds\n")
+			}
+			es, ea := layoutOf(types[u].a)
+			stride := alignUp64Safe(es, ea)
+			em("    imulq $")
+			emU(stride)
+			em(", %rcx, %rcx\n    addq %rcx, %rax\n")
+			return
+		}
+		if types[u].kind == TKindPtr && types[under(types[u].a)].kind == TKindArray {
+			au := under(types[u].a)
+			f.emitScalar(n.a, xt)
+			em("    movq ")
+			emI(idxSlot)
+			em("(%rbp), %rcx\n")
+			if (nodeFlags[en] & NFBoundsProven) == 0 {
+				em("    cmpq $")
+				emU(types[au].lenVal)
+				em(", %rcx\n    jae _fc_rt_panic_bounds\n")
+			}
+			es, ea := layoutOf(types[au].a)
+			stride := alignUp64Safe(es, ea)
+			em("    imulq $")
+			emU(stride)
+			em(", %rcx, %rcx\n    addq %rcx, %rax\n")
+			return
+		}
+		if types[u].kind == TKindSlice {
+			slSlot := f.allocLocal(24, 8)
+			f.emitExprTo(n.a, slSlot, xt)
+			em("    movq ")
+			emI(idxSlot)
+			em("(%rbp), %rcx\n")
+			if (nodeFlags[en] & NFBoundsProven) == 0 {
+				em("    cmpq ")
+				emI(slSlot + 8)
+				em("(%rbp), %rcx\n    jae _fc_rt_panic_bounds\n")
+			}
+			es, ea := layoutOf(types[u].a)
+			stride := alignUp64Safe(es, ea)
+			em("    imulq $")
+			emU(stride)
+			em(", %rcx, %rcx\n    movq ")
+			emI(slSlot)
+			em("(%rbp), %rax\n    addq %rcx, %rax\n")
+			return
+		}
+		return
+	}
+	if n.kind == NKUnary && n.op == TKMul {
+		f.emitScalar(n.a, f.typeOf(n.a))
+		return
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Expression evaluation
+
+driver func (f *FnGen) emitScalar(en u32, ty u32) {
+	if ty == 0 {
+		ty = f.typeOf(en)
+	}
+	sz, al := layoutOf(ty)
+	tmp := f.allocLocal(sz, al)
+	f.emitExprTo(en, tmp, ty)
+	f.emitLoadScalarFromFrame(tmp, ty)
+}
+
+driver func (f *FnGen) emitExprDiscard(en u32) {
+	if en == 0 {
+		return
+	}
+	if nodes[en].kind == NKCall {
+		var emptyDst [0]i64
+		var emptyDt [0]u32
+		f.emitMultiCallTo(en, emptyDst[:], emptyDt[:])
+		return
+	}
+	ty := f.typeOf(en)
+	if ty == 0 {
+		return
+	}
+	sz, al := layoutOf(ty)
+	tmp := f.allocLocal(sz, al)
+	f.emitExprTo(en, tmp, ty)
+}
+
+driver func (f *FnGen) emitExprTo(en u32, dstOff i64, wantTy u32) {
+	if en == 0 {
+		return
+	}
+	if wantTy == 0 {
+		wantTy = f.typeOf(en)
+	}
+	if (nodeFlags[en] & NFImplicitBytes) != 0 {
+		vid := nodeVal[en]
+		if vid != 0 && vals[vid].kind == VKStr {
+			f.emitStrBytesConst(vals[vid].a, dstOff)
+			return
 		}
 	}
-	if ntargs > 0 {
-		cgWc(']')
-	}
-	q := cgWmark()
-	if nconst > 0 {
-		mi, ok := cgMonoLookup(2, sym, vmark)
-		if ok {
-			cgWMonoName(mi)
+	// Constant / folded comptime value
+	if nodeVal[en] != 0 {
+		// Skip const-param ident so we substitute from bind!
+		isConstTP := false
+		if nodes[en].kind == NKIdent && nodeSym[en] != 0 && syms[nodeSym[en]].kind == SymTypeParam {
+			isConstTP = true
 		}
+		if !isConstTP {
+			f.emitConstVal(nodeVal[en], dstOff, wantTy)
+			return
+		}
+	}
+	n := nodes[en]
+	if n.kind == NKNilLit {
+		sz, _ := layoutOf(wantTy)
+		f.emitZero(dstOff, sz)
+		return
+	}
+	if n.kind == NKIdent {
+		sym := nodeSym[en]
+		// Const type parameter (e.g. `N` inside `Vec[N, T]`)
+		if syms[sym].kind == SymTypeParam {
+			ntp := f.nTP
+			for i := u32(0); i < ntp; i++ {
+				if f.tpSyms[i] == sym && types[f.targs[i]].kind == TKindConstArg {
+					em("    movabsq $")
+					emI(i64(types[f.targs[i]].lenVal))
+					em(", %rax\n")
+					f.emitStoreScalarToFrame(dstOff, wantTy)
+					return
+				}
+			}
+			return
+		}
+		// Function value `fn`
+		if syms[sym].kind == SymFunc {
+			var empty [0]u32
+			mi := requestFunc(sym, empty[:])
+			em("    leaq ")
+			emitMonoItemLabel(SecFnBody, mi)
+			em("(%rip), %rax\n    movq %rax, ")
+			emI(dstOff)
+			em("(%rbp)\n    movq $0, ")
+			emI(dstOff + 8)
+			em("(%rbp)\n")
+			return
+		}
+		// Variable (local, param, capture, global)
+		f.emitAddr(en)
+		sz, _ := layoutOf(wantTy)
+		f.emitCopyRegToFrame(dstOff, sz)
+		return
+	}
+	if n.kind == NKUnary {
+		f.emitUnary(en, dstOff, wantTy)
+		return
+	}
+	if n.kind == NKBinary {
+		f.emitBinary(en, dstOff, wantTy)
+		return
+	}
+	if n.kind == NKSelector {
+		// Package-qualified function value `pkg.Fn`
+		if nodeSym[en] != 0 && syms[nodeSym[en]].kind == SymFunc {
+			var empty [0]u32
+			mi := requestFunc(nodeSym[en], empty[:])
+			em("    leaq ")
+			emitMonoItemLabel(SecFnBody, mi)
+			em("(%rip), %rax\n    movq %rax, ")
+			emI(dstOff)
+			em("(%rbp)\n    movq $0, ")
+			emI(dstOff + 8)
+			em("(%rbp)\n")
+			return
+		}
+		// Payload-less enum variant `Enum.Variant`
+		if (nodeFlags[en] & NFVariantSel) != 0 {
+			eu := under(wantTy)
+			tagSize, totalSize, _ := enumLayout(eu)
+			f.emitZero(dstOff, totalSize)
+			vidx := nodeSelIdx[en]
+			if tagSize == 1 {
+				em("    movb $")
+			} else if tagSize == 2 {
+				em("    movw $")
+			} else {
+				em("    movl $")
+			}
+			emU(u64(vidx))
+			em(", ")
+			emI(dstOff)
+			em("(%rbp)\n")
+			return
+		}
+		// Struct field selection (addressable or non-addressable!)
+		xt := f.typeOf(n.a)
+		sz, _ := layoutOf(wantTy)
+		if (nodeFlags[en] & NFIndirect) != 0 {
+			f.emitScalar(n.a, xt)
+			stTy := types[under(xt)].a
+			foff := structFieldOffset(stTy, nodeSelIdx[en])
+			if foff != 0 {
+				em("    addq $")
+				emU(foff)
+				em(", %rax\n")
+			}
+			f.emitCopyRegToFrame(dstOff, sz)
+			return
+		}
+		if (nodeFlags[n.a] & NFAddressable) != 0 {
+			f.emitAddr(n.a)
+			foff := structFieldOffset(xt, nodeSelIdx[en])
+			if foff != 0 {
+				em("    addq $")
+				emU(foff)
+				em(", %rax\n")
+			}
+			f.emitCopyRegToFrame(dstOff, sz)
+			return
+		}
+		xsz, xal := layoutOf(xt)
+		tmp := f.allocLocal(xsz, xal)
+		f.emitExprTo(n.a, tmp, xt)
+		foff := structFieldOffset(xt, nodeSelIdx[en])
+		f.emitCopyFrame(dstOff, tmp+i64(foff), sz)
+		return
+	}
+	if n.kind == NKIndex {
+		// Generic function instantiation value `fn[T]`
+		if (nodeFlags[en] & NFGenericInst) != 0 {
+			var targs [16]u32
+			driver for i := u32(0); i < nodeInstCount[en] && i < 16; i++ {
+				targs[i] = f.subst(typeList[nodeInstStart[en]+i])
+			}
+			mi := requestFunc(nodeSym[en], targs[:usize(nodeInstCount[en])])
+			em("    leaq ")
+			emitMonoItemLabel(SecFnBody, mi)
+			em("(%rip), %rax\n    movq %rax, ")
+			emI(dstOff)
+			em("(%rbp)\n    movq $0, ")
+			emI(dstOff + 8)
+			em("(%rbp)\n")
+			return
+		}
+		xt := f.typeOf(n.a)
+		if isStringType(xt) {
+			strSlot := f.allocLocal(16, 8)
+			f.emitExprTo(n.a, strSlot, xt)
+			idxExpr := listPool[n.b]
+			f.emitScalar(idxExpr, f.typeOf(idxExpr))
+			if (nodeFlags[en] & NFBoundsProven) == 0 {
+				em("    cmpq ")
+				emI(strSlot + 8)
+				em("(%rbp), %rax\n    jae _fc_rt_panic_bounds\n")
+			}
+			em("    movq ")
+			emI(strSlot)
+			em("(%rbp), %rcx\n    movzbl (%rcx, %rax), %eax\n    movb %al, ")
+			emI(dstOff)
+			em("(%rbp)\n")
+			return
+		}
+		if types[under(xt)].kind == TKindArray && (nodeFlags[n.a]&NFAddressable) == 0 {
+			au := under(xt)
+			asz, aal := layoutOf(xt)
+			arrSlot := f.allocLocal(asz, aal)
+			f.emitExprTo(n.a, arrSlot, xt)
+			idxExpr := listPool[n.b]
+			f.emitScalar(idxExpr, f.typeOf(idxExpr))
+			if (nodeFlags[en] & NFBoundsProven) == 0 {
+				em("    cmpq $")
+				emU(types[au].lenVal)
+				em(", %rax\n    jae _fc_rt_panic_bounds\n")
+			}
+			es, ea := layoutOf(types[au].a)
+			stride := alignUp64Safe(es, ea)
+			em("    imulq $")
+			emU(stride)
+			em(", %rax, %rax\n    leaq ")
+			emI(arrSlot)
+			em("(%rbp), %rcx\n    addq %rcx, %rax\n")
+			f.emitCopyRegToFrame(dstOff, es)
+			return
+		}
+		f.emitAddr(en)
+		sz, _ := layoutOf(wantTy)
+		f.emitCopyRegToFrame(dstOff, sz)
+		return
+	}
+	if n.kind == NKSlice {
+		f.emitSliceExpr(en, dstOff)
+		return
+	}
+	if n.kind == NKStructLit {
+		stTy := under(wantTy)
+		sz, _ := layoutOf(stTy)
+		f.emitZero(dstOff, sz)
+		for i := u32(0); i < n.c; i++ {
+			fi := nodes[listPool[n.b+i]]
+			idx, fty, ok := findStructField(stTy, fi.a)
+			if ok {
+				foff := structFieldOffset(stTy, idx)
+				f.emitExprTo(fi.b, dstOff+i64(foff), fty)
+			}
+		}
+		return
+	}
+	if n.kind == NKArrayLit {
+		au := under(wantTy)
+		asz, _ := layoutOf(au)
+		es, ea := layoutOf(types[au].a)
+		stride := alignUp64Safe(es, ea)
+		f.emitZero(dstOff, asz)
+		for i := u32(0); i < n.c; i++ {
+			f.emitExprTo(listPool[n.b+i], dstOff+i64(u64(i)*stride), types[au].a)
+		}
+		return
+	}
+	if n.kind == NKMatchExpr {
+		f.emitMatch(en, true, dstOff, wantTy)
+		return
+	}
+	if n.kind == NKHandleExpr {
+		f.emitHandle(en, true, dstOff, wantTy)
+		return
+	}
+	if n.kind == NKFuncLit {
+		f.emitFuncLit(en, dstOff)
+		return
+	}
+	if n.kind == NKCall {
+		f.emitSingleCallTo(en, dstOff, wantTy)
+		return
+	}
+}
+
+func (f *FnGen) emitStrBytesConst(strID u32, dstOff i64) {
+	sb := strSlice(strID)
+	if len(sb) == 0 {
+		f.emitZero(dstOff, 24)
+		return
+	}
+	lid := internRodataStrID(strID)
+	em("    leaq .L_str_")
+	emU(u64(lid))
+	em("(%rip), %rdi\n    movq $")
+	emU(u64(len(sb)))
+	em(", %rsi\n    call _fc_rt_str_bytes\n    movq %rax, ")
+	emI(dstOff)
+	em("(%rbp)\n    movq %rdx, ")
+	emI(dstOff + 8)
+	em("(%rbp)\n    movq %rdx, ")
+	emI(dstOff + 16)
+	em("(%rbp)\n")
+}
+
+driver func (f *FnGen) emitConstVal(vid u32, dstOff i64, ty u32) {
+	sz, al := layoutOf(ty)
+	if sz == 0 {
+		return
+	}
+	u := under(ty)
+	t := types[u]
+	if t.kind == TKindBasic {
+		if u == TYBool || u == TYUntypedBool {
+			var b u64 = 0
+			if vals[vid].a != 0 {
+				b = 1
+			}
+			em("    movb $")
+			emU(b)
+			em(", ")
+			emI(dstOff)
+			em("(%rbp)\n")
+			return
+		}
+		if u == TYString || u == TYUntypedStr {
+			sid := vals[vid].a
+			sb := strSlice(sid)
+			if len(sb) == 0 {
+				em("    movq $0, ")
+				emI(dstOff)
+				em("(%rbp)\n    movq $0, ")
+				emI(dstOff + 8)
+				em("(%rbp)\n")
+			} else {
+				lid := internRodataStrID(sid)
+				em("    leaq .L_str_")
+				emU(u64(lid))
+				em("(%rip), %rax\n    movq %rax, ")
+				emI(dstOff)
+				em("(%rbp)\n    movq $")
+				emU(u64(len(sb)))
+				em(", ")
+				emI(dstOff + 8)
+				em("(%rbp)\n")
+			}
+			return
+		}
+		if u == TYError {
+			em("    movq $")
+			emU(u64(vals[vid].a))
+			em(", ")
+			emI(dstOff)
+			em("(%rbp)\n")
+			return
+		}
+		if isFloatType(u) {
+			var bits u64 = vals[vid].u64Val
+			if vals[vid].kind == VKInt {
+				bits = intToF64Bits(vals[vid].u64Val, vals[vid].flags != 0)
+			}
+			if u == TYF32 {
+				b32 := f64BitsToF32Bits(bits)
+				em("    movl $")
+				emU(u64(b32))
+				em(", ")
+				emI(dstOff)
+				em("(%rbp)\n")
+			} else {
+				em("    movabsq $")
+				emI(i64(bits))
+				em(", %rax\n    movq %rax, ")
+				emI(dstOff)
+				em("(%rbp)\n")
+			}
+			return
+		}
+		em("    movabsq $")
+		emI(i64(vals[vid].u64Val))
+		em(", %rax\n")
+		f.emitStoreScalarToFrame(dstOff, ty)
+		return
+	}
+	if t.kind == TKindSlice {
+		if vals[vid].kind == VKStr {
+			f.emitStrBytesConst(vals[vid].a, dstOff)
+			return
+		}
+		f.emitZero(dstOff, 24)
+		return
+	}
+	if t.kind == TKindArray || t.kind == TKindStruct || t.kind == TKindEnum {
+		lbl := freshLabel()
+		secWriteStr(SecRodata, ".balign ")
+		secWriteU64(SecRodata, al)
+		secWriteStr(SecRodata, "\n.L_cval_")
+		secWriteU64(SecRodata, u64(lbl))
+		secWriteStr(SecRodata, ":\n")
+		emitStaticVal(SecRodata, ty, vid)
+		em("    leaq .L_cval_")
+		emU(u64(lbl))
+		em("(%rip), %rax\n")
+		f.emitCopyRegToFrame(dstOff, sz)
+		return
+	}
+	f.emitZero(dstOff, sz)
+}
+
+driver func (f *FnGen) emitUnary(en u32, dstOff i64, wantTy u32) {
+	n := nodes[en]
+	if n.op == TKAnd {
+		f.emitAddr(n.a)
+		em("    movq %rax, ")
+		emI(dstOff)
+		em("(%rbp)\n")
+		return
+	}
+	if n.op == TKMul {
+		f.emitScalar(n.a, f.typeOf(n.a))
+		sz, _ := layoutOf(wantTy)
+		f.emitCopyRegToFrame(dstOff, sz)
+		return
+	}
+	if n.op == TKAdd {
+		f.emitExprTo(n.a, dstOff, wantTy)
+		return
+	}
+	if n.op == TKSub {
+		f.emitScalar(n.a, wantTy)
+		if isFloatType(wantTy) {
+			if under(wantTy) == TYF32 {
+				em("    xorl $0x80000000, %eax\n")
+			} else {
+				em("    movabsq $-9223372036854775808, %rcx\n    xorq %rcx, %rax\n")
+			}
+			f.emitStoreScalarToFrame(dstOff, wantTy)
+			return
+		}
+		em("    negq %rax\n")
+		f.emitMaskScalar(wantTy)
+		f.emitStoreScalarToFrame(dstOff, wantTy)
+		return
+	}
+	if n.op == TKNot {
+		f.emitScalar(n.a, TYBool)
+		em("    xorb $1, %al\n    movb %al, ")
+		emI(dstOff)
+		em("(%rbp)\n")
+		return
+	}
+	if n.op == TKXor {
+		f.emitScalar(n.a, wantTy)
+		em("    notq %rax\n")
+		f.emitMaskScalar(wantTy)
+		f.emitStoreScalarToFrame(dstOff, wantTy)
+		return
+	}
+}
+
+driver func (f *FnGen) emitBinary(en u32, dstOff i64, wantTy u32) {
+	n := nodes[en]
+	op := n.op
+	if op == TKLAnd {
+		fls := freshLabel()
+		done := freshLabel()
+		f.emitScalar(n.a, TYBool)
+		em("    testb %al, %al\n    jz ")
+		emLbl("andf", fls)
+		em("\n")
+		f.emitScalar(n.b, TYBool)
+		em("    movb %al, ")
+		emI(dstOff)
+		em("(%rbp)\n    jmp ")
+		emLbl("andd", done)
+		em("\n")
+		emLbl("andf", fls)
+		em(":\n    movb $0, ")
+		emI(dstOff)
+		em("(%rbp)\n")
+		emLbl("andd", done)
+		em(":\n")
+		return
+	}
+	if op == TKLOr {
+		tru := freshLabel()
+		done := freshLabel()
+		f.emitScalar(n.a, TYBool)
+		em("    testb %al, %al\n    jnz ")
+		emLbl("ort", tru)
+		em("\n")
+		f.emitScalar(n.b, TYBool)
+		em("    movb %al, ")
+		emI(dstOff)
+		em("(%rbp)\n    jmp ")
+		emLbl("ord", done)
+		em("\n")
+		emLbl("ort", tru)
+		em(":\n    movb $1, ")
+		emI(dstOff)
+		em("(%rbp)\n")
+		emLbl("ord", done)
+		em(":\n")
+		return
+	}
+	if op == TKEql || op == TKNeq {
+		lt := f.typeOf(n.a)
+		rt := f.typeOf(n.b)
+		cmpTy := lt
+		if cmpTy == 0 || cmpTy == TYUntypedNil || isUntyped(cmpTy) {
+			cmpTy = rt
+		}
+		if cmpTy == 0 || isUntyped(cmpTy) {
+			cmpTy = defaultType(cmpTy)
+		}
+		f.emitEquality(n.a, n.b, cmpTy, op == TKNeq, dstOff)
+		return
+	}
+	if op == TKLss || op == TKLeq || op == TKGtr || op == TKGeq {
+		lt := f.typeOf(n.a)
+		rt := f.typeOf(n.b)
+		cmpTy := lt
+		if isUntyped(cmpTy) {
+			cmpTy = rt
+		}
+		if isUntyped(cmpTy) {
+			cmpTy = defaultType(cmpTy)
+		}
+		if isStringType(cmpTy) {
+			lSlot := f.allocLocal(16, 8)
+			rSlot := f.allocLocal(16, 8)
+			f.emitExprTo(n.a, lSlot, TYString)
+			f.emitExprTo(n.b, rSlot, TYString)
+			em("    movq ")
+			emI(lSlot)
+			em("(%rbp), %rdi\n    movq ")
+			emI(lSlot + 8)
+			em("(%rbp), %rsi\n    movq ")
+			emI(rSlot)
+			em("(%rbp), %rdx\n    movq ")
+			emI(rSlot + 8)
+			em("(%rbp), %rcx\n    call _fc_rt_str_cmp\n    cmpq $0, %rax\n")
+			if op == TKLss {
+				em("    setl ")
+			} else if op == TKLeq {
+				em("    setle ")
+			} else if op == TKGtr {
+				em("    setg ")
+			} else {
+				em("    setge ")
+			}
+			emI(dstOff)
+			em("(%rbp)\n")
+			return
+		}
+		lSlot := f.allocLocal(8, 8)
+		f.emitScalar(n.a, cmpTy)
+		em("    movq %rax, ")
+		emI(lSlot)
+		em("(%rbp)\n")
+		f.emitScalar(n.b, cmpTy)
+		em("    movq ")
+		emI(lSlot)
+		em("(%rbp), %rcx\n")
+		if isFloatType(cmpTy) {
+			if under(cmpTy) == TYF32 {
+				em("    movd %ecx, %xmm0\n    movd %eax, %xmm1\n")
+				if op == TKLss || op == TKLeq {
+					em("    ucomiss %xmm0, %xmm1\n")
+				} else {
+					em("    ucomiss %xmm1, %xmm0\n")
+				}
+			} else {
+				em("    movq %rcx, %xmm0\n    movq %rax, %xmm1\n")
+				if op == TKLss || op == TKLeq {
+					em("    ucomisd %xmm0, %xmm1\n")
+				} else {
+					em("    ucomisd %xmm1, %xmm0\n")
+				}
+			}
+			if op == TKLss || op == TKGtr {
+				em("    seta %al\n    movb %al, ")
+			} else {
+				em("    setae %al\n    setnp %dl\n    andb %dl, %al\n    movb %al, ")
+			}
+			emI(dstOff)
+			em("(%rbp)\n")
+			return
+		}
+		em("    cmpq %rax, %rcx\n")
+		signed := isSignedInt(cmpTy)
+		if op == TKLss {
+			if signed {
+				em("    setl ")
+			} else {
+				em("    setb ")
+			}
+		} else if op == TKLeq {
+			if signed {
+				em("    setle ")
+			} else {
+				em("    setbe ")
+			}
+		} else if op == TKGtr {
+			if signed {
+				em("    setg ")
+			} else {
+				em("    seta ")
+			}
+		} else {
+			if signed {
+				em("    setge ")
+			} else {
+				em("    setae ")
+			}
+		}
+		emI(dstOff)
+		em("(%rbp)\n")
+		return
+	}
+	// Arithmetic / bitwise / shift
+	lSlot := f.allocLocal(8, 8)
+	f.emitScalar(n.a, wantTy)
+	em("    movq %rax, ")
+	emI(lSlot)
+	em("(%rbp)\n")
+	if op == TKShl || op == TKShr {
+		f.emitScalar(n.b, f.typeOf(n.b))
 	} else {
-		cgValTop = vmark
-		cgWSymName(sym)
+		f.emitScalar(n.b, wantTy)
 	}
-	cgWrotate(p, q)
+	em("    movq %rax, %rcx\n    movq ")
+	emI(lSlot)
+	em("(%rbp), %rax\n")
+	if isFloatType(wantTy) {
+		f.emitFloatBinOpRegs(op, wantTy)
+	} else {
+		f.emitIntBinOpRegs(op, wantTy)
+	}
+	f.emitStoreScalarToFrame(dstOff, wantTy)
 }
 
-// args writes the arguments of a call, expanding a folded multi-value
-// comptime call f(g()).
-func cgArgs(c u32, dp usize) decreases(dp) {
-	if dp == 0 {
+// Performs SSE2 float op (%rax = %rax op %rcx) for f32 or f64.
+driver func (f *FnGen) emitFloatBinOpRegs(op u8, ty u32) {
+	if under(ty) == TYF32 {
+		em("    movd %eax, %xmm0\n    movd %ecx, %xmm1\n")
+		if op == TKAdd {
+			em("    addss %xmm1, %xmm0\n")
+		} else if op == TKSub {
+			em("    subss %xmm1, %xmm0\n")
+		} else if op == TKMul {
+			em("    mulss %xmm1, %xmm0\n")
+		} else if op == TKQuo {
+			em("    divss %xmm1, %xmm0\n")
+		}
+		em("    movd %xmm0, %eax\n")
 		return
 	}
-	n := l1len(c)
-	if n == 1 {
-		a0 := l1at(c, 0)
-		cs := cgConstValueSlot(a0)
-		if cs != 0 && slotGet(cs) is Tuple(..) {
-			cgTupleValues(a0, slotGet(cs), dp-1)
+	em("    movq %rax, %xmm0\n    movq %rcx, %xmm1\n")
+	if op == TKAdd {
+		em("    addsd %xmm1, %xmm0\n")
+	} else if op == TKSub {
+		em("    subsd %xmm1, %xmm0\n")
+	} else if op == TKMul {
+		em("    mulsd %xmm1, %xmm0\n")
+	} else if op == TKQuo {
+		em("    divsd %xmm1, %xmm0\n")
+	}
+	em("    movq %xmm0, %rax\n")
+}
+
+// Performs (%rax = %rax op %rcx) masked to ty.
+driver func (f *FnGen) emitIntBinOpRegs(op u8, ty u32) {
+	signed := isSignedInt(ty)
+	sz, _ := layoutOf(ty)
+	if op == TKAdd {
+		em("    addq %rcx, %rax\n")
+	} else if op == TKSub {
+		em("    subq %rcx, %rax\n")
+	} else if op == TKMul {
+		em("    imulq %rcx, %rax\n")
+	} else if op == TKQuo || op == TKRem {
+		em("    testq %rcx, %rcx\n    jz _fc_rt_panic_div0\n")
+		if signed {
+			// Guard MinI64 / -1
+			okLbl := freshLabel()
+			doneLbl := freshLabel()
+			em("    cmpq $-1, %rcx\n    jne ")
+			emLbl("divok", okLbl)
+			em("\n    movabsq $-9223372036854775808, %rdx\n    cmpq %rdx, %rax\n    jne ")
+			emLbl("divok", okLbl)
+			em("\n")
+			if op == TKRem {
+				em("    xorq %rax, %rax\n")
+			}
+			em("    jmp ")
+			emLbl("divdn", doneLbl)
+			em("\n")
+			emLbl("divok", okLbl)
+			em(":\n    cqto\n    idivq %rcx\n")
+			if op == TKRem {
+				em("    movq %rdx, %rax\n")
+			}
+			emLbl("divdn", doneLbl)
+			em(":\n")
+		} else {
+			em("    xorq %rdx, %rdx\n    divq %rcx\n")
+			if op == TKRem {
+				em("    movq %rdx, %rax\n")
+			}
+		}
+	} else if op == TKAnd {
+		em("    andq %rcx, %rax\n")
+	} else if op == TKOr {
+		em("    orq %rcx, %rax\n")
+	} else if op == TKXor {
+		em("    xorq %rcx, %rax\n")
+	} else if op == TKShl {
+		bits := sz * 8
+		okLbl := freshLabel()
+		doneLbl := freshLabel()
+		em("    cmpq $")
+		emU(bits)
+		em(", %rcx\n    jb ")
+		emLbl("shok", okLbl)
+		em("\n    xorq %rax, %rax\n    jmp ")
+		emLbl("shdn", doneLbl)
+		em("\n")
+		emLbl("shok", okLbl)
+		em(":\n    shlq %cl, %rax\n")
+		emLbl("shdn", doneLbl)
+		em(":\n")
+	} else if op == TKShr {
+		bits := sz * 8
+		okLbl := freshLabel()
+		doneLbl := freshLabel()
+		em("    cmpq $")
+		emU(bits)
+		em(", %rcx\n    jb ")
+		emLbl("shok", okLbl)
+		em("\n")
+		if signed {
+			em("    sarq $63, %rax\n")
+		} else {
+			em("    xorq %rax, %rax\n")
+		}
+		em("    jmp ")
+		emLbl("shdn", doneLbl)
+		em("\n")
+		emLbl("shok", okLbl)
+		em(":\n")
+		if signed {
+			em("    sarq %cl, %rax\n")
+		} else {
+			em("    shrq %cl, %rax\n")
+		}
+		emLbl("shdn", doneLbl)
+		em(":\n")
+	}
+	f.emitMaskScalar(ty)
+}
+
+driver func (f *FnGen) emitEquality(lhs u32, rhs u32, ty u32, negate bool, dstOff i64) {
+	u := under(ty)
+	if isScalarType(ty) {
+		lSlot := f.allocLocal(8, 8)
+		f.emitScalar(lhs, ty)
+		em("    movq %rax, ")
+		emI(lSlot)
+		em("(%rbp)\n")
+		f.emitScalar(rhs, ty)
+		em("    cmpq %rax, ")
+		emI(lSlot)
+		em("(%rbp)\n")
+		if negate {
+			em("    setne ")
+		} else {
+			em("    sete ")
+		}
+		emI(dstOff)
+		em("(%rbp)\n")
+		return
+	}
+	if types[u].kind == TKindSlice {
+		// Slice == nil check
+		var slExpr u32 = lhs
+		if nodes[lhs].kind == NKNilLit {
+			slExpr = rhs
+		}
+		slSlot := f.allocLocal(24, 8)
+		f.emitExprTo(slExpr, slSlot, ty)
+		em("    cmpq $0, ")
+		emI(slSlot)
+		em("(%rbp)\n")
+		if negate {
+			em("    setne ")
+		} else {
+			em("    sete ")
+		}
+		emI(dstOff)
+		em("(%rbp)\n")
+		return
+	}
+	sz, al := layoutOf(ty)
+	lSlot := f.allocLocal(sz, al)
+	rSlot := f.allocLocal(sz, al)
+	f.emitExprTo(lhs, lSlot, ty)
+	f.emitExprTo(rhs, rSlot, ty)
+	f.emitValueEqualFrame(lSlot, rSlot, ty)
+	if negate {
+		em("    xorb $1, %al\n")
+	}
+	em("    movb %al, ")
+	emI(dstOff)
+	em("(%rbp)\n")
+}
+
+// Compares two frame values of type ty, leaving 0/1 in %al.
+driver func (f *FnGen) emitValueEqualFrame(aOff i64, bOff i64, ty u32) {
+	sz, _ := layoutOf(ty)
+	if sz == 0 {
+		em("    movb $1, %al\n")
+		return
+	}
+	u := under(ty)
+	if isScalarType(ty) {
+		f.emitLoadScalarFromFrame(aOff, ty)
+		em("    movq %rax, %rcx\n")
+		f.emitLoadScalarFromFrame(bOff, ty)
+		if isFloatType(ty) {
+			if under(ty) == TYF32 {
+				em("    movd %ecx, %xmm0\n    movd %eax, %xmm1\n    ucomiss %xmm1, %xmm0\n    sete %al\n    setnp %dl\n    andb %dl, %al\n")
+			} else {
+				em("    movq %rcx, %xmm0\n    movq %rax, %xmm1\n    ucomisd %xmm1, %xmm0\n    sete %al\n    setnp %dl\n    andb %dl, %al\n")
+			}
 			return
 		}
-	}
-	for i := usize(0); i < n; i++ {
-		if i > 0 {
-			cgW(", ")
-		}
-		cgExpr(l1at(c, i), dp-1)
-	}
-}
-
-// tupleValues writes the elements of a multi-value constant.
-func cgTupleValues(e u32, v Val, dp usize) decreases(dp) {
-	if dp == 0 {
+		em("    cmpq %rax, %rcx\n    sete %al\n")
 		return
 	}
-	if v is Tuple(ref, nv) && trec(ntype[usize(e)]) is Tuple(ts, tn) && tn == nv {
-		for i := usize(0); i < usize(nv); i++ {
-			if i > 0 {
-				cgW(", ")
+	if isStringType(ty) {
+		em("    movq ")
+		emI(aOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(aOff + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(bOff)
+		em("(%rbp), %rdx\n    movq ")
+		emI(bOff + 8)
+		em("(%rbp), %rcx\n    call _fc_rt_bytes_eq\n")
+		return
+	}
+	if types[u].kind == TKindStruct {
+		fls := freshLabel()
+		done := freshLabel()
+		fc := types[u].b
+		for i := u32(0); i < fc; i++ {
+			foff := structFieldOffset(u, i)
+			f.emitValueEqualFrame(aOff+i64(foff), bOff+i64(foff), fields[types[u].a+i].typeID)
+			em("    testb %al, %al\n    jz ")
+			emLbl("eqf", fls)
+			em("\n")
+		}
+		em("    movb $1, %al\n    jmp ")
+		emLbl("eqd", done)
+		em("\n")
+		emLbl("eqf", fls)
+		em(":\n    movb $0, %al\n")
+		emLbl("eqd", done)
+		em(":\n")
+		return
+	}
+	if types[u].kind == TKindArray {
+		fls := freshLabel()
+		done := freshLabel()
+		es, ea := layoutOf(types[u].a)
+		stride := alignUp64Safe(es, ea)
+		if types[u].lenVal <= 8 {
+			arrLen := types[u].lenVal
+			for i := u64(0); i < arrLen; i++ {
+				f.emitValueEqualFrame(aOff+i64(i*stride), bOff+i64(i*stride), types[u].a)
+				em("    testb %al, %al\n    jz ")
+				emLbl("eqf", fls)
+				em("\n")
 			}
-			cgValue(e, slotGet(ref+u32(i)), tlist(ts, i), dp-1)
-		}
-		return
-	}
-	cgFail(e, "malformed multi-value constant")
-}
-
-func cgCall(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	c := ncall[usize(e)]
-	if c == 0 {
-		cgFail(e, "call without type information")
-		return
-	}
-	match callTab.items[usize(c)].kind {
-		Func(sym, taS, taN) -> {
-			cgFuncRef(e, sym, taS, usize(taN), dp-1)
-			cgCallArgs(e, dp-1)
-		}
-		Method(sym, _, recv, _) -> {
-			cgPrimary(recv, dp-1)
-			cgWc('.')
-			cgWSymName(sym)
-			cgCallArgs(e, dp-1)
-		}
-		BuiltinMeth(m, recv, _) -> cgBuiltinMethod(e, meths.items[usize(m)].builtin, m, recv, dp-1)
-		Builtin(b, ..) -> cgBuiltinCall(e, c, b, dp-1)
-		Conversion(t) -> {
-			cgConvType(e, t, dp-1)
-			cgWc('(')
-			cgExpr(l1at(e, 0), dp-1)
-			cgWc(')')
-		}
-		Variant(t, v) -> cgVariantCall(e, t, usize(v), dp-1)
-		Value -> {
-			cgPrimary(na(e), dp-1)
-			cgCallArgs(e, dp-1)
-		}
-		Invalid -> cgFail(e, "unsupported call")
-	}
-}
-
-// cgCallArgs writes the parenthesized arguments of a call.
-func cgCallArgs(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	cgWc('(')
-	cgArgs(e, dp-1)
-	cgWc(')')
-}
-
-// cgVariantCall writes the construction of variant vi of enum type t.
-func cgVariantCall(e u32, t u32, vi usize, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	n := l1len(e)
-	if n == 1 && trec(ntype[usize(l1at(e, 0))]) is Tuple(..) {
-		cgVariantSpread(e, t, vi, dp-1)
-		return
-	}
-	lay := cgLayout(e, t, dp-1)
-	p := cgWmark()
-	cgWc('{')
-	if vi != 0 {
-		cgW("_tag: ")
-		cgWu(u64(vi))
-	}
-	for i := usize(0); i < n; i++ {
-		if vi != 0 || i > 0 {
-			cgW(", ")
-		}
-		cgWSlot(lay, vi, i)
-		cgW(": ")
-		cgExpr(l1at(e, i), dp-1)
-	}
-	cgWc('}')
-	q := cgWmark()
-	cgGoType(e, t, dp-1)
-	cgWrotate(p, q)
-	cgComposite(p)
-	cgLayRelease(lay)
-}
-
-// cgVariantSpread writes a variant construction whose only argument
-// supplies all payload values at once: a multi-result call or a v0.3
-// multi-value match, `T.V(g())` (decision 149). Like a call `f(g())` it
-// becomes a Go call that spreads the values over parameters,
-//
-//	func(_fc_v0 T0, _fc_v1 T1) T { return T{_tag: vi, slot0: _fc_v0, slot1: _fc_v1} }(g())
-//
-// and a folded comptime call `T.V(c())` writes its constant values into
-// the slots directly.
-func cgVariantSpread(e u32, t u32, vi usize, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	a0 := l1at(e, 0)
-	ts := u32(0)
-	tn := usize(0)
-	if trec(ntype[usize(a0)]) is Tuple(s, k) {
-		ts = s
-		tn = usize(k)
-	}
-	cs := cgConstValueSlot(a0)
-	folded := cs != 0 && slotGet(cs) is Tuple(..)
-	ref := u32(0)
-	if folded && slotGet(cs) is Tuple(r, nv) {
-		ref = r
-		if usize(nv) != tn {
-			cgFail(e, "malformed multi-value constant")
+			em("    movb $1, %al\n    jmp ")
+			emLbl("eqd", done)
+			em("\n")
+			emLbl("eqf", fls)
+			em(":\n    movb $0, %al\n")
+			emLbl("eqd", done)
+			em(":\n")
 			return
 		}
+		em("    leaq ")
+		emI(aOff)
+		em("(%rbp), %rdi\n    movq $")
+		emU(sz)
+		em(", %rsi\n    leaq ")
+		emI(bOff)
+		em("(%rbp), %rdx\n    movq $")
+		emU(sz)
+		em(", %rcx\n    call _fc_rt_bytes_eq\n")
+		return
 	}
-	saveHeader := cgHeader
-	if !folded {
-		cgHeader = 0
-		cgW("func(")
-		for i := usize(0); i < tn; i++ {
-			if i > 0 {
-				cgW(", ")
+	if types[u].kind == TKindEnum {
+		tagSize, _, _ := enumLayout(u)
+		fls := freshLabel()
+		done := freshLabel()
+		if tagSize == 1 {
+			em("    movzbl ")
+			emI(aOff)
+			em("(%rbp), %eax\n    movzbl ")
+			emI(bOff)
+			em("(%rbp), %ecx\n")
+		} else if tagSize == 2 {
+			em("    movzwl ")
+			emI(aOff)
+			em("(%rbp), %eax\n    movzwl ")
+			emI(bOff)
+			em("(%rbp), %ecx\n")
+		} else {
+			em("    movl ")
+			emI(aOff)
+			em("(%rbp), %eax\n    movl ")
+			emI(bOff)
+			em("(%rbp), %ecx\n")
+		}
+		em("    cmpl %ecx, %eax\n    jne ")
+		emLbl("eqf", fls)
+		em("\n")
+		tagSlot := f.allocLocal(4, 4)
+		em("    movl %eax, ")
+		emI(tagSlot)
+		em("(%rbp)\n")
+		vc := types[u].b
+		for vi := u32(0); vi < vc; vi++ {
+			vr := variants[types[u].a+vi]
+			if vr.payCount == 0 {
+				continue
 			}
-			cgWf(formatTo(mbuf[:], "_fc_v%d ", i))
-			cgGoType(e, tlist(ts, i), dp-1)
+			nextV := freshLabel()
+			em("    cmpl $")
+			emU(u64(vi))
+			em(", ")
+			emI(tagSlot)
+			em("(%rbp)\n    jne ")
+			emLbl("eqv", nextV)
+			em("\n")
+			for pi := u32(0); pi < vr.payCount; pi++ {
+				po := enumPayloadOffset(u, vi, pi)
+				f.emitValueEqualFrame(aOff+i64(po), bOff+i64(po), typeList[vr.payStart+pi])
+				em("    testb %al, %al\n    jz ")
+				emLbl("eqf", fls)
+				em("\n")
+			}
+			em("    movb $1, %al\n    jmp ")
+			emLbl("eqd", done)
+			em("\n")
+			emLbl("eqv", nextV)
+			em(":\n")
 		}
-		cgW(") ")
-		cgGoType(e, t, dp-1)
-		cgW(" { return ")
+		em("    movb $1, %al\n    jmp ")
+		emLbl("eqd", done)
+		em("\n")
+		emLbl("eqf", fls)
+		em(":\n    movb $0, %al\n")
+		emLbl("eqd", done)
+		em(":\n")
+		return
 	}
-	lay := cgLayout(e, t, dp-1)
-	p := cgWmark()
-	cgWc('{')
-	if vi != 0 {
-		cgW("_tag: ")
-		cgWu(u64(vi))
+	em("    leaq ")
+	emI(aOff)
+	em("(%rbp), %rdi\n    movq $")
+	emU(sz)
+	em(", %rsi\n    leaq ")
+	emI(bOff)
+	em("(%rbp), %rdx\n    movq $")
+	emU(sz)
+	em(", %rcx\n    call _fc_rt_bytes_eq\n")
+}
+
+driver func (f *FnGen) emitSliceExpr(en u32, dstOff i64) {
+	n := nodes[en]
+	xt := f.typeOf(n.a)
+	u := under(xt)
+	ptrSlot := f.allocLocal(8, 8)
+	lenSlot := f.allocLocal(8, 8)
+	capSlot := f.allocLocal(8, 8)
+	var elemTy u32 = TYU8
+	isStr := false
+
+	if u == TYString || u == TYUntypedStr {
+		isStr = true
+		sSlot := f.allocLocal(16, 8)
+		f.emitExprTo(n.a, sSlot, xt)
+		em("    movq ")
+		emI(sSlot)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(ptrSlot)
+		em("(%rbp)\n    movq ")
+		emI(sSlot + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(lenSlot)
+		em("(%rbp)\n    movq %rax, ")
+		emI(capSlot)
+		em("(%rbp)\n")
+	} else if types[u].kind == TKindArray {
+		elemTy = types[u].a
+		f.emitAddr(n.a)
+		em("    movq %rax, ")
+		emI(ptrSlot)
+		em("(%rbp)\n    movq $")
+		emU(types[u].lenVal)
+		em(", ")
+		emI(lenSlot)
+		em("(%rbp)\n    movq $")
+		emU(types[u].lenVal)
+		em(", ")
+		emI(capSlot)
+		em("(%rbp)\n")
+	} else if types[u].kind == TKindPtr && types[under(types[u].a)].kind == TKindArray {
+		au := under(types[u].a)
+		elemTy = types[au].a
+		f.emitScalar(n.a, xt)
+		em("    movq %rax, ")
+		emI(ptrSlot)
+		em("(%rbp)\n    movq $")
+		emU(types[au].lenVal)
+		em(", ")
+		emI(lenSlot)
+		em("(%rbp)\n    movq $")
+		emU(types[au].lenVal)
+		em(", ")
+		emI(capSlot)
+		em("(%rbp)\n")
+	} else if types[u].kind == TKindSlice {
+		elemTy = types[u].a
+		sSlot := f.allocLocal(24, 8)
+		f.emitExprTo(n.a, sSlot, xt)
+		em("    movq ")
+		emI(sSlot)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(ptrSlot)
+		em("(%rbp)\n    movq ")
+		emI(sSlot + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(lenSlot)
+		em("(%rbp)\n    movq ")
+		emI(sSlot + 16)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(capSlot)
+		em("(%rbp)\n")
 	}
-	for i := usize(0); i < tn; i++ {
-		if vi != 0 || i > 0 {
-			cgW(", ")
+
+	loSlot := f.allocLocal(8, 8)
+	hiSlot := f.allocLocal(8, 8)
+	mxSlot := f.allocLocal(8, 8)
+	if n.b != 0 {
+		f.emitScalar(n.b, f.typeOf(n.b))
+		em("    movq %rax, ")
+		emI(loSlot)
+		em("(%rbp)\n")
+	} else {
+		em("    movq $0, ")
+		emI(loSlot)
+		em("(%rbp)\n")
+	}
+	if n.c != 0 {
+		f.emitScalar(n.c, f.typeOf(n.c))
+		em("    movq %rax, ")
+		emI(hiSlot)
+		em("(%rbp)\n")
+	} else {
+		em("    movq ")
+		emI(lenSlot)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(hiSlot)
+		em("(%rbp)\n")
+	}
+	if n.d != 0 {
+		f.emitScalar(n.d, f.typeOf(n.d))
+		em("    movq %rax, ")
+		emI(mxSlot)
+		em("(%rbp)\n")
+	} else {
+		em("    movq ")
+		emI(capSlot)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(mxSlot)
+		em("(%rbp)\n")
+	}
+
+	// Bounds checks: lo <= hi <= max <= cap
+	em("    movq ")
+	emI(loSlot)
+	em("(%rbp), %rax\n    movq ")
+	emI(hiSlot)
+	em("(%rbp), %rcx\n    movq ")
+	emI(mxSlot)
+	em("(%rbp), %rdx\n    cmpq %rcx, %rax\n    ja _fc_rt_panic_bounds\n    cmpq %rdx, %rcx\n    ja _fc_rt_panic_bounds\n    cmpq ")
+	emI(capSlot)
+	em("(%rbp), %rdx\n    ja _fc_rt_panic_bounds\n")
+
+	es, ea := layoutOf(elemTy)
+	stride := alignUp64Safe(es, ea)
+	em("    imulq $")
+	emU(stride)
+	em(", %rax, %r8\n    addq ")
+	emI(ptrSlot)
+	em("(%rbp), %r8\n    subq %rax, %rcx\n    subq %rax, %rdx\n    movq %r8, ")
+	emI(dstOff)
+	em("(%rbp)\n    movq %rcx, ")
+	emI(dstOff + 8)
+	em("(%rbp)\n")
+	if !isStr {
+		em("    movq %rdx, ")
+		emI(dstOff + 16)
+		em("(%rbp)\n")
+	}
+}
+
+driver func (f *FnGen) emitFuncLit(en u32, dstOff i64) {
+	mi := requestLit(en, f.tpSyms[:usize(f.nTP)], f.targs[:usize(f.nTP)])
+	em("    leaq ")
+	emitMonoItemLabel(SecFnBody, mi)
+	em("(%rip), %rax\n    movq %rax, ")
+	emI(dstOff)
+	em("(%rbp)\n")
+	cc := litCapCount[en]
+	if cc == 0 {
+		em("    movq $0, ")
+		emI(dstOff + 8)
+		em("(%rbp)\n")
+		return
+	}
+	byVal := f.isGoLitNode(en)
+	cs := litCapStart[en]
+	var envOffs [64]u64
+	var envSz u64 = 0
+	var maxAl u64 = 8
+	driver for i := u32(0); i < cc && i < 64; i++ {
+		csym := capPool[cs+i]
+		var sz u64 = 8
+		var al u64 = 8
+		if byVal && !isAtomicType(f.symType(csym)) {
+			sz, al = layoutOf(f.symType(csym))
 		}
-		cgWSlot(lay, vi, i)
-		cgW(": ")
-		if folded {
-			cgValue(a0, slotGet(ref+u32(i)), tlist(ts, i), dp-1)
+		if al > maxAl {
+			maxAl = al
+		}
+		envSz = alignUp64Safe(envSz, al)
+		envOffs[i] = envSz
+		envSz += sz
+	}
+	envSz = alignUp64Safe(envSz, maxAl)
+	if envSz == 0 {
+		envSz = 8
+	}
+	if byVal {
+		f.setGoLitEnvSize(en, envSz)
+	}
+	envSlot := f.allocLocal(envSz, maxAl)
+	driver for i := u32(0); i < cc && i < 64; i++ {
+		csym := capPool[cs+i]
+		f.emitSymAddr(csym)
+		if byVal && !isAtomicType(f.symType(csym)) {
+			sz, _ := layoutOf(f.symType(csym))
+			f.emitCopyRegToFrame(envSlot+i64(envOffs[i]), sz)
 		} else {
-			cgWf(formatTo(mbuf[:], "_fc_v%d", i))
+			em("    movq %rax, ")
+			emI(envSlot + i64(envOffs[i]))
+			em("(%rbp)\n")
 		}
 	}
-	cgWc('}')
-	q := cgWmark()
-	cgGoType(e, t, dp-1)
-	cgWrotate(p, q)
-	cgLayRelease(lay)
-	if folded {
-		cgComposite(p)
-		return
-	}
-	cgW(" }(")
-	cgExpr(a0, dp-1)
-	cgWc(')')
-	cgHeader = saveHeader
+	em("    leaq ")
+	emI(envSlot)
+	em("(%rbp), %rax\n    movq %rax, ")
+	emI(dstOff + 8)
+	em("(%rbp)\n")
 }
 
-func cgBuiltinMethod(e u32, b u8, m u32, recv u32, dp usize) decreases(dp) {
-	if dp == 0 {
+func (f *FnGen) emitSymAddr(sym u32) {
+	if off, ok := f.findVarOff(sym); ok {
+		em("    leaq ")
+		emI(off)
+		em("(%rbp), %rax\n")
 		return
 	}
-	if b == BMScopeAcquireSlot {
-		cgRt("AcquireSlot")
-		cgWc('(')
-		cgPrimary(recv, dp-1)
-		// finc0 renders the pool before the context argument.
-		q := cgWmark()
-		a1 := l1at(e, 1)
-		u := cgUnparenNode(a1)
-		if nkind(u) == NkUnaryExpr && nop(u) == OpAddr {
-			cgPrimary(na(u), dp-1)
+	if coff, ok := f.findCapOff(sym); ok {
+		em("    movq ")
+		emI(f.envSaveOff)
+		em("(%rbp), %rax\n")
+		if f.capByValue && !isAtomicType(syms[sym].typeID) {
+			em("    leaq ")
+			emI(coff)
+			em("(%rax), %rax\n")
 		} else {
-			cgPrimary(a1, dp-1)
+			em("    movq ")
+			emI(coff)
+			em("(%rax), %rax\n")
 		}
-		cgW("[:]")
-		r := cgWmark()
-		cgW(", ")
-		cgExpr(l1at(e, 0), dp-1)
-		cgW(", ")
-		cgWrotate(q, r)
-		cgWc(')')
 		return
 	}
-	if b == BMScopeReleaseSlot {
-		cgRt("ReleaseSlot")
-		cgWc('(')
-		cgPrimary(recv, dp-1)
-		cgW(", ")
-		cgExpr(l1at(e, 0), dp-1)
-		cgWc(')')
+	if f.emitParentSymAddr(sym) {
 		return
 	}
-	if b == BMScopeGo {
-		cgRt("Go")
-		cgWc('(')
-		cgPrimary(recv, dp-1)
-		cgW(", ")
-		cgExpr(l1at(e, 0), dp-1)
-		cgW(", ")
-		cgExpr(l1at(e, 1), dp-1)
-		cgWc(')')
-		return
-	}
-	cgPrimary(recv, dp-1)
-	cgWf(formatTo(mbuf[:], ".%s(", nameBytes(meths.items[usize(m)].name)))
-	cgArgs(e, dp-1)
-	cgWc(')')
-}
-
-func cgBuiltinCall(e u32, c u32, b u8, dp usize) decreases(dp) {
-	if dp == 0 {
-		return
-	}
-	match b {
-		BFLen | BFCap -> {
-			cgW(match b {
-				BFLen -> "uint(len("
-				_ -> "uint(cap("
-			})
-			cgExpr(l1at(e, 0), dp-1)
-			cgW("))")
-		}
-		BFPanic -> {
-			cgW("panic(")
-			cgArgs(e, dp-1)
-			cgWc(')')
-		}
-		BFFormatTo -> cgFormatTo(e, c, dp-1)
-		BFMin | BFMax -> {
-			// v0.3: Go's min/max builtins (user names min/max are
-			// renamed _fc_u_min/_fc_u_max, so these always resolve).
-			cgW(match b {
-				BFMin -> "min("
-				_ -> "max("
-			})
-			cgArgs(e, dp-1)
-			cgWc(')')
-		}
-		BFCopy | BFBytesEqual | BFStrBytes | BFBytesToStr | BFFormatUint | BFParseUint | BFNewContext | BFNewScope -> {
-			cgRt(cgBuiltinGoName(b))
-			cgWc('(')
-			cgArgs(e, dp-1)
-			cgWc(')')
-		}
-		_ -> cgFail(e, "builtin cannot be called at run time")
-	}
-}
-
-// builtinGoName is resolve.Builtin.GoName for builtin functions.
-func cgBuiltinGoName(b u8) string {
-	return match b {
-		BFCopy -> "Copy"
-		BFBytesEqual -> "BytesEqual"
-		BFStrBytes -> "StrBytes"
-		BFBytesToStr -> "BytesToStr"
-		BFFormatUint -> "FormatUint"
-		BFParseUint -> "ParseUint"
-		BFNewContext -> "NewContext"
-		_ -> "NewScope"
-	}
+	em("    leaq ")
+	emitGlobalSymLabel(SecFnBody, sym)
+	em("(%rip), %rax\n")
 }

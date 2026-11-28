@@ -1,1751 +1,1508 @@
-// SINCE: v0.3
-// comptime.fc — the fuel-bounded compile-time interpreter (port of finc0's
-// bootstrap/internal/comptime, spec 5.3).
-//
-// callComptime is the types.Evaluator: it evaluates fn(args...) with a fresh
-// fuel budget (an evaluation root) by interpreting the type-checked bodies
-// through the typed model. Every loop iteration, call and index operation
-// costs one unit; exhaustion is E4001 with a call stack. Recursion is also
-// bounded by CtMaxDepth frames. finc0 unwinds failures with panic; here the
-// first failure sets `ifail` (code + message) and every interpreter step
-// returns as soon as it sees the flag, so the same first error is reported.
-//
-// Frames and variables live in global stacks. Each frame's variables are a
-// range [vbase, nfv) of (symbol, cell slot) pairs; cells are heap value
-// slots. Nested evaluation roots (a comptime call folded while the checker
-// checks a body on behalf of the interpreter) save and restore the
-// interpreter state, as finc0 creates a fresh interpreter per root.
 package main
 
-import "std/strconv"
+// Compile-time value representation and fuel-bounded `comptime` evaluator.
+// Handles constant folding, Layer-1 `Code n` / `El(...)` types, and `comptime func`.
 
 const (
-	DefaultFuel  = 1_000_000
-	CtMaxDepth   = 10_000
-	MaxFrames    = CtMaxDepth + 2
-	MaxFrameVars = 262_144
-	CtlNone      = 0
-	CtlBreak     = 1
-	CtlContinue  = 2
-	CtlReturn    = 3
-	CtEval       = "comptime evaluation " // prefix of comptime diagnostics
-	NotStruct    = "field access on non-struct value"
+	MaxVals     = 65536
+	MaxValList  = 131072
+	MaxCTEnv    = 256
+	MaxCTDepth  = 64
 )
 
-type Frame struct {
-	fn     u32 // FuncInfo
-	site   u32 // CallExpr in the caller (0 for the root)
-	vbase  usize
-	ret    Val
-	hasRet bool
+const (
+	VKNone   u8 = 0
+	VKInt    u8 = 1 // u64Val (bit pattern); flags: bit0=isSigned
+	VKBool   u8 = 2 // a=0/1
+	VKStr    u8 = 3 // a=strID
+	VKErr    u8 = 4 // a=errID (0..11)
+	VKArray  u8 = 5 // a=valListStart, b=count, typeID=arrayType
+	VKStruct u8 = 6 // a=valListStart, b=count, typeID=structType
+	VKEnum   u8 = 7 // a=varIdx, b=valListStart, c=payCount, typeID=enumType
+	VKSlice  u8 = 8 // a=baseValID(VKArray), b=lo, c=hi, typeID=sliceType
+	VKCode   u8 = 9 // a=codeKind, b=level, c=extra1, d=extra2, u64Val=len
+	VKField  u8 = 10 // a=nameStrID, b=codeValID (FieldCode)
+	VKFloat  u8 = 11 // u64Val = IEEE-754 f64 bit pattern
+)
+
+// Code kinds (for VKCode).
+const (
+	CodeBool   u32 = 1
+	CodeU8     u32 = 2
+	CodeU16    u32 = 3
+	CodeU32    u32 = 4
+	CodeU64    u32 = 5
+	CodeUsize  u32 = 6
+	CodeI8     u32 = 7
+	CodeI16    u32 = 8
+	CodeI32    u32 = 9
+	CodeI64    u32 = 10
+	CodeInt    u32 = 11
+	CodeString u32 = 12
+	CodeArray  u32 = 13 // u64Val=len, c=elemCodeValID
+	CodeStruct u32 = 14 // c=valListStart (VKField...), d=count
+)
+
+type Val struct {
+	kind   u8
+	flags  u8
+	pad    u16
+	typeID u32
+	a      u32
+	b      u32
+	c      u32
+	d      u32
+	u64Val u64
 }
 
-var frames [MaxFrames]Frame
-var nframes usize
-var fvSym [MaxFrameVars]u32
-var fvSlot [MaxFrameVars]u32
-var fvAddr [MaxFrameVars]bool
-var nfv usize
+var vals [MaxVals]Val
+var valCount u32
+var valList [MaxValList]u32
+var valListUsed u32
 
-// Reference stack for multi-assignments.
-var rstack [MaxOpStack]u32
-var rtop usize
+var comptimeFuelBudget u64 = 1_000_000
 
-// Interpreter state of the current evaluation root.
-var evalFuel u64 = DefaultFuel // --comptime-fuel
-var inFuel u64
-var inBudget u64
-var inBase usize // first frame of the current root
-
-// Failure state.
-var ifail bool
-var ifailCode u32
-var ifailMsg MsgBuf
-
-// failf fails with "comptime evaluation failed: " + mbuf[:k]; callers
-// format the detail with formatTo(mbuf[:], ...).
-func failf(code u32, k usize) {
-	ifail = true
-	ifailCode = code
-	ifailMsg.Reset()
-	ifailMsg.Extend(formatTo(ifailMsg.Spare(), CtEval+"failed: %s", mbuf[:k]))
+func valsInit() {
+	valCount = 1 // 0 = VKNone
+	vals[0] = Val{}
+	valListUsed = 0
 }
 
-func failS(code u32, s string) {
-	failf(code, formatTo(mbuf[:], "%s", s))
-}
-
-// failErr reports the value error in errTxt.
-func failErr(code u32) {
-	failf(code, formatTo(mbuf[:], "%s", errTxt.Bytes()))
-}
-
-// failSilent is a failure that was already reported (EvalError{}).
-func failSilent() {
-	ifail = true
-	ifailCode = 0
-	ifailMsg.Reset()
-}
-
-// CallStack renders the call stack above frame `base`, innermost first,
-// collapsing runs of identical frames.
-type CallStack usize
-
-func (base CallStack) Format(dst []byte) usize {
-	k := formatTo(dst, "call stack (innermost first): ")
-	b := usize(base)
-	if nframes <= b {
-		return k
-	}
-	i := nframes - 1
-	first := true
-	for g := usize(0); g < MaxFrames; g++ {
-		f := frames[i]
-		if !first {
-			k += formatTo(dst[k:], " <- ")
-		}
-		first = false
-		k += formatTo(dst[k:], "%v", FuncName(f.fn))
-		if f.site != 0 {
-			k += formatTo(dst[k:], " called at %v", PosRef(f.site))
-		}
-		j := i
-		for h := usize(0); h < MaxFrames; h++ {
-			if j == b || frames[j-1].fn != f.fn || frames[j-1].site != f.site {
-				break
-			}
-			j--
-		}
-		cnt := i - j + 1
-		if cnt > 1 {
-			k += formatTo(dst[k:], " (x%d)", cnt)
-		}
-		if j == b {
-			break
-		}
-		i = j - 1
-	}
-	return k
-}
-
-func tick() {
-	if ifail {
-		return
-	}
-	if inFuel == 0 {
-		ifail = true
-		ifailCode = E4001
-		ifailMsg.Reset()
-		ifailMsg.Extend(formatTo(ifailMsg.Spare(), CtEval+"ran out of fuel (budget %d steps); %v", inBudget, CallStack(inBase)))
-		return
-	}
-	inFuel--
-}
-
-// callComptime evaluates fn(vstack[argMark:vtop]) as a new evaluation root.
-// On failure it returns false; ifailCode (0 = already reported) and
-// ifailMsg describe the error.
-func callComptime(fn u32, argMark usize, dp usize) (Val, bool) decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		return z, false
-	}
-	saveFuel := inFuel
-	saveBudget := inBudget
-	saveBase := inBase
-	inFuel = evalFuel
-	inBudget = evalFuel
-	inBase = nframes
-	ifail = false
-	ifailCode = 0
-	hmark := vals.htop
-	r := icall(fn, z, false, argMark, vtop, 0, dp-1)
-	ok := !ifail
-	if ok {
-		r = persistVal(r, SemaDepth)
-	}
-	nframes = inBase
-	vals.htop = hmark
-	inFuel = saveFuel
-	inBudget = saveBudget
-	inBase = saveBase
-	ifail = false
-	return r, ok
-}
-
-// topBase returns the variable base of the current frame.
-func topBase() usize {
-	if nframes == 0 {
+func newVal(v Val) u32 {
+	if valCount >= MaxVals {
 		return 0
 	}
-	return frames[nframes-1].vbase
+	id := valCount
+	valCount++
+	vals[id] = v
+	return id
 }
 
-// defineIn binds sym to a fresh cell holding a copy of v in the frame whose
-// variables start at base.
-func defineIn(base usize, sym u32, v Val) {
-	if sym == 0 || symName(sym) == nameBlank {
-		return
+func makeIntVal(bits u64, signed bool, ty u32) u32 {
+	var fl u8 = 0
+	if signed {
+		fl = 1
 	}
-	cv := copyV(v)
-	top := nfv
-	for k := usize(0); k < top-base; k++ {
-		i := top - 1 - k
-		if fvSym[i] == sym {
-			if !fvAddr[i] {
-				slotSet(fvSlot[i], cv)
-				return
+	return newVal(Val{kind: VKInt, flags: fl, typeID: ty, u64Val: bits})
+}
+
+func makeFloatVal(bits u64, ty u32) u32 {
+	return newVal(Val{kind: VKFloat, typeID: ty, u64Val: bits})
+}
+
+func makeBoolVal(b bool) u32 {
+	var a u32 = 0
+	if b {
+		a = 1
+	}
+	return newVal(Val{kind: VKBool, typeID: TYBool, a: a})
+}
+
+func makeStrVal(strID u32) u32 {
+	return newVal(Val{kind: VKStr, typeID: TYString, a: strID})
+}
+
+func makeErrVal(errID u32) u32 {
+	return newVal(Val{kind: VKErr, typeID: TYError, a: errID})
+}
+
+func pushValList(items []u32) (u32, u32) {
+	n := len(items)
+	if n == 0 {
+		return 0, 0
+	}
+	if usize(valListUsed)+n > MaxValList {
+		return 0, 0
+	}
+	start := valListUsed
+	for i := usize(0); i < n; i++ {
+		valList[usize(start)+i] = items[i]
+	}
+	valListUsed += u32(n)
+	return start, u32(n)
+}
+
+func valMaskInt(bits u64, ty u32) u64 {
+	u := under(ty)
+	if u == TYU8 {
+		return bits & 0xff
+	}
+	if u == TYI8 {
+		return u64(i64(i8(bits)))
+	}
+	if u == TYU16 {
+		return bits & 0xffff
+	}
+	if u == TYI16 {
+		return u64(i64(i16(bits)))
+	}
+	if u == TYU32 {
+		return bits & 0xffffffff
+	}
+	if u == TYI32 {
+		return u64(i64(i32(bits)))
+	}
+	return bits
+}
+
+driver func valEqual(a u32, b u32) bool {
+	if a == b {
+		return true
+	}
+	if a == 0 || b == 0 {
+		return false
+	}
+	va := vals[a]
+	vb := vals[b]
+	if va.kind != vb.kind {
+		return false
+	}
+	if va.kind == VKInt {
+		return va.u64Val == vb.u64Val
+	}
+	if va.kind == VKBool || va.kind == VKErr {
+		return va.a == vb.a
+	}
+	if va.kind == VKStr {
+		return va.a == vb.a
+	}
+	if va.kind == VKEnum {
+		if va.a != vb.a || va.c != vb.c {
+			return false
+		}
+		for i := u32(0); i < va.c; i++ {
+			if !valEqual(valList[va.b+i], valList[vb.b+i]) {
+				return false
 			}
+		}
+		return true
+	}
+	if va.kind == VKArray || va.kind == VKStruct {
+		if va.b != vb.b {
+			return false
+		}
+		for i := u32(0); i < va.b; i++ {
+			if !valEqual(valList[va.a+i], valList[vb.a+i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// decodeCodeType decodes a Layer-1 VKCode value into a concrete TypeID (`El(c)`).
+driver func decodeCodeType(valID u32) u32 {
+	if valID == 0 || vals[valID].kind != VKCode {
+		return TYInvalid
+	}
+	v := vals[valID]
+	if v.a == CodeBool {
+		return TYBool
+	}
+	if v.a == CodeU8 {
+		return TYU8
+	}
+	if v.a == CodeU16 {
+		return TYU16
+	}
+	if v.a == CodeU32 {
+		return TYU32
+	}
+	if v.a == CodeU64 {
+		return TYU64
+	}
+	if v.a == CodeUsize {
+		return TYUsize
+	}
+	if v.a == CodeI8 {
+		return TYI8
+	}
+	if v.a == CodeI16 {
+		return TYI16
+	}
+	if v.a == CodeI32 {
+		return TYI32
+	}
+	if v.a == CodeI64 {
+		return TYI64
+	}
+	if v.a == CodeInt {
+		return TYInt
+	}
+	if v.a == CodeString {
+		return TYString
+	}
+	if v.a == CodeArray {
+		elem := decodeCodeType(v.c)
+		return makeArrayType(elem, v.u64Val)
+	}
+	if v.a == CodeStruct {
+		fs := fieldCount
+		for i := u32(0); i < v.d; i++ {
+			fv := vals[valList[v.c+i]]
+			if fieldCount < MaxFields {
+				fields[fieldCount] = Field{nameStr: fv.a, typeID: decodeCodeType(fv.b)}
+				fieldCount++
+			}
+		}
+		return newType(Type{kind: TKindStruct, a: fs, b: v.d})
+	}
+	return TYInvalid
+}
+
+// ---------------------------------------------------------------------------
+// Fuel-bounded Comptime Evaluator (evaluates const exprs & comptime funcs)
+
+type CTFrame struct {
+	fuel     u64
+	outOfFuel bool
+	failed   bool
+	fileID   u32
+	callOff  u32
+	depth    u32
+	// Local variable bindings (nameStr -> valID)
+	names    [MaxCTEnv]u32
+	varVals  [MaxCTEnv]u32
+	varTypes [MaxCTEnv]u32
+	nVars    u32
+	// Control flow
+	didReturn bool
+	didBreak  bool
+	didCont   bool
+	retVal    u32
+	// Current iota value (for const specs)
+	iotaVal   u32
+	pkgID     u32
+}
+
+func (ct *CTFrame) tick() bool {
+	if ct.fuel == 0 {
+		if !ct.outOfFuel {
+			ct.outOfFuel = true
+			addDiagStr(E4001, ct.fileID, ct.callOff, "comptime evaluation exceeded fuel limit")
+		}
+		ct.failed = true
+		return false
+	}
+	ct.fuel--
+	return true
+}
+
+func (ct *CTFrame) lookupLocal(nameStr u32) (u32, bool) {
+	if ct.nVars == 0 {
+		return 0, false
+	}
+	i := ct.nVars
+	for step := u32(0); step < MaxCTEnv; step++ {
+		if i == 0 {
 			break
 		}
-	}
-	if nfv >= MaxFrameVars {
-		setFull("comptime variables")
-		failSilent()
-		return
-	}
-	s := valAlloc(1, true)
-	if s == 0 {
-		failSilent()
-		return
-	}
-	slotSet(s, cv)
-	fvSym[nfv] = sym
-	fvSlot[nfv] = s
-	fvAddr[nfv] = false
-	nfv++
-}
-
-func define(sym u32, v Val) {
-	defineIn(topBase(), sym, v)
-}
-
-// lookupVar returns the index of sym in the current frame (or -1 via ok).
-func lookupVar(sym u32) (usize, bool) {
-	base := topBase()
-	top := nfv
-	for k := usize(0); k < top-base; k++ {
-		i := top - 1 - k
-		if fvSym[i] == sym {
+		i--
+		if ct.names[i] == nameStr {
 			return i, true
 		}
 	}
 	return 0, false
 }
 
-// lookupCell returns the cell slot of a variable (0 after a failure).
-func lookupCell(sym u32, id u32) u32 {
-	i, ok := lookupVar(sym)
-	if ok {
-		return fvSlot[i]
+func (ct *CTFrame) bindLocal(nameStr u32, valID u32, ty u32) {
+	if ct.nVars < MaxCTEnv {
+		ct.names[ct.nVars] = nameStr
+		ct.varVals[ct.nVars] = valID
+		ct.varTypes[ct.nVars] = ty
+		ct.nVars++
 	}
-	if symIsGlobal(sym) && symKind(sym) == SymVar {
-		failf(E2002, formatTo(mbuf[:], "cannot read package variable %v at compile time", NameRef(symName(sym))))
+}
+
+driver func ctZeroVal(ty u32) u32 {
+	if ty == 0 {
 		return 0
 	}
-	failf(E2002, formatTo(mbuf[:], "%s is not available at compile time", ntext(id)))
+	u := under(ty)
+	t := types[u]
+	if t.kind == TKindBasic {
+		if u == TYBool {
+			return makeBoolVal(false)
+		}
+		if u == TYString {
+			return makeStrVal(0)
+		}
+		if u == TYError {
+			return makeErrVal(0)
+		}
+		return makeIntVal(0, isSignedInt(u), ty)
+	}
+	if t.kind == TKindArray {
+		if t.lenVal > 4096 {
+			return 0
+		}
+		z := ctZeroVal(t.a)
+		start := valListUsed
+		for i := u64(0); i < t.lenVal; i++ {
+			if valListUsed < MaxValList {
+				valList[valListUsed] = z
+				valListUsed++
+			}
+		}
+		return newVal(Val{kind: VKArray, typeID: ty, a: start, b: u32(t.lenVal)})
+	}
+	if t.kind == TKindStruct {
+		var fs [64]u32
+		for i := u32(0); i < t.b; i++ {
+			fs[i] = ctZeroVal(fields[t.a+i].typeID)
+		}
+		s, c := pushValList(fs[:usize(t.b)])
+		return newVal(Val{kind: VKStruct, typeID: ty, a: s, b: c})
+	}
+	if t.kind == TKindEnum {
+		return newVal(Val{kind: VKEnum, typeID: ty, a: 0, b: 0, c: 0})
+	}
 	return 0
 }
 
-// icall runs fn with an optional receiver and the arguments
-// vstack[as:ae].
-func icall(fn u32, recv Val, hasRecv bool, as usize, ae usize, site u32, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
+driver func (ct *CTFrame) evalExpr(n u32) u32 {
+	if n == 0 || ct.failed || !ct.tick() {
+		return 0
 	}
-	if !hostEnsureBody(fn, dp-1) {
-		failSilent()
-		return z
+	nd := nodes[n]
+	if nd.kind == NKIntLit {
+		return makeIntVal(u64Pool[nd.b], false, TYUntypedInt)
 	}
-	fi := funcOfSym(fn)
-	if fi == 0 || funcs.items[usize(fi)].body == 0 {
-		failf(E2002, formatTo(mbuf[:], "%v has no body", NameRef(symName(fn))))
-		return z
+	if nd.kind == NKFloatLit {
+		return makeFloatVal(u64Pool[nd.b], TYUntypedFloat)
 	}
-	if funcs.items[usize(fi)].effect == EffDriver {
-		failf(E5001, formatTo(mbuf[:], "cannot call driver function %v at compile time", FuncName(fi)))
-		return z
+	if nd.kind == NKCharLit {
+		return makeIntVal(u64(nd.a), false, TYUntypedInt)
 	}
-	tick()
-	if ifail {
-		return z
+	if nd.kind == NKBoolLit {
+		return makeBoolVal(nd.a != 0)
 	}
-	if nframes-inBase >= CtMaxDepth || nframes >= MaxFrames {
-		ifail = true
-		ifailCode = E4001
-		ifailMsg.Reset()
-		ifailMsg.Extend(formatTo(ifailMsg.Spare(), CtEval+"exceeded the maximum call depth (%d); %v", CtMaxDepth, CallStack(inBase)))
-		return z
+	if nd.kind == NKStrLit {
+		return makeStrVal(nd.a)
 	}
-	vbase := nfv
-	rs := funcs.items[usize(fi)].recvSym
-	if rs != 0 && hasRecv {
-		defineIn(vbase, rs, recv)
+	if nd.kind == NKNilLit {
+		return makeErrVal(0)
 	}
-	sig := funcs.items[usize(fi)].sig
-	ps := funcs.items[usize(fi)].parS
-	np := usize(funcs.items[usize(fi)].parN)
-	nargs := ae - as
-	if sigVariadic(sig) && np > 0 && nargs+1 >= np {
-		nrest := nargs - (np - 1)
-		st := valAlloc(nrest, true)
-		for i := usize(0); i < nrest; i++ {
-			slotSet(st+u32(i), copyV(vstack[as+np-1+i]))
+	if nd.kind == NKIdent {
+		if nd.a == kwIota {
+			return makeIntVal(u64(ct.iotaVal), false, TYUntypedInt)
 		}
-		for i := usize(0); i < np-1; i++ {
-			defineIn(vbase, defs[usize(uat(ps, i))], vstack[as+i])
+		if idx, ok := ct.lookupLocal(nd.a); ok {
+			return ct.varVals[idx]
 		}
-		defineIn(vbase, defs[usize(uat(ps, np-1))], sliceOver(st, nrest))
-	} else {
-		for i := usize(0); i < np; i++ {
-			if i < nargs {
-				defineIn(vbase, defs[usize(uat(ps, i))], vstack[as+i])
+		sym := nodeSym[n]
+		if sym == 0 {
+			sym = lookupPkgOrUniverse(ct.pkgID, nd.a)
+		}
+		if sym != 0 && syms[sym].kind == SymConst {
+			if syms[sym].valID == 0 {
+				evalConstSym(sym)
+			}
+			return syms[sym].valID
+		}
+		ct.failed = true
+		return 0
+	}
+	if nd.kind == NKSelector {
+		// Package-qualified const `pkg.C`
+		sym := nodeSym[n]
+		if sym == 0 && nodes[nd.a].kind == NKIdent {
+			if targetPkg, ok := lookupFileImport(nd.fileID, nodes[nd.a].a); ok {
+				sym = lookupPkgSym(targetPkg, nd.b)
 			}
 		}
-	}
-	if ifail {
-		nfv = vbase
-		return z
-	}
-	var f Frame
-	f.fn = fi
-	f.site = site
-	f.vbase = vbase
-	frames[nframes] = f
-	nframes++
-	_ = iblock(funcs.items[usize(fi)].body, dp-1)
-	nframes--
-	ret := frames[nframes].ret
-	hasRet := frames[nframes].hasRet
-	nfv = vbase
-	if ifail {
-		return z
-	}
-	if sigNResults(sig) > 0 && !hasRet {
-		failf(E2002, formatTo(mbuf[:], "%v finished without returning a value", FuncName(fi)))
-		return z
-	}
-	return ret
-}
-
-// ---------------------------------------------------------------------------
-// Statements
-
-func iblock(bl u32, dp usize) u8 decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return CtlReturn
-	}
-	if bl == 0 {
-		return CtlNone
-	}
-	n := l1len(bl)
-	for i := usize(0); i < n; i++ {
-		c := istmt(l1at(bl, i), dp-1)
-		if ifail {
-			return CtlReturn
-		}
-		if c != CtlNone {
-			return c
-		}
-	}
-	return CtlNone
-}
-
-// evalList pushes n values of the expression list l2 of s onto vstack.
-func evalList(s u32, n usize, dp usize) decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return
-	}
-	ne2 := l2len(s)
-	if ne2 == 1 && n > 1 {
-		v := ieval(l2at(s, 0), dp-1)
-		if ifail {
-			return
-		}
-		if v is Tuple(ref, nt) && usize(nt) == n {
-			for i := usize(0); i < n; i++ {
-				vpush(slotGet(ref + u32(i)))
+		if sym != 0 && syms[sym].kind == SymConst {
+			if syms[sym].valID == 0 {
+				evalConstSym(sym)
 			}
-			return
+			return syms[sym].valID
 		}
-		failf(E2002, formatTo(mbuf[:], "expected %d values", n))
-		return
-	}
-	for i := usize(0); i < ne2; i++ {
-		v := ieval(l2at(s, i), dp-1)
-		if ifail {
-			return
+		// Enum variant without payload `Color.Red`
+		if (nodeFlags[n] & NFVariantSel) != 0 {
+			et := nodeType[n]
+			return newVal(Val{kind: VKEnum, typeID: et, a: nodeSelIdx[n], b: 0, c: 0})
 		}
-		vpush(v)
+		if et := resolveExprAsType(ct.pkgID, nd.a); et != 0 && types[under(et)].kind == TKindEnum {
+			if vidx, ok := findEnumVariant(et, nd.b); ok {
+				return newVal(Val{kind: VKEnum, typeID: et, a: vidx, b: 0, c: 0})
+			}
+		}
+		// Struct field access `x.f`
+		xv := ct.evalExpr(nd.a)
+		if xv != 0 && vals[xv].kind == VKStruct {
+			fi, _, ok := findStructField(vals[xv].typeID, nd.b)
+			if ok && fi < vals[xv].b {
+				return valList[vals[xv].a+fi]
+			}
+		}
+		ct.failed = true
+		return 0
 	}
-}
-
-func asgBinOp(op u8) u8 {
-	return match op {
-		AsgSub -> OpSub
-		AsgMul -> OpMul
-		AsgQuo -> OpDiv
-		_ -> OpAdd
+	if nd.kind == NKUnary {
+		xv := ct.evalExpr(nd.a)
+		if xv == 0 {
+			ct.failed = true
+			return 0
+		}
+		v := vals[xv]
+		if nd.op == TKAdd && v.kind == VKInt {
+			return xv
+		}
+		if nd.op == TKSub && v.kind == VKInt {
+			return makeIntVal(0-v.u64Val, true, v.typeID)
+		}
+		if nd.op == TKXor && v.kind == VKInt {
+			return makeIntVal(valMaskInt(^v.u64Val, v.typeID), v.flags != 0, v.typeID)
+		}
+		if nd.op == TKNot && v.kind == VKBool {
+			return makeBoolVal(v.a == 0)
+		}
+		ct.failed = true
+		return 0
 	}
-}
-
-func istmt(s u32, dp usize) u8 decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return CtlReturn
-	}
-	if s == 0 {
-		return CtlNone
-	}
-	k := nkind(s)
-	if k == NkBlockStmt {
-		return iblock(s, dp-1)
-	}
-	if k == NkDeclStmt {
-		d := na(s)
-		if nkind(d) == NkConstDecl {
-			n := l1len(d)
-			for i := usize(0); i < n; i++ {
-				sym := defs[usize(na(l1at(d, i)))]
-				if sym != 0 {
-					var v Val
-					if syms.items[usize(sym)].val != 0 {
-						v = slotGet(syms.items[usize(sym)].val)
+	if nd.kind == NKBinary {
+		// Short-circuit && and ||
+		if nd.op == TKLAnd {
+			lv := ct.evalExpr(nd.a)
+			if lv == 0 || vals[lv].kind != VKBool {
+				ct.failed = true
+				return 0
+			}
+			if vals[lv].a == 0 {
+				return makeBoolVal(false)
+			}
+			return ct.evalExpr(nd.b)
+		}
+		if nd.op == TKLOr {
+			lv := ct.evalExpr(nd.a)
+			if lv == 0 || vals[lv].kind != VKBool {
+				ct.failed = true
+				return 0
+			}
+			if vals[lv].a != 0 {
+				return makeBoolVal(true)
+			}
+			return ct.evalExpr(nd.b)
+		}
+		lv := ct.evalExpr(nd.a)
+		rv := ct.evalExpr(nd.b)
+		if lv == 0 || rv == 0 {
+			ct.failed = true
+			return 0
+		}
+		vl := vals[lv]
+		vr := vals[rv]
+		if nd.op == TKEql {
+			return makeBoolVal(valEqual(lv, rv))
+		}
+		if nd.op == TKNeq {
+			return makeBoolVal(!valEqual(lv, rv))
+		}
+		// Constant string concatenation
+		if nd.op == TKAdd && vl.kind == VKStr && vr.kind == VKStr {
+			sb1 := strSlice(vl.a)
+			sb2 := strSlice(vr.a)
+			var buf [4096]byte
+			p := copy(buf[:], sb1)
+			p += copy(buf[p:], sb2)
+			return makeStrVal(internBytes(buf[:p]))
+		}
+		if vl.kind == VKInt && vr.kind == VKInt {
+			resTy := nodeType[n]
+			if resTy == 0 {
+				resTy = vl.typeID
+			}
+			signed := isSignedInt(resTy) || (resTy == TYUntypedInt && (vl.flags != 0 || vr.flags != 0))
+			a := vl.u64Val
+			b := vr.u64Val
+			if nd.op == TKAdd {
+				return makeIntVal(valMaskInt(a+b, resTy), signed, resTy)
+			}
+			if nd.op == TKSub {
+				return makeIntVal(valMaskInt(a-b, resTy), signed, resTy)
+			}
+			if nd.op == TKMul {
+				return makeIntVal(valMaskInt(a*b, resTy), signed, resTy)
+			}
+			if nd.op == TKQuo {
+				if b == 0 {
+					ct.failed = true
+					return 0
+				}
+				if signed {
+					return makeIntVal(valMaskInt(u64(i64(a)/i64(b)), resTy), true, resTy)
+				}
+				return makeIntVal(valMaskInt(a/b, resTy), false, resTy)
+			}
+			if nd.op == TKRem {
+				if b == 0 {
+					ct.failed = true
+					return 0
+				}
+				if signed {
+					return makeIntVal(valMaskInt(u64(i64(a)%i64(b)), resTy), true, resTy)
+				}
+				return makeIntVal(valMaskInt(a%b, resTy), false, resTy)
+			}
+			if nd.op == TKAnd {
+				return makeIntVal(valMaskInt(a&b, resTy), signed, resTy)
+			}
+			if nd.op == TKOr {
+				return makeIntVal(valMaskInt(a|b, resTy), signed, resTy)
+			}
+			if nd.op == TKXor {
+				return makeIntVal(valMaskInt(a^b, resTy), signed, resTy)
+			}
+			if nd.op == TKShl {
+				if b >= 64 {
+					return makeIntVal(0, signed, resTy)
+				}
+				return makeIntVal(valMaskInt(a<<b, resTy), signed, resTy)
+			}
+			if nd.op == TKShr {
+				if b >= 64 {
+					if signed && i64(a) < 0 {
+						return makeIntVal(valMaskInt(^u64(0), resTy), true, resTy)
 					}
-					define(sym, v)
+					return makeIntVal(0, signed, resTy)
 				}
-			}
-		} else if nkind(d) == NkVarDecl {
-			sym := defs[usize(na(d))]
-			var v Val
-			if nc(d) != 0 {
-				v = ieval(nc(d), dp-1)
-			} else {
-				t := u32(0)
-				if sym != 0 {
-					t = syms.items[usize(sym)].typ
+				if signed {
+					return makeIntVal(valMaskInt(u64(i64(a)>>b), resTy), true, resTy)
 				}
-				v = izero(t)
+				return makeIntVal(valMaskInt(a>>b, resTy), false, resTy)
 			}
-			if ifail {
-				return CtlReturn
-			}
-			define(sym, v)
-		}
-		return CtlNone
-	}
-	if k == NkShortVarDecl {
-		nn := l1len(s)
-		m := vtop
-		evalList(s, nn, dp-1)
-		if ifail {
-			vtop = m
-			return CtlReturn
-		}
-		for i := usize(0); i < nn; i++ {
-			id := l1at(s, i)
-			if isBlank(id) {
-				continue
-			}
-			v := vstack[m+i]
-			if defs[usize(id)] != 0 {
-				define(defs[usize(id)], v)
-			} else if uses[usize(id)] != 0 {
-				c := lookupCell(uses[usize(id)], id)
-				if ifail {
-					vtop = m
-					return CtlReturn
+			if nd.op == TKLss {
+				if signed {
+					return makeBoolVal(i64(a) < i64(b))
 				}
-				slotSet(c, copyV(v))
+				return makeBoolVal(a < b)
 			}
-		}
-		vtop = m
-		return CtlNone
-	}
-	if k == NkAssignStmt {
-		if nop(s) != AsgAssign {
-			l0 := l1at(s, 0)
-			r := ilvalue(l0, dp-1)
-			if ifail {
-				return CtlReturn
-			}
-			y := ieval(l2at(s, 0), dp-1)
-			if ifail {
-				return CtlReturn
-			}
-			v := iarith(asgBinOp(nop(s)), slotGet(r), y, ntype[usize(l0)])
-			if ifail {
-				return CtlReturn
-			}
-			slotSet(r, v)
-			return CtlNone
-		}
-		nl := l1len(s)
-		rm := rtop
-		for i := usize(0); i < nl; i++ {
-			l := l1at(s, i)
-			ref := u32(0)
-			if !(nkind(l) == NkIdent && isBlank(l)) {
-				ref = ilvalue(l, dp-1)
-				if ifail {
-					rtop = rm
-					return CtlReturn
+			if nd.op == TKLeq {
+				if signed {
+					return makeBoolVal(i64(a) <= i64(b))
 				}
+				return makeBoolVal(a <= b)
 			}
-			if rtop < MaxOpStack {
-				rstack[rtop] = ref
-				rtop++
-			}
-		}
-		m := vtop
-		evalList(s, nl, dp-1)
-		if ifail {
-			vtop = m
-			rtop = rm
-			return CtlReturn
-		}
-		for i := usize(0); i < nl; i++ {
-			ref := rstack[rm+i]
-			if ref != 0 {
-				slotSet(ref, copyV(vstack[m+i]))
-			}
-		}
-		vtop = m
-		rtop = rm
-		return CtlNone
-	}
-	if k == NkIncDecStmt {
-		x := na(s)
-		r := ilvalue(x, dp-1)
-		if ifail {
-			return CtlReturn
-		}
-		op := u8(OpAdd)
-		if !nflag(s) {
-			op = OpSub
-		}
-		v := iarith(op, slotGet(r), vIntU(1), ntype[usize(x)])
-		if ifail {
-			return CtlReturn
-		}
-		slotSet(r, v)
-		return CtlNone
-	}
-	if k == NkExprStmt {
-		_ = ieval(na(s), dp-1)
-		return CtlNone
-	}
-	if k == NkReturnStmt {
-		fr := nframes - 1
-		nr := l1len(s)
-		fi := frames[fr].fn
-		if nr == 0 {
-			return CtlReturn
-		}
-		if nr == 1 && sigNResults(funcs.items[usize(fi)].sig) > 1 {
-			v := ieval(l1at(s, 0), dp-1)
-			if ifail {
-				return CtlReturn
-			}
-			frames[fr].ret = v
-			frames[fr].hasRet = true
-			return CtlReturn
-		}
-		if nr == 1 {
-			v := ieval(l1at(s, 0), dp-1)
-			if ifail {
-				return CtlReturn
-			}
-			frames[fr].ret = copyV(v)
-			frames[fr].hasRet = true
-			return CtlReturn
-		}
-		m := vtop
-		for i := usize(0); i < nr; i++ {
-			v := ieval(l1at(s, i), dp-1)
-			if ifail {
-				vtop = m
-				return CtlReturn
-			}
-			vpush(copyV(v))
-		}
-		st := valAlloc(nr, true)
-		for i := usize(0); i < nr; i++ {
-			slotSet(st+u32(i), vstack[m+i])
-		}
-		vtop = m
-		frames[fr].ret = Val.Tuple(st, u32(nr))
-		frames[fr].hasRet = true
-		return CtlReturn
-	}
-	if k == NkIfStmt {
-		c := istmt(na(s), dp-1)
-		if ifail {
-			return CtlReturn
-		}
-		if c != CtlNone {
-			return c
-		}
-		b := icond(nb(s), dp-1)
-		if ifail {
-			return CtlReturn
-		}
-		if b {
-			return iblock(nc(s), dp-1)
-		}
-		return istmt(nd(s), dp-1)
-	}
-	if k == NkForStmt {
-		c := istmt(na(s), dp-1)
-		if ifail {
-			return CtlReturn
-		}
-		if c != CtlNone {
-			return c
-		}
-		lim := inBudget + 2
-		for g := u64(0); g < lim; g++ {
-			if nb(s) != 0 {
-				b := icond(nb(s), dp-1)
-				if ifail {
-					return CtlReturn
+			if nd.op == TKGtr {
+				if signed {
+					return makeBoolVal(i64(a) > i64(b))
 				}
-				if !b {
-					return CtlNone
+				return makeBoolVal(a > b)
+			}
+			if nd.op == TKGeq {
+				if signed {
+					return makeBoolVal(i64(a) >= i64(b))
 				}
-			}
-			tick()
-			if ifail {
-				return CtlReturn
-			}
-			bc := iblock(ne(s), dp-1)
-			if ifail {
-				return CtlReturn
-			}
-			if bc == CtlBreak {
-				return CtlNone
-			}
-			if bc == CtlReturn {
-				return CtlReturn
-			}
-			_ = istmt(nc(s), dp-1)
-			if ifail {
-				return CtlReturn
+				return makeBoolVal(a >= b)
 			}
 		}
-		return CtlNone
+		ct.failed = true
+		return 0
 	}
-	if k == NkMatchStmt {
-		return imatch(s, dp-1)
-	}
-	if k == NkBreakStmt {
-		return CtlBreak
-	}
-	if k == NkContinueStmt {
-		return CtlContinue
-	}
-	if k == NkDeferStmt {
-		failS(E2002, "defer is not supported at compile time")
-		return CtlReturn
-	}
-	if k == NkScopeStmt {
-		failS(E2002, "scope is not supported at compile time")
-		return CtlReturn
-	}
-	return CtlNone
-}
-
-func icond(e u32, dp usize) bool decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return false
-	}
-	v := ieval(e, dp-1)
-	if ifail {
-		return false
-	}
-	if v is Bool(b) {
-		return b
-	}
-	failS(E2002, "non-boolean condition")
-	return false
-}
-
-func imatch(s u32, dp usize) u8 decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return CtlReturn
-	}
-	x := iscrutinee(na(s), dp-1)
-	if ifail {
-		return CtlReturn
-	}
-	i := iselectArm(x, s, dp-1)
-	if ifail {
-		return CtlReturn
-	}
-	if i >= l1len(s) {
-		return CtlNone
-	}
-	arm := l1at(s, i)
-	if nb(arm) != 0 {
-		_ = ieval(nb(arm), dp-1)
-		return CtlNone
-	}
-	return iblock(nc(arm), dp-1)
-}
-
-// imatchExpr evaluates a match expression (v0.2).
-func imatchExpr(e u32, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
-	}
-	x := iscrutinee(na(e), dp-1)
-	if ifail {
-		return z
-	}
-	i := iselectArm(x, e, dp-1)
-	if ifail {
-		return z
-	}
-	if i >= l1len(e) {
-		failS(E2002, "no match arm for the value")
-		return z
-	}
-	a := nb(l1at(e, i))
-	if nkind(a) == NkTupleExpr {
-		// v0.3: a multi-value arm gives a Tuple of copies of its values
-		return ivalueList(a, dp-1)
-	}
-	return ieval(a, dp-1)
-}
-
-// ivalueList evaluates the values of a multi-value match arm (v0.3) left
-// to right into a Tuple value.
-func ivalueList(e u32, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
-	}
-	n := l1len(e)
-	m := vtop
-	for i := usize(0); i < n; i++ {
-		v := ieval(l1at(e, i), dp-1)
-		if ifail {
-			vtop = m
-			return z
+	if nd.kind == NKSlice {
+		xv := ct.evalExpr(nd.a)
+		if xv == 0 {
+			ct.failed = true
+			return 0
 		}
-		vpush(copyV(v))
+		if vals[xv].kind == VKArray || vals[xv].kind == VKSlice {
+			var base u32 = xv
+			var baseLo u32 = 0
+			var baseLen u32 = vals[xv].b
+			if vals[xv].kind == VKSlice {
+				base = vals[xv].a
+				baseLo = vals[xv].b
+				baseLen = vals[xv].c - vals[xv].b
+			}
+			var lo u32 = 0
+			var hi u32 = baseLen
+			if nd.b != 0 {
+				lv := ct.evalExpr(nd.b)
+				if lv == 0 || vals[lv].kind != VKInt {
+					ct.failed = true
+					return 0
+				}
+				lo = u32(vals[lv].u64Val)
+			}
+			if nd.c != 0 {
+				hv := ct.evalExpr(nd.c)
+				if hv == 0 || vals[hv].kind != VKInt {
+					ct.failed = true
+					return 0
+				}
+				hi = u32(vals[hv].u64Val)
+			}
+			if lo > hi || hi > baseLen {
+				addDiagStr(E4003, nd.fileID, nd.off, "comptime slice out of bounds")
+				ct.failed = true
+				return 0
+			}
+			return newVal(Val{kind: VKSlice, typeID: nodeType[n], a: base, b: baseLo + lo, c: baseLo + hi})
+		}
+		return xv
 	}
-	st := valAlloc(n, true)
-	for i := usize(0); i < n; i++ {
-		slotSet(st+u32(i), vstack[m+i])
+	if nd.kind == NKIndex {
+		xv := ct.evalExpr(nd.a)
+		iv := ct.evalExpr(listPool[nd.b])
+		if xv == 0 || iv == 0 || vals[iv].kind != VKInt {
+			ct.failed = true
+			return 0
+		}
+		idx := vals[iv].u64Val
+		if vals[xv].kind == VKArray {
+			if idx >= u64(vals[xv].b) {
+				addDiagStr(E4003, nd.fileID, nd.off, "comptime array index out of bounds")
+				ct.failed = true
+				return 0
+			}
+			return valList[vals[xv].a+u32(idx)]
+		}
+		if vals[xv].kind == VKStr {
+			sb := strSlice(vals[xv].a)
+			if idx >= u64(len(sb)) {
+				ct.failed = true
+				return 0
+			}
+			return makeIntVal(u64(sb[usize(idx)]), false, TYU8)
+		}
+		ct.failed = true
+		return 0
 	}
-	vtop = m
-	return Val.Tuple(st, u32(n))
+	if nd.kind == NKStructLit {
+		stTy := nodeType[n]
+		if stTy == 0 {
+			stTy = resolveExprAsType(ct.pkgID, nd.a)
+		}
+		if stTy == 0 {
+			ct.failed = true
+			return 0
+		}
+		u := under(stTy)
+		if types[u].kind != TKindStruct {
+			ct.failed = true
+			return 0
+		}
+		var fvs [64]u32
+		fc := types[u].b
+		for i := u32(0); i < fc; i++ {
+			fvs[i] = ctZeroVal(fields[types[u].a+i].typeID)
+		}
+		for i := u32(0); i < nd.c; i++ {
+			fi := nodes[listPool[nd.b+i]]
+			idx, _, ok := findStructField(u, fi.a)
+			if ok && idx < fc {
+				fvs[idx] = ct.evalExpr(fi.b)
+			}
+		}
+		if ct.failed {
+			return 0
+		}
+		s, c := pushValList(fvs[:usize(fc)])
+		return newVal(Val{kind: VKStruct, typeID: stTy, a: s, b: c})
+	}
+	if nd.kind == NKArrayLit {
+		arrTy := nodeType[n]
+		u := under(arrTy)
+		if types[u].kind != TKindArray || types[u].lenVal > 4096 {
+			ct.failed = true
+			return 0
+		}
+		z := ctZeroVal(types[u].a)
+		start := valListUsed
+		arrLen := types[u].lenVal
+		for i := u64(0); i < arrLen; i++ {
+			v := z
+			if i < u64(nd.c) {
+				v = ct.evalExpr(listPool[nd.b+u32(i)])
+			}
+			if valListUsed < MaxValList {
+				valList[valListUsed] = v
+				valListUsed++
+			}
+		}
+		if ct.failed {
+			return 0
+		}
+		return newVal(Val{kind: VKArray, typeID: arrTy, a: start, b: u32(types[u].lenVal)})
+	}
+	if nd.kind == NKMatchExpr {
+		sv := ct.evalExpr(nd.a)
+		if sv == 0 {
+			ct.failed = true
+			return 0
+		}
+		for i := u32(0); i < nd.c; i++ {
+			arm := nodes[listPool[nd.b+i]]
+			savedVars := ct.nVars
+			if ct.matchPat(arm.a, sv) {
+				res := ct.evalExpr(arm.b)
+				ct.nVars = savedVars
+				return res
+			}
+			ct.nVars = savedVars
+		}
+		ct.failed = true
+		return 0
+	}
+	if nd.kind == NKCall {
+		return ct.evalCall(n)
+	}
+	ct.failed = true
+	return 0
 }
 
-// iscrutinee evaluates the scrutinee of a match (a tuple scrutinee to a
-// Tuple value, v0.2).
-func iscrutinee(e u32, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
-	}
-	if nkind(e) != NkTupleExpr {
-		return ieval(e, dp-1)
-	}
-	n := l1len(e)
-	m := vtop
-	for i := usize(0); i < n; i++ {
-		v := ieval(l1at(e, i), dp-1)
-		if ifail {
-			vtop = m
-			return z
-		}
-		vpush(v)
-	}
-	st := valAlloc(n, true)
-	for i := usize(0); i < n; i++ {
-		slotSet(st+u32(i), vstack[m+i])
-	}
-	vtop = m
-	return Val.Tuple(st, u32(n))
-}
-
-// iselectArm returns the index of the first arm of match m whose pattern
-// matches x and whose guard (evaluated after the bindings are defined)
-// holds; the arm count if none.
-func iselectArm(x Val, m u32, dp usize) usize decreases(dp) {
-	n := l1len(m)
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return n
-	}
-	for i := usize(0); i < n; i++ {
-		arm := l1at(m, i)
-		if !imatchPat(na(arm), x, SemaDepth) {
-			continue
-		}
-		g := nd(arm)
-		if g == 0 {
-			return i
-		}
-		b := icond(g, dp-1)
-		if ifail {
-			return n
-		}
-		if b {
-			return i
-		}
-	}
-	return n
-}
-
-// imatchPat reports whether x matches the checked pattern p, defining the
-// bindings of the matching pattern (finc0's types.MatchValue).
-func imatchPat(p u32, x Val, depth usize) bool decreases(depth) {
-	if depth == 0 || p == 0 {
-		return false
-	}
-	k := nkind(p)
-	if k is NkWildcardPattern | NkRestPattern {
+driver func (ct *CTFrame) matchPat(patNode u32, sv u32) bool {
+	pn := nodes[patNode]
+	if pn.kind == NKPatWild {
 		return true
 	}
-	if k == NkIdent {
-		if nvarEnum[usize(p)] != 0 {
-			return x is Enum(vi, ..) && vi == nvarIdx[usize(p)]
-		}
-		cs := patConst(p)
-		if cs != 0 {
-			return valsEqual(x, slotGet(cs))
-		}
-		if !isBlank(p) && defs[usize(p)] != 0 {
-			define(defs[usize(p)], x)
-		}
-		return true
-	}
-	if k == NkCtorPattern {
-		bsym := patBindSym(p)
-		if nvarEnum[usize(p)] == 0 {
-			cs := patConst(p)
-			if cs != 0 {
-				return valsEqual(x, slotGet(cs))
-			}
-			if bsym != 0 {
-				define(bsym, x) // v0.2: a top-level or tuple-element binding
-			}
-			return true
-		}
-		if !(x is Enum(vi, ps, _)) || vi != nvarIdx[usize(p)] {
-			return false
-		}
-		if bsym != 0 {
-			define(bsym, x)
-		}
-		np := variantPayN(nvarEnum[usize(p)], usize(nvarIdx[usize(p)]))
-		c := l1len(p)
-		for i := usize(0); i < c; i++ {
-			a := l1at(p, i)
-			if nkind(a) == NkRestPattern {
-				continue
-			}
-			if !imatchPat(a, slotGet(ps+u32(payloadIndex(p, i, np))), depth-1) {
-				return false
-			}
-		}
-		return true
-	}
-	if k == NkLiteralPattern {
-		s := nval[usize(na(p))]
-		return s != 0 && valsEqual(x, slotGet(s))
-	}
-	if k == NkAtPattern {
-		if !imatchPat(nb(p), x, depth-1) {
-			return false
-		}
-		if defs[usize(na(p))] != 0 {
-			define(defs[usize(na(p))], x) // v0.2: `x @ P`
-		}
-		return true
-	}
-	if k == NkOrPattern {
-		c := l1len(p)
-		for i := usize(0); i < c; i++ {
-			if imatchPat(l1at(p, i), x, depth-1) {
+	if pn.kind == NKPatOr {
+		for i := u32(0); i < pn.b; i++ {
+			if ct.matchPat(listPool[pn.a+i], sv) {
 				return true
 			}
 		}
 		return false
 	}
-	if k != NkTuplePattern || !(x is Tuple(ref, tn)) || usize(tn) != l1len(p) {
-		return false
+	if pn.kind == NKPatLit {
+		lv := ct.evalExpr(pn.a)
+		return valEqual(sv, lv)
 	}
-	for i := u32(0); i < tn; i++ {
-		if !imatchPat(l1at(p, usize(i)), slotGet(ref+i), depth-1) {
-			return false
-		}
-	}
-	return true
-}
-
-func izero(t u32) Val {
-	var z Val
-	if t == 0 {
-		failS(E2002, "unknown type")
-		return z
-	}
-	if isPointerT(underlying(t)) {
-		return Val.Ptr(0)
-	}
-	v, ok := zeroVal(t, true)
-	if !ok {
-		failErr(E2002)
-		return z
-	}
-	return v
-}
-
-// ---------------------------------------------------------------------------
-// Expressions
-
-func iderefSlot(v Val) u32 {
-	if v is Ptr(r) && r != 0 {
-		return r
-	}
-	failS(E2002, "nil pointer dereference")
-	return 0
-}
-
-func iarith(op u8, x Val, y Val, t u32) Val {
-	v, ok := binaryOpVal(op, x, y)
-	if !ok {
-		failErr(E2002)
-		return v
-	}
-	return wrapVal(v, t)
-}
-
-// intArg evaluates an index (0..1<<40).
-func intArg(e u32, dp usize) usize decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return 0
-	}
-	v := ieval(e, dp-1)
-	if ifail {
-		return 0
-	}
-	if !(v is Int(hi, lo)) || !((hi == 0 && lo < SignBit) || (hi == AllOnes && lo >= SignBit)) {
-		failS(E4003, "invalid index")
-		return 0
-	}
-	if hi != 0 || lo > 1<<40 {
-		failf(E4003, formatTo(mbuf[:], "index %v out of range", ValRef(v)))
-		return 0
-	}
-	return usize(lo)
-}
-
-func failIndexRange(i usize, n usize) {
-	failf(E4003, formatTo(mbuf[:], "index %d out of range [0:%d]", i, n))
-}
-
-// indexRef returns the slot of element i of an array or slice value.
-func indexRef(x Val, i usize) u32 {
-	match x {
-		Array(ref, n) -> return elemRef(ref, usize(n), i)
-		Slice(ref, lo, hi, _) -> return elemRef(ref+lo, usize(hi-lo), i)
-		NilSlice -> return elemRef(0, 0, i)
-		_ -> {}
-	}
-	failf(E2002, formatTo(mbuf[:], "cannot index value %v", ValRef(x)))
-	return 0
-}
-
-// elemRef returns the slot of element i of the n elements at ref.
-func elemRef(ref u32, n usize, i usize) u32 {
-	if i >= n {
-		failIndexRange(i, n)
-		return 0
-	}
-	return ref + u32(i)
-}
-
-func ieval(e u32, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
-	}
-	if nbytes[usize(e)] {
-		// a constant string used as []byte: a fresh copy (v0.2)
-		return byteSliceVal(strOf(slotGet(nval[usize(e)])))
-	}
-	if nval[usize(e)] != 0 {
-		return slotGet(nval[usize(e)])
-	}
-	k := nkind(e)
-	if k == NkParenExpr {
-		return ieval(na(e), dp-1)
-	}
-	if k == NkIdent {
-		sym := symbolOf(e)
-		if sym == 0 {
-			failf(E2002, formatTo(mbuf[:], "unresolved identifier %s", ntext(e)))
-			return z
-		}
-		sk := symKind(sym)
-		if sk == SymConst {
-			vs := hostConstValue(sym, dp-1)
-			if vs != 0 {
-				return slotGet(vs)
+	if pn.kind == NKPatCtor {
+		if vals[sv].kind == VKEnum {
+			et := under(vals[sv].typeID)
+			vname := nodes[pn.a].a
+			if nodes[pn.a].kind == NKSelector {
+				vname = nodes[pn.a].b
 			}
-			failSilent()
-			return z
-		}
-		if sk == SymVar {
-			c := lookupCell(sym, e)
-			if ifail {
-				return z
+			vidx, ok := findEnumVariant(et, vname)
+			if !ok || vals[sv].a != vidx {
+				return false
 			}
-			return slotGet(c)
-		}
-		failf(E2002, formatTo(mbuf[:], "%s cannot be used as a value at compile time", ntext(e)))
-		return z
-	}
-	if k == NkBinaryExpr {
-		op := nop(e)
-		if op is OpLAnd | OpLOr {
-			a := icond(na(e), dp-1)
-			if ifail {
-				return z
-			}
-			if op == OpLAnd && !a {
-				return vBool(false)
-			}
-			if op == OpLOr && a {
-				return vBool(true)
-			}
-			b := icond(nb(e), dp-1)
-			return vBool(b)
-		}
-		x := ieval(na(e), dp-1)
-		if ifail {
-			return z
-		}
-		y := ieval(nb(e), dp-1)
-		if ifail {
-			return z
-		}
-		if isCompareOp(op) {
-			v, ok := binaryOpVal(op, x, y)
-			if !ok {
-				failErr(E2002)
-				return z
-			}
-			return v
-		}
-		return iarith(op, x, y, ntype[usize(e)])
-	}
-	if k == NkUnaryExpr {
-		op := nop(e)
-		if op == OpAddr {
-			r := ilvalue(na(e), dp-1)
-			if ifail {
-				return z
-			}
-			markAddr(na(e), r)
-			return Val.Ptr(r)
-		}
-		if op == OpDeref {
-			v := ieval(na(e), dp-1)
-			if ifail {
-				return z
-			}
-			r := iderefSlot(v)
-			if ifail {
-				return z
-			}
-			return slotGet(r)
-		}
-		x := ieval(na(e), dp-1)
-		if ifail {
-			return z
-		}
-		v, ok := unaryOpVal(op, x)
-		if !ok {
-			failErr(E2002)
-			return z
-		}
-		return wrapVal(v, ntype[usize(e)])
-	}
-	if k == NkCallExpr {
-		return icallExpr(e, dp-1)
-	}
-	if k == NkIndexExpr {
-		x := ieval(na(e), dp-1)
-		if ifail {
-			return z
-		}
-		i := intArg(l1at(e, 0), dp-1)
-		if ifail {
-			return z
-		}
-		tick()
-		if ifail {
-			return z
-		}
-		if x is Ptr(_) {
-			r := iderefSlot(x)
-			if ifail {
-				return z
-			}
-			s := indexRef(slotGet(r), i)
-			if ifail {
-				return z
-			}
-			return slotGet(s)
-		}
-		if x is Str(off, n) {
-			if i >= usize(n) {
-				failIndexRange(i, usize(n))
-				return z
-			}
-			return vIntU(u64(strSpan(off, n)[i]))
-		}
-		s := indexRef(x, i)
-		if ifail {
-			return z
-		}
-		return slotGet(s)
-	}
-	if k == NkSliceExpr {
-		return islice(e, dp-1)
-	}
-	if k == NkSelectorExpr {
-		sel := nsel[usize(e)]
-		if sel == 0 || selTab.items[usize(sel)].kind != SelField {
-			if uses[usize(nb(e))] != 0 {
-				return ieval(nb(e), dp-1)
-			}
-			failf(E2002, formatTo(mbuf[:], "unsupported selector %s at compile time", ntext(nb(e))))
-			return z
-		}
-		x := ieval(na(e), dp-1)
-		if ifail {
-			return z
-		}
-		if x is Ptr(_) {
-			r := iderefSlot(x)
-			if ifail {
-				return z
-			}
-			x = slotGet(r)
-		}
-		if x is Struct(ref, _) {
-			return slotGet(ref + selTab.items[usize(sel)].index)
-		}
-		failS(E2002, NotStruct)
-		return z
-	}
-	if k == NkStructLit {
-		t := ntype[usize(e)]
-		sv := izero(t)
-		if ifail {
-			return z
-		}
-		if !(sv is Struct(ref, _)) {
-			failS(E2002, "invalid struct literal")
-			return z
-		}
-		st := underlying(t)
-		n := l1len(e)
-		for i := usize(0); i < n; i++ {
-			fi := l1at(e, i)
-			idx, found := fieldByName(st, idName(na(fi)))
-			if found {
-				v := ieval(nb(fi), dp-1)
-				if ifail {
-					return z
+			for i := u32(0); i < pn.c; i++ {
+				bn := nodes[listPool[pn.b+i]]
+				if bn.kind == NKIdent && bn.a != kwBlank && i < vals[sv].c {
+					ct.bindLocal(bn.a, valList[vals[sv].b+i], 0)
 				}
-				slotSet(ref+u32(idx), copyV(v))
 			}
+			return true
 		}
-		return sv
+		// Constant pattern
+		cv := ct.evalExpr(pn.a)
+		return valEqual(sv, cv)
 	}
-	if k == NkFuncLit {
-		failS(E2002, "function literals are not supported at compile time")
-		return z
-	}
-	if k == NkMatchExpr {
-		return imatchExpr(e, dp-1)
-	}
-	if k == NkIsExpr {
-		x := ieval(na(e), dp-1)
-		if ifail {
-			return z
-		}
-		return Val.Bool(imatchPat(nb(e), x, SemaDepth))
-	}
-	failS(E2002, "unsupported expression at compile time")
-	return z
+	return false
 }
 
-// markAddr records that the cell of a local variable has its address taken
-// (so a redefinition allocates a new cell, as finc0 does).
-func markAddr(x u32, r u32) {
-	u := unparen(x)
-	if nkind(u) != NkIdent {
-		return
+driver func (ct *CTFrame) evalCall(n u32) u32 {
+	nd := nodes[n]
+	// Check classified call if available, otherwise resolve callee by name
+	var ci CallInfo
+	if nodeCall[n] != 0 {
+		ci = calls[nodeCall[n]]
+	} else {
+		// Early const-eval before full typecheck: resolve simple ident callee
+		if nodes[nd.a].kind == NKIdent {
+			sym := lookupPkgOrUniverse(ct.pkgID, nodes[nd.a].a)
+			if sym != 0 {
+				if syms[sym].kind == SymType {
+					ci.kind = CKConv
+					ci.convType = syms[sym].typeID
+				} else if syms[sym].kind == SymBuiltin {
+					ci.kind = CKBuiltin
+					ci.builtinID = syms[sym].builtin
+				} else if syms[sym].kind == SymFunc {
+					ci.kind = CKFunc
+					ci.calleeSym = sym
+				}
+			}
+		} else if nodes[nd.a].kind == NKSelector {
+			if (nodeFlags[nd.a] & NFVariantSel) != 0 {
+				ci.kind = CKVariant
+				ci.varType = nodeType[n]
+				ci.varIdx = nodeSelIdx[nd.a]
+			} else if et := resolveExprAsType(ct.pkgID, nodes[nd.a].a); et != 0 && types[under(et)].kind == TKindEnum {
+				if vidx, ok := findEnumVariant(et, nodes[nd.a].b); ok {
+					ci.kind = CKVariant
+					ci.varType = et
+					ci.varIdx = vidx
+				}
+			}
+		}
 	}
-	sym := symbolOf(u)
-	i, ok := lookupVar(sym)
-	if ok && fvSlot[i] == r {
-		fvAddr[i] = true
-	}
-}
 
-func ilvalue(e u32, dp usize) u32 decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return 0
+	if ci.kind == CKConv {
+		if nd.c != 1 {
+			ct.failed = true
+			return 0
+		}
+		xv := ct.evalExpr(listPool[nd.b])
+		if xv == 0 {
+			ct.failed = true
+			return 0
+		}
+		if vals[xv].kind == VKInt && isIntType(ci.convType) {
+			return makeIntVal(valMaskInt(vals[xv].u64Val, ci.convType), isSignedInt(ci.convType), ci.convType)
+		}
+		if vals[xv].kind == VKBool && isBoolType(ci.convType) {
+			return xv
+		}
+		if vals[xv].kind == VKStr && isStringType(ci.convType) {
+			return xv
+		}
+		return xv
 	}
-	k := nkind(e)
-	if k == NkParenExpr {
-		return ilvalue(na(e), dp-1)
+	if ci.kind == CKVariant {
+		var pays [16]u32
+		for i := u32(0); i < nd.c; i++ {
+			pays[i] = ct.evalExpr(listPool[nd.b+i])
+		}
+		if ct.failed {
+			return 0
+		}
+		ps, pc := pushValList(pays[:usize(nd.c)])
+		return newVal(Val{kind: VKEnum, typeID: ci.varType, a: ci.varIdx, b: ps, c: pc})
 	}
-	if k == NkIdent {
-		sym := symbolOf(e)
-		if sym == 0 || symKind(sym) != SymVar {
-			failf(E2002, formatTo(mbuf[:], "cannot assign to %s", ntext(e)))
-			return 0
-		}
-		return lookupCell(sym, e)
+	if ci.kind == CKBuiltin {
+		return ct.evalBuiltin(ci.builtinID, nd.b, nd.c, nd.fileID, nd.off)
 	}
-	if k == NkIndexExpr {
-		x := na(e)
-		var base Val
-		v := ieval(x, dp-1)
-		if ifail {
+	if ci.kind == CKFunc && ci.calleeSym != 0 {
+		fnDecl := syms[ci.calleeSym].declNode
+		if fnDecl == 0 || (nodes[fnDecl].op != EffComptime && (ct.depth == 0 || nodes[fnDecl].op != EffTotal)) {
+			ct.failed = true
 			return 0
 		}
-		if v is Ptr(_) {
-			r := iderefSlot(v)
-			if ifail {
-				return 0
-			}
-			base = slotGet(r)
-		} else if isSliceT(underlying(ntype[usize(x)])) {
-			base = ieval(x, dp-1)
-		} else {
-			r := ilvalue(x, dp-1)
-			if ifail {
-				return 0
-			}
-			base = slotGet(r)
-		}
-		if ifail {
+		if ct.depth >= MaxCTDepth {
+			addDiagStr(E4001, ct.fileID, ct.callOff, "comptime recursion depth exceeded")
+			ct.failed = true
 			return 0
 		}
-		i := intArg(l1at(e, 0), dp-1)
-		if ifail {
+		// Evaluate arguments
+		var argVals [16]u32
+		for i := u32(0); i < nd.c; i++ {
+			argVals[i] = ct.evalExpr(listPool[nd.b+i])
+		}
+		if ct.failed {
 			return 0
 		}
-		tick()
-		if ifail {
+		// Create child frame sharing remaining fuel!
+		var child CTFrame
+		child.fuel = ct.fuel
+		child.fileID = ct.fileID
+		child.callOff = ct.callOff
+		child.depth = ct.depth + 1
+		child.pkgID = syms[ci.calleeSym].pkgID
+		sig := nodes[nodes[fnDecl].c]
+		lim := sig.d
+		if nd.c < lim {
+			lim = nd.c
+		}
+		for i := u32(0); i < lim; i++ {
+			pnode := nodes[listPool[sig.c+i]]
+			child.bindLocal(pnode.a, argVals[i], nodeType[pnode.b])
+		}
+		child.execBlock(nodes[fnDecl].d)
+		ct.fuel = child.fuel
+		if child.outOfFuel {
+			ct.outOfFuel = true
+		}
+		if child.failed {
+			ct.failed = true
 			return 0
 		}
-		return indexRef(base, i)
+		return child.retVal
 	}
-	if k == NkSelectorExpr {
-		sel := nsel[usize(e)]
-		if sel == 0 || selTab.items[usize(sel)].kind != SelField {
-			failf(E2002, formatTo(mbuf[:], "cannot assign to %s", ntext(nb(e))))
-			return 0
-		}
-		var base Val
-		if selTab.items[usize(sel)].indirect {
-			v := ieval(na(e), dp-1)
-			if ifail {
-				return 0
-			}
-			r := iderefSlot(v)
-			if ifail {
-				return 0
-			}
-			base = slotGet(r)
-		} else {
-			r := ilvalue(na(e), dp-1)
-			if ifail {
-				return 0
-			}
-			base = slotGet(r)
-		}
-		if base is Struct(ref, _) {
-			return ref + selTab.items[usize(sel)].index
-		}
-		failS(E2002, NotStruct)
-		return 0
-	}
-	if k == NkUnaryExpr && nop(e) == OpDeref {
-		v := ieval(na(e), dp-1)
-		if ifail {
-			return 0
-		}
-		return iderefSlot(v)
-	}
-	failS(E2002, "expression is not addressable at compile time")
+	ct.failed = true
 	return 0
 }
 
-func failSliceBounds(lo usize, hi usize, n usize) {
-	failf(E4003, formatTo(mbuf[:], "slice bounds [%d:%d] out of range [0:%d]", lo, hi, n))
-}
-
-func islice(e u32, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
+func ctExtractBytes(v u32, dst []byte) usize {
+	if v == 0 {
+		return 0
 	}
-	xe := na(e)
-	var x Val
-	if isArrayT(underlying(ntype[usize(xe)])) {
-		r := ilvalue(xe, dp-1)
-		if ifail {
-			return z
-		}
-		x = slotGet(r)
+	var base u32 = 0
+	var lo u32 = 0
+	var n u32 = 0
+	if vals[v].kind == VKSlice {
+		base = vals[v].a
+		lo = vals[v].b
+		n = vals[v].c - vals[v].b
+	} else if vals[v].kind == VKArray {
+		base = v
+		lo = 0
+		n = vals[v].b
 	} else {
-		x = ieval(xe, dp-1)
+		return 0
 	}
-	if ifail {
-		return z
+	if usize(n) > len(dst) {
+		n = u32(len(dst))
 	}
-	if x is Ptr(_) {
-		r := iderefSlot(x)
-		if ifail {
-			return z
-		}
-		x = slotGet(r)
-	}
-	lo := usize(0)
-	hi := usize(0)
-	hasHi := false
-	if nb(e) != 0 {
-		lo = intArg(nb(e), dp-1)
-		if ifail {
-			return z
+	for i := u32(0); i < n; i++ {
+		if lo+i < vals[base].b {
+			ev := valList[vals[base].a+lo+i]
+			dst[usize(i)] = byte(vals[ev].u64Val)
 		}
 	}
-	if nc(e) != 0 {
-		hi = intArg(nc(e), dp-1)
-		if ifail {
-			return z
-		}
-		hasHi = true
-	}
-	match x {
-		Str(off, sn) -> {
-			n := usize(sn)
-			if !hasHi {
-				hi = n
-			}
-			if lo > hi || hi > n {
-				failSliceBounds(lo, hi, n)
-				return z
-			}
-			return Val.Str(off+u32(lo), u32(hi-lo))
-		}
-		Array(ref, an) -> {
-			n := usize(an)
-			if !hasHi {
-				hi = n
-			}
-			if lo > hi || hi > n {
-				failSliceBounds(lo, hi, n)
-				return z
-			}
-			return Val.Slice(ref, u32(lo), u32(hi), u64(n))
-		}
-		Slice(ref, slo, shi, alen) -> {
-			capn := usize(alen) - usize(slo)
-			if !hasHi {
-				hi = usize(shi - slo)
-			}
-			if lo > hi || hi > capn {
-				failSliceBounds(lo, hi, capn)
-				return z
-			}
-			return Val.Slice(ref, slo+u32(lo), slo+u32(hi), alen)
-		}
-		NilSlice -> {
-			if lo > hi || hi > 0 {
-				failSliceBounds(lo, hi, 0)
-				return z
-			}
-			return x
-		}
-		_ -> {}
-	}
-	failS(E2002, "cannot slice value")
-	return z
+	return usize(n)
 }
 
-// ---------------------------------------------------------------------------
-// Calls
+driver func (ct *CTFrame) evalBuiltin(bid u16, argStart u32, argCount u32, fileID u32, off u32) u32 {
+	if bid == BFLen && argCount == 1 {
+		v := ct.evalExpr(listPool[argStart])
+		if v == 0 {
+			ct.failed = true
+			return 0
+		}
+		if vals[v].kind == VKArray {
+			return makeIntVal(u64(vals[v].b), false, TYUsize)
+		}
+		if vals[v].kind == VKStr {
+			return makeIntVal(u64(len(strSlice(vals[v].a))), false, TYUsize)
+		}
+	}
+	if bid == BFFormatTo && argCount >= 2 {
+		dstv := ct.evalExpr(listPool[argStart])
+		fmtv := ct.evalExpr(listPool[argStart+1])
+		if fmtv == 0 || vals[fmtv].kind != VKStr {
+			ct.failed = true
+			return 0
+		}
+		var dstBase u32 = 0
+		var dstLo u32 = 0
+		var dstCap usize = 1024
+		if dstv != 0 && vals[dstv].kind == VKSlice {
+			dstBase = vals[dstv].a
+			dstLo = vals[dstv].b
+			dstCap = usize(vals[dstv].c - vals[dstv].b)
+		} else if dstv != 0 && vals[dstv].kind == VKArray {
+			dstBase = dstv
+			dstLo = 0
+			dstCap = usize(vals[dstv].b)
+		}
+		if dstCap > 1024 {
+			dstCap = 1024
+		}
+		fb := strSlice(vals[fmtv].a)
+		var outBuf [1024]byte
+		pos := usize(0)
+		aidx := u32(2)
+		i := usize(0)
+		for step := usize(0); step < len(fb)+1; step++ {
+			if i >= len(fb) {
+				break
+			}
+			if fb[i] != '%' {
+				if pos < dstCap {
+					outBuf[pos] = fb[i]
+					pos++
+				}
+				i++
+				continue
+			}
+			i++
+			if i >= len(fb) {
+				break
+			}
+			if fb[i] == '%' {
+				if pos < dstCap {
+					outBuf[pos] = '%'
+					pos++
+				}
+				i++
+				continue
+			}
+			leftAlign := false
+			if fb[i] == '-' {
+				leftAlign = true
+				i++
+			}
+			zeroPad := false
+			if i < len(fb) && fb[i] == '0' {
+				zeroPad = true
+				i++
+			}
+			width := usize(0)
+			for sk := usize(0); sk < 8; sk++ {
+				if i >= len(fb) || !isDigit(fb[i]) {
+					break
+				}
+				width = width*10 + usize(fb[i]-'0')
+				i++
+			}
+			if i >= len(fb) || aidx >= argCount {
+				break
+			}
+			verb := fb[i]
+			i++
+			av := ct.evalExpr(listPool[argStart+aidx])
+			aidx++
+			if av == 0 {
+				ct.failed = true
+				return 0
+			}
+			var ftmp [256]byte
+			flen := usize(0)
+			isNum := false
+			if verb == 'd' && vals[av].kind == VKInt {
+				isNum = true
+				if vals[av].flags != 0 {
+					flen = formatTo(ftmp[:], "%d", i64(vals[av].u64Val))
+				} else {
+					flen = formatTo(ftmp[:], "%d", vals[av].u64Val)
+				}
+			} else if verb == 'x' && vals[av].kind == VKInt {
+				isNum = true
+				if vals[av].flags != 0 {
+					flen = formatTo(ftmp[:], "%x", i64(vals[av].u64Val))
+				} else {
+					flen = formatTo(ftmp[:], "%x", vals[av].u64Val)
+				}
+			} else if verb == 's' {
+				if vals[av].kind == VKStr {
+					flen = copy(ftmp[:], strSlice(vals[av].a))
+				} else if vals[av].kind == VKSlice || vals[av].kind == VKArray {
+					flen = ctExtractBytes(av, ftmp[:])
+				}
+			} else if verb == 'q' {
+				if vals[av].kind == VKStr {
+					flen = formatTo(ftmp[:], "%q", bytesToStr(strSlice(vals[av].a)))
+				} else if vals[av].kind == VKSlice || vals[av].kind == VKArray {
+					var rawB [256]byte
+					rn := ctExtractBytes(av, rawB[:])
+					flen = formatTo(ftmp[:], "%q", rawB[:rn])
+				}
+			} else if verb == 'c' && vals[av].kind == VKInt {
+				ftmp[0] = byte(vals[av].u64Val)
+				flen = 1
+			} else if verb == 'v' {
+				if vals[av].kind == VKBool {
+					flen = formatTo(ftmp[:], "%v", vals[av].a != 0)
+				} else if vals[av].kind == VKInt {
+					isNum = true
+					if vals[av].flags != 0 {
+						flen = formatTo(ftmp[:], "%d", i64(vals[av].u64Val))
+					} else {
+						flen = formatTo(ftmp[:], "%d", vals[av].u64Val)
+					}
+				} else if vals[av].kind == VKStr {
+					flen = copy(ftmp[:], strSlice(vals[av].a))
+				} else if vals[av].kind == VKSlice || vals[av].kind == VKArray {
+					flen = ctExtractBytes(av, ftmp[:])
+				} else if vals[av].kind == VKStruct || vals[av].kind == VKEnum {
+					origSym := typeOriginSym(vals[av].typeID)
+					if origSym != 0 {
+						if mSym, ok := findUserMethod(origSym, strFormat); ok {
+							fnDecl := syms[mSym].declNode
+							// Scratch array for Format([]byte) output
+							scArr := ctZeroVal(makeArrayType(TYU8, 64))
+							scSlice := newVal(Val{kind: VKSlice, typeID: makeSliceType(TYU8), a: scArr, b: 0, c: 64})
+							var child CTFrame
+							child.fuel = ct.fuel
+							child.fileID = ct.fileID
+							child.callOff = ct.callOff
+							child.depth = ct.depth + 1
+							child.pkgID = syms[mSym].pkgID
+							if nodes[fnDecl].b != 0 {
+								child.bindLocal(nodes[nodes[fnDecl].b].a, av, vals[av].typeID)
+							}
+							sig := nodes[nodes[fnDecl].c]
+							if sig.d >= 1 {
+								pnode := nodes[listPool[sig.c]]
+								child.bindLocal(pnode.a, scSlice, makeSliceType(TYU8))
+							}
+							child.execBlock(nodes[fnDecl].d)
+							ct.fuel = child.fuel
+							if !child.failed && child.retVal != 0 && vals[child.retVal].kind == VKInt {
+								rn := usize(vals[child.retVal].u64Val)
+								if rn > 64 {
+									rn = 64
+								}
+								for j := usize(0); j < rn; j++ {
+									ev := valList[vals[scArr].a+u32(j)]
+									ftmp[j] = byte(vals[ev].u64Val)
+								}
+								flen = rn
+							}
+						}
+					}
+				}
+			}
+			// Apply width & padding, truncating to dstCap
+			var padN usize = 0
+			if width > flen {
+				padN = width - flen
+			}
+			var padCh byte = ' '
+			if zeroPad && isNum && !leftAlign {
+				padCh = '0'
+			}
+			if !leftAlign && padN > 0 {
+				start := usize(0)
+				if padCh == '0' && flen > 0 && ftmp[0] == '-' {
+					if pos < dstCap {
+						outBuf[pos] = '-'
+						pos++
+					}
+					start = 1
+				}
+				for p := usize(0); p < padN; p++ {
+					if pos < dstCap {
+						outBuf[pos] = padCh
+						pos++
+					}
+				}
+				for j := start; j < flen; j++ {
+					if pos < dstCap {
+						outBuf[pos] = ftmp[j]
+						pos++
+					}
+				}
+			} else {
+				for j := usize(0); j < flen; j++ {
+					if pos < dstCap {
+						outBuf[pos] = ftmp[j]
+						pos++
+					}
+				}
+				if leftAlign {
+					for p := usize(0); p < padN; p++ {
+						if pos < dstCap {
+							outBuf[pos] = ' '
+							pos++
+						}
+					}
+				}
+			}
+		}
+		if dstBase != 0 && vals[dstBase].kind == VKArray {
+			for j := usize(0); j < pos; j++ {
+				idx := dstLo + u32(j)
+				if idx < vals[dstBase].b {
+					valList[vals[dstBase].a+idx] = makeIntVal(u64(outBuf[j]), false, TYU8)
+				}
+			}
+		}
+		return makeIntVal(u64(pos), false, TYUsize)
+	}
+	if bid >= BFCodeBool && bid <= BFCodeString {
+		ck := u32(bid-BFCodeBool) + CodeBool
+		return newVal(Val{kind: VKCode, a: ck, b: 0})
+	}
+	if bid == BFCodeArray && argCount == 2 {
+		lv := ct.evalExpr(listPool[argStart])
+		ev := ct.evalExpr(listPool[argStart+1])
+		if lv == 0 || ev == 0 || vals[lv].kind != VKInt || vals[ev].kind != VKCode {
+			ct.failed = true
+			return 0
+		}
+		return newVal(Val{kind: VKCode, a: CodeArray, b: vals[ev].b, c: ev, u64Val: vals[lv].u64Val})
+	}
+	if bid == BFCodeField && argCount == 2 {
+		nv := ct.evalExpr(listPool[argStart])
+		tv := ct.evalExpr(listPool[argStart+1])
+		if nv == 0 || tv == 0 || vals[nv].kind != VKStr || vals[tv].kind != VKCode {
+			ct.failed = true
+			return 0
+		}
+		return newVal(Val{kind: VKField, a: vals[nv].a, b: tv})
+	}
+	if bid == BFCodeStruct {
+		var fvs [64]u32
+		var maxLvl u32 = 0
+		for i := u32(0); i < argCount; i++ {
+			fv := ct.evalExpr(listPool[argStart+i])
+			if fv == 0 || vals[fv].kind != VKField {
+				ct.failed = true
+				return 0
+			}
+			fvs[i] = fv
+			if vals[vals[fv].b].b > maxLvl {
+				maxLvl = vals[vals[fv].b].b
+			}
+		}
+		s, c := pushValList(fvs[:usize(argCount)])
+		return newVal(Val{kind: VKCode, a: CodeStruct, b: maxLvl, c: s, d: c})
+	}
+	if bid == BFCodeUniv && argCount == 1 {
+		lv := ct.evalExpr(listPool[argStart])
+		if lv == 0 || vals[lv].kind != VKInt {
+			ct.failed = true
+			return 0
+		}
+		return newVal(Val{kind: VKCode, a: CodeBool, b: u32(vals[lv].u64Val) + 1})
+	}
+	_ = fileID
+	_ = off
+	ct.failed = true
+	return 0
+}
 
-// iargs pushes the argument values of a call onto vstack.
-func iargs(e u32, dp usize) decreases(dp) {
-	if dp == 0 {
-		tooDeep()
-		failSilent()
+driver func (ct *CTFrame) execBlock(blkNode u32) {
+	if blkNode == 0 || ct.failed {
 		return
 	}
-	n := l1len(e)
-	if n == 1 {
-		a0 := l1at(e, 0)
-		t := ntype[usize(a0)]
-		if isTupleT(t) {
-			v := ieval(a0, dp-1)
-			if ifail {
+	saved := ct.nVars
+	b := nodes[blkNode]
+	for i := u32(0); i < b.b; i++ {
+		ct.execStmt(listPool[b.a+i])
+		if ct.failed || ct.didReturn || ct.didBreak || ct.didCont {
+			break
+		}
+	}
+	ct.nVars = saved
+}
+
+driver func (ct *CTFrame) execStmt(n u32) {
+	if n == 0 || ct.failed || !ct.tick() {
+		return
+	}
+	nd := nodes[n]
+	if nd.kind == NKBlock {
+		ct.execBlock(n)
+		return
+	}
+	if nd.kind == NKReturn {
+		if nd.b > 0 {
+			ct.retVal = ct.evalExpr(listPool[nd.a])
+		}
+		ct.didReturn = true
+		return
+	}
+	if nd.kind == NKBreak {
+		ct.didBreak = true
+		return
+	}
+	if nd.kind == NKContinue {
+		ct.didCont = true
+		return
+	}
+	if nd.kind == NKDeclStmt {
+		d := nodes[nd.a]
+		if d.kind == NKVarDecl {
+			ty := nodeType[nd.a]
+			if ty == 0 && d.b != 0 {
+				ty = resolveTypeNode(ct.pkgID, d.b)
+			}
+			var v u32 = 0
+			if d.c != 0 {
+				v = ct.evalExpr(d.c)
+			} else {
+				v = ctZeroVal(ty)
+			}
+			ct.bindLocal(d.a, v, ty)
+		}
+		return
+	}
+	if nd.kind == NKShortDecl {
+		lim := nd.b
+		if nd.d < lim {
+			lim = nd.d
+		}
+		for i := u32(0); i < lim; i++ {
+			lhs := nodes[listPool[nd.a+i]]
+			v := ct.evalExpr(listPool[nd.c+i])
+			if lhs.a != kwBlank {
+				if idx, ok := ct.lookupLocal(lhs.a); ok {
+					ct.varVals[idx] = v
+				} else {
+					ct.bindLocal(lhs.a, v, vals[v].typeID)
+				}
+			}
+		}
+		return
+	}
+	if nd.kind == NKAssign {
+		lim := nd.b
+		if nd.d < lim {
+			lim = nd.d
+		}
+		for i := u32(0); i < lim; i++ {
+			lhs := listPool[nd.a+i]
+			rv := ct.evalExpr(listPool[nd.c+i])
+			if ct.failed {
 				return
 			}
-			if v is Tuple(ref, m) {
-				for i := u32(0); i < m; i++ {
-					vpush(slotGet(ref + i))
+			if nd.op != TKAssign {
+				lv := ct.evalExpr(lhs)
+				if lv != 0 && rv != 0 && vals[lv].kind == VKInt && vals[rv].kind == VKInt {
+					a := vals[lv].u64Val
+					b := vals[rv].u64Val
+					var res u64 = a
+					if nd.op == TKAddAssign {
+						res = a + b
+					} else if nd.op == TKSubAssign {
+						res = a - b
+					} else if nd.op == TKMulAssign {
+						res = a * b
+					} else if nd.op == TKQuoAssign && b != 0 {
+						res = a / b
+					} else if nd.op == TKRemAssign && b != 0 {
+						res = a % b
+					} else if nd.op == TKAndAssign {
+						res = a & b
+					} else if nd.op == TKOrAssign {
+						res = a | b
+					} else if nd.op == TKXorAssign {
+						res = a ^ b
+					} else if nd.op == TKShlAssign {
+						res = a << b
+					} else if nd.op == TKShrAssign {
+						res = a >> b
+					}
+					rv = makeIntVal(valMaskInt(res, vals[lv].typeID), vals[lv].flags != 0, vals[lv].typeID)
 				}
 			}
-			return
+			ct.assignLValue(lhs, rv)
 		}
+		return
 	}
-	for i := usize(0); i < n; i++ {
-		v := ieval(l1at(e, i), dp-1)
-		if ifail {
-			return
-		}
-		vpush(v)
-	}
-}
-
-func icallExpr(e u32, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
-	}
-	ci := ncall[usize(e)]
-	if ci == 0 {
-		failS(E2002, "unchecked call")
-		return z
-	}
-	match callTab.items[usize(ci)].kind {
-		Func(sym, ..) -> {
-			m := vtop
-			iargs(e, dp-1)
-			if ifail {
-				vtop = m
-				return z
-			}
-			r := icall(sym, z, false, m, vtop, e, dp-1)
-			vtop = m
-			return r
-		}
-		Method(sym, mi, rx, autoAddr) -> {
-			var recv Val
-			if autoAddr {
-				// x.M() means (&x).M() (v0.2)
-				r := ilvalue(rx, dp-1)
-				if ifail {
-					return z
-				}
-				markAddr(rx, r)
-				recv = Val.Ptr(r)
+	if nd.kind == NKIncDec {
+		lv := ct.evalExpr(nd.a)
+		if lv != 0 && vals[lv].kind == VKInt {
+			v := vals[lv].u64Val
+			if nd.op == TKInc {
+				v++
 			} else {
-				recv = ieval(rx, dp-1)
+				v--
 			}
-			if ifail {
-				return z
+			ct.assignLValue(nd.a, makeIntVal(valMaskInt(v, vals[lv].typeID), vals[lv].flags != 0, vals[lv].typeID))
+		}
+		return
+	}
+	if nd.kind == NKIf {
+		saved := ct.nVars
+		if nd.a != 0 {
+			ct.execStmt(nd.a)
+		}
+		cv := ct.evalExpr(nd.b)
+		if !ct.failed && cv != 0 && vals[cv].kind == VKBool {
+			if vals[cv].a != 0 {
+				ct.execBlock(nd.c)
+			} else if nd.d != 0 {
+				ct.execStmt(nd.d)
 			}
-			// the receiver type (*T for x.M() with autoAddr) is a pointer
-			ptr := meths.items[usize(mi)].ptrRecv && (autoAddr || isPointerT(ntype[usize(rx)]))
-			if !ptr && recv is Ptr(_) {
-				r := iderefSlot(recv)
-				if ifail {
-					return z
+		}
+		ct.nVars = saved
+		return
+	}
+	if nd.kind == NKFor {
+		saved := ct.nVars
+		if nd.a != 0 {
+			ct.execStmt(nd.a)
+		}
+		driver for {
+			if ct.failed || !ct.tick() {
+				break
+			}
+			if nd.b != 0 {
+				cv := ct.evalExpr(nd.b)
+				if ct.failed || cv == 0 || vals[cv].kind != VKBool || vals[cv].a == 0 {
+					break
 				}
-				recv = slotGet(r)
 			}
-			m := vtop
-			iargs(e, dp-1)
-			if ifail {
-				vtop = m
-				return z
+			ct.execBlock(nd.d)
+			if ct.didReturn {
+				break
 			}
-			r := icall(sym, recv, true, m, vtop, e, dp-1)
-			vtop = m
-			return r
+			if ct.didBreak {
+				ct.didBreak = false
+				break
+			}
+			if ct.didCont {
+				ct.didCont = false
+			}
+			if nd.c != 0 {
+				ct.execStmt(nd.c)
+			}
 		}
-		Conversion(t) -> {
-			v := ieval(l1at(e, 0), dp-1)
-			if ifail {
-				return z
-			}
-			return wrapVal(v, t)
-		}
-		Variant(_, vi) -> {
-			m := vtop
-			iargs(e, dp-1)
-			if ifail {
-				vtop = m
-				return z
-			}
-			n := vtop - m
-			st := valAlloc(n, true)
-			for i := usize(0); i < n; i++ {
-				slotSet(st+u32(i), copyV(vstack[m+i]))
-			}
-			vtop = m
-			return Val.Enum(vi, st, u32(n))
-		}
-		Builtin(b, ..) -> return ibuiltin(e, b, dp-1)
-		BuiltinMeth(..) -> failS(E2002, "builtin-method calls are not supported at compile time")
-		Value -> failS(E2002, "value calls are not supported at compile time")
-		Invalid -> failS(E2002, "invalid calls are not supported at compile time")
+		ct.nVars = saved
+		return
 	}
-	return z
+	if nd.kind == NKMatchStmt {
+		sv := ct.evalExpr(nd.a)
+		if sv == 0 {
+			ct.failed = true
+			return
+		}
+		for i := u32(0); i < nd.c; i++ {
+			arm := nodes[listPool[nd.b+i]]
+			saved := ct.nVars
+			if ct.matchPat(arm.a, sv) {
+				if nodes[arm.b].kind == NKBlock {
+					ct.execBlock(arm.b)
+				} else {
+					ct.execStmt(arm.b)
+				}
+				ct.nVars = saved
+				return
+			}
+			ct.nVars = saved
+		}
+		return
+	}
+	if nd.kind == NKExprStmt {
+		_ = ct.evalExpr(nd.a)
+		return
+	}
 }
 
-// bytesOfSlice copies the bytes of a []byte value into tmpBuf.
-func bytesOfSlice(v Val) bool {
-	if !isSliceVal(v) {
-		failS(E2002, "expected a byte slice")
-		return false
+driver func (ct *CTFrame) assignLValue(lhs u32, rv u32) {
+	nd := nodes[lhs]
+	if nd.kind == NKIdent {
+		if nd.a == kwBlank {
+			return
+		}
+		if idx, ok := ct.lookupLocal(nd.a); ok {
+			ct.varVals[idx] = rv
+		}
+		return
 	}
-	tmpBuf.Reset()
-	ref, n := sliceElems(v)
-	for i := u32(0); i < n; i++ {
-		tmpBuf.WriteByte(byte(intLo(slotGet(ref + i))))
+	if nd.kind == NKIndex {
+		// Copy-on-write update of array element `arr[i] = rv`
+		if nodes[nd.a].kind == NKIdent {
+			if idx, ok := ct.lookupLocal(nodes[nd.a].a); ok {
+				iv := ct.evalExpr(listPool[nd.b])
+				av := ct.varVals[idx]
+				if iv != 0 && av != 0 && vals[av].kind == VKArray && vals[iv].kind == VKInt {
+					pos := vals[iv].u64Val
+					if pos < u64(vals[av].b) {
+						valList[vals[av].a+u32(pos)] = rv
+					} else {
+						addDiagStr(E4003, nd.fileID, nd.off, "comptime array index out of bounds")
+						ct.failed = true
+					}
+				}
+			}
+		}
+		return
 	}
-	return true
+	if nd.kind == NKSelector {
+		if nodes[nd.a].kind == NKIdent {
+			if idx, ok := ct.lookupLocal(nodes[nd.a].a); ok {
+				sv := ct.varVals[idx]
+				if sv != 0 && vals[sv].kind == VKStruct {
+					fi, _, found := findStructField(vals[sv].typeID, nd.b)
+					if found && fi < vals[sv].b {
+						valList[vals[sv].a+fi] = rv
+					}
+				}
+			}
+		}
+	}
 }
 
-func byteSliceVal(b []byte) Val {
-	n := len(b)
-	st := valAlloc(n, true)
-	for i := usize(0); i < n; i++ {
-		slotSet(st+u32(i), vIntU(u64(b[i])))
+// evalConstExpr evaluates a standalone constant expression with full fuel budget.
+driver func evalConstExpr(pkgID u32, exprNode u32, iotaVal u32) (u32, bool) {
+	var ct CTFrame
+	ct.fuel = comptimeFuelBudget
+	ct.fileID = nodes[exprNode].fileID
+	ct.callOff = nodes[exprNode].off
+	ct.iotaVal = iotaVal
+	ct.pkgID = pkgID
+	v := ct.evalExpr(exprNode)
+	if ct.failed || v == 0 {
+		return 0, false
 	}
-	return sliceOver(st, n)
-}
-
-func tuple2(a Val, b Val) Val {
-	st := valAlloc(2, true)
-	slotSet(st, a)
-	slotSet(st+1, b)
-	return Val.Tuple(st, 2)
-}
-
-func icode(v Val) bool {
-	if !isCodeVal(v) {
-		failS(E2002, "expected a Code value")
-		return false
-	}
-	return true
-}
-
-func ibuiltin(e u32, b u8, dp usize) Val decreases(dp) {
-	var z Val
-	if dp == 0 {
-		tooDeep()
-		failSilent()
-		return z
-	}
-	m := vtop
-	iargs(e, dp-1)
-	if ifail {
-		vtop = m
-		return z
-	}
-	if b == BFFormatTo {
-		rf := iformatTo(e, m, dp-1)
-		vtop = m
-		return rf
-	}
-	r := ibuiltin0(b, m)
-	vtop = m
-	return r
-}
-
-func ibuiltin0(b u8, m usize) Val {
-	var z Val
-	if b is BFLen | BFCap {
-		x := vstack[m]
-		if x is Ptr(_) {
-			r := iderefSlot(x)
-			if ifail {
-				return z
-			}
-			x = slotGet(r)
-		}
-		match (b, x) {
-			(_, Str(_, n) | Array(_, n)) -> return vIntU(u64(n))
-			(BFCap, Slice(_, lo, _, alen)) -> return vIntU(alen - u64(lo))
-			(_, Slice(_, lo, hi, _)) -> return vIntU(u64(hi - lo))
-			(_, NilSlice) -> return vIntU(0)
-			_ -> {}
-		}
-	} else if b is BFMin | BFMax {
-		// v0.3: the first least (greatest) operand.
-		r := vstack[m]
-		n := vtop - m
-		op := u8(OpLt)
-		if b == BFMax {
-			op = OpGt
-		}
-		for i := usize(1); i < n; i++ {
-			c, ok := compareVals(op, vstack[m+i], r)
-			if !ok {
-				failS(E2002, "cannot compare the operands of min/max")
-				return z
-			}
-			if c is Bool(true) {
-				r = vstack[m+i]
-			}
-		}
-		return r
-	} else if b == BFCopy {
-		d := vstack[m]
-		s := vstack[m+1]
-		if isSliceVal(d) && isSliceVal(s) {
-			dref, dn := sliceElems(d)
-			sref, sn := sliceElems(s)
-			n := usize(min(dn, sn))
-			tmp := valAlloc(n, true)
-			for i := usize(0); i < n; i++ {
-				slotSet(tmp+u32(i), copyV(slotGet(sref+u32(i))))
-			}
-			for i := usize(0); i < n; i++ {
-				slotSet(dref+u32(i), slotGet(tmp+u32(i)))
-			}
-			return vIntU(u64(n))
-		}
-	} else if b == BFBytesEqual {
-		x := vstack[m]
-		y := vstack[m+1]
-		if !isSliceVal(x) || !isSliceVal(y) {
-			failS(E2002, "expected a byte slice")
-			return z
-		}
-		xr, nx := sliceElems(x)
-		yr, ny := sliceElems(y)
-		if nx != ny {
-			return vBool(false)
-		}
-		for i := u32(0); i < nx; i++ {
-			if byte(intLo(slotGet(xr+i))) != byte(intLo(slotGet(yr+i))) {
-				return vBool(false)
-			}
-		}
-		return vBool(true)
-	} else if b == BFStrBytes {
-		return byteSliceVal(strOf(vstack[m]))
-	} else if b == BFBytesToStr {
-		if !bytesOfSlice(vstack[m]) {
-			return z
-		}
-		return vStr(tmpBuf.Bytes())
-	} else if b == BFFormatUint {
-		u := intLo(vstack[m]) // a u64
-		var db [24]byte
-		nd, _ := formatUint(u, db[:])
-		d := vstack[m+1]
-		dref, room := sliceElems(d)
-		if nd > usize(room) {
-			return tuple2(vIntU(0), vErr(BCErrArenaFull))
-		}
-		for i := usize(0); i < nd; i++ {
-			slotSet(dref+u32(i), vIntU(u64(db[i])))
-		}
-		return tuple2(vIntU(u64(nd)), vErr(0))
-	} else if b == BFParseUint {
-		if !bytesOfSlice(vstack[m]) {
-			return z
-		}
-		v, okp := strconv.ParseUint(tmpBuf.Bytes(), 10)
-		if !okp {
-			return tuple2(vIntU(0), vErr(BCErrParse))
-		}
-		return tuple2(vIntU(v), vErr(0))
-	} else if b == BFPanic {
-		failf(E5001, formatTo(mbuf[:], "panic at compile time: %v", ValRef(vstack[m])))
-		return z
-	} else if b == BFCodeArray {
-		n, _ := valUint64(vstack[m])
-		if !icode(vstack[m+1]) {
-			return z
-		}
-		el := valAlloc(1, true)
-		slotSet(el, vstack[m+1])
-		return Val.CodeArray(n, el)
-	} else if b == BFCodeSlice {
-		if !icode(vstack[m]) {
-			return z
-		}
-		el := valAlloc(1, true)
-		slotSet(el, vstack[m])
-		return Val.CodeSlice(el)
-	} else if b == BFCodeField {
-		s := vstack[m]
-		if !icode(vstack[m+1]) {
-			return z
-		}
-		c := valAlloc(1, true)
-		slotSet(c, vstack[m+1])
-		return fieldCodeOf(s, c)
-	} else if b == BFCodeStruct {
-		sref, n := sliceElems(vstack[m])
-		st := valAlloc(usize(n), true)
-		for i := u32(0); i < n; i++ {
-			f := slotGet(sref + i)
-			if !(f is FieldCode(..)) {
-				failS(E2002, "CodeStruct: zero FieldCode element")
-				return z
-			}
-			slotSet(st+i, f)
-		}
-		return Val.CodeStruct(st, n)
-	} else if b == BFCodeUniv {
-		n, _ := valUint64(vstack[m])
-		return Val.CodeUniv(n)
-	} else if b >= BFCodeEmpty && b <= BFCodeI64 {
-		return Val.CodeBasic(b - BFCodeEmpty)
-	}
-	failf(E2002, formatTo(mbuf[:], "builtin %s is not available at compile time", builtinName(b)))
-	return z
+	return v, true
 }

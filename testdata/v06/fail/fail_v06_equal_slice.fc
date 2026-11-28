@@ -1,0 +1,12 @@
+// SINCE: v0.6
+package main
+
+func eq[T Equal](a T, b T) bool {
+	return a == b
+}
+
+driver func main() error {
+	var a [2]u8
+	_ = eq[[]u8](a[:], a[:]) // ERROR E2011
+	return nil
+}

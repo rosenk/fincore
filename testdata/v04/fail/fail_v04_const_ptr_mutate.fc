@@ -1,0 +1,17 @@
+// SINCE: v0.4
+package main
+
+type Point struct {
+	x u32
+	y u32
+}
+
+func bad(p const *Point) {
+	p.x = 7 // ERROR E2014
+}
+
+driver func main() error {
+	p := Point{x: 1, y: 2}
+	bad(&p)
+	return nil
+}

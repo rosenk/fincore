@@ -1,1933 +1,1899 @@
-// SINCE: v0.3
-// types.fc — the typed model (port of finc0's bootstrap/internal/types:
-// type.go, universe.go, info.go and the instantiation half of typexpr.go).
-//
-// Types live in a TypeArena indexed by TypeID (u32, 0 = no type); a type is
-// a TypeRec, one variant per type form. All structural types (arrays,
-// slices, pointers, structs, enums, signatures, codes, const args, tuples)
-// and generic instances are hash-consed, so type identity
-// (types.Identical) is TypeID equality. Declared named types, type
-// parameters and opaque resource types are unique records. Child lists
-// (fields, variants, params, type args, ...) are runs of a vec.ListArena;
-// they are interned as well, so equal lists are equal (start, len) pairs
-// and hash-consing compares TypeRecs with ==. The mutable state of named
-// types (underlying type, type parameters, method and class caches) lives
-// in NamedRec records.
 package main
 
-import (
-	"std/maps"
-	"std/vec"
-)
+// Unified Type System, Symbol Table, Universe Builtins, Call Classifications,
+// and x86_64 Memory Layout Calculator.
 
 const (
-	MaxTypes         = 32_768
-	TypeBuckets      = 65_536
-	MaxTypeLists     = 1 << 18
-	MaxTypeListStack = 65_536 // type lists under construction
-	MaxListRecs      = 32_768
-	ListBuckets      = 65_536
-	MaxNamedRecs     = 8192
-	MaxMethods       = 16_384
-	MaxInsts         = 8192
-	MaxPending       = 8192
-	MaxFuncs         = 16_384
-	MaxCalls         = 131_072
-	MaxSels          = 65_536
+	MaxPkgs      = 32
+	MaxSyms      = 32768
+	MaxTypes     = 32768
+	MaxFields    = 16384
+	MaxVariants  = 8192
+	MaxTypeList  = 65536
+	MaxMethods   = 4096
+	MaxCalls     = 65536
+	MaxFmtSpecs  = 4096
+	MaxFmtItems  = 16384
+	MaxCaptures  = 8192
+	MaxEffOps    = 1024
+	MaxHandles   = 1024
+	MaxDimExprs  = 8192
 )
 
-// Basic kinds (types.BasicKind) and the TypeIDs of the basic types
-// (TypeID = kind + 1; byte is u8).
+// Fixed pre-allocated Type IDs for basics and builtin resources.
 const (
-	BkInvalid       = 0
-	BkBool          = 1
-	BkU8            = 2
-	BkU16           = 3
-	BkU32           = 4
-	BkU64           = 5
-	BkI8            = 6
-	BkI16           = 7
-	BkI32           = 8
-	BkI64           = 9
-	BkInt           = 10
-	BkUsize         = 11
-	BkString        = 12
-	BkError         = 13
-	BkUntypedInt    = 14
-	BkUntypedChar   = 15
-	BkUntypedBool   = 16
-	BkUntypedString = 17
-	BkUntypedNil    = 18
-	NumBasic        = 19
+	TYInvalid    u32 = 0
+	TYBool       u32 = 1
+	TYU8         u32 = 2
+	TYU16        u32 = 3
+	TYU32        u32 = 4
+	TYU64        u32 = 5
+	TYUsize      u32 = 6
+	TYI8         u32 = 7
+	TYI16        u32 = 8
+	TYI32        u32 = 9
+	TYI64        u32 = 10
+	TYInt        u32 = 11
+	TYString     u32 = 12
+	TYError      u32 = 13
+	TYUntypedInt u32 = 14
+	TYUntypedBool u32 = 15
+	TYUntypedStr   u32 = 16
+	TYUntypedNil   u32 = 17
+	TYF32          u32 = 18
+	TYF64          u32 = 19
 
-	TyInvalid       = 1
-	TyBool          = 2
-	TyU8            = 3
-	TyU16           = 4
-	TyU32           = 5
-	TyU64           = 6
-	TyI8            = 7
-	TyI16           = 8
-	TyI32           = 9
-	TyI64           = 10
-	TyInt           = 11
-	TyUsize         = 12
-	TyString        = 13
-	TyError         = 14
-	TyUntypedInt    = 15
-	TyUntypedChar   = 16
-	TyUntypedBool   = 17
-	TyUntypedString = 18
-	TyUntypedNil    = 19
+	TYNet          u32 = 20
+	TYListener     u32 = 21
+	TYConn         u32 = 22
+	TYSignals      u32 = 23
+	TYClock        u32 = 24
+	TYContext      u32 = 25
+	TYCancelFunc   u32 = 26
+	TYScope        u32 = 27
+	TYFS           u32 = 28
+	TYEnv          u32 = 29
+	TYStdio        u32 = 30
+	TYExec         u32 = 31
+	TYFieldCode    u32 = 32
+	TYAny          u32 = 33
+	TYSlotOrigin   u32 = 34
+	TYExitStatus   u32 = 35
+	TYArena        u32 = 36
+	TYUntypedFloat u32 = 37
+	TYAtomicOrigin u32 = 38
+	TYFirstDyn     u32 = 40
 )
 
-// Effects (types.Effect): Comptime < Total < Driver.
+// Type kinds.
 const (
-	EffComptime = 0
-	EffTotal    = 1
-	EffDriver   = 2
+	TKindInvalid   u8 = 0
+	TKindBasic     u8 = 1
+	TKindBuiltin   u8 = 2
+	TKindArray     u8 = 3  // a=elemType, lenVal=arrayLen
+	TKindSlice     u8 = 4  // a=elemType
+	TKindPtr       u8 = 5  // a=elemType
+	TKindStruct    u8 = 6  // a=fieldStart, b=fieldCount
+	TKindEnum      u8 = 7  // a=varStart, b=varCount
+	TKindSig       u8 = 8  // op=effect, flags: bit0=variadic; a=paramStart, b=paramCount, c=retStart, d=retCount
+	TKindNamed     u8 = 9  // flags: bit0=isSlot; a=symID, b=underType, c=targStart, d=targCount, origin=originType
+	TKindTypeParam u8 = 10 // flags: bit0=isConst; a=symID, b=constType
+	TKindConstArg  u8 = 11 // lenVal=constVal
+	TKindCode      u8 = 12 // a=level
+	TKindTuple     u8 = 13 // a=typeListStart, b=count
+	TKindEffect    u8 = 14 // a=effSym, c=targStart, d=targCount, origin=originEffType
+	TKindResume    u8 = 15 // a=opRetType(0=void), b=handleResType(0=void)
 )
 
-// Value classes (spec 4.1).
+// Resource classes.
 const (
-	ClassValue  = 0
-	ClassScoped = 1
-	ClassLinear = 2
+	ClsValue  u8 = 0
+	ClsScoped u8 = 1
+	ClsLinear u8 = 2
 )
 
-// TypeRec is a type form. Lists are (start, len) runs of TypeArena.lists.
-// The variant order fixes the compact layout (u8, bool, 6 x u32, u64:
-// 40 bytes).
-type TypeRec enum {
-	NoType                                      // TypeID 0
-	Basic(u8)                                   // BasicKind
-	Sig(u8, bool, u32, u32, u32, u32, u32, u32) // effect, variadic, params, results, type params (generic functions)
-	Named(u32)                                  // NamedRec ID: declared named types and generic instances
-	Array(u32, u32, u64)                        // elem, length type parameter (0 = constant length), length
-	Slice(u32)                                  // elem
-	Pointer(u32)                                // elem
-	Struct(u32, u32)                            // (name, type) pairs
-	Enum(u32, u32)                              // (name, payload start, payload len) triples
-	Code(u32)                                   // level + 1 (0 = level-polymorphic `Code ?`)
-	TypeParam(u32, u32, u32, u32)               // name, symbol, index, const type (0 = type parameter)
-	ConstArg(u64)                               // value
-	Tuple(u32, u32)                             // types
-	Opaque(u32, u8)                             // name, builtin
+// Symbol kinds.
+const (
+	SymNone      u8 = 0
+	SymPkg       u8 = 1
+	SymConst     u8 = 2
+	SymVar       u8 = 3 // package-level global
+	SymLocal     u8 = 4 // function-local variable
+	SymParam     u8 = 5 // function parameter or receiver
+	SymType      u8 = 6
+	SymFunc      u8 = 7
+	SymMethod    u8 = 8
+	SymTypeParam u8 = 9
+	SymBuiltin   u8 = 10
+	SymEffect    u8 = 11
+)
+
+// Builtin function IDs.
+const (
+	BFNone        u16 = 0
+	BFLen         u16 = 1
+	BFCap         u16 = 2
+	BFCopy        u16 = 3
+	BFBytesEqual  u16 = 4
+	BFStrBytes    u16 = 5
+	BFBytesToStr  u16 = 6
+	BFFormatUint  u16 = 7
+	BFParseUint   u16 = 8
+	BFNewContext  u16 = 9
+	BFNewScope    u16 = 10
+	BFPanic       u16 = 11
+	BFFormatTo    u16 = 12
+	BFNewArena    u16 = 13
+	BFStrView     u16 = 14
+	BFNewFiberScope u16 = 15
+	BFFiberYield    u16 = 16
+	BFCodeBool    u16 = 20
+	BFCodeU8      u16 = 21
+	BFCodeU16     u16 = 22
+	BFCodeU32     u16 = 23
+	BFCodeU64     u16 = 24
+	BFCodeUsize   u16 = 25
+	BFCodeI8      u16 = 26
+	BFCodeI16     u16 = 27
+	BFCodeI32     u16 = 28
+	BFCodeI64     u16 = 29
+	BFCodeInt     u16 = 30
+	BFCodeString  u16 = 31
+	BFCodeArray   u16 = 32
+	BFCodeStruct  u16 = 33
+	BFCodeField   u16 = 34
+	BFCodeUniv    u16 = 35
+)
+
+// Builtin method IDs.
+const (
+	BMNone              u16 = 0
+	BMNetListenTCP      u16 = 1
+	BMNetDialTCP        u16 = 2
+	BMListenerAddr      u16 = 3
+	BMListenerAccept    u16 = 4
+	BMListenerClose     u16 = 5
+	BMConnRead          u16 = 6
+	BMConnWrite         u16 = 7
+	BMConnCloseWrite    u16 = 8
+	BMConnClose         u16 = 9
+	BMSignalsNotifyCtx  u16 = 10
+	BMClockNow          u16 = 11
+	BMClockSleep        u16 = 12
+	BMCtxDone           u16 = 13
+	BMCtxErr            u16 = 14
+	BMCtxWithTimeout    u16 = 15
+	BMScopeAcquireSlot  u16 = 16
+	BMScopeReleaseSlot  u16 = 17
+	BMScopeGo           u16 = 18
+	BMScopeWait         u16 = 19
+	BMScopeWaitTimeout  u16 = 20
+	BMFSReadFileInto    u16 = 21
+	BMFSWriteFile       u16 = 22
+	BMFSIsDir           u16 = 23
+	BMFSListSourceFiles u16 = 24
+	BMFSMkdirTemp       u16 = 25
+	BMFSRemoveAll       u16 = 26
+	BMEnvArgsCount      u16 = 27
+	BMEnvArg            u16 = 28
+	BMEnvGetenv         u16 = 29
+	BMStdioWriteStdout  u16 = 30
+	BMStdioWriteStderr  u16 = 31
+	BMStdioReadStdin    u16 = 32
+	BMExecRun           u16 = 33
+	BMArenaAllocBytes   u16 = 34
+	BMArenaUsed         u16 = 35
+	BMArenaCap          u16 = 36
+	BMArenaReset        u16 = 37
+	BMScopeSpawn        u16 = 38
+	BMScopeReady        u16 = 39
+	BMAtomicLoad        u16 = 40
+	BMAtomicStore       u16 = 41
+	BMAtomicAdd         u16 = 42
+	BMAtomicSwap        u16 = 43
+	BMAtomicCAS         u16 = 44
+)
+
+// Call kinds.
+const (
+	CKInvalid     u8 = 0
+	CKFunc        u8 = 1
+	CKMethod      u8 = 2
+	CKBuiltin     u8 = 3
+	CKBuiltinMeth u8 = 4
+	CKConv        u8 = 5
+	CKVariant     u8 = 6
+	CKValue       u8 = 7
+	CKEffectOp    u8 = 8
+	CKResume      u8 = 9
+)
+
+// Node flags (stored in nodeFlags[nodeID]).
+const (
+	NFImplicitBytes u16 = 1
+	NFIndirect      u16 = 2
+	NFAddressable   u16 = 4
+	NFVariantSel    u16 = 8
+	NFExhaustive    u16 = 16
+	NFGenericInst   u16 = 32
+	NFAutoAddr      u16 = 64
+	NFConstChecked  u16 = 128
+	NFBoundsProven  u16 = 256
+)
+
+// Error sentinel IDs (must match runtime/linux_amd64/sys.s .L_err_table).
+const (
+	ErrIDNil       u32 = 0
+	ErrIDEOF       u32 = 1
+	ErrIDTimeout   u32 = 2
+	ErrIDCancelled u32 = 3
+	ErrIDZeroWrite u32 = 4
+	ErrIDClosed    u32 = 5
+	ErrIDIO        u32 = 6
+	ErrIDNotFound  u32 = 7
+	ErrIDMaxDepth  u32 = 8
+	ErrIDArenaFull u32 = 9
+	ErrIDExec      u32 = 10
+	ErrIDParse     u32 = 11
+)
+
+type Pkg struct {
+	importPathStr u32
+	nameStr       u32
+	fileStart     u32
+	fileCount     u32
+	symStart      u32
+	symCount      u32
+	prefixStr     u32 // "" for root, "_pkg_<name>_" for imported
+	state         u8  // 0=unloaded, 1=loading, 2=loaded
 }
 
-// NamedRec holds a named type. Instances (origin != 0) are hash-consed by
-// (origin, type args).
-type NamedRec struct {
-	name    u32 // NameID
-	sym     u32 // declaring symbol
-	pkg     u32
-	under   u32 // underlying type (0 = not yet resolved)
-	origin  u32 // generic type (instances)
-	argS    u32 // type args (instances)
-	argN    u32
-	tpS     u32 // type params (generic declarations)
-	tpN     u32
-	methS   u32 // method IDs (ulists), valid when methOK
-	methN   u32
-	builtin u8
-	cls     u8 // value class, valid when clsOK
-	clsOK   bool
-	methOK  bool
+type Sym struct {
+	kind     u8
+	flags    u8 // bit0=untypedConst, bit1=checking, bit2=checked, bit3=ptrRecv
+	builtin  u16
+	nameStr  u32
+	pkgID    u32
+	fileID   u32
+	off      u32
+	declNode u32
+	typeID   u32
+	valID    u32
+	extra    u32 // recvTypeSym for SymMethod; tparamStart in typeList for SymFunc/SymType; funcIdx for funcs
+	extra2   u32 // tparamCount for SymFunc/SymType; variantIdx etc.
 }
 
-type TypeArena struct {
-	items   [MaxTypes]TypeRec
-	count   usize
-	table   maps.Table[TypeBuckets]
-	lists   vec.ListArena[MaxTypeLists, MaxTypeListStack, u32]
-	listTab maps.Table[ListBuckets]
-	listS   [MaxListRecs]u32 // interned list i: run (listS[i], listN[i])
-	listN   [MaxListRecs]u32
-	nlrec   usize
-	named   [MaxNamedRecs]NamedRec
-	nnamed  usize
+type Type struct {
+	kind   u8
+	op     u8 // effect for TKindSig
+	flags  u16
+	a      u32
+	b      u32
+	c      u32
+	d      u32
+	origin u32
+	lenVal u64
 }
 
-var typs TypeArena
-
-func trec(t u32) TypeRec {
-	return typs.items[usize(t)]
+type Field struct {
+	nameStr u32
+	typeID  u32
 }
 
-func tlist(s u32, i usize) u32 {
-	return typs.lists.At(usize(s) + i)
+type Variant struct {
+	nameStr   u32
+	payStart  u32 // index in typeList
+	payCount  u32
 }
 
-// tlistSlice returns the run (s, n) as a slice.
-func tlistSlice(s u32, n u32) []u32 {
-	return typs.lists.Run(s, n)
+type MethodEntry struct {
+	recvTypeSym u32 // SymID of origin named type
+	nameStr     u32
+	funcSym     u32 // SymID of SymMethod
+	ptrRecv     bool
 }
 
-func tpush(x u32) {
-	typs.lists.Push(x)
-	if typs.lists.Full() {
-		setFull("type lists")
+type CallInfo struct {
+	kind       u8
+	autoAddr   u8
+	builtinID  u16
+	calleeSym  u32 // SymFunc / SymMethod
+	recvExpr   u32
+	recvType   u32
+	sigType    u32
+	convType   u32
+	varType    u32
+	varIdx     u32
+	targStart  u32 // index in typeList
+	targCount  u32
+	fmtSpecID  u32 // index in fmtSpecs (for formatTo)
+}
+
+// FormatTo parsed directive items.
+const (
+	FmtLit    u8 = 0
+	FmtInt    u8 = 1 // %d signed
+	FmtUint   u8 = 2 // %d unsigned
+	FmtHex    u8 = 3 // %x unsigned
+	FmtHexInt u8 = 4 // %x signed
+	FmtStr    u8 = 5 // %s string
+	FmtBytes  u8 = 6 // %s []byte
+	FmtQuote  u8 = 7 // %q string/[]byte
+	FmtChar   u8 = 8 // %c u8
+	FmtBool   u8 = 9 // %v bool
+	FmtMethod u8 = 10 // %v with Format([]byte) usize method
+	FmtFloat  u8 = 11 // %f or %v float (f32/f64)
+)
+
+type FmtItem struct {
+	kind      u8
+	zeroPad   u8
+	leftAlign u8
+	isBytes   u8 // for FmtQuote
+	width     u16
+	pad       u16
+	argIdx    u32 // index into call args (0..k-1 after dst, fmt)
+	litStrID  u32 // for FmtLit
+	methSym   u32 // for FmtMethod
+	argType   u32 // for FmtMethod
+}
+
+type FmtSpec struct {
+	itemStart u32
+	itemCount u32
+}
+
+type EffectOp struct {
+	effSym  u32 // SymEffect
+	nameStr u32
+	sigType u32 // TKindSig (parameterized by effSym's type params)
+	opIdx   u32 // 0-based index within effect
+}
+
+type HandleInfo struct {
+	effType      u32  // instantiated TKindEffect
+	evLocalSym   u32  // SymLocal holding evidence pointer inside handled body
+	resType      u32  // result type of handle expr (0 = void)
+	isTailResump bool // true => Tier 1 direct call fast path; false => Tier 2/3 effect.s
+	isExpr       bool
+}
+
+// Global semantic arenas.
+var pkgs [MaxPkgs]Pkg
+var pkgCount u32
+var pkgFiles [MaxFiles]u32 // fileIDs grouped by package
+var pkgFileCount u32
+var pkgOrder [MaxPkgs]u32 // topological order (root last)
+var pkgOrderCount u32
+var rootPkgID u32
+
+var syms [MaxSyms]Sym
+var symCount u32
+var pkgSyms [MaxSyms]u32
+var pkgSymCount u32
+
+var types [MaxTypes]Type
+var typeCount u32
+var fields [MaxFields]Field
+var fieldCount u32
+var variants [MaxVariants]Variant
+var variantCount u32
+var typeList [MaxTypeList]u32
+var typeListUsed u32
+
+var methods [MaxMethods]MethodEntry
+var methodCount u32
+
+var calls [MaxCalls]CallInfo
+var callCount u32
+var fmtSpecs [MaxFmtSpecs]FmtSpec
+var fmtSpecCount u32
+var fmtItems [MaxFmtItems]FmtItem
+var fmtItemCount u32
+
+// Per-AST-node side tables.
+var nodeSym [MaxNodes]u32
+var nodeType [MaxNodes]u32
+var nodeVal [MaxNodes]u32
+var nodeCall [MaxNodes]u32
+var nodeFlags [MaxNodes]u16
+var nodeSelIdx [MaxNodes]u32 // field index or variant index for NKSelector / NKPatCtor
+var nodeInstStart [MaxNodes]u32 // typeList start for generic func/type inst
+var nodeInstCount [MaxNodes]u32
+
+// Per-function-literal capture list (indexed via litCapStart[litNode], litCapCount[litNode]).
+var litCapStart [MaxNodes]u32
+var litCapCount [MaxNodes]u32
+var capPool [MaxCaptures]u32
+var capPoolUsed u32
+
+// Algebraic effects & delimited continuation side tables (v0.3).
+var effOps [MaxEffOps]EffectOp
+var effOpCount u32
+var symEffOpStart [MaxSyms]u32
+var symEffOpCount [MaxSyms]u32
+var sigTypeEffStart [MaxTypes]u32 // typeList start of `with E1, E2` on TKindSig
+var sigTypeEffCount [MaxTypes]u32
+var fnEvStart [MaxNodes]u32 // capPool/callEvSyms start of hidden evidence SymParams on NKFuncDecl
+var fnEvCount [MaxNodes]u32
+var callEvStart [MaxCalls]u32 // callEvSyms start of lexical evidence local syms passed at CKFunc/CKMethod
+var callEvCount [MaxCalls]u32
+var callEvSyms [MaxCaptures]u32
+var callEvSymUsed u32
+var handles [MaxHandles]HandleInfo
+var handleCount u32
+var nodeHandle [MaxNodes]u32    // index into handles (1-based)
+var handleArmOpIdx [MaxNodes]u32 // resolved 0-based opIdx for NKHandleArm
+var handleArmResumeSym [MaxNodes]u32 // SymLocal of `resume` inside NKHandleArm
+
+// Symbolic array dimension expressions (QTT 0-multiplicity, FinCore v0.4).
+const (
+	DimConst u8 = 0
+	DimParam u8 = 1 // a = TypeParam symID
+	DimAdd   u8 = 2 // a = lhs DimID, b = rhs DimID (canonicalized)
+	DimSub   u8 = 3 // a = lhs DimID, b = rhs DimID
+	DimMul   u8 = 4 // a = lhs DimID, b = rhs DimID (canonicalized)
+)
+
+type DimExpr struct {
+	kind u8
+	pad  u8
+	pad2 u16
+	a    u32
+	b    u32
+	val  u64
+}
+
+var dimExprs [MaxDimExprs]DimExpr
+var dimExprCount u32
+
+// Main function symbol (set by checker).
+var mainFuncSym u32
+
+// Universe pre-interned method/builtin StrIDs.
+var strFormat u32
+
+func typesInit() {
+	pkgCount = 0
+	pkgFileCount = 0
+	pkgOrderCount = 0
+	rootPkgID = 0
+	symCount = 1 // 0 = none
+	pkgSymCount = 0
+	typeCount = TYFirstDyn
+	fieldCount = 0
+	variantCount = 0
+	typeListUsed = 0
+	methodCount = 0
+	callCount = 1 // 0 = none
+	fmtSpecCount = 1
+	fmtItemCount = 0
+	capPoolUsed = 0
+	effOpCount = 0
+	callEvSymUsed = 0
+	handleCount = 1 // 0 = none
+	dimExprCount = 1 // 0 = constant (uses Type.lenVal)
+	mainFuncSym = 0
+
+	for i := u32(0); i < TYFirstDyn; i++ {
+		types[i] = Type{}
 	}
-}
-
-func tmark() usize {
-	return typs.lists.Depth()
-}
-
-// tslice returns the pending list stack[a:top].
-func tslice(a usize) []u32 {
-	return typs.lists.Pending(a)
-}
-
-// tdiscard pops the list stack back to mark.
-func tdiscard(mark usize) {
-	typs.lists.Discard(mark)
-}
-
-func tlistsUsed() usize {
-	return typs.lists.Used()
-}
-
-func hashList(xs []u32) u64 {
-	n := len(xs)
-	h := maps.HashU64(u64(n))
-	for i := usize(0); i < n; i++ {
-		h = maps.Mix(h, u64(xs[i]))
+	for i := u32(1); i <= TYF64; i++ {
+		types[i] = Type{kind: TKindBasic, a: i}
 	}
-	return h
+	for i := TYNet; i <= TYSlotOrigin; i++ {
+		types[i] = Type{kind: TKindBuiltin, a: i}
+	}
+	types[TYArena] = Type{kind: TKindBuiltin, a: TYArena}
+	types[TYUntypedFloat] = Type{kind: TKindBasic, a: TYUntypedFloat}
+	types[TYAtomicOrigin] = Type{kind: TKindBuiltin, a: TYAtomicOrigin}
+	// CancelFunc is a linear func()
+	types[TYCancelFunc] = Type{kind: TKindBuiltin, a: TYCancelFunc}
+	// ExitStatus is struct { Code int }
+	fs := fieldCount
+	fields[fs] = Field{nameStr: internStr("Code"), typeID: TYInt}
+	fieldCount++
+	types[TYExitStatus] = Type{kind: TKindStruct, a: fs, b: 1}
+	strFormat = internStr("Format")
 }
 
-// tcommitStack interns stack[mark:top], pops it and returns its run: equal
-// lists get the same run.
-func tcommitStack(mark usize) (u32, u32) {
-	xs := typs.lists.Pending(mark)
-	if len(xs) == 0 {
-		typs.lists.Discard(mark)
+func newType(t Type) u32 {
+	if typeCount >= MaxTypes {
+		return TYInvalid
+	}
+	id := typeCount
+	typeCount++
+	types[id] = t
+	sigTypeEffStart[id] = 0
+	sigTypeEffCount[id] = 0
+	return id
+}
+
+func pushEvSyms(items []u32) (u32, u32) {
+	n := len(items)
+	if n == 0 {
 		return 0, 0
 	}
-	s := typs.listTab.Start(hashList(xs))
-	lim := typs.listTab.Cap()
-	for g := usize(0); g < lim; g++ {
-		id := typs.listTab.At(s)
-		if id == 0 {
-			if typs.nlrec == 0 {
-				typs.nlrec = 1
-			}
-			if typs.nlrec >= MaxListRecs {
-				setFull("type lists")
-				typs.lists.Discard(mark)
-				return 0, 0
-			}
-			st, n := typs.lists.Commit(mark)
-			if n == 0 {
-				setFull("type lists")
-				return 0, 0
-			}
-			r := typs.nlrec
-			typs.nlrec++
-			typs.listS[r] = st
-			typs.listN[r] = n
-			typs.listTab.Set(s, u32(r))
-			return st, n
-		}
-		if u32sEqual(typs.lists.Run(typs.listS[usize(id)], typs.listN[usize(id)]), xs) {
-			typs.lists.Discard(mark)
-			return typs.listS[usize(id)], typs.listN[usize(id)]
-		}
-		s = typs.listTab.Next(s)
+	if usize(callEvSymUsed)+n > MaxCaptures {
+		return 0, 0
 	}
-	setFull("type lists")
-	typs.lists.Discard(mark)
-	return 0, 0
-}
-
-// tcommit interns xs (a slice that may alias the list arena or the stack).
-func tcommit(xs []u32) (u32, u32) {
-	m := tmark()
-	n := len(xs)
+	start := callEvSymUsed
 	for i := usize(0); i < n; i++ {
-		tpush(xs[i])
+		callEvSyms[usize(start)+i] = items[i]
 	}
-	return tcommitStack(m)
+	callEvSymUsed += u32(n)
+	return start, u32(n)
 }
 
-func u32sEqual(a []u32, b []u32) bool {
-	n := len(a)
-	if n != len(b) {
-		return false
+func pushTypeList(items []u32) (u32, u32) {
+	n := len(items)
+	if n == 0 {
+		return 0, 0
 	}
+	if usize(typeListUsed)+n > MaxTypeList {
+		return 0, 0
+	}
+	start := typeListUsed
 	for i := usize(0); i < n; i++ {
-		if a[i] != b[i] {
-			return false
-		}
+		typeList[usize(start)+i] = items[i]
 	}
-	return true
+	typeListUsed += u32(n)
+	return start, u32(n)
 }
 
-func newTypeRec(r TypeRec) u32 {
-	if typs.count == 0 {
-		typs.count = 1
-	}
-	if typs.count >= MaxTypes {
-		setFull("types")
-		return TyInvalid
-	}
-	id := typs.count
-	typs.count++
-	typs.items[id] = r
-	return u32(id)
+func makeSliceType(elem u32) u32 {
+	return newType(Type{kind: TKindSlice, a: elem})
 }
 
-func newNamedRec(r NamedRec) u32 {
-	if typs.nnamed == 0 {
-		typs.nnamed = 1
-	}
-	if typs.nnamed >= MaxNamedRecs {
-		setFull("named types")
+func makeConstSliceType(elem u32) u32 {
+	return newType(Type{kind: TKindSlice, flags: 1, a: elem})
+}
+
+func makePtrType(elem u32) u32 {
+	return newType(Type{kind: TKindPtr, a: elem})
+}
+
+func makeConstPtrType(elem u32) u32 {
+	return newType(Type{kind: TKindPtr, flags: 1, a: elem})
+}
+
+func isConstView(ty u32) bool {
+	u := under(ty)
+	return (types[u].kind == TKindSlice || types[u].kind == TKindPtr) && types[u].flags != 0
+}
+
+func newDimExpr(d DimExpr) u32 {
+	if dimExprCount >= MaxDimExprs {
 		return 0
 	}
-	id := typs.nnamed
-	typs.nnamed++
-	typs.named[id] = r
-	return u32(id)
+	id := dimExprCount
+	dimExprCount++
+	dimExprs[id] = d
+	return id
 }
 
-func mix3(h u64, a u64, b u64, c u64) u64 {
-	return maps.Mix(maps.Mix(maps.Mix(h, a), b), c)
+func makeDimConst(v u64) u32 {
+	return newDimExpr(DimExpr{kind: DimConst, val: v})
 }
 
-// typeHash hashes the identity of a hash-consed type: its fields (lists
-// are interned) or, for an instance, its origin and type args.
-func typeHash(r TypeRec) u64 {
-	return match r {
-		NoType -> 1
-		Basic(k) -> maps.Mix(2, u64(k))
-		Sig(eff, va, ps, pn, rs, rn, ts, tn) -> mix3(mix3(mix3(3, u64(eff), boolU64(va), u64(ps)), u64(pn), u64(rs), u64(rn)), u64(ts), u64(tn), 0)
-		Named(id) -> mix3(4, u64(typs.named[usize(id)].origin), u64(typs.named[usize(id)].argS), u64(typs.named[usize(id)].argN))
-		Array(e, p, n) -> mix3(5, u64(e), u64(p), n)
-		Slice(e) -> maps.Mix(6, u64(e))
-		Pointer(e) -> maps.Mix(7, u64(e))
-		Struct(s, n) -> mix3(8, u64(s), u64(n), 0)
-		Enum(s, n) -> mix3(9, u64(s), u64(n), 0)
-		Code(l) -> maps.Mix(10, u64(l))
-		TypeParam(nm, sym, i, ct) -> mix3(mix3(11, u64(nm), u64(sym), u64(i)), u64(ct), 0, 0)
-		ConstArg(v) -> maps.Mix(12, v)
-		Tuple(s, n) -> mix3(13, u64(s), u64(n), 0)
-		Opaque(nm, b) -> mix3(14, u64(nm), u64(b), 0)
+func makeDimParam(symID u32) u32 {
+	return newDimExpr(DimExpr{kind: DimParam, a: symID})
+}
+
+driver func dimCmp(a u32, b u32) i32 {
+	if a == b {
+		return 0
 	}
+	da := dimExprs[a]
+	db := dimExprs[b]
+	if da.kind != db.kind {
+		if da.kind < db.kind {
+			return -1
+		}
+		return 1
+	}
+	if da.kind == DimConst {
+		if da.val < db.val {
+			return -1
+		}
+		if da.val > db.val {
+			return 1
+		}
+		return 0
+	}
+	if da.kind == DimParam {
+		if da.a < db.a {
+			return -1
+		}
+		if da.a > db.a {
+			return 1
+		}
+		return 0
+	}
+	c := dimCmp(da.a, db.a)
+	if c != 0 {
+		return c
+	}
+	return dimCmp(da.b, db.b)
 }
 
-func boolU64(b bool) u64 {
-	if b {
-		return 1
+driver func makeDimAdd(l u32, r u32) u32 {
+	dl := dimExprs[l]
+	dr := dimExprs[r]
+	if dl.kind == DimConst && dr.kind == DimConst {
+		return makeDimConst(dl.val + dr.val)
+	}
+	if dl.kind == DimConst && dl.val == 0 {
+		return r
+	}
+	if dr.kind == DimConst && dr.val == 0 {
+		return l
+	}
+	// Flatten (x + c1) + c2 -> x + (c1 + c2)
+	if dl.kind == DimAdd && dimExprs[dl.b].kind == DimConst && dr.kind == DimConst {
+		return makeDimAdd(dl.a, makeDimConst(dimExprs[dl.b].val+dr.val))
+	}
+	if dr.kind == DimAdd && dimExprs[dr.b].kind == DimConst && dl.kind == DimConst {
+		return makeDimAdd(dr.a, makeDimConst(dimExprs[dr.b].val+dl.val))
+	}
+	// Canonicalize commutative order so m + n == n + m!
+	if dimCmp(l, r) > 0 {
+		tmp := l
+		l = r
+		r = tmp
+	}
+	return newDimExpr(DimExpr{kind: DimAdd, a: l, b: r})
+}
+
+driver func makeDimSub(l u32, r u32) u32 {
+	dl := dimExprs[l]
+	dr := dimExprs[r]
+	if dl.kind == DimConst && dr.kind == DimConst {
+		if dl.val >= dr.val {
+			return makeDimConst(dl.val - dr.val)
+		}
+		return makeDimConst(0)
+	}
+	if dr.kind == DimConst && dr.val == 0 {
+		return l
+	}
+	if dimCmp(l, r) == 0 {
+		return makeDimConst(0)
+	}
+	return newDimExpr(DimExpr{kind: DimSub, a: l, b: r})
+}
+
+driver func makeDimMul(l u32, r u32) u32 {
+	dl := dimExprs[l]
+	dr := dimExprs[r]
+	if dl.kind == DimConst && dr.kind == DimConst {
+		return makeDimConst(dl.val * dr.val)
+	}
+	if (dl.kind == DimConst && dl.val == 0) || (dr.kind == DimConst && dr.val == 0) {
+		return makeDimConst(0)
+	}
+	if dl.kind == DimConst && dl.val == 1 {
+		return r
+	}
+	if dr.kind == DimConst && dr.val == 1 {
+		return l
+	}
+	if dimCmp(l, r) > 0 {
+		tmp := l
+		l = r
+		r = tmp
+	}
+	return newDimExpr(DimExpr{kind: DimMul, a: l, b: r})
+}
+
+driver func dimEqual(d1 u32, len1 u64, d2 u32, len2 u64) bool {
+	if d1 == 0 && d2 == 0 {
+		return len1 == len2
+	}
+	if d1 == 0 {
+		return dimExprs[d2].kind == DimConst && dimExprs[d2].val == len1
+	}
+	if d2 == 0 {
+		return dimExprs[d1].kind == DimConst && dimExprs[d1].val == len2
+	}
+	return dimCmp(d1, d2) == 0
+}
+
+driver func substDim(d u32, tpSyms []u32, targs []u32) (u32, u64) {
+	if d == 0 {
+		return 0, 0
+	}
+	de := dimExprs[d]
+	if de.kind == DimConst {
+		return 0, de.val
+	}
+	if de.kind == DimParam {
+		for i := usize(0); i < len(tpSyms); i++ {
+			if de.a == tpSyms[i] {
+				if types[targs[i]].kind == TKindConstArg {
+					if types[targs[i]].a != 0 {
+						return types[targs[i]].a, 0
+					}
+					return 0, types[targs[i]].lenVal
+				}
+				if types[targs[i]].kind == TKindTypeParam {
+					return makeDimParam(types[targs[i]].a), 0
+				}
+				return 0, 0
+			}
+		}
+		return d, 0
+	}
+	ld, lv := substDim(de.a, tpSyms, targs)
+	rd, rv := substDim(de.b, tpSyms, targs)
+	if ld == 0 && rd == 0 {
+		if de.kind == DimAdd {
+			return 0, lv + rv
+		}
+		if de.kind == DimSub {
+			if lv >= rv {
+				return 0, lv - rv
+			}
+			return 0, 0
+		}
+		if de.kind == DimMul {
+			return 0, lv * rv
+		}
+	}
+	var la u32 = ld
+	if la == 0 {
+		la = makeDimConst(lv)
+	}
+	var rb u32 = rd
+	if rb == 0 {
+		rb = makeDimConst(rv)
+	}
+	var res u32 = 0
+	if de.kind == DimAdd {
+		res = makeDimAdd(la, rb)
+	} else if de.kind == DimSub {
+		res = makeDimSub(la, rb)
+	} else {
+		res = makeDimMul(la, rb)
+	}
+	if dimExprs[res].kind == DimConst {
+		return 0, dimExprs[res].val
+	}
+	return res, 0
+}
+
+func makeArrayType(elem u32, length u64) u32 {
+	return newType(Type{kind: TKindArray, a: elem, lenVal: length})
+}
+
+func makeConstArgType(val u64) u32 {
+	return newType(Type{kind: TKindConstArg, lenVal: val})
+}
+
+func makeSlotType(elem u32) u32 {
+	var a [1]u32
+	a[0] = elem
+	ts, tc := pushTypeList(a[:])
+	return newType(Type{kind: TKindNamed, flags: 1, a: 0, b: TYSlotOrigin, c: ts, d: tc, origin: TYSlotOrigin})
+}
+
+func makeAtomicType(elem u32) u32 {
+	var a [1]u32
+	a[0] = elem
+	ts, tc := pushTypeList(a[:])
+	return newType(Type{kind: TKindNamed, flags: 2, a: 0, b: TYAtomicOrigin, c: ts, d: tc, origin: TYAtomicOrigin})
+}
+
+func isAtomicType(ty u32) bool {
+	return ty != 0 && types[ty].kind == TKindNamed && types[ty].flags == 2
+}
+
+func atomicElemType(ty u32) u32 {
+	if isAtomicType(ty) && types[ty].d == 1 {
+		return typeList[types[ty].c]
+	}
+	return TYInvalid
+}
+
+func isAtomicSupportedElem(ty u32) bool {
+	u := under(ty)
+	return u == TYU32 || u == TYU64 || u == TYI32 || u == TYI64 || u == TYUsize || u == TYInt || u == TYBool
+}
+
+func makeTupleType(items []u32) u32 {
+	ts, tc := pushTypeList(items)
+	return newType(Type{kind: TKindTuple, a: ts, b: tc})
+}
+
+func under(ty u32) u32 {
+	t := ty
+	for step := u32(0); step < 64; step++ {
+		if t == 0 || t >= typeCount {
+			return t
+		}
+		if types[t].kind == TKindNamed && types[t].flags == 0 && types[t].b != 0 {
+			t = types[t].b
+			continue
+		}
+		break
+	}
+	return t
+}
+
+func isIntType(ty u32) bool {
+	u := under(ty)
+	return u >= TYU8 && u <= TYInt
+}
+
+func isUnsignedInt(ty u32) bool {
+	u := under(ty)
+	return u >= TYU8 && u <= TYUsize
+}
+
+func isSignedInt(ty u32) bool {
+	u := under(ty)
+	return u >= TYI8 && u <= TYInt
+}
+
+func isFloatType(ty u32) bool {
+	u := under(ty)
+	return u == TYF32 || u == TYF64
+}
+
+// Shallow static generic constraints (FinCore v0.6 — zero vtables, 100% monomorphized).
+// Stored in TKindTypeParam.flags >> 1 (bit 0 = isConst):
+//   0 = any, 1 = Equal, 2 = Ordered, 3 = Numeric
+const (
+	ConstrAny     u16 = 0
+	ConstrEqual   u16 = 1
+	ConstrOrdered u16 = 2
+	ConstrNumeric u16 = 3
+)
+
+func tpConstraint(ty u32) u16 {
+	if ty == 0 || ty >= typeCount {
+		return 0
+	}
+	if types[ty].kind == TKindTypeParam && (types[ty].flags&1) == 0 {
+		return types[ty].flags >> 1
 	}
 	return 0
 }
 
-// sameType reports whether x and r are the same hash-consed type.
-func sameType(x TypeRec, r TypeRec) bool {
-	if x is Named(xn) && r is Named(rn) {
-		a := typs.named[usize(xn)]
-		b := typs.named[usize(rn)]
-		return a.origin == b.origin && a.argS == b.argS && a.argN == b.argN
+func constraintFlagsForStr(sid u32) u16 {
+	s := strSlice(sid)
+	if sliceEq(s, strBytes("Equal")) {
+		return ConstrEqual << 1
 	}
-	return x == r
+	if sliceEq(s, strBytes("Ordered")) {
+		return ConstrOrdered << 1
+	}
+	if sliceEq(s, strBytes("Numeric")) {
+		return ConstrNumeric << 1
+	}
+	return 0
 }
 
-// internType returns the canonical TypeID of r (whose lists are interned)
-// and whether it is new. An instance's NamedRec must be the last one
-// allocated; it is released if the instance already exists.
-func internType(r TypeRec) (u32, bool) {
-	s := typs.table.Start(typeHash(r))
-	lim := typs.table.Cap()
-	for g := usize(0); g < lim; g++ {
-		id := typs.table.At(s)
-		if id == 0 {
-			nid := newTypeRec(r)
-			if nid != TyInvalid {
-				typs.table.Set(s, nid)
+driver func isEqualType(ty u32) bool {
+	if ty == 0 {
+		return true
+	}
+	if types[ty].kind == TKindTypeParam {
+		if (types[ty].flags & 1) != 0 {
+			return true
+		}
+		return tpConstraint(ty) >= ConstrEqual
+	}
+	u := under(ty)
+	t := types[u]
+	if t.kind == TKindBasic {
+		return true
+	}
+	if t.kind == TKindPtr {
+		return true
+	}
+	if t.kind == TKindArray {
+		return isEqualType(t.a)
+	}
+	if t.kind == TKindStruct {
+		for i := u32(0); i < t.b; i++ {
+			if !isEqualType(fields[t.a+i].typeID) {
+				return false
 			}
-			return nid, true
 		}
-		if sameType(typs.items[usize(id)], r) {
-			if r is Named(_) {
-				typs.nnamed--
-			}
-			return id, false
-		}
-		s = typs.table.Next(s)
+		return true
 	}
-	setFull("type table")
-	return TyInvalid, false
-}
-
-func intern1(r TypeRec) u32 {
-	t, _ := internType(r)
-	return t
-}
-
-func emptyU32() []u32 {
-	return tslice(tmark())
-}
-
-// ---------------------------------------------------------------------------
-// Constructors
-
-func initBasicTypes() {
-	typs.count = 1
-	for k := u8(0); k < NumBasic; k++ {
-		_ = newTypeRec(TypeRec.Basic(k))
-	}
-}
-
-func mkArray(n u64, lenParam u32, elem u32) u32 {
-	return intern1(TypeRec.Array(elem, lenParam, n))
-}
-
-func mkSlice(elem u32) u32 {
-	return intern1(TypeRec.Slice(elem))
-}
-
-func mkPointer(elem u32) u32 {
-	return intern1(TypeRec.Pointer(elem))
-}
-
-// mkCode returns `Code level` (level < 0: level-polymorphic).
-func mkCode(level int) u32 {
-	if level >= 0 {
-		return intern1(TypeRec.Code(u32(level + 1)))
-	}
-	return intern1(TypeRec.Code(0))
-}
-
-func codeLevel(t u32) int {
-	return match trec(t) {
-		Code(l) -> int(l) - 1
-		_ -> -1
-	}
-}
-
-func mkConstArg(v u64) u32 {
-	return intern1(TypeRec.ConstArg(v))
-}
-
-// mkStruct interns a struct from (name, type) pairs on the stack [mark:top].
-func mkStruct(mark usize) u32 {
-	s, n := tcommitStack(mark)
-	return intern1(TypeRec.Struct(s, n))
-}
-
-// mkEnum interns an enum from (name, payS, payN) triples on the stack.
-func mkEnum(mark usize) u32 {
-	s, n := tcommitStack(mark)
-	return intern1(TypeRec.Enum(s, n))
-}
-
-// mkSig interns a signature: params stack[m1:m2], results [m2:m3],
-// type params [m3:top].
-func mkSig(eff u8, variadic bool, m1 usize, m2 usize, m3 usize) u32 {
-	ts, tn := tcommitStack(m3)
-	rs, rn := tcommitStack(m2)
-	ps, pn := tcommitStack(m1)
-	return intern1(TypeRec.Sig(eff, variadic, ps, pn, rs, rn, ts, tn))
-}
-
-// mkSigLists interns a signature from lists.
-func mkSigLists(eff u8, variadic bool, ps []u32, rs []u32, tps []u32) u32 {
-	s1, n1 := tcommit(ps)
-	s2, n2 := tcommit(rs)
-	s3, n3 := tcommit(tps)
-	return intern1(TypeRec.Sig(eff, variadic, s1, n1, s2, n2, s3, n3))
-}
-
-func mkTuple(xs []u32) u32 {
-	s, n := tcommit(xs)
-	return intern1(TypeRec.Tuple(s, n))
-}
-
-// mkTupleStack interns a tuple of the types on the stack [mark:top].
-func mkTupleStack(mark usize) u32 {
-	s, n := tcommitStack(mark)
-	return intern1(TypeRec.Tuple(s, n))
-}
-
-func newNamed(name u32, sym u32, pkg u32, builtin u8) u32 {
-	var r NamedRec
-	r.name = name
-	r.sym = sym
-	r.pkg = pkg
-	r.builtin = builtin
-	id := newNamedRec(r)
-	if id == 0 {
-		return TyInvalid
-	}
-	return newTypeRec(TypeRec.Named(id))
-}
-
-func newTypeParam(name u32, sym u32, index u32, constT u32) u32 {
-	return newTypeRec(TypeRec.TypeParam(name, sym, index, constT))
-}
-
-func newOpaque(name u32, builtin u8) u32 {
-	return newTypeRec(TypeRec.Opaque(name, builtin))
-}
-
-// ---------------------------------------------------------------------------
-// Type forms
-
-func isNamedT(t u32) bool {
-	return trec(t) is Named(_)
-}
-
-func isArrayT(t u32) bool {
-	return trec(t) is Array(..)
-}
-
-func isSliceT(t u32) bool {
-	return trec(t) is Slice(_)
-}
-
-func isPointerT(t u32) bool {
-	return trec(t) is Pointer(_)
-}
-
-func isStructT(t u32) bool {
-	return trec(t) is Struct(..)
-}
-
-func isEnumT(t u32) bool {
-	return trec(t) is Enum(..)
-}
-
-func isSigT(t u32) bool {
-	return trec(t) is Sig(..)
-}
-
-func isTypeParamT(t u32) bool {
-	return trec(t) is TypeParam(..)
-}
-
-func isTupleT(t u32) bool {
-	return trec(t) is Tuple(..)
-}
-
-// ---------------------------------------------------------------------------
-// Accessors and predicates
-
-// namedID returns the NamedRec of a named type (0 for other types).
-func namedID(t u32) u32 {
-	return match trec(t) {
-		Named(id) -> id
-		_ -> 0
-	}
-}
-
-func underlying(t u32) u32 {
-	if trec(t) is Named(id) {
-		u := typs.named[usize(id)].under
-		if u == 0 {
-			return TyInvalid
-		}
-		return u
-	}
-	return t
-}
-
-// namedUnder returns the underlying type of a named type as recorded (0 =
-// not yet resolved or not a named type).
-func namedUnder(t u32) u32 {
-	return nrec(t).under
-}
-
-func setNamedUnder(t u32, u u32) {
-	id := namedID(t)
-	if id != 0 {
-		typs.named[usize(id)].under = u
-	}
-}
-
-// setNamedClass caches the value class of a named type.
-func setNamedClass(t u32, c u8) {
-	id := namedID(t)
-	if id != 0 {
-		typs.named[usize(id)].cls = c
-		typs.named[usize(id)].clsOK = true
-	}
-}
-
-// namedClass returns the cached class of a named type (ok == false if none).
-func namedClass(t u32) (u8, bool) {
-	r := nrec(t)
-	return r.cls, r.clsOK
-}
-
-func isInvalid(t u32) bool {
-	return t is 0 | TyInvalid
-}
-
-func basicKind(t u32) u8 {
-	return match trec(underlying(t)) {
-		Basic(k) -> k
-		_ -> BkInvalid
-	}
-}
-
-func isInteger(t u32) bool {
-	k := basicKind(t)
-	return (k >= BkU8 && k <= BkUsize) || k is BkUntypedInt | BkUntypedChar
-}
-
-func isUnsigned(t u32) bool {
-	k := basicKind(t)
-	return k >= BkU8 && k <= BkU64 || k == BkUsize
-}
-
-func isUntyped(t u32) bool {
-	k := basicKind(t)
-	return k >= BkUntypedInt && k <= BkUntypedNil
-}
-
-func isBoolean(t u32) bool {
-	k := basicKind(t)
-	return k is BkBool | BkUntypedBool
-}
-
-func isString(t u32) bool {
-	k := basicKind(t)
-	return k is BkString | BkUntypedString
-}
-
-// intInfo returns bit width and signedness of an integer type.
-func intInfo(t u32) (u32, bool, bool) {
-	k := basicKind(t)
-	match k {
-		BkU8 -> return 8, false, true
-		BkU16 -> return 16, false, true
-		BkU32 -> return 32, false, true
-		BkU64 | BkUsize -> return 64, false, true
-		BkI8 -> return 8, true, true
-		BkI16 -> return 16, true, true
-		BkI32 -> return 32, true, true
-		BkI64 | BkInt -> return 64, true, true
-		_ -> return 0, false, false
-	}
-}
-
-func isPolyCode(t u32) bool {
-	return trec(t) is Code(0)
-}
-
-// defaultOf returns the default type of an untyped type (types.Default).
-func defaultOf(t u32) u32 {
-	return match basicKind(t) {
-		BkUntypedInt -> TyInt
-		BkUntypedChar -> TyU8
-		BkUntypedBool -> TyBool
-		BkUntypedString -> TyString
-		_ if isPolyCode(t) -> mkCode(0)
-		_ -> t
-	}
-}
-
-// typeName returns the name of a named type, type parameter or opaque type.
-func typeName(t u32) u32 {
-	return match trec(t) {
-		Named(id) -> typs.named[usize(id)].name
-		TypeParam(nm, ..) -> nm
-		Opaque(nm, _) -> nm
-		_ -> 0
-	}
-}
-
-// Type parameters.
-func tpSym(t u32) u32 {
-	return match trec(t) {
-		TypeParam(_, sym, ..) -> sym
-		_ -> 0
-	}
-}
-
-// tpConstType returns the type of a const type parameter (0 for a type
-// parameter).
-func tpConstType(t u32) u32 {
-	return match trec(t) {
-		TypeParam(.., ct) -> ct
-		_ -> 0
-	}
-}
-
-func tpIsConst(t u32) bool {
-	return tpConstType(t) != 0
-}
-
-// Struct fields: pairs (name, type).
-func nfields(st u32) usize {
-	return match trec(st) {
-		Struct(_, n) -> usize(n) / 2
-		_ -> 0
-	}
-}
-
-func fieldName(st u32, i usize) u32 {
-	return match trec(st) {
-		Struct(s, _) -> tlist(s, 2*i)
-		_ -> 0
-	}
-}
-
-func fieldType(st u32, i usize) u32 {
-	return match trec(st) {
-		Struct(s, _) -> tlist(s, 2*i+1)
-		_ -> 0
-	}
-}
-
-func fieldByName(st u32, name u32) (usize, bool) {
-	n := nfields(st)
-	for i := usize(0); i < n; i++ {
-		if fieldName(st, i) == name {
-			return i, true
-		}
-	}
-	return 0, false
-}
-
-// Enum variants: triples (name, payload start, payload len).
-func nvariants(en u32) usize {
-	return match trec(en) {
-		Enum(_, n) -> usize(n) / 3
-		_ -> 0
-	}
-}
-
-func variantName(en u32, i usize) u32 {
-	return match trec(en) {
-		Enum(s, _) -> tlist(s, 3*i)
-		_ -> 0
-	}
-}
-
-func variantPayS(en u32, i usize) u32 {
-	return match trec(en) {
-		Enum(s, _) -> tlist(s, 3*i+1)
-		_ -> 0
-	}
-}
-
-func variantPayN(en u32, i usize) usize {
-	return match trec(en) {
-		Enum(s, _) -> usize(tlist(s, 3*i+2))
-		_ -> 0
-	}
-}
-
-func variantPay(en u32, i usize, j usize) u32 {
-	return tlist(variantPayS(en, i), j)
-}
-
-func variantByName(en u32, name u32) (usize, bool) {
-	n := nvariants(en)
-	for i := usize(0); i < n; i++ {
-		if variantName(en, i) == name {
-			return i, true
-		}
-	}
-	return 0, false
-}
-
-// Signatures.
-func sigEffect(s u32) u8 {
-	return match trec(s) {
-		Sig(eff, ..) -> eff
-		_ -> EffComptime
-	}
-}
-
-func sigVariadic(s u32) bool {
-	return match trec(s) {
-		Sig(_, va, ..) -> va
-		_ -> false
-	}
-}
-
-func sigNParams(s u32) usize {
-	return match trec(s) {
-		Sig(_, _, _, pn, ..) -> usize(pn)
-		_ -> 0
-	}
-}
-
-func sigParam(s u32, i usize) u32 {
-	return match trec(s) {
-		Sig(_, _, ps, ..) -> tlist(ps, i)
-		_ -> 0
-	}
-}
-
-func sigParamsSlice(s u32) []u32 {
-	return match trec(s) {
-		Sig(_, _, ps, pn, ..) -> tlistSlice(ps, pn)
-		_ -> emptyU32()
-	}
-}
-
-func sigNResults(s u32) usize {
-	return match trec(s) {
-		Sig(_, _, _, _, _, rn, ..) -> usize(rn)
-		_ -> 0
-	}
-}
-
-func sigResult(s u32, i usize) u32 {
-	return match trec(s) {
-		Sig(_, _, _, _, rs, ..) -> tlist(rs, i)
-		_ -> 0
-	}
-}
-
-func sigResultsSlice(s u32) []u32 {
-	return match trec(s) {
-		Sig(_, _, _, _, rs, rn, ..) -> tlistSlice(rs, rn)
-		_ -> emptyU32()
-	}
-}
-
-func sigNTParams(s u32) usize {
-	return match trec(s) {
-		Sig(.., tn) -> usize(tn)
-		_ -> 0
-	}
-}
-
-// sigResultType: 0 for no results, the result, or a Tuple.
-func sigResultType(s u32) u32 {
-	n := sigNResults(s)
-	if n == 0 {
-		return 0
-	}
-	if n == 1 {
-		return sigResult(s, 0)
-	}
-	return mkTuple(sigResultsSlice(s))
-}
-
-// Named types. nrec returns the NamedRec of t (the zero record for other
-// types).
-func nrec(t u32) NamedRec {
-	return typs.named[usize(namedID(t))]
-}
-
-func namedBuiltin(t u32) u8 {
-	return nrec(t).builtin
-}
-
-func namedOrigin(t u32) u32 {
-	return nrec(t).origin
-}
-
-func namedSym(t u32) u32 {
-	return nrec(t).sym
-}
-
-// Type args of an instance.
-func namedArgList(t u32) (u32, u32) {
-	r := nrec(t)
-	return r.argS, r.argN
-}
-
-func namedNArgs(t u32) usize {
-	return usize(nrec(t).argN)
-}
-
-func namedArg(t u32, i usize) u32 {
-	return tlist(nrec(t).argS, i)
-}
-
-func namedArgs(t u32) []u32 {
-	r := nrec(t)
-	return tlistSlice(r.argS, r.argN)
-}
-
-// Type params of a generic declaration.
-func namedTParamList(t u32) (u32, u32) {
-	r := nrec(t)
-	return r.tpS, r.tpN
-}
-
-func namedNTParams(t u32) usize {
-	return usize(nrec(t).tpN)
-}
-
-func namedTParam(t u32, i usize) u32 {
-	return tlist(nrec(t).tpS, i)
-}
-
-func setNamedTParams(t u32, s u32, n u32) {
-	id := namedID(t)
-	if id != 0 {
-		typs.named[usize(id)].tpS = s
-		typs.named[usize(id)].tpN = n
-	}
-}
-
-// Method cache (ulists of method IDs).
-func namedMethodCache(t u32) (u32, u32, bool) {
-	r := nrec(t)
-	return r.methS, r.methN, r.methOK
-}
-
-func setNamedMethods(t u32, s u32, n u32) {
-	id := namedID(t)
-	if id != 0 {
-		typs.named[usize(id)].methS = s
-		typs.named[usize(id)].methN = n
-		typs.named[usize(id)].methOK = true
-	}
-}
-
-// builtinOf returns the predeclared identity of a named type (origin for
-// instances), 0 if none.
-func builtinOf(t u32) u8 {
-	if o := namedOrigin(t); o != 0 {
-		return namedBuiltin(o)
-	}
-	return namedBuiltin(t) // 0 for other types
-}
-
-func isCapability(t u32) bool {
-	b := builtinOf(t)
-	return b is BTNet | BTSignals | BTClock | BTFS | BTEnv | BTStdio | BTExec
-}
-
-// maxClassOf returns the largest class of the n types in the run at s.
-func maxClassOf(s u32, n u32, depth usize) u8 decreases(depth) {
-	c := u8(ClassValue)
-	if depth == 0 {
-		return c
-	}
-	for i := u32(0); i < n; i++ {
-		c = max(c, classOf(tlist(s, usize(i)), depth-1))
-	}
-	return c
-}
-
-// classOf computes the value class of t (types.ClassOf).
-func classOf(t u32, depth usize) u8 decreases(depth) {
-	if depth == 0 || t == 0 {
-		return ClassValue
-	}
-	match trec(t) {
-		Named(id) -> {
-			if typs.named[usize(id)].clsOK {
-				return typs.named[usize(id)].cls
-			}
-			u := typs.named[usize(id)].under
-			if u == 0 {
-				return ClassValue
-			}
-			setNamedClass(t, ClassValue)
-			c := classOf(u, depth-1)
-			typs.named[usize(id)].cls = c
-			return c
-		}
-		Pointer(_) | Sig(..) -> return ClassScoped
-		Array(e, ..) | Slice(e) -> return classOf(e, depth-1)
-		Struct(..) -> {
-			c := u8(ClassValue)
-			nf := nfields(t)
-			for i := usize(0); i < nf; i++ {
-				c = max(c, classOf(fieldType(t, i), depth-1))
-			}
-			return c
-		}
-		Enum(..) -> {
-			c := u8(ClassValue)
-			nv := nvariants(t)
-			for i := usize(0); i < nv; i++ {
-				c = max(c, maxClassOf(variantPayS(t, i), u32(variantPayN(t, i)), depth-1))
-			}
-			return c
-		}
-		Tuple(s, n) -> return maxClassOf(s, n, depth-1)
-		NoType | Basic(_) | Code(_) | TypeParam(..) | ConstArg(_) | Opaque(..) -> return ClassValue
-	}
-}
-
-func classOfT(t u32) u8 {
-	return classOf(t, SemaDepth)
-}
-
-func isScoped(t u32) bool {
-	return classOfT(t) >= ClassScoped
-}
-
-func isLinear(t u32) bool {
-	return classOfT(t) == ClassLinear
-}
-
-func comparable(t u32, depth usize) bool decreases(depth) {
-	if depth == 0 || t == 0 {
-		return false
-	}
-	u := underlying(t)
-	match trec(u) {
-		Basic(b) -> return !(b is BkUntypedNil | BkInvalid)
-		Pointer(_) | Code(_) -> return true
-		Array(e, ..) -> return comparable(e, depth-1)
-		Struct(..) -> {
-			n := nfields(u)
-			for i := usize(0); i < n; i++ {
-				if !comparable(fieldType(u, i), depth-1) {
+	if t.kind == TKindEnum {
+		for i := u32(0); i < t.b; i++ {
+			v := variants[t.a+i]
+			for j := u32(0); j < v.payCount; j++ {
+				if !isEqualType(typeList[v.payStart+j]) {
 					return false
 				}
 			}
-			return true
 		}
-		Enum(..) -> {
-			n := nvariants(u)
-			for i := usize(0); i < n; i++ {
-				m := variantPayN(u, i)
-				for j := usize(0); j < m; j++ {
-					if !comparable(variantPay(u, i, j), depth-1) {
-						return false
-					}
-				}
-			}
-			return true
-		}
-		NoType | Sig(..) | Named(_) | Slice(_) | TypeParam(..) | ConstArg(_) | Tuple(..) | Opaque(..) -> return false
+		return true
 	}
+	return false
 }
 
-// listHasTypeParam reports whether one of the n types in the run at s
-// mentions a type parameter.
-func listHasTypeParam(s u32, n u32, depth usize) bool decreases(depth) {
-	if depth == 0 {
+func isOrderedType(ty u32) bool {
+	if ty == 0 {
+		return true
+	}
+	if types[ty].kind == TKindTypeParam {
+		if (types[ty].flags & 1) != 0 {
+			return true
+		}
+		return tpConstraint(ty) >= ConstrOrdered
+	}
+	return isIntType(ty) || isFloatType(ty) || isStringType(ty)
+}
+
+func isNumericConstraintType(ty u32) bool {
+	if ty == 0 {
+		return true
+	}
+	if types[ty].kind == TKindTypeParam {
+		if (types[ty].flags & 1) != 0 {
+			return true
+		}
+		return tpConstraint(ty) >= ConstrNumeric
+	}
+	return isIntType(ty) || isFloatType(ty)
+}
+
+driver func satisfiesConstraint(ty u32, constr u16) bool {
+	if constr == ConstrAny || ty == 0 {
+		return true
+	}
+	if constr == ConstrEqual {
+		return isEqualType(ty)
+	}
+	if constr == ConstrOrdered {
+		return isOrderedType(ty)
+	}
+	if constr == ConstrNumeric {
+		return isNumericConstraintType(ty)
+	}
+	return false
+}
+
+func isUntyped(ty u32) bool {
+	return (ty >= TYUntypedInt && ty <= TYUntypedNil) || ty == TYUntypedFloat
+}
+
+func isNumericOrUntyped(ty u32) bool {
+	return isIntType(ty) || isFloatType(ty) || ty == TYUntypedInt || ty == TYUntypedFloat || tpConstraint(ty) == ConstrNumeric
+}
+
+func isBoolType(ty u32) bool {
+	u := under(ty)
+	return u == TYBool || u == TYUntypedBool
+}
+
+func isStringType(ty u32) bool {
+	u := under(ty)
+	return u == TYString || u == TYUntypedStr
+}
+
+func isErrorType(ty u32) bool {
+	return under(ty) == TYError
+}
+
+func isByteSlice(ty u32) bool {
+	u := under(ty)
+	return types[u].kind == TKindSlice && under(types[u].a) == TYU8
+}
+
+func isSlotType(ty u32) bool {
+	return ty != 0 && types[ty].kind == TKindNamed && types[ty].flags == 1
+}
+
+func slotElemType(ty u32) u32 {
+	if isSlotType(ty) && types[ty].d == 1 {
+		return typeList[types[ty].c]
+	}
+	return TYInvalid
+}
+
+func isCapabilityType(ty u32) bool {
+	return ty == TYNet || ty == TYSignals || ty == TYClock ||
+		ty == TYFS || ty == TYEnv || ty == TYStdio || ty == TYExec
+}
+
+func defaultType(ty u32) u32 {
+	if ty == TYUntypedInt {
+		return TYInt
+	}
+	if ty == TYUntypedFloat {
+		return TYF64
+	}
+	if ty == TYUntypedBool {
+		return TYBool
+	}
+	if ty == TYUntypedStr {
+		return TYString
+	}
+	return ty
+}
+
+func typeOriginSym(ty u32) u32 {
+	if ty == 0 || ty >= typeCount {
+		return 0
+	}
+	if types[ty].kind == TKindNamed {
+		if types[ty].origin != 0 && types[types[ty].origin].kind == TKindNamed {
+			return types[types[ty].origin].a
+		}
+		return types[ty].a
+	}
+	return 0
+}
+
+// typeEqual checks strict FinCore type identity.
+driver func typeEqual(a u32, b u32) bool {
+	if a == b {
+		return true
+	}
+	if a == 0 || b == 0 || a >= typeCount || b >= typeCount {
 		return false
 	}
-	for i := u32(0); i < n; i++ {
-		if hasTypeParam(tlist(s, usize(i)), depth-1) {
+	ta := types[a]
+	tb := types[b]
+	if ta.kind != tb.kind {
+		return false
+	}
+	if ta.kind == TKindBasic || ta.kind == TKindBuiltin {
+		return ta.a == tb.a
+	}
+	if ta.kind == TKindConstArg {
+		return ta.lenVal == tb.lenVal
+	}
+	if ta.kind == TKindTypeParam {
+		return ta.a == tb.a
+	}
+	if ta.kind == TKindCode {
+		return ta.a == tb.a
+	}
+	if ta.kind == TKindSlice || ta.kind == TKindPtr {
+		return ta.flags == tb.flags && typeEqual(ta.a, tb.a)
+	}
+	if ta.kind == TKindArray {
+		return dimEqual(ta.b, ta.lenVal, tb.b, tb.lenVal) && typeEqual(ta.a, tb.a)
+	}
+	if ta.kind == TKindNamed {
+		if ta.flags != tb.flags {
+			return false
+		}
+		if ta.flags == 1 || ta.flags == 2 {
+			// Slot[T] or Atomic[T]
+			return ta.d == 1 && tb.d == 1 && typeEqual(typeList[ta.c], typeList[tb.c])
+		}
+		if typeOriginSym(a) != typeOriginSym(b) {
+			return false
+		}
+		if ta.d != tb.d {
+			return false
+		}
+		for i := u32(0); i < ta.d; i++ {
+			if !typeEqual(typeList[ta.c+i], typeList[tb.c+i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if ta.kind == TKindSig {
+		if ta.op != tb.op || ta.flags != tb.flags || ta.b != tb.b || ta.d != tb.d {
+			return false
+		}
+		for i := u32(0); i < ta.b; i++ {
+			if !typeEqual(typeList[ta.a+i], typeList[tb.a+i]) {
+				return false
+			}
+		}
+		for i := u32(0); i < ta.d; i++ {
+			if !typeEqual(typeList[ta.c+i], typeList[tb.c+i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if ta.kind == TKindStruct {
+		if ta.b != tb.b {
+			return false
+		}
+		for i := u32(0); i < ta.b; i++ {
+			fa := fields[ta.a+i]
+			fb := fields[tb.a+i]
+			if fa.nameStr != fb.nameStr || !typeEqual(fa.typeID, fb.typeID) {
+				return false
+			}
+		}
+		return true
+	}
+	if ta.kind == TKindEnum {
+		return a == b
+	}
+	if ta.kind == TKindEffect {
+		if ta.a != tb.a || ta.d != tb.d {
+			return false
+		}
+		for i := u32(0); i < ta.d; i++ {
+			if !typeEqual(typeList[ta.c+i], typeList[tb.c+i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if ta.kind == TKindResume {
+		return typeEqual(ta.a, tb.a) && typeEqual(ta.b, tb.b)
+	}
+	return false
+}
+
+// assignable reports whether a value of type src can be assigned to dst.
+driver func assignable(src u32, dst u32) bool {
+	if src == 0 || dst == 0 {
+		return true // suppress cascade errors
+	}
+	if typeEqual(src, dst) {
+		return true
+	}
+	if src == TYUntypedInt && (isIntType(dst) || isFloatType(dst)) {
+		return true
+	}
+	if src == TYUntypedFloat && isFloatType(dst) {
+		return true
+	}
+	if src == TYUntypedBool && isBoolType(dst) {
+		return true
+	}
+	if src == TYUntypedStr && isStringType(dst) {
+		return true
+	}
+	if src == TYUntypedNil {
+		du := under(dst)
+		if du == TYError || types[du].kind == TKindSlice || types[du].kind == TKindPtr {
 			return true
+		}
+		return false
+	}
+	// Mutable []T -> const []T and mutable *T -> const *T widening (0 runtime cost; reverse forbidden!)
+	su := under(src)
+	du0 := under(dst)
+	if (types[su].kind == TKindSlice && types[du0].kind == TKindSlice) || (types[su].kind == TKindPtr && types[du0].kind == TKindPtr) {
+		if types[su].flags == 0 && types[du0].flags == 1 && typeEqual(types[su].a, types[du0].a) {
+			return true
+		}
+	}
+	// Implicit unnamed <-> named if one is unnamed and underlying types match (Go rule for composites & error interface)
+	if types[src].kind != TKindNamed || types[dst].kind != TKindNamed {
+		if typeEqual(under(src), under(dst)) {
+			du := under(dst)
+			if du == TYError || types[du].kind == TKindSlice || types[du].kind == TKindArray || types[du].kind == TKindPtr || types[du].kind == TKindSig {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-func hasTypeParam(t u32, depth usize) bool decreases(depth) {
-	if depth == 0 || t == 0 {
-		return false
+// classOf computes the resource class (Value=0, Scoped=1, Linear=2) of ty.
+driver func classOf(ty u32) u8 {
+	if ty == 0 || ty >= typeCount {
+		return ClsValue
 	}
-	match trec(t) {
-		TypeParam(..) -> return true
-		Named(id) -> return listHasTypeParam(typs.named[usize(id)].argS, typs.named[usize(id)].argN, depth-1)
-		Tuple(s, n) -> return listHasTypeParam(s, n, depth-1)
-		Array(e, p, _) -> return p != 0 || hasTypeParam(e, depth-1)
-		Slice(e) | Pointer(e) -> return hasTypeParam(e, depth-1)
-		Struct(..) -> {
-			n := nfields(t)
-			for i := usize(0); i < n; i++ {
-				if hasTypeParam(fieldType(t, i), depth-1) {
-					return true
+	if isSlotType(ty) {
+		return ClsLinear
+	}
+	if isAtomicType(ty) {
+		return ClsValue
+	}
+	t := types[ty]
+	if t.kind == TKindBuiltin {
+		if ty == TYConn || ty == TYListener || ty == TYCancelFunc {
+			return ClsLinear
+		}
+		if ty == TYFieldCode {
+			return ClsValue
+		}
+		return ClsScoped
+	}
+	if t.kind == TKindPtr || t.kind == TKindSlice || t.kind == TKindSig || t.kind == TKindEffect {
+		return ClsScoped
+	}
+	if t.kind == TKindResume {
+		return ClsLinear
+	}
+	if t.kind == TKindNamed {
+		return classOf(t.b)
+	}
+	if t.kind == TKindArray {
+		return classOf(t.a)
+	}
+	if t.kind == TKindStruct {
+		var mx u8 = ClsValue
+		for i := u32(0); i < t.b; i++ {
+			c := classOf(fields[t.a+i].typeID)
+			if c > mx {
+				mx = c
+			}
+		}
+		return mx
+	}
+	if t.kind == TKindEnum {
+		var mx u8 = ClsValue
+		for i := u32(0); i < t.b; i++ {
+			v := variants[t.a+i]
+			for j := u32(0); j < v.payCount; j++ {
+				c := classOf(typeList[v.payStart+j])
+				if c > mx {
+					mx = c
 				}
 			}
-			return false
 		}
-		Enum(..) -> {
-			n := nvariants(t)
-			for i := usize(0); i < n; i++ {
-				if listHasTypeParam(variantPayS(t, i), u32(variantPayN(t, i)), depth-1) {
-					return true
-				}
-			}
-			return false
-		}
-		Sig(_, _, ps, pn, rs, rn, ..) -> return listHasTypeParam(ps, pn, depth-1) || listHasTypeParam(rs, rn, depth-1)
-		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(..) -> return false
+		return mx
 	}
+	return ClsValue
 }
 
-func anyTypeParam(xs []u32) bool {
-	n := len(xs)
-	for i := usize(0); i < n; i++ {
-		if hasTypeParam(xs[i], SemaDepth) {
-			return true
-		}
+func isScalarType(ty u32) bool {
+	u := under(ty)
+	if u == 0 {
+		return false
+	}
+	t := types[u]
+	if t.kind == TKindPtr || t.kind == TKindEffect {
+		return true
+	}
+	if t.kind == TKindBasic {
+		return u == TYBool || (u >= TYU8 && u <= TYInt) || u == TYF32 || u == TYF64 || u == TYError || u == TYUntypedInt || u == TYUntypedFloat || u == TYUntypedBool
+	}
+	if t.kind == TKindBuiltin {
+		return u == TYConn || u == TYScope || u == TYArena
 	}
 	return false
 }
 
 // ---------------------------------------------------------------------------
-// Type strings (types.Type.String)
+// Type Substitution (for generic instantiation & full monomorphization)
 
-func basicName(k u8) string {
-	return match k {
-		BkInvalid -> "invalid type"
-		BkUntypedInt -> "untyped int"
-		BkUntypedChar -> "untyped char"
-		BkUntypedBool -> "untyped bool"
-		BkUntypedString -> "untyped string"
-		BkUntypedNil -> "untyped nil"
-		BkError -> "error"
-		BkString -> "string"
-		_ -> builtinTypeName(k)
+driver func substType(ty u32, tpSyms []u32, targs []u32) u32 {
+	if ty == 0 || len(tpSyms) == 0 {
+		return ty
 	}
-}
-
-func putTypeList(o *OutBuf, xs []u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	n := len(xs)
-	for i := usize(0); i < n; i++ {
-		if i > 0 {
-			o.WriteString(", ")
-		}
-		putType(o, xs[i], depth-1)
-	}
-}
-
-func putType(o *OutBuf, t u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	if t == 0 {
-		o.WriteString("<nil>")
-		return
-	}
-	match trec(t) {
-		NoType -> {}
-		Basic(k) -> o.WriteString(basicName(k))
-		Named(id) -> {
-			r := typs.named[usize(id)]
-			if r.pkg != 0 && len(pkgs.items[usize(r.pkg)].path) > 0 {
-				o.WriteBytes(nameBytes(pkgs.items[usize(r.pkg)].name))
-				o.WriteByte('.')
-			}
-			o.WriteBytes(nameBytes(r.name))
-			if r.argN > 0 {
-				o.WriteByte('[')
-				putTypeList(o, tlistSlice(r.argS, r.argN), depth-1)
-				o.WriteByte(']')
+	t := types[ty]
+	if t.kind == TKindTypeParam {
+		for i := usize(0); i < len(tpSyms); i++ {
+			if t.a == tpSyms[i] {
+				return targs[i]
 			}
 		}
-		Array(e, p, n) -> {
-			o.WriteByte('[')
-			if p != 0 {
-				o.WriteBytes(nameBytes(typeName(p)))
-			} else {
-				o.WriteUint(n)
-			}
-			o.WriteByte(']')
-			putType(o, e, depth-1)
+		return ty
+	}
+	if t.kind == TKindConstArg {
+		if t.a != 0 {
+			nd, nv := substDim(t.a, tpSyms, targs)
+			return newType(Type{kind: TKindConstArg, a: nd, lenVal: nv})
 		}
-		Slice(e) -> {
-			o.WriteString("[]")
-			putType(o, e, depth-1)
+		return ty
+	}
+	if t.kind == TKindBasic || t.kind == TKindBuiltin || t.kind == TKindCode {
+		return ty
+	}
+	if t.kind == TKindPtr {
+		ne := substType(t.a, tpSyms, targs)
+		if ne == t.a {
+			return ty
 		}
-		Pointer(e) -> {
-			o.WriteByte('*')
-			putType(o, e, depth-1)
+		return newType(Type{kind: TKindPtr, flags: t.flags, a: ne})
+	}
+	if t.kind == TKindSlice {
+		ne := substType(t.a, tpSyms, targs)
+		if ne == t.a {
+			return ty
 		}
-		Struct(..) -> {
-			o.WriteString("struct{")
-			n := nfields(t)
-			for i := usize(0); i < n; i++ {
-				if i > 0 {
-					o.WriteString("; ")
-				}
-				o.WriteBytes(nameBytes(fieldName(t, i)))
-				o.WriteByte(' ')
-				putType(o, fieldType(t, i), depth-1)
-			}
-			o.WriteByte('}')
+		return newType(Type{kind: TKindSlice, flags: t.flags, a: ne})
+	}
+	if t.kind == TKindArray {
+		ne := substType(t.a, tpSyms, targs)
+		nl := t.lenVal
+		nb := t.b
+		if t.b != 0 {
+			nb, nl = substDim(t.b, tpSyms, targs)
 		}
-		Enum(..) -> {
-			o.WriteString("enum{")
-			n := nvariants(t)
-			for i := usize(0); i < n; i++ {
-				if i > 0 {
-					o.WriteString("; ")
-				}
-				o.WriteBytes(nameBytes(variantName(t, i)))
-				m := variantPayN(t, i)
-				if m > 0 {
-					o.WriteByte('(')
-					putTypeList(o, tlistSlice(variantPayS(t, i), u32(m)), depth-1)
-					o.WriteByte(')')
-				}
-			}
-			o.WriteByte('}')
+		if ne == t.a && nl == t.lenVal && nb == t.b {
+			return ty
 		}
-		Sig(eff, va, ps, pn, rs, rn, ..) -> {
-			if eff == EffDriver {
-				o.WriteString("driver ")
-			} else if eff == EffComptime {
-				o.WriteString("comptime ")
+		return newType(Type{kind: TKindArray, a: ne, b: nb, lenVal: nl})
+	}
+	if t.kind == TKindStruct {
+		changed := false
+		var nf [128]Field
+		for i := u32(0); i < t.b; i++ {
+			f := fields[t.a+i]
+			nt := substType(f.typeID, tpSyms, targs)
+			if nt != f.typeID {
+				changed = true
 			}
-			o.WriteString("func(")
-			n := usize(pn)
-			for i := usize(0); i < n; i++ {
-				if i > 0 {
-					o.WriteString(", ")
-				}
-				if va && i == n-1 {
-					o.WriteString("...")
-				}
-				putType(o, tlist(ps, i), depth-1)
-			}
-			o.WriteByte(')')
-			if rn == 1 {
-				o.WriteByte(' ')
-				putType(o, tlist(rs, 0), depth-1)
-			} else if rn > 1 {
-				o.WriteString(" (")
-				putTypeList(o, tlistSlice(rs, rn), depth-1)
-				o.WriteByte(')')
+			nf[i] = Field{nameStr: f.nameStr, typeID: nt}
+		}
+		if !changed {
+			return ty
+		}
+		fs := fieldCount
+		for i := u32(0); i < t.b; i++ {
+			if fieldCount < MaxFields {
+				fields[fieldCount] = nf[i]
+				fieldCount++
 			}
 		}
-		Code(l) -> {
-			if l == 0 {
-				o.WriteString("Code ?")
-			} else {
-				o.WriteString("Code ")
-				o.WriteUint(u64(l - 1))
-			}
-		}
-		TypeParam(nm, ..) | Opaque(nm, _) -> o.WriteBytes(nameBytes(nm))
-		ConstArg(v) -> o.WriteUint(v)
-		Tuple(s, n) -> {
-			o.WriteByte('(')
-			putTypeList(o, tlistSlice(s, n), depth-1)
-			o.WriteByte(')')
-		}
+		return newType(Type{kind: TKindStruct, a: fs, b: t.b})
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Methods (types.Method) and builtin method IDs
-
-const (
-	BMNone               = 0
-	BMContextDone        = 1
-	BMContextErr         = 2
-	BMContextWithTimeout = 3
-	BMSignalsNotifyCtx   = 4
-	BMNetListenTCP       = 5
-	BMListenerAccept     = 6
-	BMListenerAddr       = 7
-	BMListenerClose      = 8
-	BMConnRead           = 9
-	BMConnWrite          = 10
-	BMConnCloseWrite     = 11
-	BMConnClose          = 12
-	BMScopeAcquireSlot   = 13
-	BMScopeReleaseSlot   = 14
-	BMScopeGo            = 15
-	BMScopeWaitTimeout   = 16
-	BMScopeWait          = 17
-	BMFSReadFileInto     = 18
-	BMFSWriteFile        = 19
-	BMFSIsDir            = 20
-	BMFSListSourceFiles  = 21
-	BMFSMkdirTemp        = 22
-	BMFSRemoveAll        = 23
-	BMEnvArgsCount       = 24
-	BMEnvArg             = 25
-	BMEnvGetEnv          = 26
-	BMStdioWriteStdout   = 27
-	BMStdioWriteStderr   = 28
-	BMExecRun            = 29
-)
-
-type Method struct {
-	name    u32
-	recv    u32 // origin receiver type (Named)
-	ptrRecv bool
-	builtin u8
-	rtpS    u32 // RecvTypeParams (type lists)
-	rtpN    u32
-	sig     u32 // signature without receiver (0 for the generic Scope methods)
-	sym     u32 // user methods
-	decl    u32
-}
-
-type MethodTable struct {
-	items [MaxMethods]Method
-	count usize
-}
-
-var meths MethodTable
-
-func newMethod(m Method) u32 {
-	if meths.count == 0 {
-		meths.count = 1
-	}
-	if meths.count >= MaxMethods {
-		setFull("methods")
-		return 0
-	}
-	id := meths.count
-	meths.count++
-	meths.items[id] = m
-	return u32(id)
-}
-
-func methodEffect(m u32) u8 {
-	s := meths.items[usize(m)].sig
-	if s != 0 {
-		return sigEffect(s)
-	}
-	return EffTotal
-}
-
-// ---------------------------------------------------------------------------
-// Predeclared named types and their methods (types/universe.go)
-
-var univNamed [NumBuiltins]u32
-var slotT u32
-
-func mkUnivNamed(b u8, under u32, class u8) u32 {
-	t := newNamed(internStr(builtinName(b)), builtinSym[usize(b)], 0, b)
-	setNamedUnder(t, under)
-	setNamedClass(t, class)
-	univNamed[usize(b)] = t
-	return t
-}
-
-// addUnivMethod pushes one builtin method onto the ulists stack (params/results are
-// on the type stack [m1:m2] / [m2:top]).
-func addUnivMethod(recv u8, name string, id u8, variadic bool, eff u8, m1 usize, m2 usize) {
-	sig := u32(0)
-	if !(id is BMScopeAcquireSlot | BMScopeReleaseSlot | BMScopeGo) {
-		sig = mkSig(eff, variadic, m1, m2, tmark())
-	} else {
-		tdiscard(m1)
-	}
-	var m Method
-	m.name = internStr(name)
-	m.recv = univNamed[usize(recv)]
-	m.builtin = id
-	m.sig = sig
-	upush(newMethod(m))
-}
-
-func setUnivMethods(recv u8, mark usize) {
-	s, n := ucommit(mark)
-	setNamedMethods(univNamed[usize(recv)], s, n)
-}
-
-func initUnivTypes() {
-	duration := mkUnivNamed(BTDuration, TyU64, ClassValue)
-	signal := mkUnivNamed(BTSignal, TyU8, ClassValue)
-	sm := tmark()
-	tpush(internStr("Code"))
-	tpush(TyInt)
-	_ = mkUnivNamed(BTExitStatus, mkStruct(sm), ClassValue)
-	for b := u8(BTNet); b <= BTExec; b++ {
-		if b is BTNet | BTSignals | BTClock | BTContext | BTScope | BTFS | BTEnv | BTStdio | BTExec {
-			_ = mkUnivNamed(b, newOpaque(internStr(builtinName(b)), b), ClassScoped)
-		}
-	}
-	_ = mkUnivNamed(BTListener, newOpaque(internStr("Listener"), BTListener), ClassLinear)
-	_ = mkUnivNamed(BTConn, newOpaque(internStr("Conn"), BTConn), ClassLinear)
-	m0 := tmark()
-	_ = mkUnivNamed(BTCancelFunc, mkSig(EffTotal, false, m0, m0, m0), ClassLinear)
-	slot := mkUnivNamed(BTSlot, newOpaque(internStr("Slot"), BTSlot), ClassLinear)
-	slotT = newTypeParam(internStr("T"), 0, 0, 0)
-	sp := tmark()
-	tpush(slotT)
-	s2, n2 := tcommitStack(sp)
-	setNamedTParams(slot, s2, n2)
-	_ = mkUnivNamed(BTFieldCode, newOpaque(internStr("FieldCode"), BTFieldCode), ClassValue)
-
-	ctx := univNamed[BTContext]
-	bytesT := mkSlice(TyU8)
-	strs := mkSlice(TyString)
-	// Context
-	um := umark()
-	m := tmark()
-	tpush(TyBool)
-	addUnivMethod(BTContext, "Done", BMContextDone, false, EffTotal, m, m)
-	m = tmark()
-	tpush(TyError)
-	addUnivMethod(BTContext, "Err", BMContextErr, false, EffTotal, m, m)
-	m = tmark()
-	tpush(duration)
-	tpush(ctx)
-	addUnivMethod(BTContext, "WithTimeout", BMContextWithTimeout, false, EffTotal, m, m+1)
-	setUnivMethods(BTContext, um)
-	// Signals
-	um = umark()
-	m = tmark()
-	tpush(signal)
-	tpush(ctx)
-	tpush(univNamed[BTCancelFunc])
-	addUnivMethod(BTSignals, "NotifyContext", BMSignalsNotifyCtx, true, EffTotal, m, m+1)
-	setUnivMethods(BTSignals, um)
-	// Net
-	um = umark()
-	m = tmark()
-	tpush(TyString)
-	tpush(univNamed[BTListener])
-	tpush(TyError)
-	addUnivMethod(BTNet, "ListenTCP", BMNetListenTCP, false, EffTotal, m, m+1)
-	setUnivMethods(BTNet, um)
-	// Listener
-	um = umark()
-	m = tmark()
-	tpush(ctx)
-	tpush(univNamed[BTConn])
-	tpush(TyError)
-	addUnivMethod(BTListener, "Accept", BMListenerAccept, false, EffTotal, m, m+1)
-	m = tmark()
-	tpush(TyString)
-	addUnivMethod(BTListener, "Addr", BMListenerAddr, false, EffTotal, m, m)
-	m = tmark()
-	tpush(TyError)
-	addUnivMethod(BTListener, "Close", BMListenerClose, false, EffTotal, m, m)
-	setUnivMethods(BTListener, um)
-	// Conn
-	um = umark()
-	m = tmark()
-	tpush(ctx)
-	tpush(bytesT)
-	tpush(TyUsize)
-	tpush(TyError)
-	addUnivMethod(BTConn, "Read", BMConnRead, false, EffTotal, m, m+2)
-	m = tmark()
-	tpush(ctx)
-	tpush(bytesT)
-	tpush(TyUsize)
-	tpush(TyError)
-	addUnivMethod(BTConn, "Write", BMConnWrite, false, EffTotal, m, m+2)
-	m = tmark()
-	tpush(TyError)
-	addUnivMethod(BTConn, "CloseWrite", BMConnCloseWrite, false, EffTotal, m, m)
-	m = tmark()
-	tpush(TyError)
-	addUnivMethod(BTConn, "Close", BMConnClose, false, EffTotal, m, m)
-	setUnivMethods(BTConn, um)
-	// Scope
-	um = umark()
-	m = tmark()
-	addUnivMethod(BTScope, "AcquireSlot", BMScopeAcquireSlot, false, EffTotal, m, m)
-	addUnivMethod(BTScope, "ReleaseSlot", BMScopeReleaseSlot, false, EffTotal, m, m)
-	addUnivMethod(BTScope, "Go", BMScopeGo, false, EffTotal, m, m)
-	m = tmark()
-	tpush(duration)
-	tpush(TyBool)
-	addUnivMethod(BTScope, "WaitTimeout", BMScopeWaitTimeout, false, EffTotal, m, m+1)
-	m = tmark()
-	addUnivMethod(BTScope, "Wait", BMScopeWait, false, EffTotal, m, m)
-	setUnivMethods(BTScope, um)
-	// FS
-	um = umark()
-	m = tmark()
-	tpush(TyString)
-	tpush(bytesT)
-	tpush(TyUsize)
-	tpush(TyError)
-	addUnivMethod(BTFS, "ReadFileInto", BMFSReadFileInto, false, EffTotal, m, m+2)
-	m = tmark()
-	tpush(TyString)
-	tpush(bytesT)
-	tpush(TyError)
-	addUnivMethod(BTFS, "WriteFile", BMFSWriteFile, false, EffTotal, m, m+2)
-	m = tmark()
-	tpush(TyString)
-	tpush(TyBool)
-	addUnivMethod(BTFS, "IsDir", BMFSIsDir, false, EffTotal, m, m+1)
-	m = tmark()
-	tpush(TyString)
-	tpush(strs)
-	tpush(TyUsize)
-	tpush(TyError)
-	addUnivMethod(BTFS, "ListSourceFiles", BMFSListSourceFiles, false, EffTotal, m, m+2)
-	m = tmark()
-	tpush(TyString)
-	tpush(TyString)
-	tpush(TyError)
-	addUnivMethod(BTFS, "MkdirTemp", BMFSMkdirTemp, false, EffTotal, m, m+1)
-	m = tmark()
-	tpush(TyString)
-	tpush(TyError)
-	addUnivMethod(BTFS, "RemoveAll", BMFSRemoveAll, false, EffTotal, m, m+1)
-	setUnivMethods(BTFS, um)
-	// Env
-	um = umark()
-	m = tmark()
-	tpush(TyUsize)
-	addUnivMethod(BTEnv, "ArgsCount", BMEnvArgsCount, false, EffTotal, m, m)
-	m = tmark()
-	tpush(TyUsize)
-	tpush(TyString)
-	addUnivMethod(BTEnv, "Arg", BMEnvArg, false, EffTotal, m, m+1)
-	m = tmark()
-	tpush(TyString)
-	tpush(TyString)
-	tpush(TyBool)
-	addUnivMethod(BTEnv, "GetEnv", BMEnvGetEnv, false, EffTotal, m, m+1)
-	setUnivMethods(BTEnv, um)
-	// Stdio
-	um = umark()
-	m = tmark()
-	tpush(bytesT)
-	tpush(TyError)
-	addUnivMethod(BTStdio, "WriteStdout", BMStdioWriteStdout, false, EffTotal, m, m+1)
-	m = tmark()
-	tpush(bytesT)
-	tpush(TyError)
-	addUnivMethod(BTStdio, "WriteStderr", BMStdioWriteStderr, false, EffTotal, m, m+1)
-	setUnivMethods(BTStdio, um)
-	// Exec
-	um = umark()
-	m = tmark()
-	tpush(ctx)
-	tpush(TyString)
-	tpush(strs)
-	tpush(strs)
-	tpush(TyString)
-	tpush(bytesT)
-	tpush(univNamed[BTExitStatus])
-	tpush(TyUsize)
-	tpush(TyError)
-	addUnivMethod(BTExec, "Run", BMExecRun, false, EffDriver, m, m+6)
-	setUnivMethods(BTExec, um)
-}
-
-// predeclaredType returns the type of a predeclared type symbol (0 for
-// Code, El and anything that is not a type).
-func predeclaredType(b u8) u32 {
-	if b == BTByte {
-		return TyU8
-	}
-	if b >= BTBool && b <= BTUsize {
-		return u32(b) + 1 // BTBool..BTUsize line up with BkBool..BkUsize
-	}
-	return match b {
-		BTString -> TyString
-		BTError -> TyError
-		BTCode | BTEl -> 0
-		_ -> univNamed[usize(b)]
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Typed model records (types.Info)
-
-// Expression kinds (types.ExprKind).
-const (
-	KNone        = 0
-	KValue       = 1
-	KVar         = 2
-	KConst       = 3
-	KType        = 4
-	KNoValue     = 5
-	KBuiltin     = 6
-	KFunc        = 7
-	KPackage     = 8
-	KVariantCtor = 9
-)
-
-// Selection kinds (types.SelKind).
-const (
-	SelField   = 0
-	SelMethod  = 1
-	SelVariant = 2
-)
-
-// FuncInfo describes a function declaration, method or function literal.
-type FuncInfo struct {
-	sym     u32 // 0 for literals
-	decl    u32 // FuncDecl node (0 for literals)
-	lit     u32 // FuncLit node (0 for declarations)
-	outer   u32 // enclosing FuncInfo of a literal
-	effect  u8
-	sig     u32
-	method  u32
-	recvSym u32
-	parS    u32 // parameter Ident nodes in order (ulists); symbol = defs[ident] (0 for `_`)
-	parN    u32
-	tpS     u32 // TypeParams (type lists)
-	tpN     u32
-	measure u32 // measure expression node (0 = none)
-	body    u32 // BlockStmt node
-	callH   u32 // calls in the body, source order (cells of CallExpr nodes)
-	callT   u32
-	litH    u32 // directly nested literals (cells of FuncInfo IDs)
-	litT    u32
-}
-
-type FuncTable struct {
-	items  [MaxFuncs]FuncInfo
-	count  usize
-	orderS u32 // Info.Funcs order (ulists), set by finish
-	orderN u32
-	main   u32
-}
-
-var funcs FuncTable
-
-func newFuncInfo(fi FuncInfo) u32 {
-	if funcs.count == 0 {
-		funcs.count = 1
-	}
-	if funcs.count >= MaxFuncs {
-		setFull("functions")
-		return 0
-	}
-	id := funcs.count
-	funcs.count++
-	funcs.items[id] = fi
-	return u32(id)
-}
-
-// CallKind is what a CallExpr calls, with the kind-specific parts of
-// types.Call. The variant order fixes the compact layout (u32 x 3, bool,
-// u8: 20 bytes).
-type CallKind enum {
-	Invalid                     // not checked or erroneous
-	Func(u32, u32, u32)         // function symbol, type args (type lists run)
-	Method(u32, u32, u32, bool) // method symbol, MethodID, receiver node, autoAddr
-	BuiltinMeth(u32, u32, bool) // MethodID, receiver node, autoAddr (capability methods)
-	Builtin(u8, bool, u32, u32) // builtin; formatTo (v0.2): checked without errors, (op, method) pairs (ulists)
-	Conversion(u32)             // target type
-	Variant(u32, u32)           // enum type (as written), variant index
-	Value                       // call through a function value
-}
-
-// Call describes a CallExpr (types.Call). For method calls the receiver is
-// the operand x of x.M(...) and autoAddr records that a pointer-receiver
-// method on an addressable x means (&x).M() (v0.2).
-type Call struct {
-	kind         CallKind
-	effect       u8
-	folded       bool
-	consumesRecv bool
-	consumesArg0 bool // ConsumesArgs == [0]
-	sig          u32
-}
-
-// callKind returns the kind of the CallExpr e (Invalid if it was not
-// checked).
-func callKind(e u32) CallKind {
-	return callTab.items[usize(ncall[usize(e)])].kind
-}
-
-// scopeGoRecv returns the receiver s of the CallExpr e if it is the
-// capability call s.Go(slot, fn), else 0.
-func scopeGoRecv(e u32) u32 {
-	if callKind(e) is BuiltinMeth(m, r, _) && meths.items[usize(m)].builtin == BMScopeGo {
-		return r
-	}
-	return 0
-}
-
-type CallTable struct {
-	items [MaxCalls]Call
-	count usize
-}
-
-var callTab CallTable
-
-// Selection describes a SelectorExpr x.f (types.Selection).
-type Selection struct {
-	kind     u8
-	indirect bool
-	recv     u32 // type of x (SelVariant: the enum type)
-	ctype    u32 // SelField: struct TypeID; SelVariant: underlying Enum TypeID
-	index    u32 // field or variant index
-	method   u32 // SelMethod
-}
-
-type SelTable struct {
-	items [MaxSels]Selection
-	count usize
-}
-
-var selTab SelTable
-
-// Instance is an instantiation of a generic function or type.
-type Inst struct {
-	sym     u32 // generic function/type symbol
-	named   u32 // instance type (0 for functions)
-	argS    u32 // type args (type lists)
-	argN    u32
-	sig     u32 // instantiated signature (functions)
-	generic bool
-}
-
-type InstTable struct {
-	items [MaxInsts]Inst
-	count usize
-}
-
-var insts InstTable
-
-// Per-node tables of the typed model.
-var ntype [MaxNodes]u32    // TypeOf
-var nmode [MaxNodes]u8     // KindOf (ExprKind)
-var nval [MaxNodes]u32     // ValueOf: value slot (0 = none)
-var ncall [MaxNodes]u32    // CallOf
-var nsel [MaxNodes]u32     // SelectionOf
-var ninst [MaxNodes]u32    // InstanceOf
-var nvarEnum [MaxNodes]u32 // VariantOf (CtorPattern): underlying Enum TypeID
-var nvarIdx [MaxNodes]u32  //   and variant index (also v0.2 payload Idents)
-var nexh [MaxNodes]bool    // Exhaustive (v0.2): match counts as exhaustive
-var nfunc [MaxNodes]u32    // FuncDecl/FuncLit -> FuncInfo
-var nbytes [MaxNodes]bool  // ImplicitBytes: a constant string used as []byte (v0.2)
-
-// funcOfSym returns the FuncInfo of a function or method symbol.
-func funcOfSym(s u32) u32 {
-	if s == 0 || symKind(s) != SymFunc {
-		return 0
-	}
-	d := syms.items[usize(s)].decl
-	if d == 0 || nkind(d) != NkFuncDecl {
-		return 0
-	}
-	return nfunc[usize(d)]
-}
-
-// FuncName renders FuncInfo.Name(): "f", "T.m" or "func literal".
-type FuncName u32
-
-func (fi FuncName) Format(dst []byte) usize {
-	s := funcs.items[usize(fi)].sym
-	if s == 0 {
-		return formatTo(dst, "func literal")
-	}
-	if syms.items[usize(s)].recvType != 0 {
-		return formatTo(dst, "%v.%v", NameRef(syms.items[usize(s)].recvType), NameRef(syms.items[usize(s)].name))
-	}
-	return formatTo(dst, "%v", NameRef(syms.items[usize(s)].name))
-}
-
-// ---------------------------------------------------------------------------
-// Instantiation (typexpr.go: instantiate, completeInstance, subst)
-
-var pendOrigin [MaxPending]u32
-var pendInst [MaxPending]u32
-var npend usize
-
-// findInstRec finds the Info.InstanceList record of sym[args].
-func findInstRec(sym u32, args []u32) u32 {
-	n := insts.count
-	for i := usize(1); i < n; i++ {
-		if insts.items[i].sym == sym && u32sEqual(tlistSlice(insts.items[i].argS, insts.items[i].argN), args) {
-			return u32(i)
-		}
-	}
-	return 0
-}
-
-func newInstRec(r Inst) u32 {
-	if insts.count == 0 {
-		insts.count = 1
-	}
-	if insts.count >= MaxInsts {
-		setFull("instances")
-		return 0
-	}
-	id := insts.count
-	insts.count++
-	insts.items[id] = r
-	return u32(id)
-}
-
-// instantiate returns the canonical instance origin[args]; node (if not 0)
-// records the instantiation in ninst.
-func instantiate(origin u32, args []u32, node u32, depth usize) u32 decreases(depth) {
-	if depth == 0 {
-		setFull("recursion depth")
-		return TyInvalid
-	}
-	o := typs.named[usize(namedID(origin))]
-	var r NamedRec
-	r.origin = origin
-	r.name = o.name
-	r.sym = o.sym
-	r.pkg = o.pkg
-	r.builtin = o.builtin
-	if o.clsOK && o.builtin != 0 {
-		r.clsOK = true
-		r.cls = o.cls
-	}
-	r.argS, r.argN = tcommit(args)
-	nid := newNamedRec(r)
-	if nid == 0 {
-		return TyInvalid
-	}
-	inst, isNew := internType(TypeRec.Named(nid))
-	if inst == TyInvalid {
-		return TyInvalid
-	}
-	if isNew {
-		if o.under == 0 {
-			if npend >= MaxPending {
-				setFull("pending instances")
-			} else {
-				pendOrigin[npend] = origin
-				pendInst[npend] = inst
-				npend++
-			}
-		} else {
-			completeInstance(inst, depth-1)
-		}
-	}
-	ia := namedArgs(inst)
-	rec := findInstRec(o.sym, ia)
-	if rec == 0 {
-		var ir Inst
-		ir.sym = o.sym
-		ir.named = inst
-		ir.argS, ir.argN = namedArgList(inst)
-		ir.generic = anyTypeParam(ia)
-		rec = newInstRec(ir)
-	}
-	if node != 0 {
-		ninst[usize(node)] = rec
-	}
-	return inst
-}
-
-func completeInstance(inst u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	o := namedOrigin(inst)
-	u := namedUnder(o)
-	if trec(u) is Opaque(..) {
-		setNamedUnder(inst, u)
-		return
-	}
-	tpS, tpN := namedTParamList(o)
-	argS, argN := namedArgList(inst)
-	setNamedUnder(inst, subst(u, tpS, tpN, argS, argN, depth-1))
-}
-
-// completePending completes the instances of origin created before its
-// underlying type was known.
-func completePending(origin u32) {
-	n := npend
-	for i := usize(0); i < n; i++ {
-		if pendOrigin[i] == origin {
-			pendOrigin[i] = 0
-			completeInstance(pendInst[i], SemaDepth)
-		}
-	}
-}
-
-// substLookup returns the binding of type parameter t (0 if unbound).
-func substLookup(t u32, tpS u32, tpN u32, argS u32, argN u32) u32 {
-	n := usize(min(tpN, argN))
-	for i := usize(0); i < n; i++ {
-		if tlist(tpS, i) == t {
-			return tlist(argS, i)
-		}
-	}
-	return 0
-}
-
-// subst replaces the type parameters tps[i] by args[i] in t.
-func subst(t u32, tpS u32, tpN u32, argS u32, argN u32, depth usize) u32 decreases(depth) {
-	if depth == 0 {
-		setFull("recursion depth")
-		return t
-	}
-	if t == 0 || tpN == 0 || argN == 0 {
-		return t
-	}
-	match trec(t) {
-		TypeParam(..) -> {
-			b := substLookup(t, tpS, tpN, argS, argN)
-			if b != 0 {
-				return b
-			}
-			return t
-		}
-		Named(id) -> {
-			r := typs.named[usize(id)]
-			if r.origin == 0 {
-				return t
-			}
-			m := tmark()
-			changed := false
-			for i := usize(0); i < usize(r.argN); i++ {
-				a := tlist(r.argS, i)
-				x := subst(a, tpS, tpN, argS, argN, depth-1)
-				if x != a {
+	if t.kind == TKindEnum {
+		changed := false
+		var nv [64]Variant
+		for i := u32(0); i < t.b; i++ {
+			v := variants[t.a+i]
+			var np [16]u32
+			for j := u32(0); j < v.payCount; j++ {
+				pt := typeList[v.payStart+j]
+				npt := substType(pt, tpSyms, targs)
+				if npt != pt {
 					changed = true
 				}
-				tpush(x)
+				np[j] = npt
 			}
-			if !changed {
-				tdiscard(m)
-				return t
-			}
-			s, cnt := tcommitStack(m)
-			return instantiate(r.origin, tlistSlice(s, cnt), 0, depth-1)
+			ps, pc := pushTypeList(np[:usize(v.payCount)])
+			nv[i] = Variant{nameStr: v.nameStr, payStart: ps, payCount: pc}
 		}
-		Array(e, p, n) -> {
-			elem := subst(e, tpS, tpN, argS, argN, depth-1)
-			if p != 0 {
-				b := substLookup(p, tpS, tpN, argS, argN)
-				match trec(b) {
-					ConstArg(v) -> return mkArray(v, 0, elem)
-					TypeParam(..) -> return mkArray(0, b, elem)
-					_ -> {}
-				}
-			}
-			return mkArray(n, p, elem)
+		if !changed {
+			return ty
 		}
-		Slice(e) -> return mkSlice(subst(e, tpS, tpN, argS, argN, depth-1))
-		Pointer(e) -> return mkPointer(subst(e, tpS, tpN, argS, argN, depth-1))
-		Struct(..) -> {
-			m := tmark()
-			n := nfields(t)
-			for i := usize(0); i < n; i++ {
-				nm := fieldName(t, i)
-				ft := subst(fieldType(t, i), tpS, tpN, argS, argN, depth-1)
-				tpush(nm)
-				tpush(ft)
+		vs := variantCount
+		for i := u32(0); i < t.b; i++ {
+			if variantCount < MaxVariants {
+				variants[variantCount] = nv[i]
+				variantCount++
 			}
-			return mkStruct(m)
 		}
-		Enum(..) -> {
-			m := tmark()
-			n := nvariants(t)
-			for i := usize(0); i < n; i++ {
-				pm := tmark()
-				pn := variantPayN(t, i)
-				for j := usize(0); j < pn; j++ {
-					tpush(subst(variantPay(t, i, j), tpS, tpN, argS, argN, depth-1))
-				}
-				ps, pc := tcommitStack(pm)
-				tpush(variantName(t, i))
-				tpush(ps)
-				tpush(pc)
-			}
-			return mkEnum(m)
-		}
-		Sig(eff, va, ps, pn, rs, rn, ..) -> {
-			m1 := tmark()
-			for i := usize(0); i < usize(pn); i++ {
-				tpush(subst(tlist(ps, i), tpS, tpN, argS, argN, depth-1))
-			}
-			m2 := tmark()
-			for i := usize(0); i < usize(rn); i++ {
-				tpush(subst(tlist(rs, i), tpS, tpN, argS, argN, depth-1))
-			}
-			m3 := tmark()
-			return mkSig(eff, va, m1, m2, m3)
-		}
-		Tuple(s, n) -> {
-			m := tmark()
-			for i := usize(0); i < usize(n); i++ {
-				tpush(subst(tlist(s, i), tpS, tpN, argS, argN, depth-1))
-			}
-			return mkTupleStack(m)
-		}
-		NoType | Basic(_) | Code(_) | ConstArg(_) | Opaque(..) -> return t
+		return newType(Type{kind: TKindEnum, a: vs, b: t.b})
 	}
+	if t.kind == TKindSig {
+		changed := false
+		var np [32]u32
+		for i := u32(0); i < t.b; i++ {
+			pt := typeList[t.a+i]
+			npt := substType(pt, tpSyms, targs)
+			if npt != pt {
+				changed = true
+			}
+			np[i] = npt
+		}
+		var nr [16]u32
+		for i := u32(0); i < t.d; i++ {
+			rt := typeList[t.c+i]
+			nrt := substType(rt, tpSyms, targs)
+			if nrt != rt {
+				changed = true
+			}
+			nr[i] = nrt
+		}
+		var ne [16]u32
+		ec := sigTypeEffCount[ty]
+		driver for i := u32(0); i < ec && i < 16; i++ {
+			et := typeList[sigTypeEffStart[ty]+i]
+			net := substType(et, tpSyms, targs)
+			if net != et {
+				changed = true
+			}
+			ne[i] = net
+		}
+		if !changed {
+			return ty
+		}
+		ps, pc := pushTypeList(np[:usize(t.b)])
+		rs, rc := pushTypeList(nr[:usize(t.d)])
+		resSig := newType(Type{kind: TKindSig, op: t.op, flags: t.flags, a: ps, b: pc, c: rs, d: rc})
+		if ec > 0 {
+			es, ec2 := pushTypeList(ne[:usize(ec)])
+			sigTypeEffStart[resSig] = es
+			sigTypeEffCount[resSig] = ec2
+		}
+		return resSig
+	}
+	if t.kind == TKindEffect {
+		if t.d == 0 {
+			return ty
+		}
+		changed := false
+		var na [16]u32
+		for i := u32(0); i < t.d; i++ {
+			at := typeList[t.c+i]
+			nat := substType(at, tpSyms, targs)
+			if nat != at {
+				changed = true
+			}
+			na[i] = nat
+		}
+		if !changed {
+			return ty
+		}
+		orig := t.origin
+		if orig == 0 {
+			orig = ty
+		}
+		return instantiateEffect(orig, na[:usize(t.d)])
+	}
+	if t.kind == TKindNamed {
+		if t.flags == 1 {
+			// Slot[T]
+			el := substType(typeList[t.c], tpSyms, targs)
+			if el == typeList[t.c] {
+				return ty
+			}
+			return makeSlotType(el)
+		}
+		if t.flags == 2 {
+			// Atomic[T]
+			el := substType(typeList[t.c], tpSyms, targs)
+			if el == typeList[t.c] {
+				return ty
+			}
+			return makeAtomicType(el)
+		}
+		if t.d == 0 {
+			return ty
+		}
+		changed := false
+		var na [16]u32
+		for i := u32(0); i < t.d; i++ {
+			at := typeList[t.c+i]
+			nat := substType(at, tpSyms, targs)
+			if nat != at {
+				changed = true
+			}
+			na[i] = nat
+		}
+		if !changed {
+			return ty
+		}
+		orig := t.origin
+		if orig == 0 {
+			orig = ty
+		}
+		return instantiateNamed(orig, na[:usize(t.d)])
+	}
+	return ty
+}
+
+// instantiateNamed creates a concrete or partially-specialized instance of generic Named type orig.
+driver func instantiateNamed(orig u32, args []u32) u32 {
+	if orig == TYSlotOrigin && len(args) == 1 {
+		return makeSlotType(args[0])
+	}
+	if orig == TYAtomicOrigin && len(args) == 1 {
+		return makeAtomicType(args[0])
+	}
+	t := types[orig]
+	if t.kind != TKindNamed {
+		return orig
+	}
+	sym := syms[t.a]
+	var tpSyms [16]u32
+	ntp := usize(sym.extra2)
+	for i := usize(0); i < ntp; i++ {
+		tpSyms[i] = typeList[usize(sym.extra)+i]
+	}
+	underSub := substType(t.b, tpSyms[:ntp], args)
+	ts, tc := pushTypeList(args)
+	return newType(Type{
+		kind:   TKindNamed,
+		a:      t.a,
+		b:      underSub,
+		c:      ts,
+		d:      tc,
+		origin: orig,
+	})
+}
+
+driver func instantiateEffect(orig u32, args []u32) u32 {
+	t := types[orig]
+	if t.kind != TKindEffect {
+		return orig
+	}
+	ts, tc := pushTypeList(args)
+	return newType(Type{
+		kind:   TKindEffect,
+		a:      t.a,
+		c:      ts,
+		d:      tc,
+		origin: orig,
+	})
+}
+
+// findEffectOp looks up an operation by name on an instantiated TKindEffect,
+// returning (opIdx, substitutedOpSigType, ok).
+driver func findEffectOp(effTy u32, opNameStr u32) (u32, u32, bool) {
+	if effTy == 0 || types[effTy].kind != TKindEffect {
+		return 0, 0, false
+	}
+	et := types[effTy]
+	esym := et.a
+	os := symEffOpStart[esym]
+	oc := symEffOpCount[esym]
+	for i := u32(0); i < oc; i++ {
+		eo := effOps[os+i]
+		if eo.nameStr == opNameStr {
+			sig := eo.sigType
+			if et.d > 0 && syms[esym].extra2 > 0 {
+				var tpSyms [16]u32
+				var targs [16]u32
+				ntp := usize(syms[esym].extra2)
+				for j := usize(0); j < ntp; j++ {
+					tpSyms[j] = typeList[usize(syms[esym].extra)+j]
+				}
+				for j := u32(0); j < et.d; j++ {
+					targs[j] = typeList[et.c+j]
+				}
+				sig = substType(sig, tpSyms[:ntp], targs[:usize(et.d)])
+			}
+			return eo.opIdx, sig, true
+		}
+	}
+	return 0, 0, false
+}
+
+// ---------------------------------------------------------------------------
+// x86_64 Memory Layout Calculator (matches bootstrap/internal/codegen/amd64/layout.go)
+
+func alignUp64Safe(n u64, align u64) u64 {
+	if align <= 1 {
+		return n
+	}
+	rem := n % align
+	if rem == 0 {
+		return n
+	}
+	return n + (align - rem)
+}
+
+driver func layoutOf(ty u32) (u64, u64) {
+	if ty == 0 || ty >= typeCount {
+		return 0, 1
+	}
+	if isSlotType(ty) {
+		return 16, 8
+	}
+	if isAtomicType(ty) {
+		return layoutOf(atomicElemType(ty))
+	}
+	u := under(ty)
+	t := types[u]
+	if t.kind == TKindBasic {
+		if u == TYBool || u == TYU8 || u == TYI8 || u == TYUntypedBool {
+			return 1, 1
+		}
+		if u == TYU16 || u == TYI16 {
+			return 2, 2
+		}
+		if u == TYU32 || u == TYI32 || u == TYF32 {
+			return 4, 4
+		}
+		if u == TYU64 || u == TYI64 || u == TYInt || u == TYUsize || u == TYF64 || u == TYUntypedFloat || u == TYError || u == TYUntypedInt {
+			return 8, 8
+		}
+		if u == TYString || u == TYUntypedStr {
+			return 16, 8
+		}
+		return 0, 1
+	}
+	if t.kind == TKindBuiltin {
+		if u == TYNet || u == TYSignals || u == TYClock || u == TYFS || u == TYEnv || u == TYStdio || u == TYExec || u == TYFieldCode {
+			return 0, 1
+		}
+		if u == TYConn || u == TYScope || u == TYArena {
+			return 8, 8
+		}
+		if u == TYListener || u == TYCancelFunc {
+			return 16, 8
+		}
+		if u == TYContext {
+			return 24, 8
+		}
+		return 0, 1
+	}
+	if t.kind == TKindPtr || t.kind == TKindEffect {
+		return 8, 8
+	}
+	if t.kind == TKindSlice {
+		return 24, 8
+	}
+	if t.kind == TKindSig || t.kind == TKindResume {
+		return 16, 8
+	}
+	if t.kind == TKindArray {
+		es, ea := layoutOf(t.a)
+		stride := alignUp64Safe(es, ea)
+		return stride * t.lenVal, ea
+	}
+	if t.kind == TKindStruct {
+		var off u64 = 0
+		var maxAl u64 = 1
+		for i := u32(0); i < t.b; i++ {
+			fs, fa := layoutOf(fields[t.a+i].typeID)
+			if fa > maxAl {
+				maxAl = fa
+			}
+			off = alignUp64Safe(off, fa)
+			off += fs
+		}
+		return alignUp64Safe(off, maxAl), maxAl
+	}
+	if t.kind == TKindEnum {
+		_, sz, al := enumLayout(u)
+		return sz, al
+	}
+	return 0, 1
+}
+
+driver func structFieldOffset(structTy u32, idx u32) u64 {
+	u := under(structTy)
+	t := types[u]
+	var off u64 = 0
+	for i := u32(0); i < t.b; i++ {
+		fs, fa := layoutOf(fields[t.a+i].typeID)
+		off = alignUp64Safe(off, fa)
+		if i == idx {
+			return off
+		}
+		off += fs
+	}
+	return off
+}
+
+driver func enumLayout(enumTy u32) (u64, u64, u64) {
+	u := under(enumTy)
+	t := types[u]
+	var tagSize u64 = 1
+	if t.b > 65536 {
+		tagSize = 4
+	} else if t.b > 256 {
+		tagSize = 2
+	}
+	maxAl := tagSize
+	var maxPaySize u64 = 0
+	for i := u32(0); i < t.b; i++ {
+		v := variants[t.a+i]
+		var po u64 = 0
+		var va u64 = 1
+		for j := u32(0); j < v.payCount; j++ {
+			ps, pa := layoutOf(typeList[v.payStart+j])
+			if pa > va {
+				va = pa
+			}
+			po = alignUp64Safe(po, pa)
+			po += ps
+		}
+		if va > maxAl {
+			maxAl = va
+		}
+		if po > maxPaySize {
+			maxPaySize = po
+		}
+	}
+	payOff := alignUp64Safe(tagSize, maxAl)
+	total := alignUp64Safe(payOff+maxPaySize, maxAl)
+	if maxPaySize == 0 {
+		total = tagSize
+		maxAl = tagSize
+	}
+	return tagSize, total, maxAl
+}
+
+driver func enumPayloadOffset(enumTy u32, varIdx u32, payIdx u32) u64 {
+	u := under(enumTy)
+	t := types[u]
+	tagSize, _, maxAl := enumLayout(u)
+	payBase := alignUp64Safe(tagSize, maxAl)
+	v := variants[t.a+varIdx]
+	var po u64 = 0
+	for j := u32(0); j < v.payCount; j++ {
+		ps, pa := layoutOf(typeList[v.payStart+j])
+		po = alignUp64Safe(po, pa)
+		if j == payIdx {
+			return payBase + po
+		}
+		po += ps
+	}
+	return payBase + po
+}
+
+func findStructField(structTy u32, nameStr u32) (u32, u32, bool) {
+	u := under(structTy)
+	t := types[u]
+	if t.kind != TKindStruct {
+		return 0, 0, false
+	}
+	for i := u32(0); i < t.b; i++ {
+		if fields[t.a+i].nameStr == nameStr {
+			return i, fields[t.a+i].typeID, true
+		}
+	}
+	return 0, 0, false
+}
+
+func findEnumVariant(enumTy u32, nameStr u32) (u32, bool) {
+	u := under(enumTy)
+	t := types[u]
+	if t.kind != TKindEnum {
+		return 0, false
+	}
+	for i := u32(0); i < t.b; i++ {
+		if variants[t.a+i].nameStr == nameStr {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func findUserMethod(recvTypeSym u32, nameStr u32) (u32, bool) {
+	for i := u32(0); i < methodCount; i++ {
+		if methods[i].recvTypeSym == recvTypeSym && methods[i].nameStr == nameStr {
+			return methods[i].funcSym, true
+		}
+	}
+	return 0, false
+}
+
+func lookupBuiltinMethod(recvTy u32, nameStr u32) u16 {
+	s := strSlice(nameStr)
+	if recvTy == TYNet {
+		if sliceEq(s, strBytes("ListenTCP")) {
+			return BMNetListenTCP
+		}
+		if sliceEq(s, strBytes("DialTCP")) {
+			return BMNetDialTCP
+		}
+	} else if recvTy == TYListener {
+		if sliceEq(s, strBytes("Addr")) {
+			return BMListenerAddr
+		}
+		if sliceEq(s, strBytes("Accept")) {
+			return BMListenerAccept
+		}
+		if sliceEq(s, strBytes("Close")) {
+			return BMListenerClose
+		}
+	} else if recvTy == TYConn {
+		if sliceEq(s, strBytes("Read")) {
+			return BMConnRead
+		}
+		if sliceEq(s, strBytes("Write")) {
+			return BMConnWrite
+		}
+		if sliceEq(s, strBytes("CloseWrite")) {
+			return BMConnCloseWrite
+		}
+		if sliceEq(s, strBytes("Close")) {
+			return BMConnClose
+		}
+	} else if recvTy == TYSignals {
+		if sliceEq(s, strBytes("NotifyContext")) {
+			return BMSignalsNotifyCtx
+		}
+	} else if recvTy == TYClock {
+		if sliceEq(s, strBytes("Now")) {
+			return BMClockNow
+		}
+		if sliceEq(s, strBytes("Sleep")) {
+			return BMClockSleep
+		}
+	} else if recvTy == TYContext {
+		if sliceEq(s, strBytes("Done")) {
+			return BMCtxDone
+		}
+		if sliceEq(s, strBytes("Err")) {
+			return BMCtxErr
+		}
+		if sliceEq(s, strBytes("WithTimeout")) {
+			return BMCtxWithTimeout
+		}
+	} else if recvTy == TYScope {
+		if sliceEq(s, strBytes("AcquireSlot")) {
+			return BMScopeAcquireSlot
+		}
+		if sliceEq(s, strBytes("ReleaseSlot")) {
+			return BMScopeReleaseSlot
+		}
+		if sliceEq(s, strBytes("Go")) {
+			return BMScopeGo
+		}
+		if sliceEq(s, strBytes("Spawn")) {
+			return BMScopeSpawn
+		}
+		if sliceEq(s, strBytes("Ready")) {
+			return BMScopeReady
+		}
+		if sliceEq(s, strBytes("Wait")) {
+			return BMScopeWait
+		}
+		if sliceEq(s, strBytes("WaitTimeout")) {
+			return BMScopeWaitTimeout
+		}
+	} else if recvTy == TYFS {
+		if sliceEq(s, strBytes("ReadFileInto")) {
+			return BMFSReadFileInto
+		}
+		if sliceEq(s, strBytes("WriteFile")) {
+			return BMFSWriteFile
+		}
+		if sliceEq(s, strBytes("IsDir")) {
+			return BMFSIsDir
+		}
+		if sliceEq(s, strBytes("ListSourceFiles")) {
+			return BMFSListSourceFiles
+		}
+		if sliceEq(s, strBytes("MkdirTemp")) {
+			return BMFSMkdirTemp
+		}
+		if sliceEq(s, strBytes("RemoveAll")) {
+			return BMFSRemoveAll
+		}
+	} else if recvTy == TYEnv {
+		if sliceEq(s, strBytes("ArgsCount")) {
+			return BMEnvArgsCount
+		}
+		if sliceEq(s, strBytes("Arg")) {
+			return BMEnvArg
+		}
+		if sliceEq(s, strBytes("GetEnv")) {
+			return BMEnvGetenv
+		}
+	} else if recvTy == TYStdio {
+		if sliceEq(s, strBytes("WriteStdout")) {
+			return BMStdioWriteStdout
+		}
+		if sliceEq(s, strBytes("WriteStderr")) {
+			return BMStdioWriteStderr
+		}
+		if sliceEq(s, strBytes("ReadStdin")) {
+			return BMStdioReadStdin
+		}
+	} else if recvTy == TYExec {
+		if sliceEq(s, strBytes("Run")) {
+			return BMExecRun
+		}
+	} else if recvTy == TYArena {
+		if sliceEq(s, strBytes("AllocBytes")) {
+			return BMArenaAllocBytes
+		}
+		if sliceEq(s, strBytes("Used")) {
+			return BMArenaUsed
+		}
+		if sliceEq(s, strBytes("Cap")) {
+			return BMArenaCap
+		}
+		if sliceEq(s, strBytes("Reset")) {
+			return BMArenaReset
+		}
+	} else if isAtomicType(recvTy) {
+		if sliceEq(s, strBytes("Load")) {
+			return BMAtomicLoad
+		}
+		if sliceEq(s, strBytes("Store")) {
+			return BMAtomicStore
+		}
+		if sliceEq(s, strBytes("Add")) {
+			return BMAtomicAdd
+		}
+		if sliceEq(s, strBytes("Swap")) {
+			return BMAtomicSwap
+		}
+		if sliceEq(s, strBytes("CompareAndSwap")) {
+			return BMAtomicCAS
+		}
+	}
+	return BMNone
 }

@@ -1,0 +1,18 @@
+// SINCE: v0.3
+// fail_v03_missing_effect: calling a function that requires `with Fail` without
+// an enclosing `handle` or `with Fail` capability is E5003.
+package main
+
+effect Fail {
+	fail(code u32)
+}
+
+func boom() with Fail {
+	fail(1)
+}
+
+driver func main(io Stdio) error {
+	_ = io
+	boom() // ERROR E5003
+	return nil
+}

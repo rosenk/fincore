@@ -1,0 +1,160 @@
+// SINCE: v0.4
+package main
+
+type Point struct {
+	x u32
+	y u32
+}
+
+effect Abort {
+	stop(code u32) u32
+}
+
+func concat[m usize, n usize, T any](a [m]T, b [n]T) [m + n]T {
+	var out [m + n]T
+	for i := usize(0); i < m; i++ {
+		out[i] = a[i]
+	}
+	for j := usize(0); j < n; j++ {
+		out[m+j] = b[j]
+	}
+	return out
+}
+
+func doubleArr[n usize, T any](a [n]T) [n * 2]T {
+	var out [n * 2]T
+	for i := usize(0); i < n; i++ {
+		out[i] = a[i]
+		out[n+i] = a[i]
+	}
+	return out
+}
+
+func at[n usize, T any](a *[n]T, i usize where i < n) T {
+	return a[i]
+}
+
+func first[n usize, T any](a *[n]T where n > 0) T {
+	return a[0]
+}
+
+func safeGet[n usize, T any](a *[n]T, i usize) (T, bool) {
+	if i < n {
+		return at[n, T](a, i), true
+	}
+	var zero T
+	return zero, false
+}
+
+func guardGet[n usize, T any](a *[n]T, i usize) (T, bool) {
+	if i >= n {
+		var zero T
+		return zero, false
+	}
+	return at[n, T](a, i), true
+}
+
+func sumConstSlice(xs const []u32) u32 {
+	var s u32 = 0
+	for i := usize(0); i < len(xs); i++ {
+		s += xs[i]
+	}
+	return s
+}
+
+func readPoint(p const *Point) u32 {
+	return p.x + p.y
+}
+
+func countUpper(s const []byte) u32 {
+	var c u32 = 0
+	for i := usize(0); i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			c++
+		}
+	}
+	return c
+}
+
+func arenaEarlyReturn(limit usize) u32 {
+	scope a := NewArena(128) {
+		b, err := a.AllocBytes(16)
+		if err != nil {
+			return 999
+		}
+		b[0] = 42
+		if limit > 0 {
+			return u32(b[0]) + u32(a.Used())
+		}
+		return 0
+	}
+}
+
+func arenaAbortCheck() u32 with Abort {
+	scope a := NewArena(256) {
+		b, err := a.AllocBytes(24)
+		if err != nil {
+			return 0
+		}
+		b[0] = 7
+		return stop(u32(b[0]) + u32(a.Used()))
+	}
+}
+
+driver func main(io Stdio) error {
+	var a [3]u32 = [3]u32{10, 20, 30}
+	var b [2]u32 = [2]u32{40, 50}
+	// Canonical dim equality: [3 + 2]u32 == [2 + 3]u32 == [5]u32
+	var c [2 + 3]u32 = concat[3, 2, u32](a, b)
+	var d [6]u32 = doubleArr[3, u32](a)
+
+	v0 := first[5, u32](&c)
+	v3 := at[5, u32](&c, 3)
+	g1, ok1 := safeGet[5, u32](&c, 4)
+	g2, ok2 := safeGet[5, u32](&c, 5)
+	g3, ok3 := guardGet[5, u32](&c, 2)
+	g4, ok4 := guardGet[5, u32](&c, 9)
+
+	// Const views & zero-copy strView
+	s1 := sumConstSlice(c[:])
+	s2 := sumConstSlice(d[:])
+	pt := Point{x: 11, y: 22}
+	ps := readPoint(&pt)
+	sv := strView("FinCoreV04")
+	up := countUpper(sv)
+
+	// Bounded Arena: alloc, overflow -> ErrArenaFull, reset, reuse, early return, effect abort
+	var arenaCap usize = 0
+	var used1 usize = 0
+	var usedAfterReset usize = 0
+	var gotFull bool = false
+	var reused byte = 0
+	scope ar := NewArena(64) {
+		arenaCap = ar.Cap()
+		buf1, err1 := ar.AllocBytes(20)
+		if err1 == nil && len(buf1) == 20 {
+			buf1[0] = 'K'
+			used1 = ar.Used()
+		}
+		_, err2 := ar.AllocBytes(128)
+		if err2 == ErrArenaFull {
+			gotFull = true
+		}
+		ar.Reset()
+		usedAfterReset = ar.Used()
+		buf3, err3 := ar.AllocBytes(8)
+		if err3 == nil && len(buf3) == 8 {
+			buf3[0] = 'Z'
+			reused = buf3[0]
+		}
+	}
+	early := arenaEarlyReturn(1)
+	aborted := handle arenaAbortCheck() {
+		stop(code) -> code + 100
+	}
+
+	var out [256]byte
+	n := formatTo(out[:], "c=%d,%d g=%d,%v,%d,%v,%d,%v,%d,%v sum=%d,%d pt=%d up=%d cap=%d u=%d,%d full=%v r=%d e=%d ab=%d\n",
+		v0, v3, g1, ok1, g2, ok2, g3, ok3, g4, ok4, s1, s2, ps, up, arenaCap, used1, usedAfterReset, gotFull, reused, early, aborted)
+	return io.WriteStdout(out[:n])
+}

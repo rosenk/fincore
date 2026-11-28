@@ -1,5 +1,0 @@
-package main
-
-driver func main(n Net, s Signals, c Clock, f FS, e Env, io Stdio, x Exec, n2 Net) error {
-	return nil
-}

@@ -1,0 +1,1747 @@
+package main
+
+// Call, Builtin, Capability/Resource Method, and Deferred Call code generation
+// for the FinCore Stage-1 Linux x86_64 backend.
+
+driver func (f *FnGen) emitSingleCallTo(en u32, dstOff i64, wantTy u32) {
+	var dsts [1]i64
+	var dts [1]u32
+	dsts[0] = dstOff
+	dts[0] = wantTy
+	f.emitMultiCallTo(en, dsts[:], dts[:])
+}
+
+driver func (f *FnGen) emitMultiCallTo(en u32, dsts []i64, dts []u32) {
+	if nodeCall[en] == 0 {
+		return
+	}
+	ci := calls[nodeCall[en]]
+	if ci.kind == CKConv {
+		f.emitConversion(en, dsts[0], f.subst(ci.convType))
+		return
+	}
+	if ci.kind == CKVariant {
+		f.emitVariantCtor(en, ci, dsts[0])
+		return
+	}
+	if ci.kind == CKBuiltin {
+		f.emitBuiltinCall(en, ci, dsts, dts)
+		return
+	}
+	if ci.kind == CKBuiltinMeth {
+		f.emitBuiltinMethodCall(en, ci, dsts, dts)
+		return
+	}
+	if ci.kind == CKFunc || ci.kind == CKMethod || ci.kind == CKValue {
+		f.emitUserCall(en, ci, dsts, dts)
+		return
+	}
+	if ci.kind == CKEffectOp {
+		f.emitEffectOpCall(en, ci, dsts)
+		return
+	}
+	if ci.kind == CKResume {
+		f.emitResumeCall(en, ci, dsts)
+		return
+	}
+}
+
+driver func (f *FnGen) emitConversion(en u32, dstOff i64, target u32) {
+	src := listPool[nodes[en].b]
+	st := f.typeOf(src)
+	if isStringType(target) {
+		f.emitExprTo(src, dstOff, target)
+		return
+	}
+	if types[under(target)].kind == TKindPtr {
+		f.emitScalar(src, st)
+		em("    movq %rax, ")
+		emI(dstOff)
+		em("(%rbp)\n")
+		return
+	}
+	if isScalarType(target) {
+		tu := under(target)
+		su := under(st)
+		if isFloatType(tu) {
+			if isFloatType(su) {
+				f.emitScalar(src, st)
+				if su == TYF64 && tu == TYF32 {
+					em("    movq %rax, %xmm0\n    cvtsd2ss %xmm0, %xmm0\n    movd %xmm0, %eax\n")
+				} else if su == TYF32 && tu == TYF64 {
+					em("    movd %eax, %xmm0\n    cvtss2sd %xmm0, %xmm0\n    movq %xmm0, %rax\n")
+				}
+				f.emitStoreScalarToFrame(dstOff, target)
+				return
+			}
+			// Integer (or untyped int) -> f32 / f64
+			if st == TYUntypedInt || st == TYUntypedFloat {
+				f.emitExprTo(src, dstOff, target)
+				return
+			}
+			f.emitScalar(src, st)
+			if tu == TYF32 {
+				em("    cvtsi2ssq %rax, %xmm0\n    movd %xmm0, %eax\n")
+			} else {
+				em("    cvtsi2sdq %rax, %xmm0\n    movq %xmm0, %rax\n")
+			}
+			f.emitStoreScalarToFrame(dstOff, target)
+			return
+		}
+		if isFloatType(su) {
+			// f32 / f64 -> integer
+			f.emitScalar(src, st)
+			if su == TYF32 {
+				em("    movd %eax, %xmm0\n    cvttss2siq %xmm0, %rax\n")
+			} else {
+				em("    movq %rax, %xmm0\n    cvttsd2siq %xmm0, %rax\n")
+			}
+			f.emitMaskScalar(target)
+			f.emitStoreScalarToFrame(dstOff, target)
+			return
+		}
+		f.emitScalar(src, st)
+		f.emitMaskScalar(target)
+		f.emitStoreScalarToFrame(dstOff, target)
+		return
+	}
+	f.emitExprTo(src, dstOff, target)
+}
+
+driver func (f *FnGen) emitVariantCtor(en u32, ci CallInfo, dstOff i64) {
+	et := under(f.subst(ci.varType))
+	tagSize, totalSize, _ := enumLayout(et)
+	f.emitZero(dstOff, totalSize)
+	if tagSize == 1 {
+		em("    movb $")
+	} else if tagSize == 2 {
+		em("    movw $")
+	} else {
+		em("    movl $")
+	}
+	emU(u64(ci.varIdx))
+	em(", ")
+	emI(dstOff)
+	em("(%rbp)\n")
+	n := nodes[en]
+	vr := variants[types[et].a+ci.varIdx]
+	driver for i := u32(0); i < n.c && i < vr.payCount; i++ {
+		pt := f.subst(typeList[vr.payStart+i])
+		po := enumPayloadOffset(et, ci.varIdx, i)
+		f.emitExprTo(listPool[n.b+i], dstOff+i64(po), pt)
+	}
+}
+
+driver func (f *FnGen) emitUserCall(en u32, ci CallInfo, dsts []i64, dts []u32) {
+	_ = dts
+	sigTy := f.subst(ci.sigType)
+	sig := types[sigTy]
+	var recvTy u32 = 0
+	var recvSlot i64 = 0
+	if ci.kind == CKMethod {
+		recvTy = f.subst(ci.recvType)
+		rsz, ral := layoutOf(recvTy)
+		recvSlot = f.allocLocal(rsz, ral)
+		if ci.autoAddr != 0 {
+			f.emitAddr(ci.recvExpr)
+			em("    movq %rax, ")
+			emI(recvSlot)
+			em("(%rbp)\n")
+		} else {
+			f.emitExprTo(ci.recvExpr, recvSlot, recvTy)
+		}
+	}
+	var fnValSlot i64 = 0
+	if ci.kind == CKValue {
+		fnValSlot = f.allocLocal(16, 8)
+		f.emitExprTo(nodes[en].a, fnValSlot, sigTy)
+	}
+
+	var ptypes [32]u32
+	var argSlots [32]i64
+	driver for i := u32(0); i < sig.b && i < 32; i++ {
+		ptypes[i] = f.subst(typeList[sig.a+i])
+		sz, al := layoutOf(ptypes[i])
+		argSlots[i] = f.allocLocal(sz, al)
+	}
+	// Append hidden effect capability evidence arguments (`with E1, E2`)
+	evCount := callEvCount[nodeCall[en]]
+	evStart := callEvStart[nodeCall[en]]
+	totalParams := sig.b
+	if ci.kind == CKFunc || ci.kind == CKMethod {
+		driver for i := u32(0); i < evCount && totalParams < 32; i++ {
+			ptypes[totalParams] = TYU64
+			argSlots[totalParams] = f.allocLocal(8, 8)
+			totalParams++
+		}
+	}
+	var rtypes [16]u32
+	driver for i := u32(0); i < sig.d && i < 16; i++ {
+		rtypes[i] = f.subst(typeList[sig.c+i])
+	}
+
+	n := nodes[en]
+	if n.c == 1 && sig.b > 1 {
+		f.emitMultiCallTo(listPool[n.b], argSlots[:usize(sig.b)], ptypes[:usize(sig.b)])
+	} else {
+		driver for i := u32(0); i < n.c && i < sig.b; i++ {
+			f.emitExprTo(listPool[n.b+i], argSlots[i], ptypes[i])
+		}
+	}
+	if (ci.kind == CKFunc || ci.kind == CKMethod) && evCount > 0 {
+		driver for i := u32(0); i < evCount && sig.b+i < 32; i++ {
+			evSym := callEvSyms[evStart+i]
+			f.emitSymAddr(evSym)
+			em("    movq 0(%rax), %rax\n    movq %rax, ")
+			emI(argSlots[sig.b+i])
+			em("(%rbp)\n")
+		}
+	}
+
+	abi := computeCallABI(recvTy, ptypes[:usize(totalParams)], rtypes[:usize(sig.d)])
+	if abi.totalSize > 0 {
+		em("    subq $")
+		emU(abi.totalSize)
+		em(", %rsp\n")
+	}
+	if recvTy != 0 {
+		rsz, _ := layoutOf(recvTy)
+		f.emitCopyFrameToRSP(abi.recvOff, recvSlot, rsz)
+	}
+	driver for i := u32(0); i < totalParams && i < 32; i++ {
+		psz, _ := layoutOf(ptypes[i])
+		f.emitCopyFrameToRSP(abi.argOffs[i], argSlots[i], psz)
+	}
+
+	if ci.kind == CKFunc || ci.kind == CKMethod {
+		var targs [16]u32
+		nt := ci.targCount
+		driver for i := u32(0); i < nt && i < 16; i++ {
+			targs[i] = f.subst(typeList[ci.targStart+i])
+		}
+		mi := requestFunc(ci.calleeSym, targs[:usize(nt)])
+		em("    xorq %r12, %r12\n    call ")
+		emitMonoItemLabel(SecFnBody, mi)
+		em("\n")
+	} else {
+		em("    movq ")
+		emI(fnValSlot)
+		em("(%rbp), %rax\n    movq ")
+		emI(fnValSlot + 8)
+		em("(%rbp), %r12\n    call *%rax\n")
+	}
+
+	driver for i := u32(0); i < sig.d && usize(i) < len(dsts); i++ {
+		if dsts[i] != 0 {
+			rsz, _ := layoutOf(rtypes[i])
+			f.emitCopyRSPToFrame(dsts[i], abi.retOffs[i], rsz)
+		}
+	}
+	if abi.totalSize > 0 {
+		em("    addq $")
+		emU(abi.totalSize)
+		em(", %rsp\n")
+	}
+	// Propagate abort/unwind from any passed Tier-2/3 effect capability so our own defers & scopes run in LIFO order!
+	if (ci.kind == CKFunc || ci.kind == CKMethod) && evCount > 0 {
+		driver for i := u32(0); i < evCount && sig.b+i < 32; i++ {
+			okLbl := freshLabel()
+			em("    movq ")
+			emI(argSlots[sig.b+i])
+			em("(%rbp), %rax\n    movq 0(%rax), %rcx\n    testq %rcx, %rcx\n    jz ")
+			emLbl("evok", okLbl)
+			em("\n    cmpq $3, 16(%rcx)\n    je ")
+			emLbl("epi", f.epilogueLbl)
+			em("\n")
+			emLbl("evok", okLbl)
+			em(":\n")
+		}
+	}
+}
+
+func (f *FnGen) emitCopyFrameToRSP(rspOff u64, srcOff i64, size u64) {
+	if size == 0 {
+		return
+	}
+	if size <= 32 {
+		var p u64 = 0
+		for step := u64(0); step < 4; step++ {
+			if p+8 > size {
+				break
+			}
+			em("    movq ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %rax\n    movq %rax, ")
+			emU(rspOff + p)
+			em("(%rsp)\n")
+			p += 8
+		}
+		if p+4 <= size {
+			em("    movl ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %eax\n    movl %eax, ")
+			emU(rspOff + p)
+			em("(%rsp)\n")
+			p += 4
+		}
+		for step := u64(0); step < 4; step++ {
+			if p >= size {
+				break
+			}
+			em("    movzbl ")
+			emI(srcOff + i64(p))
+			em("(%rbp), %eax\n    movb %al, ")
+			emU(rspOff + p)
+			em("(%rsp)\n")
+			p++
+		}
+		return
+	}
+	em("    leaq ")
+	emU(rspOff)
+	em("(%rsp), %rdi\n    leaq ")
+	emI(srcOff)
+	em("(%rbp), %rsi\n    movq $")
+	emU(size)
+	em(", %rcx\n    cld\n    rep movsb\n")
+}
+
+func (f *FnGen) emitCopyRSPToFrame(dstOff i64, rspOff u64, size u64) {
+	if size == 0 {
+		return
+	}
+	if size <= 32 {
+		var p u64 = 0
+		for step := u64(0); step < 4; step++ {
+			if p+8 > size {
+				break
+			}
+			em("    movq ")
+			emU(rspOff + p)
+			em("(%rsp), %rax\n    movq %rax, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p += 8
+		}
+		if p+4 <= size {
+			em("    movl ")
+			emU(rspOff + p)
+			em("(%rsp), %eax\n    movl %eax, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p += 4
+		}
+		for step := u64(0); step < 4; step++ {
+			if p >= size {
+				break
+			}
+			em("    movzbl ")
+			emU(rspOff + p)
+			em("(%rsp), %eax\n    movb %al, ")
+			emI(dstOff + i64(p))
+			em("(%rbp)\n")
+			p++
+		}
+		return
+	}
+	em("    leaq ")
+	emI(dstOff)
+	em("(%rbp), %rdi\n    leaq ")
+	emU(rspOff)
+	em("(%rsp), %rsi\n    movq $")
+	emU(size)
+	em(", %rcx\n    cld\n    rep movsb\n")
+}
+
+// ---------------------------------------------------------------------------
+// Deferred call execution at function epilogue (emits into fnBodyBuf)
+
+driver func (f *FnGen) emitDeferredCall(deferIdx u32) {
+	ds := f.defers[deferIdx]
+	ci := calls[nodeCall[ds.callNode]]
+	if ci.kind == CKFunc || ci.kind == CKMethod || ci.kind == CKValue {
+		sigTy := f.subst(ci.sigType)
+		sig := types[sigTy]
+		var recvTy u32 = 0
+		if ci.kind == CKMethod {
+			recvTy = ds.recvType
+		}
+		var ptypes [32]u32
+		driver for i := u32(0); i < sig.b && i < 32; i++ {
+			ptypes[i] = f.subst(typeList[sig.a+i])
+		}
+		var rtypes [16]u32
+		driver for i := u32(0); i < sig.d && i < 16; i++ {
+			rtypes[i] = f.subst(typeList[sig.c+i])
+		}
+		abi := computeCallABI(recvTy, ptypes[:usize(sig.b)], rtypes[:usize(sig.d)])
+		if abi.totalSize > 0 {
+			em("    subq $")
+			emU(abi.totalSize)
+			em(", %rsp\n")
+		}
+		if recvTy != 0 {
+			rsz, _ := layoutOf(recvTy)
+			f.emitCopyFrameToRSP(abi.recvOff, ds.recvOff, rsz)
+		}
+		driver for i := u32(0); i < ds.nArgs && i < sig.b; i++ {
+			psz, _ := layoutOf(ptypes[i])
+			f.emitCopyFrameToRSP(abi.argOffs[i], ds.argOffs[i], psz)
+		}
+		if ci.kind == CKFunc || ci.kind == CKMethod {
+			var targs [16]u32
+			nt := ci.targCount
+			driver for i := u32(0); i < nt && i < 16; i++ {
+				targs[i] = f.subst(typeList[ci.targStart+i])
+			}
+			mi := requestFunc(ci.calleeSym, targs[:usize(nt)])
+			em("    xorq %r12, %r12\n    call ")
+			emitMonoItemLabel(SecFnBody, mi)
+			em("\n")
+		} else {
+			em("    movq ")
+			emI(ds.recvOff)
+			em("(%rbp), %rax\n    movq ")
+			emI(ds.recvOff + 8)
+			em("(%rbp), %r12\n    call *%rax\n")
+		}
+		if abi.totalSize > 0 {
+			em("    addq $")
+			emU(abi.totalSize)
+			em(", %rsp\n")
+		}
+		return
+	}
+	if ci.kind == CKBuiltinMeth {
+		var noDst [0]i64
+		f.emitBuiltinMethodFromSlots(ci.builtinID, ds.recvOff, ds.argOffs[:usize(ds.nArgs)], noDst[:])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Builtin functions
+
+driver func (f *FnGen) emitBuiltinCall(en u32, ci CallInfo, dsts []i64, dts []u32) {
+	_ = dts
+	n := nodes[en]
+	bid := ci.builtinID
+	var dst0 i64 = 0
+	var dst1 i64 = 0
+	if len(dsts) > 0 {
+		dst0 = dsts[0]
+	}
+	if len(dsts) > 1 {
+		dst1 = dsts[1]
+	}
+
+	if bid == BFLen || bid == BFCap {
+		arg := listPool[n.b]
+		at := f.typeOf(arg)
+		u := under(at)
+		if types[u].kind == TKindArray {
+			em("    movq $")
+			emU(types[u].lenVal)
+			em(", ")
+			emI(dst0)
+			em("(%rbp)\n")
+			return
+		}
+		if types[u].kind == TKindPtr && types[under(types[u].a)].kind == TKindArray {
+			em("    movq $")
+			emU(types[under(types[u].a)].lenVal)
+			em(", ")
+			emI(dst0)
+			em("(%rbp)\n")
+			return
+		}
+		if u == TYString || u == TYUntypedStr {
+			sSlot := f.allocLocal(16, 8)
+			f.emitExprTo(arg, sSlot, at)
+			em("    movq ")
+			emI(sSlot + 8)
+			em("(%rbp), %rax\n    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+			return
+		}
+		sSlot := f.allocLocal(24, 8)
+		f.emitExprTo(arg, sSlot, at)
+		if bid == BFLen {
+			em("    movq ")
+			emI(sSlot + 8)
+			em("(%rbp), %rax\n")
+		} else {
+			em("    movq ")
+			emI(sSlot + 16)
+			em("(%rbp), %rax\n")
+		}
+		em("    movq %rax, ")
+		emI(dst0)
+		em("(%rbp)\n")
+		return
+	}
+
+	if bid == BFCopy {
+		dstArg := listPool[n.b]
+		srcArg := listPool[n.b+1]
+		dstTy := f.typeOf(dstArg)
+		dSlot := f.allocLocal(24, 8)
+		sSlot := f.allocLocal(24, 8)
+		f.emitExprTo(dstArg, dSlot, dstTy)
+		f.emitExprTo(srcArg, sSlot, f.typeOf(srcArg))
+		elemTy := types[under(dstTy)].a
+		es, ea := layoutOf(elemTy)
+		stride := alignUp64Safe(es, ea)
+		em("    movq ")
+		emI(dSlot + 8)
+		em("(%rbp), %rax\n    movq ")
+		emI(sSlot + 8)
+		em("(%rbp), %rcx\n    cmpq %rcx, %rax\n    cmova %rcx, %rax\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		em("    imulq $")
+		emU(stride)
+		em(", %rax, %rdx\n    movq ")
+		emI(dSlot)
+		em("(%rbp), %rdi\n    movq ")
+		emI(sSlot)
+		em("(%rbp), %rsi\n    call _fc_rt_memmove\n")
+		return
+	}
+
+	if bid == BFBytesEqual {
+		aSlot := f.allocLocal(24, 8)
+		bSlot := f.allocLocal(24, 8)
+		f.emitExprTo(listPool[n.b], aSlot, makeSliceType(TYU8))
+		f.emitExprTo(listPool[n.b+1], bSlot, makeSliceType(TYU8))
+		em("    movq ")
+		emI(aSlot)
+		em("(%rbp), %rdi\n    movq ")
+		emI(aSlot + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(bSlot)
+		em("(%rbp), %rdx\n    movq ")
+		emI(bSlot + 8)
+		em("(%rbp), %rcx\n    call _fc_rt_bytes_eq\n")
+		if dst0 != 0 {
+			em("    movb %al, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFStrBytes {
+		sSlot := f.allocLocal(16, 8)
+		f.emitExprTo(listPool[n.b], sSlot, TYString)
+		em("    movq ")
+		emI(sSlot)
+		em("(%rbp), %rdi\n    movq ")
+		emI(sSlot + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_str_bytes\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 16)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFBytesToStr {
+		bSlot := f.allocLocal(24, 8)
+		f.emitExprTo(listPool[n.b], bSlot, makeSliceType(TYU8))
+		em("    movq ")
+		emI(bSlot)
+		em("(%rbp), %rdi\n    movq ")
+		emI(bSlot + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_bytes_to_str\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFFormatUint {
+		vSlot := f.allocLocal(8, 8)
+		bSlot := f.allocLocal(24, 8)
+		f.emitExprTo(listPool[n.b], vSlot, TYU64)
+		f.emitExprTo(listPool[n.b+1], bSlot, makeSliceType(TYU8))
+		em("    movq ")
+		emI(vSlot)
+		em("(%rbp), %rdi\n    movq ")
+		emI(bSlot)
+		em("(%rbp), %rsi\n    movq ")
+		emI(bSlot + 8)
+		em("(%rbp), %rdx\n    call _fc_rt_format_uint\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFParseUint {
+		bSlot := f.allocLocal(24, 8)
+		f.emitExprTo(listPool[n.b], bSlot, makeSliceType(TYU8))
+		em("    movq ")
+		emI(bSlot)
+		em("(%rbp), %rdi\n    movq ")
+		emI(bSlot + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_parse_uint\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFNewContext {
+		em("    call _fc_rt_new_ctx\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq $0, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n    movq $0, ")
+			emI(dst0 + 16)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    leaq _fc_rt_cancel_fn(%rip), %rcx\n    movq %rcx, ")
+			emI(dst1)
+			em("(%rbp)\n    movq %rax, ")
+			emI(dst1 + 8)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFNewScope {
+		f.emitScalar(listPool[n.b], TYUsize)
+		em("    movq %rax, %rdi\n    call _fc_rt_scope_new\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFNewFiberScope {
+		wSlot := f.allocLocal(8, 8)
+		f.emitScalar(listPool[n.b], TYUsize)
+		em("    movq %rax, ")
+		emI(wSlot)
+		em("(%rbp)\n")
+		f.emitScalar(listPool[n.b+1], TYUsize)
+		em("    movq %rax, %rsi\n    movq ")
+		emI(wSlot)
+		em("(%rbp), %rdi\n    call _fc_rt_fscope_new\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFFiberYield {
+		em("    call _fc_rt_fiber_yield\n")
+		return
+	}
+
+	if bid == BFNewArena {
+		f.emitScalar(listPool[n.b], TYUsize)
+		em("    movq %rax, %rdi\n    call _fc_rt_arena_new\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFStrView {
+		sSlot := f.allocLocal(16, 8)
+		f.emitExprTo(listPool[n.b], sSlot, TYString)
+		if dst0 != 0 {
+			em("    movq ")
+			emI(sSlot)
+			em("(%rbp), %rax\n    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq ")
+			emI(sSlot + 8)
+			em("(%rbp), %rax\n    movq %rax, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n    movq %rax, ")
+			emI(dst0 + 16)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFPanic {
+		sSlot := f.allocLocal(16, 8)
+		f.emitExprTo(listPool[n.b], sSlot, TYString)
+		em("    movq ")
+		emI(sSlot)
+		em("(%rbp), %rdi\n    movq ")
+		emI(sSlot + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_panic\n")
+		return
+	}
+
+	if bid == BFFormatTo {
+		f.emitFormatToCall(en, ci, dst0)
+		return
+	}
+}
+
+driver func (f *FnGen) emitFormatToCall(en u32, ci CallInfo, dst0 i64) {
+	n := nodes[en]
+	dstSlot := f.allocLocal(24, 8)
+	f.emitExprTo(listPool[n.b], dstSlot, makeSliceType(TYU8))
+
+	nArgs := n.c - 2
+	var argSlots [32]i64
+	var argTypes [32]u32
+	driver for i := u32(0); i < nArgs && i < 32; i++ {
+		an := listPool[n.b+2+i]
+		at := f.typeOf(an)
+		if isUntyped(at) {
+			if at == TYUntypedInt && nodeVal[an] != 0 && vals[nodeVal[an]].kind == VKInt && vals[nodeVal[an]].flags != 0 {
+				at = TYI64
+			} else {
+				at = defaultType(at)
+			}
+		}
+		sz, al := layoutOf(at)
+		argSlots[i] = f.allocLocal(sz, al)
+		argTypes[i] = at
+		f.emitExprTo(an, argSlots[i], at)
+	}
+
+	// Allocate 88-byte fc_fmt state (includes 64-byte scratch buffer for width padding)
+	fwSlot := f.allocLocal(88, 8)
+	em("    leaq ")
+	emI(fwSlot)
+	em("(%rbp), %rdi\n    movq ")
+	emI(dstSlot)
+	em("(%rbp), %rsi\n    movq ")
+	emI(dstSlot + 8)
+	em("(%rbp), %rdx\n    call _fc_rt_fmt_init\n")
+
+	spec := fmtSpecs[ci.fmtSpecID]
+	for i := u32(0); i < spec.itemCount; i++ {
+		it := fmtItems[spec.itemStart+i]
+		var w i64 = i64(it.width)
+		if it.leftAlign != 0 {
+			w = -w
+		}
+		var z u64 = 0
+		if it.zeroPad != 0 {
+			z = 1
+		}
+		if it.kind == FmtLit {
+			sb := strSlice(it.litStrID)
+			if len(sb) == 0 {
+				continue
+			}
+			lid := internRodataStrID(it.litStrID)
+			em("    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    leaq .L_str_")
+			emU(u64(lid))
+			em("(%rip), %rsi\n    movq $")
+			emU(u64(len(sb)))
+			em(", %rdx\n    call _fc_rt_fmt_lit\n")
+		} else if it.kind == FmtInt || it.kind == FmtUint || it.kind == FmtHex || it.kind == FmtHexInt {
+			f.emitLoadScalarFromFrame(argSlots[it.argIdx], argTypes[it.argIdx])
+			em("    movq %rax, %rsi\n    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq $")
+			emI(w)
+			em(", %rdx\n    movq $")
+			emU(z)
+			em(", %rcx\n")
+			if it.kind == FmtInt {
+				em("    call _fc_rt_fmt_int\n")
+			} else if it.kind == FmtUint {
+				em("    call _fc_rt_fmt_uint\n")
+			} else if it.kind == FmtHex {
+				em("    call _fc_rt_fmt_hex\n")
+			} else {
+				em("    call _fc_rt_fmt_hex_int\n")
+			}
+		} else if it.kind == FmtFloat {
+			if under(argTypes[it.argIdx]) == TYF32 {
+				em("    movd ")
+				emI(argSlots[it.argIdx])
+				em("(%rbp), %xmm0\n    cvtss2sd %xmm0, %xmm0\n    movq %xmm0, %rsi\n")
+			} else {
+				em("    movq ")
+				emI(argSlots[it.argIdx])
+				em("(%rbp), %rsi\n")
+			}
+			em("    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq $")
+			emI(w)
+			em(", %rdx\n    call _fc_rt_fmt_f64\n")
+		} else if it.kind == FmtStr || it.kind == FmtBytes {
+			em("    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq ")
+			emI(argSlots[it.argIdx])
+			em("(%rbp), %rsi\n    movq ")
+			emI(argSlots[it.argIdx] + 8)
+			em("(%rbp), %rdx\n    movq $")
+			emI(w)
+			em(", %rcx\n    call _fc_rt_fmt_str\n")
+		} else if it.kind == FmtQuote {
+			em("    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq ")
+			emI(argSlots[it.argIdx])
+			em("(%rbp), %rsi\n    movq ")
+			emI(argSlots[it.argIdx] + 8)
+			em("(%rbp), %rdx\n    movq $")
+			emI(w)
+			em(", %rcx\n    call _fc_rt_fmt_quote\n")
+		} else if it.kind == FmtChar {
+			f.emitLoadScalarFromFrame(argSlots[it.argIdx], argTypes[it.argIdx])
+			em("    movq %rax, %rsi\n    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq $")
+			emI(w)
+			em(", %rdx\n    call _fc_rt_fmt_byte\n")
+		} else if it.kind == FmtBool {
+			f.emitLoadScalarFromFrame(argSlots[it.argIdx], TYBool)
+			em("    movq %rax, %rsi\n    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq $")
+			emI(w)
+			em(", %rdx\n    call _fc_rt_fmt_bool\n")
+		} else if it.kind == FmtMethod {
+			at := f.subst(it.argType)
+			var mTargs [16]u32
+			var mNT u32 = 0
+			if types[at].kind == TKindNamed && types[at].d > 0 {
+				mNT = types[at].d
+				driver for k := u32(0); k < mNT && k < 16; k++ {
+					mTargs[k] = f.subst(typeList[types[at].c+k])
+				}
+			}
+			mi := requestFunc(it.methSym, mTargs[:usize(mNT)])
+			var mParams [1]u32
+			mParams[0] = makeSliceType(TYU8)
+			var mRets [1]u32
+			mRets[0] = TYUsize
+			abi := computeCallABI(at, mParams[:], mRets[:])
+			inScSlot := f.allocLocal(8, 8)
+			remSlot := f.allocLocal(24, 8)
+			em("    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq $")
+			emI(w)
+			em(", %rsi\n    call _fc_rt_fmt_dst\n    movq %rax, ")
+			emI(remSlot)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(remSlot + 8)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(remSlot + 16)
+			em("(%rbp)\n    movq %rcx, ")
+			emI(inScSlot)
+			em("(%rbp)\n")
+			if abi.totalSize > 0 {
+				em("    subq $")
+				emU(abi.totalSize)
+				em(", %rsp\n")
+			}
+			asz, _ := layoutOf(at)
+			f.emitCopyFrameToRSP(abi.recvOff, argSlots[it.argIdx], asz)
+			f.emitCopyFrameToRSP(abi.argOffs[0], remSlot, 24)
+			em("    xorq %r12, %r12\n    call ")
+			emitMonoItemLabel(SecFnBody, mi)
+			em("\n    movq ")
+			emU(abi.retOffs[0])
+			em("(%rsp), %rsi\n")
+			if abi.totalSize > 0 {
+				em("    addq $")
+				emU(abi.totalSize)
+				em(", %rsp\n")
+			}
+			em("    leaq ")
+			emI(fwSlot)
+			em("(%rbp), %rdi\n    movq $")
+			emI(w)
+			em(", %rdx\n    movq ")
+			emI(inScSlot)
+			em("(%rbp), %rcx\n    call _fc_rt_fmt_advance\n")
+		}
+	}
+
+	if dst0 != 0 {
+		em("    leaq ")
+		emI(fwSlot)
+		em("(%rbp), %rdi\n    call _fc_rt_fmt_n\n    movq %rax, ")
+		emI(dst0)
+		em("(%rbp)\n")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Builtin Capability & Resource Methods
+
+driver func (f *FnGen) emitBuiltinMethodCall(en u32, ci CallInfo, dsts []i64, dts []u32) {
+	_ = dts
+	bm := ci.builtinID
+	n := nodes[en]
+
+	// Evaluate receiver (skip for Atomic[T] which takes pointer/address directly)
+	rty := f.subst(ci.recvType)
+	rsz, ral := layoutOf(rty)
+	var recvOff i64 = 0
+	if rsz > 0 && !(bm >= BMAtomicLoad && bm <= BMAtomicCAS) {
+		recvOff = f.allocLocal(rsz, ral)
+		f.emitExprTo(ci.recvExpr, recvOff, rty)
+	}
+
+	// Special case: Signals.NotifyContext(sig1, sig2, ...) variadic -> bitmask in %rdi
+	if bm == BMSignalsNotifyCtx {
+		maskOff := f.allocLocal(8, 8)
+		em("    movq $0, ")
+		emI(maskOff)
+		em("(%rbp)\n")
+		for i := u32(0); i < n.c; i++ {
+			f.emitScalar(listPool[n.b+i], TYU64)
+			em("    movq %rax, %rcx\n    movq $1, %rdx\n    shlq %cl, %rdx\n    orq %rdx, ")
+			emI(maskOff)
+			em("(%rbp)\n")
+		}
+		em("    movq ")
+		emI(maskOff)
+		em("(%rbp), %rdi\n    call _fc_rt_sig_notify\n")
+		if len(dsts) > 0 && dsts[0] != 0 {
+			em("    movq %rax, ")
+			emI(dsts[0])
+			em("(%rbp)\n    movq $0, ")
+			emI(dsts[0] + 8)
+			em("(%rbp)\n    movq $0, ")
+			emI(dsts[0] + 16)
+			em("(%rbp)\n")
+		}
+		if len(dsts) > 1 && dsts[1] != 0 {
+			em("    leaq _fc_rt_cancel_fn(%rip), %rcx\n    movq %rcx, ")
+			emI(dsts[1])
+			em("(%rbp)\n    movq %rax, ")
+			emI(dsts[1] + 8)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	// Special case: Scope.AcquireSlot(ctx, &pool)
+	if bm == BMScopeAcquireSlot {
+		ctxOff := f.allocLocal(24, 8)
+		poolPtrOff := f.allocLocal(8, 8)
+		f.emitExprTo(listPool[n.b], ctxOff, TYContext)
+		poolArgTy := f.typeOf(listPool[n.b+1])
+		f.emitExprTo(listPool[n.b+1], poolPtrOff, poolArgTy)
+		var poolLen u64 = types[f.subst(typeList[ci.targStart])].lenVal
+		if types[under(poolArgTy)].kind == TKindPtr {
+			au := under(types[under(poolArgTy)].a)
+			if types[au].kind == TKindArray {
+				poolLen = types[au].lenVal
+			}
+		}
+		elemTy := f.subst(typeList[ci.targStart+1])
+		es, ea := layoutOf(elemTy)
+		stride := alignUp64Safe(es, ea)
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(ctxOff)
+		em("(%rbp), %rsi\n    movq ")
+		emI(ctxOff + 8)
+		em("(%rbp), %rdx\n    movq ")
+		emI(poolPtrOff)
+		em("(%rbp), %rcx\n    movq $")
+		emU(poolLen)
+		em(", %r8\n    movq $")
+		emU(stride)
+		em(", %r9\n    call _fc_rt_scope_acquire\n")
+		if len(dsts) > 0 && dsts[0] != 0 {
+			em("    movq %rax, ")
+			emI(dsts[0])
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dsts[0] + 8)
+			em("(%rbp)\n")
+		}
+		if len(dsts) > 1 && dsts[1] != 0 {
+			em("    movq %rcx, ")
+			emI(dsts[1])
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	// Special case: Scope.Go(slot, fn)
+	if bm == BMScopeGo {
+		slotOff := f.allocLocal(16, 8)
+		fnOff := f.allocLocal(16, 8)
+		f.emitExprTo(listPool[n.b], slotOff, f.typeOf(listPool[n.b]))
+		fnArg := listPool[n.b+1]
+		f.emitExprTo(fnArg, fnOff, f.typeOf(fnArg))
+		var envSz u64 = 0
+		if nodes[fnArg].kind == NKFuncLit {
+			envSz = f.getGoLitEnvSize(fnArg)
+		}
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(slotOff)
+		em("(%rbp), %rsi\n    movq ")
+		emI(slotOff + 8)
+		em("(%rbp), %rdx\n    movq ")
+		emI(fnOff)
+		em("(%rbp), %rcx\n    movq ")
+		emI(fnOff + 8)
+		em("(%rbp), %r8\n    movq $")
+		emU(envSz)
+		em(", %r9\n    call _fc_rt_scope_go\n")
+		return
+	}
+
+	// Special case: Scope.Spawn(ctx, fn) -> error (Slot completely hidden!)
+	if bm == BMScopeSpawn {
+		ctxOff := f.allocLocal(24, 8)
+		fnOff := f.allocLocal(16, 8)
+		f.emitExprTo(listPool[n.b], ctxOff, TYContext)
+		fnArg := listPool[n.b+1]
+		f.emitExprTo(fnArg, fnOff, f.typeOf(fnArg))
+		var envSz u64 = 0
+		if nodes[fnArg].kind == NKFuncLit {
+			envSz = f.getGoLitEnvSize(fnArg)
+		}
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(ctxOff)
+		em("(%rbp), %rsi\n    movq ")
+		emI(ctxOff + 8)
+		em("(%rbp), %rdx\n    movq ")
+		emI(fnOff)
+		em("(%rbp), %rcx\n    movq ")
+		emI(fnOff + 8)
+		em("(%rbp), %r8\n    movq $")
+		emU(envSz)
+		em(", %r9\n    call _fc_rt_scope_spawn\n")
+		if len(dsts) > 0 && dsts[0] != 0 {
+			em("    movq %rax, ")
+			emI(dsts[0])
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	// Special case: Atomic[T] hardware lock-free operations (0 runtime calls!)
+	if bm >= BMAtomicLoad && bm <= BMAtomicCAS {
+		ptrOff := f.allocLocal(8, 8)
+		if ci.autoAddr != 0 {
+			f.emitAddr(ci.recvExpr)
+			em("    movq %rax, ")
+			emI(ptrOff)
+			em("(%rbp)\n")
+		} else {
+			f.emitScalar(ci.recvExpr, rty)
+			em("    movq %rax, ")
+			emI(ptrOff)
+			em("(%rbp)\n")
+		}
+		elemTy := f.subst(typeList[ci.targStart])
+		esz, _ := layoutOf(elemTy)
+		var dst0 i64 = 0
+		if len(dsts) > 0 {
+			dst0 = dsts[0]
+		}
+		if bm == BMAtomicLoad {
+			em("    movq ")
+			emI(ptrOff)
+			em("(%rbp), %rcx\n")
+			if esz == 8 {
+				em("    movq (%rcx), %rax\n")
+			} else if esz == 4 {
+				em("    movl (%rcx), %eax\n")
+			} else {
+				em("    movzbl (%rcx), %eax\n")
+			}
+			if dst0 != 0 {
+				f.emitStoreScalarToFrame(dst0, elemTy)
+			}
+			return
+		}
+		if bm == BMAtomicStore || bm == BMAtomicSwap {
+			f.emitScalar(listPool[n.b], elemTy)
+			em("    movq ")
+			emI(ptrOff)
+			em("(%rbp), %rcx\n")
+			if esz == 8 {
+				em("    xchgq %rax, (%rcx)\n")
+			} else if esz == 4 {
+				em("    xchgl %eax, (%rcx)\n")
+			} else {
+				em("    xchgb %al, (%rcx)\n")
+			}
+			if bm == BMAtomicSwap && dst0 != 0 {
+				f.emitStoreScalarToFrame(dst0, elemTy)
+			}
+			return
+		}
+		if bm == BMAtomicAdd {
+			f.emitScalar(listPool[n.b], elemTy)
+			em("    movq %rax, %rdx\n    movq ")
+			emI(ptrOff)
+			em("(%rbp), %rcx\n")
+			if esz == 8 {
+				em("    lock xaddq %rax, (%rcx)\n    addq %rdx, %rax\n")
+			} else {
+				em("    lock xaddl %eax, (%rcx)\n    addl %edx, %eax\n")
+			}
+			if dst0 != 0 {
+				f.emitStoreScalarToFrame(dst0, elemTy)
+			}
+			return
+		}
+		if bm == BMAtomicCAS {
+			oldOff := f.allocLocal(8, 8)
+			newOff := f.allocLocal(8, 8)
+			f.emitScalar(listPool[n.b], elemTy)
+			em("    movq %rax, ")
+			emI(oldOff)
+			em("(%rbp)\n")
+			f.emitScalar(listPool[n.b+1], elemTy)
+			em("    movq %rax, ")
+			emI(newOff)
+			em("(%rbp)\n    movq ")
+			emI(oldOff)
+			em("(%rbp), %rax\n    movq ")
+			emI(newOff)
+			em("(%rbp), %rdx\n    movq ")
+			emI(ptrOff)
+			em("(%rbp), %rcx\n")
+			if esz == 8 {
+				em("    lock cmpxchgq %rdx, (%rcx)\n")
+			} else if esz == 4 {
+				em("    lock cmpxchgl %edx, (%rcx)\n")
+			} else {
+				em("    lock cmpxchgb %dl, (%rcx)\n")
+			}
+			if dst0 != 0 {
+				em("    sete ")
+				emI(dst0)
+				em("(%rbp)\n")
+			}
+			return
+		}
+	}
+
+	// Standard capability / resource methods: evaluate args into slots
+	var argOffs [16]i64
+	driver for i := u32(0); i < n.c && i < 16; i++ {
+		an := listPool[n.b+i]
+		at := f.typeOf(an)
+		if (nodeFlags[an] & NFImplicitBytes) != 0 {
+			at = makeSliceType(TYU8)
+		}
+		if isUntyped(at) {
+			at = defaultType(at)
+		}
+		sz, al := layoutOf(at)
+		argOffs[i] = f.allocLocal(sz, al)
+		f.emitExprTo(an, argOffs[i], at)
+	}
+	f.emitBuiltinMethodFromSlots(bm, recvOff, argOffs[:usize(n.c)], dsts)
+}
+
+driver func (f *FnGen) emitBuiltinMethodFromSlots(bm u16, recvOff i64, argOffs []i64, dsts []i64) {
+	var dst0 i64 = 0
+	var dst1 i64 = 0
+	var dst2 i64 = 0
+	if len(dsts) > 0 {
+		dst0 = dsts[0]
+	}
+	if len(dsts) > 1 {
+		dst1 = dsts[1]
+	}
+	if len(dsts) > 2 {
+		dst2 = dsts[2]
+	}
+
+	if bm == BMNetListenTCP {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_net_listen_tcp\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rcx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMNetDialTCP {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[1])
+		em("(%rbp), %rdx\n    movq ")
+		emI(argOffs[1] + 8)
+		em("(%rbp), %rcx\n    call _fc_rt_net_dial_tcp\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMListenerAddr {
+		em("    movq ")
+		emI(recvOff + 8)
+		em("(%rbp), %rdi\n    call _fc_rt_listener_addr\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMListenerAccept {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rdx\n    call _fc_rt_listener_accept\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMListenerClose || bm == BMConnClose {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    call _fc_rt_close_fd\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMConnCloseWrite {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    call _fc_rt_conn_close_write\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMConnRead || bm == BMConnWrite {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rdx\n    movq ")
+		emI(argOffs[1])
+		em("(%rbp), %rcx\n    movq ")
+		emI(argOffs[1] + 8)
+		em("(%rbp), %r8\n")
+		if bm == BMConnRead {
+			em("    call _fc_rt_conn_read\n")
+		} else {
+			em("    call _fc_rt_conn_write\n")
+		}
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMClockNow {
+		em("    call _fc_rt_clock_now\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMClockSleep {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[1])
+		em("(%rbp), %rdx\n    call _fc_rt_clock_sleep\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMCtxDone {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(recvOff + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_ctx_done\n")
+		if dst0 != 0 {
+			em("    movb %al, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMCtxErr {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(recvOff + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_ctx_err\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMCtxWithTimeout {
+		em("    movq ")
+		emI(recvOff + 8)
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rsi\n    call _fc_rt_ctx_with_timeout\n")
+		if dst0 != 0 {
+			em("    movq ")
+			emI(recvOff)
+			em("(%rbp), %rcx\n    movq %rcx, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rax, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n    movq $0, ")
+			emI(dst0 + 16)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMScopeReleaseSlot {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rsi\n    call _fc_rt_scope_release\n")
+		return
+	}
+	if bm == BMScopeWait {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    call _fc_rt_scope_wait\n")
+		return
+	}
+	if bm == BMScopeWaitTimeout {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rsi\n    call _fc_rt_scope_wait_timeout\n")
+		if dst0 != 0 {
+			em("    movb %al, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMFSReadFileInto {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[1])
+		em("(%rbp), %rdx\n    movq ")
+		emI(argOffs[1] + 8)
+		em("(%rbp), %rcx\n    call _fc_rt_fs_read_file_into\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMFSWriteFile {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[1])
+		em("(%rbp), %rdx\n    movq ")
+		emI(argOffs[1] + 8)
+		em("(%rbp), %rcx\n    call _fc_rt_fs_write_file\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMFSIsDir {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_fs_is_dir\n")
+		if dst0 != 0 {
+			em("    movb %al, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMFSListSourceFiles {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[1])
+		em("(%rbp), %rdx\n    movq ")
+		emI(argOffs[1] + 8)
+		em("(%rbp), %rcx\n    call _fc_rt_fs_list_fc\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMFSMkdirTemp {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_fs_mkdir_temp\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rcx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMFSRemoveAll {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_fs_remove_all\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMEnvArgsCount {
+		em("    call _fc_rt_args_count\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMEnvArg {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    call _fc_rt_arg\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMEnvGetenv {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_getenv\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movb %cl, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMStdioWriteStdout || bm == BMStdioWriteStderr {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n")
+		if bm == BMStdioWriteStdout {
+			em("    call _fc_rt_write_stdout\n")
+		} else {
+			em("    call _fc_rt_write_stderr\n")
+		}
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMStdioReadStdin {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    call _fc_rt_read_stdin\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMArenaAllocBytes {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rsi\n    call _fc_rt_arena_alloc_bytes\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 8)
+			em("(%rbp)\n    movq %rdx, ")
+			emI(dst0 + 16)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rcx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMArenaUsed {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    call _fc_rt_arena_used\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMArenaCap {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    call _fc_rt_arena_cap\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMArenaReset {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    call _fc_rt_arena_reset\n")
+		return
+	}
+	if bm == BMScopeReady {
+		em("    movq ")
+		emI(recvOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rsi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rdx\n    call _fc_rt_scope_ready\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMExecRun {
+		// Pack 96-byte struct on frame: ctx(16), bin(16), args(16), env(16), workdir(16), stderr(16)
+		stOff := f.allocLocal(96, 8)
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 8)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[1])
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 16)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[1] + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 24)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[2])
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 32)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[2] + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 40)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[3])
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 48)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[3] + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 56)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[4])
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 64)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[4] + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 72)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[5])
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 80)
+		em("(%rbp)\n    movq ")
+		emI(argOffs[5] + 8)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(stOff + 88)
+		em("(%rbp)\n    leaq ")
+		emI(stOff)
+		em("(%rbp), %rdi\n    call _fc_rt_exec_run\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		if dst2 != 0 {
+			em("    movq %rcx, ")
+			emI(dst2)
+			em("(%rbp)\n")
+		}
+		return
+	}
+}

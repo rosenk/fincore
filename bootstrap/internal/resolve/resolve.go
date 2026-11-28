@@ -14,17 +14,9 @@ func Resolve(p *Program) diag.List {
 		p.Captures = map[ast.NodeID][]*Symbol{}
 	}
 	p.Universe = newUniverse(p)
-	b := &binder{prog: p, declOf: map[*ast.Ident]*Symbol{}, variantNames: map[string]bool{}}
+	b := &binder{prog: p, declOf: map[*ast.Ident]*Symbol{}}
 	for _, pkg := range p.Packages {
 		b.declarePackage(pkg)
-		for _, f := range pkg.AST.Files {
-			ast.Inspect(f, func(n ast.Node) bool {
-				if v, ok := n.(*ast.Variant); ok {
-					b.variantNames[v.Name.Name] = true
-				}
-				return true
-			})
-		}
 	}
 	n := p.IDs.Count() + 1
 	p.Defs = make([]*Symbol, n)
@@ -32,7 +24,6 @@ func Resolve(p *Program) diag.List {
 	for _, pkg := range p.Packages {
 		b.bindPackage(pkg)
 	}
-	b.applyMerges()
 	b.diags.Sort()
 	return b.diags
 }
@@ -82,14 +73,6 @@ type binder struct {
 	// declOf maps the defining identifier of each package-level symbol
 	// (including methods and redeclared duplicates) to its symbol.
 	declOf map[*ast.Ident]*Symbol
-	// variantNames holds the names of the variants of every enum type of
-	// the program (v0.2 patterns: such a bare pattern name is declared
-	// hidden, see patternNames).
-	variantNames map[string]bool
-	// merged maps an `is` binding to the binding of the same name it was
-	// intersected with (v0.2 flow intersections, see intersect); the
-	// symbols are unified by applyMerges.
-	merged map[*Symbol]*Symbol
 }
 
 func (b *binder) errorf(code diag.Code, sp diag.SourceSpan, format string, args ...any) {
@@ -429,10 +412,6 @@ func (b *binder) bindExpr(e ast.Expr) {
 		b.ident(e)
 	case *ast.BasicLit, *ast.BoolLit, *ast.NilLit:
 	case *ast.BinaryExpr:
-		if e.Op == ast.OpLAnd || e.Op == ast.OpLOr {
-			b.flow(e) // v0.2: `is` bindings flow into the right operand
-			return
-		}
 		b.bindExpr(e.X)
 		b.bindExpr(e.Y)
 	case *ast.UnaryExpr:
@@ -474,6 +453,11 @@ func (b *binder) bindExpr(e ast.Expr) {
 		for _, f := range e.Fields {
 			b.bindExpr(f.Value)
 		}
+	case *ast.ArrayLit:
+		b.bindType(e.Type)
+		for _, el := range e.Elems {
+			b.bindExpr(el)
+		}
 	case *ast.TypeExpr:
 		b.bindType(e.Type)
 	case *ast.MatchExpr:
@@ -481,12 +465,6 @@ func (b *binder) bindExpr(e ast.Expr) {
 		for _, arm := range e.Arms {
 			b.matchArm(arm)
 		}
-	case *ast.TupleExpr:
-		for _, x := range e.Elems {
-			b.bindExpr(x)
-		}
-	case *ast.IsExpr:
-		b.flow(e)
 	}
 }
 
@@ -507,10 +485,6 @@ func (b *binder) openScope(n ast.Node) func() {
 
 func (b *binder) stmts(list []ast.Stmt) {
 	for _, s := range list {
-		if is, ok := s.(*ast.IfStmt); ok {
-			b.ifStmt(is, true)
-			continue
-		}
 		b.stmt(s)
 	}
 }
@@ -581,19 +555,20 @@ func (b *binder) stmt(s ast.Stmt) {
 			b.bindExpr(r)
 		}
 	case *ast.IfStmt:
-		b.ifStmt(s, false)
+		defer b.openScope(s)()
+		b.stmt(s.Init)
+		b.bindExpr(s.Cond)
+		b.block(s.Then)
+		b.stmt(s.Else)
 	case *ast.ForStmt:
 		defer b.openScope(s)()
 		b.stmt(s.Init)
-		t, _ := b.flow(s.Cond)
+		b.bindExpr(s.Cond)
 		b.stmt(s.Post)
 		if s.Decreases != nil {
 			b.bindExpr(s.Decreases.Measure)
 		}
-		// v0.2: the condition's true-outcome bindings are visible in the body.
-		closeT := b.visible(t)
 		b.block(s.Body)
-		closeT()
 	case *ast.MatchStmt:
 		b.bindExpr(s.X)
 		for _, arm := range s.Arms {
@@ -610,10 +585,7 @@ func (b *binder) stmt(s ast.Stmt) {
 
 func (b *binder) matchArm(arm *ast.MatchArm) {
 	defer b.openScope(arm)()
-	b.patternNames(arm.Pattern, true)
-	// v0.2: the guard's true-outcome bindings are visible in the body.
-	t, _ := b.flow(arm.Guard)
-	defer b.visible(t)()
+	b.patternNames(arm.Pattern)
 	if arm.Expr != nil {
 		b.bindExpr(arm.Expr)
 	}
@@ -622,35 +594,12 @@ func (b *binder) matchArm(arm *ast.MatchArm) {
 	}
 }
 
-// patternNames resolves the names of a pattern and, if declare is set,
-// declares its bindings in the current scope (v0.2, decisions 110-113).
-// A bare identifier in any pattern position (top level, tuple element or
-// payload; an *ast.Ident in payloads, an unqualified *ast.CtorPattern
-// without parentheses elsewhere) that resolves to a constant is a
-// constant pattern (a use of the constant); any other bare identifier is
-// declared as a binding. The type checker later classifies a bare name
-// that is a variant of the expected enum type as that variant (the
-// binding, if declared, is then bound to the value, which is that
-// variant). A name bound in several places of one pattern (or-pattern
-// alternatives) is one symbol; the type checker checks that the
-// alternatives agree and that no alternative binds a name twice. A name
-// that is the name of a variant of some enum type of the program is
-// declared hidden: it gets a symbol (a binding if the type checker finds
-// no such variant in the expected type) but is not inserted into the
-// scope, so variant names shadow nothing and cannot be referenced.
-// Bindings of an undeclared pattern keep no symbol (E2002 in the type
-// checker unless the name is a variant).
-func (b *binder) patternNames(p ast.Pattern, declare bool) {
+// patternNames resolves flat pattern names (variants, constants, and
+// payload bindings inside variant patterns).
+func (b *binder) patternNames(p ast.Pattern) {
 	var seen []*Symbol
-	bare := func(id *ast.Ident) {
+	bindPayload := func(id *ast.Ident) {
 		if id.Name == "_" {
-			return
-		}
-		if sym := b.scope.Lookup(id.Name); sym != nil && sym.Kind == SymConst {
-			b.prog.Uses[id.ID()] = sym
-			return
-		}
-		if !declare {
 			return
 		}
 		for _, sym := range seen {
@@ -659,32 +608,21 @@ func (b *binder) patternNames(p ast.Pattern, declare bool) {
 				return
 			}
 		}
-		if b.variantNames[id.Name] {
-			// Probably a variant of the expected enum type: declared but
-			// not visible, so it shadows nothing (and two `is` tests of
-			// one && chain may name the same variant).
-			sym := b.prog.NewSymbol(SymVar, id.Name, id, id, b.pkg)
-			sym.VarKind = VarBinding
-			if len(b.funcs) > 0 {
-				sym.Func = b.funcs[len(b.funcs)-1]
-			}
-			b.def(sym)
-			seen = append(seen, sym)
-			return
-		}
 		seen = append(seen, b.declare(SymVar, VarBinding, id, id))
 	}
 	var walk func(p ast.Pattern)
 	walk = func(p ast.Pattern) {
 		switch p := p.(type) {
 		case *ast.Ident:
-			bare(p)
+			bindPayload(p)
 		case *ast.CtorPattern:
-			if p.Qual == nil && !p.HasParens {
-				bare(p.Name)
-				return
+			if p.Qual != nil {
+				b.ctorPattern(p)
+			} else if !p.HasParens {
+				if sym := b.scope.Lookup(p.Name.Name); sym != nil && sym.Kind == SymConst {
+					b.prog.Uses[p.Name.ID()] = sym
+				}
 			}
-			b.ctorPattern(p)
 			for _, a := range p.Args {
 				walk(a)
 			}
@@ -692,222 +630,7 @@ func (b *binder) patternNames(p ast.Pattern, declare bool) {
 			for _, a := range p.Alts {
 				walk(a)
 			}
-		case *ast.TuplePattern:
-			for _, a := range p.Elems {
-				walk(a)
-			}
-		case *ast.AtPattern:
-			// v0.2: the name before '@' is always a binding.
-			id := p.Name
-			switch {
-			case id.Name == "_":
-				b.errorf(diag.E2002, id.Range, "cannot bind _ with '@' (write the pattern alone)")
-			case b.isConstName(id.Name):
-				b.errorf(diag.E2002, id.Range, "cannot bind %s with '@': %s is a constant", id.Name, id.Name)
-			case b.variantNames[id.Name]:
-				b.errorf(diag.E2002, id.Range, "cannot bind %s with '@': %s is the name of a variant", id.Name, id.Name)
-			default:
-				bare(id)
-			}
-			walk(p.Pattern)
 		}
 	}
 	walk(p)
-}
-
-// isConstName reports whether name resolves to a constant in scope.
-func (b *binder) isConstName(name string) bool {
-	sym := b.scope.Lookup(name)
-	return sym != nil && sym.Kind == SymConst
-}
-
-// ifStmt binds an if statement (v0.2 `is` flow bindings): the bindings of
-// the condition's true outcome are visible in the then block, those of its
-// false outcome in the else branch. If the if statement is directly in a
-// statement list (inList) and has no else branch, the false-outcome
-// bindings are declared in the enclosing block after it, like a `:=` at
-// the if statement (let-else; the type checker requires the then block
-// to terminate where they are used).
-func (b *binder) ifStmt(s *ast.IfStmt, inList bool) {
-	outer := b.scope
-	b.scope = NewScope(outer, ScopeBlock, s)
-	b.stmt(s.Init)
-	t, f := b.flow(s.Cond)
-	closeT := b.visible(t)
-	b.block(s.Then)
-	closeT()
-	closeF := b.visible(f)
-	b.stmt(s.Else)
-	closeF()
-	b.scope = outer
-	if inList && s.Else == nil {
-		for _, sym := range f {
-			if old := b.scope.Insert(sym); old != nil {
-				b.errorf(diag.E2001, sym.Ident.Range, "%s redeclared in this block", sym.Name)
-			}
-		}
-	}
-}
-
-// flow binds a boolean expression and returns its outcome sets (v0.2):
-// the variables bound by `is` tests that are definitely matched when e is
-// true (t) and when e is false (f), in source order.
-//
-//	e is P      t = bindings of P, f = {}
-//	!A          t = f(A), f = t(A)
-//	A && B      t = t(A) + t(B), f = f(A) * (t(A) + f(B)); t(A) is visible in B
-//	A || B      t = t(A) * (f(A) + t(B)), f = f(A) + f(B); f(A) is visible in B
-//	(A)         those of A
-//	otherwise   {}, {}
-//
-// where + is a union and * an intersection by name. The symbols of an
-// `is` pattern are created in a scope of their own and become visible
-// only where flow makes them visible. A name in both operand sets of a
-// union is E2001. The true and false set of an expression never share a
-// name (by induction over the rules), so f(A) * (t(A) + f(B)) = f(A) *
-// f(B) and t(A) * (f(A) + t(B)) = t(A) * t(B), which is what flow
-// computes (intersect).
-func (b *binder) flow(e ast.Expr) (t, f []*Symbol) {
-	switch e := e.(type) {
-	case *ast.ParenExpr:
-		return b.flow(e.X)
-	case *ast.UnaryExpr:
-		if e.Op == ast.OpNot {
-			t, f = b.flow(e.X)
-			return f, t
-		}
-	case *ast.IsExpr:
-		b.bindExpr(e.X)
-		outer := b.scope
-		b.scope = NewScope(outer, ScopeBlock, e)
-		b.patternNames(e.Pattern, true)
-		t = b.scope.Syms
-		b.scope = outer
-		return t, nil
-	case *ast.BinaryExpr:
-		if e.Op == ast.OpLAnd || e.Op == ast.OpLOr {
-			ta, fa := b.flow(e.X)
-			vis := ta
-			if e.Op == ast.OpLOr {
-				vis = fa
-			}
-			closeV := b.visible(vis)
-			tb, fb := b.flow(e.Y)
-			closeV()
-			if e.Op == ast.OpLAnd {
-				return b.union(ta, tb), b.intersect(fa, fb)
-			}
-			return b.intersect(ta, tb), b.union(fa, fb)
-		}
-	}
-	b.bindExpr(e)
-	return nil, nil
-}
-
-// visible opens a scope holding syms (none if empty) and returns its
-// closer.
-func (b *binder) visible(syms []*Symbol) func() {
-	if len(syms) == 0 {
-		return func() {}
-	}
-	outer := b.scope
-	b.scope = NewScope(outer, ScopeBlock, nil)
-	for _, sym := range syms {
-		b.scope.Insert(sym)
-	}
-	return func() { b.scope = outer }
-}
-
-// union returns x followed by the symbols of y; a name of y already in x
-// is E2001 (one outcome set binds it twice) and is dropped.
-func (b *binder) union(x, y []*Symbol) []*Symbol {
-	if len(y) == 0 {
-		return x
-	}
-	out := append([]*Symbol(nil), x...)
-	for _, sym := range y {
-		dup := false
-		for _, o := range x {
-			if o.Name == sym.Name {
-				dup = true
-				break
-			}
-		}
-		if dup {
-			b.errorf(diag.E2001, sym.Ident.Range, "%s redeclared in this condition", sym.Name)
-			continue
-		}
-		out = append(out, sym)
-	}
-	return out
-}
-
-// intersect returns the symbols of x whose name is also bound in y, in
-// the order of x (v0.2 flow intersections: a name is bound in an outcome
-// if it is bound on every path to it). The binding of y is merged into
-// the one of x: both name one variable, which either `is` test assigns.
-// The type checker requires identical types.
-func (b *binder) intersect(x, y []*Symbol) []*Symbol {
-	var out []*Symbol
-	for _, sym := range x {
-		for _, o := range y {
-			if o.Name == sym.Name {
-				if b.merged == nil {
-					b.merged = map[*Symbol]*Symbol{}
-				}
-				b.merged[o] = sym
-				out = append(out, sym)
-				break
-			}
-		}
-	}
-	return out
-}
-
-// mergedRoot returns the symbol sym was (transitively) merged into.
-func (b *binder) mergedRoot(sym *Symbol) *Symbol {
-	for {
-		m, ok := b.merged[sym]
-		if !ok {
-			return sym
-		}
-		sym = m
-	}
-}
-
-// applyMerges replaces every merged `is` binding by its root in Defs,
-// Uses and Captures, so the intersected bindings of a name are one
-// symbol for every later pass (like the alternatives of an or-pattern).
-func (b *binder) applyMerges() {
-	if len(b.merged) == 0 {
-		return
-	}
-	p := b.prog
-	for i, s := range p.Defs {
-		if s != nil {
-			p.Defs[i] = b.mergedRoot(s)
-		}
-	}
-	for i, s := range p.Uses {
-		if s != nil {
-			p.Uses[i] = b.mergedRoot(s)
-		}
-	}
-	for id, caps := range p.Captures {
-		var out []*Symbol
-		for _, s := range caps {
-			s = b.mergedRoot(s)
-			dup := false
-			for _, o := range out {
-				if o == s {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				out = append(out, s)
-			}
-		}
-		p.Captures[id] = out
-	}
 }

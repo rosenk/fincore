@@ -1,0 +1,958 @@
+package main
+
+// Native x86_64 code generation for FinCore v0.3 Algebraic Effects &
+// Linear One-Shot Delimited Continuations (zero libc, zero GC, zero malloc).
+//
+// Two-tier lowering sharing a single stack-allocated Evidence struct:
+//   Evidence layout on handler's frame:
+//     +0:  cont_ptr  (0 = Tier 1 tail-resumptive; &fc_cont = Tier 2/3)
+//     +8:  env_ptr   (handler's %rbp)
+//     +16: op_fn[0]  (Tier 1 arm code ptr)
+//     +24: op_fn[1]  ...
+//
+//   Tier 1 (Tail-Resumptive): inline body + direct call through op_fn[k] (~3ns, 0 stack switch).
+//   Tier 2/3 (Abortive / Deep One-Shot Continuations): bounded 64 KiB stack via
+//     runtime/linux_amd64/effect.s (_fc_rt_cont_{start,yield,resume,abort})
+//     with automatic LIFO defer & scope unwinding on abort.
+
+const (
+	MaxHelperCtxs    = 256
+	MaxHandleHelpers = 512
+
+	HHKArm  u8 = 1 // Tier 1 tail-resumptive arm thunk (_fc_harm_<n>)
+	HHKBody u8 = 2 // Tier 2/3 handled body thunk (_fc_hbody_<n>)
+	HHKDisp u8 = 3 // Tier 2/3 dispatch function (_fc_hdisp_<n>)
+)
+
+type HelperCtx struct {
+	parentCtxID u32
+	envSaveOff  i64
+	capByValue  bool
+	isRealFunc  bool
+	nVars       u32
+	varSyms     [MaxFnVars]u32
+	varOffs     [MaxFnVars]i64
+	nCaps       u32
+	capSyms     [64]u32
+	capOffs     [64]i64
+	nResults    u32
+	results     [16]u32
+	retOffs     [16]u64
+	nTP         u32
+	tpSyms      [16]u32
+	targs       [16]u32
+	contOff     i64
+	resOff      i64
+	earlyRetOff i64
+}
+
+type HandleHelper struct {
+	kind       u8
+	labelNum   u32
+	dispLblNum u32
+	handleNode u32
+	armIdx     u32
+	ctxID      u32
+}
+
+var helperCtxs [MaxHelperCtxs]HelperCtx
+var helperCtxCount u32
+var handleHelpers [MaxHandleHelpers]HandleHelper
+var handleHelperCount u32
+
+func effectCodegenInit() {
+	helperCtxCount = 1 // 0 = none
+	handleHelperCount = 0
+}
+
+func snapshotFnCtx(f *FnGen, contOff i64, resOff i64, earlyRetOff i64) u32 {
+	if helperCtxCount >= MaxHelperCtxs {
+		return 0
+	}
+	id := helperCtxCount
+	helperCtxCount++
+	var c HelperCtx
+	c.parentCtxID = f.parentCtxID
+	c.envSaveOff = f.envSaveOff
+	c.capByValue = f.capByValue
+	c.isRealFunc = !f.isHandleArm && !f.isHandleBody && !f.isHandleDisp
+	c.nVars = f.nVars
+	for i := u32(0); i < f.nVars; i++ {
+		c.varSyms[i] = f.varSyms[i]
+		c.varOffs[i] = f.varOffs[i]
+	}
+	c.nCaps = f.nCaps
+	for i := u32(0); i < f.nCaps; i++ {
+		c.capSyms[i] = f.capSyms[i]
+		c.capOffs[i] = f.capOffs[i]
+	}
+	c.nResults = f.nResults
+	for i := u32(0); i < f.nResults; i++ {
+		c.results[i] = f.results[i]
+		c.retOffs[i] = f.abi.retOffs[i]
+	}
+	c.nTP = f.nTP
+	for i := u32(0); i < f.nTP; i++ {
+		c.tpSyms[i] = f.tpSyms[i]
+		c.targs[i] = f.targs[i]
+	}
+	c.contOff = contOff
+	c.resOff = resOff
+	c.earlyRetOff = earlyRetOff
+	helperCtxs[id] = c
+	return id
+}
+
+func queueHandleHelper(h HandleHelper) u32 {
+	if handleHelperCount >= MaxHandleHelpers {
+		return 0
+	}
+	id := handleHelperCount
+	handleHelperCount++
+	handleHelpers[id] = h
+	return id
+}
+
+func emitHelperLabel(sec u8, kind u8, num u32) {
+	if kind == HHKArm {
+		secWriteStr(sec, "_fc_harm_")
+	} else if kind == HHKBody {
+		secWriteStr(sec, "_fc_hbody_")
+	} else {
+		secWriteStr(sec, "_fc_hdisp_")
+	}
+	secWriteU64(sec, u64(num))
+}
+
+// emitParentSymAddr walks the parentCtxID chain via %r12 (saved at envSaveOff(%rbp))
+// to compute the address of an enclosing function/handle variable into %rax.
+func (f *FnGen) emitParentSymAddr(sym u32) bool {
+	if f.parentCtxID == 0 {
+		return false
+	}
+	// First check whether sym exists anywhere in the parentCtx chain!
+	depth := u32(0)
+	found := false
+	foundIsCap := false
+	var foundOff i64 = 0
+	foundCapByVal := false
+	var foundCapEnvOff i64 = 0
+
+	cid := f.parentCtxID
+	for step := u32(0); step < 32; step++ {
+		if cid == 0 {
+			break
+		}
+		ctx := helperCtxs[cid]
+		for i := u32(0); i < ctx.nVars; i++ {
+			if ctx.varSyms[i] == sym {
+				found = true
+				foundOff = ctx.varOffs[i]
+				break
+			}
+		}
+		if found {
+			break
+		}
+		for i := u32(0); i < ctx.nCaps; i++ {
+			if ctx.capSyms[i] == sym {
+				found = true
+				foundIsCap = true
+				foundOff = ctx.capOffs[i]
+				foundCapByVal = ctx.capByValue
+				foundCapEnvOff = ctx.envSaveOff
+				break
+			}
+		}
+		if found {
+			break
+		}
+		cid = ctx.parentCtxID
+		depth++
+	}
+	if !found {
+		return false
+	}
+
+	// Walk `depth` hops up the parent %rbp chain into %rax
+	em("    movq ")
+	emI(f.envSaveOff)
+	em("(%rbp), %rax\n")
+	cur := f.parentCtxID
+	for hop := u32(0); hop < depth; hop++ {
+		em("    movq ")
+		emI(helperCtxs[cur].envSaveOff)
+		em("(%rax), %rax\n")
+		cur = helperCtxs[cur].parentCtxID
+	}
+	if foundIsCap {
+		em("    movq ")
+		emI(foundCapEnvOff)
+		em("(%rax), %rax\n")
+		if foundCapByVal {
+			em("    leaq ")
+			emI(foundOff)
+			em("(%rax), %rax\n")
+		} else {
+			em("    movq ")
+			emI(foundOff)
+			em("(%rax), %rax\n")
+		}
+	} else {
+		em("    leaq ")
+		emI(foundOff)
+		em("(%rax), %rax\n")
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Emit `handle` statement / expression inside the enclosing function
+
+driver func (f *FnGen) emitHandle(hn u32, isExpr bool, dstOff i64, wantTy u32) {
+	_ = wantTy
+	hid := nodeHandle[hn]
+	if hid == 0 {
+		return
+	}
+	hi := handles[hid]
+	n := nodes[hn]
+	effTy := f.subst(hi.effType)
+	esym := types[effTy].a
+	numOps := symEffOpCount[esym]
+	evOff := f.ensureLocal(hi.evLocalSym)
+
+	if hi.isTailResump {
+		// TIER 1 FAST PATH: Stack-allocated Evidence table, inline body, 0 stack switches!
+		evBufSz := u64(16) + u64(numOps)*8
+		evBufOff := f.allocLocal(evBufSz, 8)
+		em("    movq $0, ")
+		emI(evBufOff)
+		em("(%rbp)\n    movq %rbp, ")
+		emI(evBufOff + 8)
+		em("(%rbp)\n")
+
+		ctxID := snapshotFnCtx(f, 0, 0, 0)
+		for i := u32(0); i < n.c; i++ {
+			an := listPool[n.b+i]
+			opIdx := handleArmOpIdx[an]
+			lbl := freshLabel()
+			_ = queueHandleHelper(HandleHelper{
+				kind:       HHKArm,
+				labelNum:   lbl,
+				handleNode: hn,
+				armIdx:     i,
+				ctxID:      ctxID,
+			})
+			em("    leaq ")
+			emitHelperLabel(SecFnBody, HHKArm, lbl)
+			em("(%rip), %rax\n    movq %rax, ")
+			emI(evBufOff + 16 + i64(opIdx)*8)
+			em("(%rbp)\n")
+		}
+		// evLocalSym = &evBuf
+		em("    leaq ")
+		emI(evBufOff)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(evOff)
+		em("(%rbp)\n")
+
+		// Emit handled body INLINE!
+		if (n.flags & 1) != 0 {
+			b := nodes[n.a]
+			if isExpr && b.b > 0 {
+				for i := u32(0); i < b.b-1; i++ {
+					f.emitStmt(listPool[b.a+i])
+				}
+				last := listPool[b.a+b.b-1]
+				if nodes[last].kind == NKExprStmt && hi.resType != 0 && dstOff != 0 {
+					f.emitExprTo(nodes[last].a, dstOff, f.subst(hi.resType))
+				} else {
+					f.emitStmt(last)
+				}
+			} else {
+				f.emitBlock(n.a)
+			}
+		} else {
+			if isExpr && hi.resType != 0 && dstOff != 0 {
+				f.emitExprTo(n.a, dstOff, f.subst(hi.resType))
+			} else {
+				f.emitExprDiscard(n.a)
+			}
+		}
+		return
+	}
+
+	// TIER 2 / 3 GENERAL PATH: Bounded 64 KiB delimited stack via runtime/linux_amd64/effect.s
+	contOff := f.allocLocal(80, 8)
+	evBufOff := f.allocLocal(16, 8)
+	earlyRetOff := f.allocLocal(8, 8)
+	var resOff i64 = 0
+	resTy := f.subst(hi.resType)
+	if isExpr && resTy != 0 {
+		rsz, ral := layoutOf(resTy)
+		resOff = f.allocLocal(rsz, ral)
+	}
+	em("    movb $0, ")
+	emI(earlyRetOff)
+	em("(%rbp)\n    leaq ")
+	emI(contOff)
+	em("(%rbp), %rax\n    movq %rax, ")
+	emI(evBufOff)
+	em("(%rbp)\n    movq %rbp, ")
+	emI(evBufOff + 8)
+	em("(%rbp)\n    leaq ")
+	emI(evBufOff)
+	em("(%rbp), %rax\n    movq %rax, ")
+	emI(evOff)
+	em("(%rbp)\n")
+
+	ctxID := snapshotFnCtx(f, contOff, resOff, earlyRetOff)
+	bodyLbl := freshLabel()
+	dispLbl := freshLabel()
+	_ = queueHandleHelper(HandleHelper{
+		kind:       HHKBody,
+		labelNum:   bodyLbl,
+		dispLblNum: dispLbl,
+		handleNode: hn,
+		ctxID:      ctxID,
+	})
+	_ = queueHandleHelper(HandleHelper{
+		kind:       HHKDisp,
+		labelNum:   dispLbl,
+		dispLblNum: dispLbl,
+		handleNode: hn,
+		ctxID:      ctxID,
+	})
+
+	// 1. op0 := _fc_rt_cont_start(&cont, &_fc_hbody_<bodyLbl>, %rbp)
+	op0Slot := f.allocLocal(8, 8)
+	em("    leaq ")
+	emI(contOff)
+	em("(%rbp), %rdi\n    leaq ")
+	emitHelperLabel(SecFnBody, HHKBody, bodyLbl)
+	em("(%rip), %rsi\n    movq %rbp, %rdx\n    call _fc_rt_cont_start\n    movq %rax, ")
+	emI(op0Slot)
+	em("(%rbp)\n")
+
+	// 2. Call _fc_hdisp_<dispLbl>(op0) with %r12 = %rbp
+	var dParams [1]u32
+	dParams[0] = TYU64
+	var dRets [1]u32
+	var nDRets usize = 0
+	if isExpr && resTy != 0 {
+		dRets[0] = resTy
+		nDRets = 1
+	}
+	dAbi := computeCallABI(0, dParams[:], dRets[:nDRets])
+	em("    subq $")
+	emU(dAbi.totalSize)
+	em(", %rsp\n    movq ")
+	emI(op0Slot)
+	em("(%rbp), %rax\n    movq %rax, 0(%rsp)\n    movq %rbp, %r12\n    call ")
+	emitHelperLabel(SecFnBody, HHKDisp, dispLbl)
+	em("\n")
+	if isExpr && resTy != 0 && dstOff != 0 {
+		rsz, _ := layoutOf(resTy)
+		f.emitCopyRSPToFrame(dstOff, dAbi.retOffs[0], rsz)
+	}
+	em("    addq $")
+	emU(dAbi.totalSize)
+	em(", %rsp\n")
+
+	// 3. Safety-net abort (idempotent no-op if already CONT_DONE)
+	em("    leaq ")
+	emI(contOff)
+	em("(%rbp), %rdi\n    call _fc_rt_cont_abort\n")
+
+	// 4. Check earlyRetFlag (if an arm returned from the enclosing function, e.g. firstMatch!)
+	noEarlyLbl := freshLabel()
+	em("    cmpb $0, ")
+	emI(earlyRetOff)
+	em("(%rbp)\n    je ")
+	emLbl("hnoer", noEarlyLbl)
+	em("\n    jmp ")
+	emLbl("epi", f.epilogueLbl)
+	em("\n")
+	emLbl("hnoer", noEarlyLbl)
+	em(":\n")
+}
+
+// ---------------------------------------------------------------------------
+// Emit Effect Operation Call (`CKEffectOp`) and Continuation Resume (`CKResume`)
+
+driver func (f *FnGen) emitEffectOpCall(en u32, ci CallInfo, dsts []i64) {
+	n := nodes[en]
+	sigTy := f.subst(ci.sigType)
+	sig := types[sigTy]
+
+	var ptypes [32]u32
+	var argSlots [32]i64
+	driver for i := u32(0); i < sig.b && i < 32; i++ {
+		ptypes[i] = f.subst(typeList[sig.a+i])
+		sz, al := layoutOf(ptypes[i])
+		argSlots[i] = f.allocLocal(sz, al)
+		f.emitExprTo(listPool[n.b+i], argSlots[i], ptypes[i])
+	}
+	var rtypes [16]u32
+	driver for i := u32(0); i < sig.d && i < 16; i++ {
+		rtypes[i] = f.subst(typeList[sig.c+i])
+	}
+
+	abi := computeCallABI(0, ptypes[:usize(sig.b)], rtypes[:usize(sig.d)])
+	var packSz u64 = abi.totalSize
+	if packSz < 16 {
+		packSz = 16
+	}
+	packOff := f.allocLocal(packSz, 16)
+	driver for i := u32(0); i < sig.b && i < 32; i++ {
+		psz, _ := layoutOf(ptypes[i])
+		f.emitCopyFrame(packOff+i64(abi.argOffs[i]), argSlots[i], psz)
+	}
+
+	// Load evidence pointer (*Evidence) into evSlot
+	evSlot := f.allocLocal(8, 8)
+	f.emitSymAddr(ci.calleeSym)
+	em("    movq 0(%rax), %rax\n    movq %rax, ")
+	emI(evSlot)
+	em("(%rbp)\n")
+
+	genLbl := freshLabel()
+	doneLbl := freshLabel()
+	// Check ev->cont_ptr: 0 => Tier 1 direct call; !=0 => Tier 2/3 yield!
+	em("    movq 0(%rax), %rcx\n    testq %rcx, %rcx\n    jnz ")
+	emLbl("efgen", genLbl)
+	em("\n")
+
+	// TIER 1 FAST PATH: direct call to ev->op_fn[opIdx] with %r12 = ev->env_ptr!
+	if abi.totalSize > 0 {
+		em("    subq $")
+		emU(abi.totalSize)
+		em(", %rsp\n")
+		driver for i := u32(0); i < sig.b && i < 32; i++ {
+			psz, _ := layoutOf(ptypes[i])
+			f.emitCopyFrameToRSP(abi.argOffs[i], argSlots[i], psz)
+		}
+	}
+	em("    movq ")
+	emI(evSlot)
+	em("(%rbp), %rax\n    movq 8(%rax), %r12\n    movq ")
+	emU(16 + u64(ci.varIdx)*8)
+	em("(%rax), %rax\n    call *%rax\n")
+	driver for i := u32(0); i < sig.d && usize(i) < len(dsts); i++ {
+		if dsts[i] != 0 {
+			rsz, _ := layoutOf(rtypes[i])
+			f.emitCopyRSPToFrame(dsts[i], abi.retOffs[i], rsz)
+		}
+	}
+	if abi.totalSize > 0 {
+		em("    addq $")
+		emU(abi.totalSize)
+		em(", %rsp\n")
+	}
+	em("    jmp ")
+	emLbl("efdn", doneLbl)
+	em("\n")
+
+	// TIER 2 / 3 GENERAL PATH: _fc_rt_cont_yield(cont, opIdx+1, &pack, &pack.ret0)
+	emLbl("efgen", genLbl)
+	em(":\n    movq %rcx, %rdi\n    movq $")
+	emU(u64(ci.varIdx) + 1)
+	em(", %rsi\n    leaq ")
+	emI(packOff)
+	em("(%rbp), %rdx\n    leaq ")
+	if sig.d > 0 {
+		emI(packOff + i64(abi.retOffs[0]))
+	} else {
+		emI(packOff)
+	}
+	em("(%rbp), %rcx\n    call _fc_rt_cont_yield\n    testq %rax, %rax\n    jnz ")
+	emLbl("epi", f.epilogueLbl)
+	em("\n")
+	if sig.d > 0 && len(dsts) > 0 && dsts[0] != 0 {
+		rsz, _ := layoutOf(rtypes[0])
+		f.emitCopyFrame(dsts[0], packOff+i64(abi.retOffs[0]), rsz)
+	}
+	emLbl("efdn", doneLbl)
+	em(":\n")
+}
+
+driver func (f *FnGen) emitResumeCall(en u32, ci CallInfo, dsts []i64) {
+	n := nodes[en]
+	opRetTy := f.subst(ci.sigType)
+	hResTy := f.subst(ci.convType)
+
+	if f.isHandleArm {
+		// TIER 1 TAIL-RESUMPTIVE: store resume arg into return slot and jump to epilogue!
+		if opRetTy != 0 && n.c >= 1 {
+			f.emitExprTo(listPool[n.b], 16+i64(f.abi.retOffs[0]), opRetTy)
+		}
+		em("    jmp ")
+		emLbl("epi", f.epilogueLbl)
+		em("\n")
+		return
+	}
+
+	// TIER 2 / 3 GENERAL CONTINUATION:
+	// 1. Write resume value (if non-void) into *(cont.ret_ptr)
+	if opRetTy != 0 && n.c >= 1 {
+		sz, al := layoutOf(opRetTy)
+		valSlot := f.allocLocal(sz, al)
+		f.emitExprTo(listPool[n.b], valSlot, opRetTy)
+		em("    movq ")
+		emI(f.envSaveOff)
+		em("(%rbp), %rax\n    leaq ")
+		emI(f.dispContOff)
+		em("(%rax), %rcx\n    movq 40(%rcx), %rdi\n")
+		f.emitCopyFrameToReg(valSlot, sz)
+	}
+	// 2. next_op := _fc_rt_cont_resume(&cont)
+	nextOpSlot := f.allocLocal(8, 8)
+	em("    movq ")
+	emI(f.envSaveOff)
+	em("(%rbp), %rax\n    leaq ")
+	emI(f.dispContOff)
+	em("(%rax), %rdi\n    call _fc_rt_cont_resume\n    movq %rax, ")
+	emI(nextOpSlot)
+	em("(%rbp)\n")
+
+	// 3. Recursively dispatch next_op via _fc_hdisp_<dispLabelNum>(next_op) with %r12 = handler_rbp!
+	var dParams [1]u32
+	dParams[0] = TYU64
+	var dRets [1]u32
+	var nDRets usize = 0
+	if hResTy != 0 {
+		dRets[0] = hResTy
+		nDRets = 1
+	}
+	dAbi := computeCallABI(0, dParams[:], dRets[:nDRets])
+	em("    subq $")
+	emU(dAbi.totalSize)
+	em(", %rsp\n    movq ")
+	emI(nextOpSlot)
+	em("(%rbp), %rax\n    movq %rax, 0(%rsp)\n    movq ")
+	emI(f.envSaveOff)
+	em("(%rbp), %r12\n    call ")
+	emitHelperLabel(SecFnBody, HHKDisp, f.dispLabelNum)
+	em("\n")
+	if hResTy != 0 && len(dsts) > 0 && dsts[0] != 0 {
+		rsz, _ := layoutOf(hResTy)
+		f.emitCopyRSPToFrame(dsts[0], dAbi.retOffs[0], rsz)
+	}
+	em("    addq $")
+	emU(dAbi.totalSize)
+	em(", %rsp\n")
+}
+
+// emitHandleDispReturn handles `return e0, e1` inside a Tier-2/3 handler arm
+// (aborts the suspended continuation, writes return values into the enclosing
+// real function's return slots, sets earlyRetFlag along the chain, and exits!).
+driver func (f *FnGen) emitHandleDispReturn(sn u32) {
+	s := nodes[sn]
+	// Find enclosing real function ctx and hop count
+	realCid := f.parentCtxID
+	hops := u32(0)
+	for step := u32(0); step < 32; step++ {
+		if realCid == 0 || helperCtxs[realCid].isRealFunc {
+			break
+		}
+		realCid = helperCtxs[realCid].parentCtxID
+		hops++
+	}
+	if realCid != 0 {
+		rctx := helperCtxs[realCid]
+		var tmps [16]i64
+		var rts [16]u32
+		if s.b == 1 && rctx.nResults > 1 {
+			for i := u32(0); i < rctx.nResults; i++ {
+				rts[i] = f.subst(rctx.results[i])
+				sz, al := layoutOf(rts[i])
+				tmps[i] = f.allocLocal(sz, al)
+			}
+			f.emitMultiCallTo(listPool[s.a], tmps[:usize(rctx.nResults)], rts[:usize(rctx.nResults)])
+		} else {
+			driver for i := u32(0); i < s.b && i < rctx.nResults; i++ {
+				rts[i] = f.subst(rctx.results[i])
+				sz, al := layoutOf(rts[i])
+				tmps[i] = f.allocLocal(sz, al)
+				f.emitExprTo(listPool[s.a+i], tmps[i], rts[i])
+			}
+		}
+		// Copy evaluated return values into enclosing real function's return slots
+		realRbpSlot := f.allocLocal(8, 8)
+		em("    movq ")
+		emI(f.envSaveOff)
+		em("(%rbp), %rax\n")
+		cur := f.parentCtxID
+		for h := u32(0); h < hops; h++ {
+			em("    movb $1, ")
+			emI(helperCtxs[cur].earlyRetOff)
+			em("(%rax)\n    movq ")
+			emI(helperCtxs[cur].envSaveOff)
+			em("(%rax), %rax\n")
+			cur = helperCtxs[cur].parentCtxID
+		}
+		em("    movb $1, ")
+		emI(rctx.earlyRetOff)
+		em("(%rax)\n    movq %rax, ")
+		emI(realRbpSlot)
+		em("(%rbp)\n")
+
+		driver for i := u32(0); i < rctx.nResults; i++ {
+			sz, _ := layoutOf(rts[i])
+			em("    movq ")
+			emI(realRbpSlot)
+			em("(%rbp), %rdi\n    addq $")
+			emU(16 + rctx.retOffs[i])
+			em(", %rdi\n")
+			f.emitCopyFrameToReg(tmps[i], sz)
+		}
+	}
+	// Abort our suspended continuation so its defers & scopes run in LIFO order!
+	em("    movq ")
+	emI(f.envSaveOff)
+	em("(%rbp), %rax\n    leaq ")
+	emI(f.dispContOff)
+	em("(%rax), %rdi\n    call _fc_rt_cont_abort\n    jmp ")
+	emLbl("epi", f.epilogueLbl)
+	em("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Drain Handle Helper Queue (emits _fc_harm_*, _fc_hbody_*, _fc_hdisp_*)
+
+driver func emitHandleHelper(idx u32) {
+	hh := handleHelpers[idx]
+	ctx := helperCtxs[hh.ctxID]
+	hn := hh.handleNode
+	n := nodes[hn]
+	hid := nodeHandle[hn]
+	hi := handles[hid]
+
+	var f FnGen
+	f.parentCtxID = hh.ctxID
+	f.epilogueLbl = freshLabel()
+	f.nTP = ctx.nTP
+	for i := u32(0); i < ctx.nTP; i++ {
+		f.tpSyms[i] = ctx.tpSyms[i]
+		f.targs[i] = ctx.targs[i]
+	}
+	// Save %r12 (parent handler's %rbp) in our own frame!
+	f.envSaveOff = f.allocLocal(8, 8)
+	effTy := f.subst(hi.effType)
+
+	if hh.kind == HHKArm {
+		// TIER 1 TAIL-RESUMPTIVE ARM THUNK: signature matches op(params...) -> opRet
+		f.isHandleArm = true
+		an := listPool[n.b+hh.armIdx]
+		arm := nodes[an]
+		_, opSig, _ := findEffectOp(effTy, arm.a)
+		sig := types[opSig]
+		f.nParams = sig.b
+		driver for i := u32(0); i < sig.b && i < 32; i++ {
+			f.params[i] = f.subst(typeList[sig.a+i])
+		}
+		f.nResults = sig.d
+		driver for i := u32(0); i < sig.d && i < 16; i++ {
+			f.results[i] = f.subst(typeList[sig.c+i])
+		}
+		f.abi = computeCallABI(0, f.params[:usize(f.nParams)], f.results[:usize(f.nResults)])
+		driver for i := u32(0); i < arm.c && i < f.nParams; i++ {
+			bn := listPool[arm.b+i]
+			if nodes[bn].kind == NKIdent && nodeSym[bn] != 0 {
+				f.setVarOff(nodeSym[bn], 16+i64(f.abi.argOffs[i]))
+			}
+		}
+		f.prescanStmt(arm.d)
+		fnBodyLen = 0
+		if nodes[arm.d].kind == NKBlock {
+			f.emitBlock(arm.d)
+		} else {
+			f.emitStmt(arm.d)
+		}
+		f.emitFinishedHelper(HHKArm, hh.labelNum)
+		return
+	}
+
+	if hh.kind == HHKBody {
+		// TIER 2 / 3 BODY THUNK (0 args, 0 rets, %r12 = handler_rbp)
+		f.isHandleBody = true
+		if (n.flags & 1) != 0 {
+			f.prescanStmt(n.a)
+		} else {
+			f.prescanExpr(n.a)
+		}
+		fnBodyLen = 0
+		resTy := f.subst(hi.resType)
+		if (n.flags & 1) != 0 {
+			b := nodes[n.a]
+			if hi.isExpr && b.b > 0 {
+				for i := u32(0); i < b.b-1; i++ {
+					f.emitStmt(listPool[b.a+i])
+				}
+				last := listPool[b.a+b.b-1]
+				if nodes[last].kind == NKExprStmt && resTy != 0 {
+					sz, al := layoutOf(resTy)
+					tmp := f.allocLocal(sz, al)
+					f.emitExprTo(nodes[last].a, tmp, resTy)
+					em("    movq ")
+					emI(f.envSaveOff)
+					em("(%rbp), %rdi\n    addq $")
+					emI(ctx.resOff)
+					em(", %rdi\n")
+					f.emitCopyFrameToReg(tmp, sz)
+				} else {
+					f.emitStmt(last)
+				}
+			} else {
+				f.emitBlock(n.a)
+			}
+		} else {
+			if hi.isExpr && resTy != 0 {
+				sz, al := layoutOf(resTy)
+				tmp := f.allocLocal(sz, al)
+				f.emitExprTo(n.a, tmp, resTy)
+				em("    movq ")
+				emI(f.envSaveOff)
+				em("(%rbp), %rdi\n    addq $")
+				emI(ctx.resOff)
+				em(", %rdi\n")
+				f.emitCopyFrameToReg(tmp, sz)
+			} else {
+				f.emitExprDiscard(n.a)
+			}
+		}
+		f.emitFinishedHelper(HHKBody, hh.labelNum)
+		return
+	}
+
+	// HHKDisp: TIER 2 / 3 DISPATCH FUNCTION: _fc_hdisp_<lbl>(op_idx u64) [resTy]
+	f.isHandleDisp = true
+	f.dispLabelNum = hh.dispLblNum
+	f.dispContOff = ctx.contOff
+	f.dispResOff = ctx.resOff
+	f.dispEarlyRetOff = ctx.earlyRetOff
+
+	resTy := f.subst(hi.resType)
+	f.nParams = 1
+	f.params[0] = TYU64
+	if hi.isExpr && resTy != 0 {
+		f.nResults = 1
+		f.results[0] = resTy
+	} else {
+		f.nResults = 0
+	}
+	f.abi = computeCallABI(0, f.params[:1], f.results[:usize(f.nResults)])
+
+	// Pre-scan all arm bodies
+	for i := u32(0); i < n.c; i++ {
+		an := listPool[n.b+i]
+		arm := nodes[an]
+		for j := u32(0); j < arm.c; j++ {
+			bn := listPool[arm.b+j]
+			if nodes[bn].kind == NKIdent && nodeSym[bn] != 0 {
+				_ = f.ensureLocal(nodeSym[bn])
+			}
+		}
+		if nodes[arm.d].kind == NKBlock {
+			f.prescanStmt(arm.d)
+		} else {
+			f.prescanExpr(arm.d)
+		}
+	}
+
+	fnBodyLen = 0
+	// Case op_idx == 0: body finished normally -> return resSlot from handler's frame!
+	notZeroLbl := freshLabel()
+	em("    movq 16(%rbp), %rax\n    testq %rax, %rax\n    jnz ")
+	emLbl("hdnz", notZeroLbl)
+	em("\n")
+	if hi.isExpr && resTy != 0 {
+		sz, _ := layoutOf(resTy)
+		em("    movq ")
+		emI(f.envSaveOff)
+		em("(%rbp), %rax\n    leaq ")
+		emI(ctx.resOff)
+		em("(%rax), %rax\n")
+		f.emitCopyRegToFrame(16+i64(f.abi.retOffs[0]), sz)
+	}
+	em("    jmp ")
+	emLbl("epi", f.epilogueLbl)
+	em("\n")
+	emLbl("hdnz", notZeroLbl)
+	em(":\n")
+
+	// Dispatch each arm (op_idx == armOpIdx + 1)
+	for i := u32(0); i < n.c; i++ {
+		an := listPool[n.b+i]
+		arm := nodes[an]
+		opIdx := handleArmOpIdx[an]
+		nextArmLbl := freshLabel()
+		em("    cmpq $")
+		emU(u64(opIdx) + 1)
+		em(", 16(%rbp)\n    jne ")
+		emLbl("hdna", nextArmLbl)
+		em("\n")
+
+		// Unpack op arguments from *(cont.arg_ptr) using op's CallABI!
+		_, opSig, _ := findEffectOp(effTy, arm.a)
+		sig := types[opSig]
+		var optypes [32]u32
+		driver for j := u32(0); j < sig.b && j < 32; j++ {
+			optypes[j] = f.subst(typeList[sig.a+j])
+		}
+		var ortypes [16]u32
+		driver for j := u32(0); j < sig.d && j < 16; j++ {
+			ortypes[j] = f.subst(typeList[sig.c+j])
+		}
+		opAbi := computeCallABI(0, optypes[:usize(sig.b)], ortypes[:usize(sig.d)])
+		driver for j := u32(0); j < arm.c && j < sig.b; j++ {
+			bn := listPool[arm.b+j]
+			if nodes[bn].kind == NKIdent && nodeSym[bn] != 0 {
+				pOff := f.ensureLocal(nodeSym[bn])
+				psz, _ := layoutOf(optypes[j])
+				em("    movq ")
+				emI(f.envSaveOff)
+				em("(%rbp), %rax\n    movq ")
+				emI(ctx.contOff + 32)
+				em("(%rax), %rax\n")
+				if opAbi.argOffs[j] != 0 {
+					em("    addq $")
+					emU(opAbi.argOffs[j])
+					em(", %rax\n")
+				}
+				f.emitCopyRegToFrame(pOff, psz)
+			}
+		}
+
+		// Emit arm body
+		if nodes[arm.d].kind == NKBlock {
+			ab := nodes[arm.d]
+			if hi.isExpr && ab.b > 0 {
+				for k := u32(0); k < ab.b-1; k++ {
+					f.emitStmt(listPool[ab.a+k])
+				}
+				last := listPool[ab.a+ab.b-1]
+				if nodes[last].kind == NKExprStmt && resTy != 0 {
+					f.emitExprTo(nodes[last].a, 16+i64(f.abi.retOffs[0]), resTy)
+				} else {
+					f.emitStmt(last)
+				}
+			} else {
+				f.emitBlock(arm.d)
+			}
+		} else if hi.isExpr && resTy != 0 {
+			f.emitExprTo(arm.d, 16+i64(f.abi.retOffs[0]), resTy)
+		} else {
+			f.emitStmt(arm.d)
+		}
+
+		// Abort continuation if still suspended (abortive arm didn't call resume!)
+		em("    movq ")
+		emI(f.envSaveOff)
+		em("(%rbp), %rax\n    leaq ")
+		emI(ctx.contOff)
+		em("(%rax), %rdi\n    call _fc_rt_cont_abort\n    jmp ")
+		emLbl("epi", f.epilogueLbl)
+		em("\n")
+		emLbl("hdna", nextArmLbl)
+		em(":\n")
+	}
+
+	f.emitFinishedHelper(HHKDisp, hh.labelNum)
+}
+
+driver func (f *FnGen) emitFinishedHelper(kind u8, labelNum u32) {
+	frameBytes := alignUp64Safe(f.frameUsed, 16)
+	emitHelperLabel(SecText, kind, labelNum)
+	secWriteStr(SecText, ":\n")
+	secWriteStr(SecText, "    pushq %rbp\n")
+	secWriteStr(SecText, "    movq %rsp, %rbp\n")
+	secWriteStr(SecText, "    pushq %rbx\n")
+	secWriteStr(SecText, "    pushq %r12\n")
+	if frameBytes > 0 {
+		secWriteStr(SecText, "    subq $")
+		secWriteU64(SecText, frameBytes)
+		secWriteStr(SecText, ", %rsp\n")
+		qwords := frameBytes / 8
+		if qwords <= 8 {
+			for i := u64(0); i < qwords; i++ {
+				secWriteStr(SecText, "    movq $0, ")
+				secWriteU64(SecText, i*8)
+				secWriteStr(SecText, "(%rsp)\n")
+			}
+		} else {
+			secWriteStr(SecText, "    movq %rsp, %rdi\n")
+			secWriteStr(SecText, "    xorl %eax, %eax\n")
+			secWriteStr(SecText, "    movq $")
+			secWriteU64(SecText, qwords)
+			secWriteStr(SecText, ", %rcx\n")
+			secWriteStr(SecText, "    cld\n")
+			secWriteStr(SecText, "    rep stosq\n")
+		}
+	}
+	if f.envSaveOff != 0 {
+		secWriteStr(SecText, "    movq %r12, ")
+		secWriteI64(SecText, f.envSaveOff)
+		secWriteStr(SecText, "(%rbp)\n")
+	}
+	emitOptimizedFnBody()
+	secWriteStr(SecText, ".L_epi_")
+	secWriteU64(SecText, u64(f.epilogueLbl))
+	secWriteStr(SecText, ":\n")
+
+	if f.nAllScope > 0 {
+		i := f.nAllScope
+		for step := u32(0); step < MaxFnScopes; step++ {
+			if i == 0 {
+				break
+			}
+			i--
+			off := f.allScopes[i]
+			skip := freshLabel()
+			secWriteStr(SecText, "    movq ")
+			secWriteI64(SecText, off)
+			secWriteStr(SecText, "(%rbp), %rdi\n    testq %rdi, %rdi\n    jz .L_scd_")
+			secWriteU64(SecText, u64(skip))
+			secWriteStr(SecText, "\n    movq $0, ")
+			secWriteI64(SecText, off)
+			if f.allScopeIsArena[i] {
+				secWriteStr(SecText, "(%rbp)\n    call _fc_rt_arena_destroy\n.L_scd_")
+			} else {
+				secWriteStr(SecText, "(%rbp)\n    call _fc_rt_scope_destroy\n.L_scd_")
+			}
+			secWriteU64(SecText, u64(skip))
+			secWriteStr(SecText, ":\n")
+		}
+	}
+	if f.nDefers > 0 {
+		i := f.nDefers
+		for step := u32(0); step < MaxFnDefers; step++ {
+			if i == 0 {
+				break
+			}
+			i--
+			ds := f.defers[i]
+			skip := freshLabel()
+			secWriteStr(SecText, "    cmpb $0, ")
+			secWriteI64(SecText, ds.activeOff)
+			secWriteStr(SecText, "(%rbp)\n    je .L_dsk_")
+			secWriteU64(SecText, u64(skip))
+			secWriteStr(SecText, "\n    movb $0, ")
+			secWriteI64(SecText, ds.activeOff)
+			secWriteStr(SecText, "(%rbp)\n")
+			fnBodyLen = 0
+			f.emitDeferredCall(i)
+			emitOptimizedFnBody()
+			secWriteStr(SecText, ".L_dsk_")
+			secWriteU64(SecText, u64(skip))
+			secWriteStr(SecText, ":\n")
+		}
+	}
+	if frameBytes > 0 {
+		secWriteStr(SecText, "    addq $")
+		secWriteU64(SecText, frameBytes)
+		secWriteStr(SecText, ", %rsp\n")
+	}
+	secWriteStr(SecText, "    popq %r12\n    popq %rbx\n    popq %rbp\n    ret\n\n")
+}

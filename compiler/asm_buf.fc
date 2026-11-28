@@ -1,0 +1,767 @@
+package main
+
+// x86_64 GAS assembly section buffers, .rodata string interning, static
+// composite emission, call ABI layout, and monomorphization worklist.
+
+const (
+	MaxTextBytes   = 12 * 1024 * 1024
+	MaxFnBodyBytes = 1024 * 1024
+	MaxRodataBytes = 1024 * 1024
+	MaxStrAsmBytes = 1024 * 1024
+	MaxDataBytes   = 256 * 1024
+	MaxBssBytes    = 64 * 1024
+	MaxMonoItems   = 4096
+	MaxGlobalSyms  = 4096
+)
+
+var textBuf [MaxTextBytes]byte
+var textLen usize
+var fnBodyBuf [MaxFnBodyBytes]byte
+var fnBodyLen usize
+var rodataBuf [MaxRodataBytes]byte
+var rodataLen usize
+var strAsmBuf [MaxStrAsmBytes]byte
+var strAsmLen usize
+var dataBuf [MaxDataBytes]byte
+var dataLen usize
+var bssBuf [MaxBssBytes]byte
+var bssLen usize
+
+// Target selector for generic emission helpers.
+const (
+	SecText   u8 = 0
+	SecFnBody u8 = 1
+	SecRodata u8 = 2
+	SecStrAsm u8 = 3
+	SecData   u8 = 4
+	SecBss    u8 = 5
+)
+
+var cgLabelSeq u32
+var cgStrSeq u32
+// Indexed by StrID (0..MaxStrs-1): 0 = not yet emitted in .rodata, else label num .L_str_<n>.
+var strRodataID [MaxStrs]u32
+var emptyStrRodataID u32
+
+type MonoItem struct {
+	funcSym  u32 // SymFunc/SymMethod, or 0 for FuncLit
+	litNode  u32 // NKFuncLit node ID if funcSym == 0
+	labelNum u32 // unique numeric suffix
+	isPlain  bool
+	tpStart  u32 // index in typeList
+	tpCount  u32
+	taStart  u32 // index in typeList
+	taCount  u32
+}
+
+var monoItems [MaxMonoItems]MonoItem
+var monoCount u32
+
+// Per-symbol global label IDs (1-based index into globalLabelSym, or direct symID label `_fc_g_<id>`).
+// Using deterministic numeric-free or clean symbol names `_fc_g_<pkg>_<name>` ensures deterministic asm!
+
+func codegenInit() {
+	textLen = 0
+	fnBodyLen = 0
+	rodataLen = 0
+	strAsmLen = 0
+	dataLen = 0
+	bssLen = 0
+	cgLabelSeq = 0
+	cgStrSeq = 0
+	emptyStrRodataID = 0
+	for i := usize(0); i < usize(strCount); i++ {
+		strRodataID[i] = 0
+	}
+	monoCount = 0
+}
+
+func freshLabel() u32 {
+	cgLabelSeq++
+	return cgLabelSeq
+}
+
+// ---------------------------------------------------------------------------
+// Low-level section buffer writers
+
+func secWrite(sec u8, b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	if sec == SecText {
+		if textLen+len(b) <= MaxTextBytes {
+			textLen += copy(textBuf[textLen:], b)
+		}
+	} else if sec == SecFnBody {
+		if fnBodyLen+len(b) <= MaxFnBodyBytes {
+			fnBodyLen += copy(fnBodyBuf[fnBodyLen:], b)
+		}
+	} else if sec == SecRodata {
+		if rodataLen+len(b) <= MaxRodataBytes {
+			rodataLen += copy(rodataBuf[rodataLen:], b)
+		}
+	} else if sec == SecStrAsm {
+		if strAsmLen+len(b) <= MaxStrAsmBytes {
+			strAsmLen += copy(strAsmBuf[strAsmLen:], b)
+		}
+	} else if sec == SecData {
+		if dataLen+len(b) <= MaxDataBytes {
+			dataLen += copy(dataBuf[dataLen:], b)
+		}
+	} else if sec == SecBss {
+		if bssLen+len(b) <= MaxBssBytes {
+			bssLen += copy(bssBuf[bssLen:], b)
+		}
+	}
+}
+
+func secWriteStr(sec u8, s string) {
+	var tmp [256]byte
+	n := len(s)
+	if n <= len(tmp) {
+		for i := usize(0); i < n; i++ {
+			tmp[i] = s[i]
+		}
+		secWrite(sec, tmp[:n])
+		return
+	}
+	secWrite(sec, strBytes(s))
+}
+
+func secWriteByte(sec u8, c byte) {
+	var b [1]byte
+	b[0] = c
+	secWrite(sec, b[:])
+}
+
+func secWriteI64(sec u8, v i64) {
+	var tmp [32]byte
+	n := formatTo(tmp[:], "%d", v)
+	secWrite(sec, tmp[:n])
+}
+
+func secWriteU64(sec u8, v u64) {
+	var tmp [32]byte
+	n := formatTo(tmp[:], "%d", v)
+	secWrite(sec, tmp[:n])
+}
+
+// Convenience emitters into current function body (SecFnBody).
+func em(s string) {
+	secWriteStr(SecFnBody, s)
+}
+
+func emI(v i64) {
+	secWriteI64(SecFnBody, v)
+}
+
+func emU(v u64) {
+	secWriteU64(SecFnBody, v)
+}
+
+func emBytes(b []byte) {
+	secWrite(SecFnBody, b)
+}
+
+func emLbl(prefix string, num u32) {
+	em(".L_")
+	em(prefix)
+	em("_")
+	emU(u64(num))
+}
+
+// internRodataStrID emits a string (by StrID) once into strAsmBuf and returns its label number.
+func internRodataStrID(sid u32) u32 {
+	if sid == 0 {
+		if emptyStrRodataID == 0 {
+			cgStrSeq++
+			emptyStrRodataID = cgStrSeq
+			secWriteStr(SecStrAsm, ".L_str_")
+			secWriteU64(SecStrAsm, u64(emptyStrRodataID))
+			secWriteStr(SecStrAsm, ":\n    .byte 0\n")
+		}
+		return emptyStrRodataID
+	}
+	if strRodataID[sid] != 0 {
+		return strRodataID[sid]
+	}
+	cgStrSeq++
+	id := cgStrSeq
+	strRodataID[sid] = id
+	secWriteStr(SecStrAsm, ".L_str_")
+	secWriteU64(SecStrAsm, u64(id))
+	secWriteStr(SecStrAsm, ":\n")
+	sb := strSlice(sid)
+	if len(sb) == 0 {
+		secWriteStr(SecStrAsm, "    .byte 0\n")
+		return id
+	}
+	emitRawBytesSec(SecStrAsm, sb)
+	return id
+}
+
+func emitRawBytesSec(sec u8, raw []byte) {
+	for i := usize(0); i < len(raw); i += 16 {
+		end := i + 16
+		if end > len(raw) {
+			end = len(raw)
+		}
+		secWriteStr(sec, "    .byte ")
+		for j := i; j < end; j++ {
+			if j > i {
+				secWriteStr(sec, ", ")
+			}
+			secWriteU64(sec, u64(raw[j]))
+		}
+		secWriteByte(sec, '\n')
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Symbol label formatting (deterministic!)
+
+func emitGlobalSymLabel(sec u8, sym u32) {
+	s := syms[sym]
+	secWriteStr(sec, "_fc_g_")
+	if s.pkgID < pkgCount && pkgs[s.pkgID].prefixStr != 0 {
+		secWrite(sec, strSlice(pkgs[s.pkgID].prefixStr))
+	}
+	secWrite(sec, strSlice(s.nameStr))
+}
+
+func emitBaseFuncLabel(sec u8, sym u32) {
+	if sym == mainFuncSym {
+		secWriteStr(sec, "_fc_main")
+		return
+	}
+	s := syms[sym]
+	secWriteStr(sec, "_fc_fn_")
+	if s.pkgID < pkgCount && pkgs[s.pkgID].prefixStr != 0 {
+		secWrite(sec, strSlice(pkgs[s.pkgID].prefixStr))
+	}
+	if s.kind == SymMethod && s.extra != 0 {
+		secWrite(sec, strSlice(syms[s.extra].nameStr))
+		secWriteByte(sec, '_')
+	}
+	secWrite(sec, strSlice(s.nameStr))
+}
+
+func emitMonoItemLabel(sec u8, idx u32) {
+	it := monoItems[idx]
+	if it.litNode != 0 {
+		secWriteStr(sec, "_fc_lit_")
+		secWriteU64(sec, u64(it.labelNum))
+		return
+	}
+	emitBaseFuncLabel(sec, it.funcSym)
+	if !it.isPlain {
+		secWriteStr(sec, "__m")
+		secWriteU64(sec, u64(it.labelNum))
+	}
+}
+
+// requestFunc queues a concrete (or non-generic) function/method and returns its monoItems index.
+driver func requestFunc(sym u32, targs []u32) u32 {
+	dn := syms[sym].declNode
+	ntp := nodeInstCount[dn]
+	if ntp == 0 {
+		// Non-generic function: find or register once
+		mc := monoCount
+		for i := u32(0); i < mc; i++ {
+			if monoItems[i].funcSym == sym && monoItems[i].isPlain {
+				return i
+			}
+		}
+		idx := monoCount
+		if monoCount < MaxMonoItems {
+			monoItems[idx] = MonoItem{funcSym: sym, isPlain: true}
+			monoCount++
+		}
+		return idx
+	}
+	// Generic function: deduplicate by (sym, targs...)
+	mc := monoCount
+	for i := u32(0); i < mc; i++ {
+		it := monoItems[i]
+		if it.funcSym == sym && !it.isPlain && usize(it.taCount) == len(targs) {
+			same := true
+			for j := usize(0); j < len(targs); j++ {
+				if !typeEqual(typeList[usize(it.taStart)+j], targs[j]) {
+					same = false
+					break
+				}
+			}
+			if same {
+				return i
+			}
+		}
+	}
+	ts, tc := pushTypeList(targs)
+	idx := monoCount
+	if monoCount < MaxMonoItems {
+		monoItems[idx] = MonoItem{
+			funcSym:  sym,
+			labelNum: idx + 1,
+			isPlain:  false,
+			tpStart:  nodeInstStart[dn],
+			tpCount:  ntp,
+			taStart:  ts,
+			taCount:  tc,
+		}
+		monoCount++
+	}
+	return idx
+}
+
+// requestLit queues a function literal (under current type bindings) and returns its monoItems index.
+driver func requestLit(litNode u32, tpSyms []u32, targs []u32) u32 {
+	mc := monoCount
+	for i := u32(0); i < mc; i++ {
+		it := monoItems[i]
+		if it.litNode == litNode && usize(it.taCount) == len(targs) {
+			same := true
+			for j := usize(0); j < len(targs); j++ {
+				if !typeEqual(typeList[usize(it.taStart)+j], targs[j]) {
+					same = false
+					break
+				}
+			}
+			if same {
+				return i
+			}
+		}
+	}
+	tps, tpc := pushTypeList(tpSyms)
+	tas, tac := pushTypeList(targs)
+	idx := monoCount
+	if monoCount < MaxMonoItems {
+		monoItems[idx] = MonoItem{
+			litNode:  litNode,
+			labelNum: idx + 1,
+			tpStart:  tps,
+			tpCount:  tpc,
+			taStart:  tas,
+			taCount:  tac,
+		}
+		monoCount++
+	}
+	return idx
+}
+
+// ---------------------------------------------------------------------------
+// Uniform Stack Call ABI (matches bootstrap/internal/codegen/amd64/layout.go)
+
+type CallABI struct {
+	recvOff   u64
+	argOffs   [32]u64
+	retOffs   [16]u64
+	totalSize u64 // 16-byte aligned
+}
+
+driver func computeCallABI(recvTy u32, params []u32, rets []u32) CallABI {
+	var abi CallABI
+	var off u64 = 0
+	if recvTy != 0 {
+		sz, al := layoutOf(recvTy)
+		off = alignUp64Safe(off, al)
+		abi.recvOff = off
+		off += sz
+	}
+	driver for i := usize(0); i < len(params) && i < 32; i++ {
+		sz, al := layoutOf(params[i])
+		off = alignUp64Safe(off, al)
+		abi.argOffs[i] = off
+		off += sz
+	}
+	driver for i := usize(0); i < len(rets) && i < 16; i++ {
+		sz, al := layoutOf(rets[i])
+		off = alignUp64Safe(off, al)
+		abi.retOffs[i] = off
+		off += sz
+	}
+	abi.totalSize = alignUp64Safe(off, 16)
+	return abi
+}
+
+// ---------------------------------------------------------------------------
+// Static constant & global emission
+
+driver func isZeroVal(vid u32) bool {
+	if vid == 0 {
+		return true
+	}
+	v := vals[vid]
+	if v.kind == VKInt {
+		return v.u64Val == 0
+	}
+	if v.kind == VKBool || v.kind == VKErr {
+		return v.a == 0
+	}
+	if v.kind == VKStr {
+		return v.a == 0 || len(strSlice(v.a)) == 0
+	}
+	if v.kind == VKArray || v.kind == VKStruct {
+		for i := u32(0); i < v.b; i++ {
+			if !isZeroVal(valList[v.a+i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if v.kind == VKEnum {
+		if v.a != 0 {
+			return false
+		}
+		for i := u32(0); i < v.c; i++ {
+			if !isZeroVal(valList[v.b+i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+driver func emitStaticVal(sec u8, ty u32, vid u32) {
+	sz, _ := layoutOf(ty)
+	if sz == 0 {
+		return
+	}
+	u := under(ty)
+	t := types[u]
+	if t.kind == TKindBasic {
+		if u == TYBool {
+			var b u64 = 0
+			if vid != 0 && vals[vid].a != 0 {
+				b = 1
+			}
+			secWriteStr(sec, "    .byte ")
+			secWriteU64(sec, b)
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYU8 || u == TYI8 {
+			var bits u64 = 0
+			if vid != 0 {
+				bits = vals[vid].u64Val & 0xff
+			}
+			secWriteStr(sec, "    .byte ")
+			secWriteU64(sec, bits)
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYU16 || u == TYI16 {
+			var bits u64 = 0
+			if vid != 0 {
+				bits = vals[vid].u64Val & 0xffff
+			}
+			secWriteStr(sec, "    .short ")
+			secWriteU64(sec, bits)
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYU32 || u == TYI32 {
+			var bits u64 = 0
+			if vid != 0 {
+				bits = vals[vid].u64Val & 0xffffffff
+			}
+			secWriteStr(sec, "    .long ")
+			secWriteU64(sec, bits)
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYU64 || u == TYI64 || u == TYInt || u == TYUsize {
+			var bits i64 = 0
+			if vid != 0 {
+				bits = i64(vals[vid].u64Val)
+			}
+			secWriteStr(sec, "    .quad ")
+			secWriteI64(sec, bits)
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYF32 {
+			var b32 u32 = 0
+			if vid != 0 {
+				if vals[vid].kind == VKInt {
+					b32 = f64BitsToF32Bits(intToF64Bits(vals[vid].u64Val, vals[vid].flags != 0))
+				} else {
+					b32 = f64BitsToF32Bits(vals[vid].u64Val)
+				}
+			}
+			secWriteStr(sec, "    .long ")
+			secWriteU64(sec, u64(b32))
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYF64 {
+			var bits i64 = 0
+			if vid != 0 {
+				if vals[vid].kind == VKInt {
+					bits = i64(intToF64Bits(vals[vid].u64Val, vals[vid].flags != 0))
+				} else {
+					bits = i64(vals[vid].u64Val)
+				}
+			}
+			secWriteStr(sec, "    .quad ")
+			secWriteI64(sec, bits)
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYError {
+			var eid u64 = 0
+			if vid != 0 {
+				eid = u64(vals[vid].a)
+			}
+			secWriteStr(sec, "    .quad ")
+			secWriteU64(sec, eid)
+			secWriteByte(sec, '\n')
+			return
+		}
+		if u == TYString {
+			if vid == 0 || vals[vid].a == 0 || len(strSlice(vals[vid].a)) == 0 {
+				secWriteStr(sec, "    .quad 0, 0\n")
+			} else {
+				sid := internRodataStrID(vals[vid].a)
+				secWriteStr(sec, "    .quad .L_str_")
+				secWriteU64(sec, u64(sid))
+				secWriteStr(sec, ", ")
+				secWriteU64(sec, u64(len(strSlice(vals[vid].a))))
+				secWriteByte(sec, '\n')
+			}
+			return
+		}
+	}
+	if t.kind == TKindArray {
+		if vid == 0 || vals[vid].kind != VKArray {
+			secWriteStr(sec, "    .skip ")
+			secWriteU64(sec, sz)
+			secWriteByte(sec, '\n')
+			return
+		}
+		es, ea := layoutOf(t.a)
+		stride := alignUp64Safe(es, ea)
+		arrLen := t.lenVal
+		for i := u64(0); i < arrLen; i++ {
+			if i < u64(vals[vid].b) {
+				emitStaticVal(sec, t.a, valList[vals[vid].a+u32(i)])
+			} else {
+				secWriteStr(sec, "    .skip ")
+				secWriteU64(sec, es)
+				secWriteByte(sec, '\n')
+			}
+			if stride > es {
+				secWriteStr(sec, "    .skip ")
+				secWriteU64(sec, stride-es)
+				secWriteByte(sec, '\n')
+			}
+		}
+		return
+	}
+	if t.kind == TKindStruct {
+		if vid == 0 || vals[vid].kind != VKStruct {
+			secWriteStr(sec, "    .skip ")
+			secWriteU64(sec, sz)
+			secWriteByte(sec, '\n')
+			return
+		}
+		var pos u64 = 0
+		for i := u32(0); i < t.b; i++ {
+			foff := structFieldOffset(u, i)
+			if foff > pos {
+				secWriteStr(sec, "    .skip ")
+				secWriteU64(sec, foff-pos)
+				secWriteByte(sec, '\n')
+				pos = foff
+			}
+			ft := fields[t.a+i].typeID
+			fs, _ := layoutOf(ft)
+			if i < vals[vid].b {
+				emitStaticVal(sec, ft, valList[vals[vid].a+i])
+			} else {
+				secWriteStr(sec, "    .skip ")
+				secWriteU64(sec, fs)
+				secWriteByte(sec, '\n')
+			}
+			pos += fs
+		}
+		if sz > pos {
+			secWriteStr(sec, "    .skip ")
+			secWriteU64(sec, sz-pos)
+			secWriteByte(sec, '\n')
+		}
+		return
+	}
+	if t.kind == TKindEnum {
+		if vid == 0 || vals[vid].kind != VKEnum {
+			secWriteStr(sec, "    .skip ")
+			secWriteU64(sec, sz)
+			secWriteByte(sec, '\n')
+			return
+		}
+		tagSize, totalSize, _ := enumLayout(u)
+		vidx := vals[vid].a
+		if tagSize == 1 {
+			secWriteStr(sec, "    .byte ")
+		} else if tagSize == 2 {
+			secWriteStr(sec, "    .short ")
+		} else {
+			secWriteStr(sec, "    .long ")
+		}
+		secWriteU64(sec, u64(vidx))
+		secWriteByte(sec, '\n')
+		pos := tagSize
+		vr := variants[t.a+vidx]
+		for pi := u32(0); pi < vr.payCount; pi++ {
+			target := enumPayloadOffset(u, vidx, pi)
+			if target > pos {
+				secWriteStr(sec, "    .skip ")
+				secWriteU64(sec, target-pos)
+				secWriteByte(sec, '\n')
+				pos = target
+			}
+			pt := typeList[vr.payStart+pi]
+			ps, _ := layoutOf(pt)
+			if pi < vals[vid].c {
+				emitStaticVal(sec, pt, valList[vals[vid].b+pi])
+			} else {
+				secWriteStr(sec, "    .skip ")
+				secWriteU64(sec, ps)
+				secWriteByte(sec, '\n')
+			}
+			pos += ps
+		}
+		if totalSize > pos {
+			secWriteStr(sec, "    .skip ")
+			secWriteU64(sec, totalSize-pos)
+			secWriteByte(sec, '\n')
+		}
+		return
+	}
+	secWriteStr(sec, "    .skip ")
+	secWriteU64(sec, sz)
+	secWriteByte(sec, '\n')
+}
+
+// ---------------------------------------------------------------------------
+// Top-level program codegen driver
+
+driver func generateProgramAsm() bool {
+	if mainFuncSym == 0 {
+		return false
+	}
+	codegenInit()
+
+	// 1. Emit globals in package dependency order
+	poc := pkgOrderCount
+	for i := u32(0); i < poc; i++ {
+		p := pkgs[pkgOrder[i]]
+		for si := u32(0); si < p.symCount; si++ {
+			s := pkgSyms[p.symStart+si]
+			if syms[s].kind == SymVar {
+				emitGlobalSym(s)
+			}
+		}
+	}
+
+	// 2. Emit _fc_entry calling _fc_main
+	emitEntryFn()
+
+	// 3. Queue all non-generic functions & methods in package/file/decl order
+	for i := u32(0); i < poc; i++ {
+		p := pkgs[pkgOrder[i]]
+		for fi := u32(0); fi < p.fileCount; fi++ {
+			fid := pkgFiles[p.fileStart+fi]
+			fn := nodes[files[fid].astNode]
+			for di := u32(0); di < fn.e; di++ {
+				dn := listPool[fn.d+di]
+				if nodes[dn].kind == NKFuncDecl && nodes[dn].op != EffComptime {
+					if nodeInstCount[dn] == 0 {
+						var empty [0]u32
+						_ = requestFunc(nodeSym[dn], empty[:])
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Drain monomorphization, closure literal, and effect handle helper queues until fixpoint!
+	effectCodegenInit()
+	mi := u32(0)
+	hi := u32(0)
+	driver for mi < monoCount || hi < handleHelperCount {
+		if mi < monoCount {
+			emitMonoFunc(mi)
+			mi++
+		} else {
+			emitHandleHelper(hi)
+			hi++
+		}
+	}
+	return true
+}
+
+driver func emitGlobalSym(sym u32) {
+	ty := syms[sym].typeID
+	if ty == 0 {
+		return
+	}
+	// Skip compile-time Code globals
+	if types[under(ty)].kind == TKindCode {
+		return
+	}
+	sz, al := layoutOf(ty)
+	if sz == 0 {
+		sz = 1
+	}
+	vid := syms[sym].valID
+	if vid == 0 || isZeroVal(vid) {
+		secWriteStr(SecBss, ".balign ")
+		secWriteU64(SecBss, al)
+		secWriteByte(SecBss, '\n')
+		emitGlobalSymLabel(SecBss, sym)
+		secWriteStr(SecBss, ":\n    .skip ")
+		secWriteU64(SecBss, sz)
+		secWriteByte(SecBss, '\n')
+		return
+	}
+	secWriteStr(SecData, ".balign ")
+	secWriteU64(SecData, al)
+	secWriteByte(SecData, '\n')
+	emitGlobalSymLabel(SecData, sym)
+	secWriteStr(SecData, ":\n")
+	emitStaticVal(SecData, ty, vid)
+}
+
+driver func emitEntryFn() {
+	sig := types[syms[mainFuncSym].typeID]
+	var ps [16]u32
+	driver for i := u32(0); i < sig.b && i < 16; i++ {
+		ps[i] = typeList[sig.a+i]
+	}
+	var rs [4]u32
+	driver for i := u32(0); i < sig.d && i < 4; i++ {
+		rs[i] = typeList[sig.c+i]
+	}
+	abi := computeCallABI(0, ps[:usize(sig.b)], rs[:usize(sig.d)])
+	secWriteStr(SecText, ".global _fc_entry\n_fc_entry:\n")
+	secWriteStr(SecText, "    pushq %rbp\n")
+	secWriteStr(SecText, "    movq %rsp, %rbp\n")
+	if abi.totalSize > 0 {
+		secWriteStr(SecText, "    subq $")
+		secWriteU64(SecText, abi.totalSize)
+		secWriteStr(SecText, ", %rsp\n")
+	}
+	secWriteStr(SecText, "    xorq %r12, %r12\n")
+	secWriteStr(SecText, "    call _fc_main\n")
+	if sig.d > 0 {
+		secWriteStr(SecText, "    movq ")
+		secWriteU64(SecText, abi.retOffs[0])
+		secWriteStr(SecText, "(%rsp), %rax\n")
+	} else {
+		secWriteStr(SecText, "    xorq %rax, %rax\n")
+	}
+	secWriteStr(SecText, "    movq %rbp, %rsp\n")
+	secWriteStr(SecText, "    popq %rbp\n")
+	secWriteStr(SecText, "    ret\n\n")
+}

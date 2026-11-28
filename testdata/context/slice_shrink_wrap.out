@@ -1,4 +1,0 @@
-testdata/context/slice_shrink_wrap.fc:8:2: error[E4002]: cannot prove termination of for loop: slice rem is not provably shortened on every path (need rem = rem[k:] with k > 0: a positive constant, or after `if k == 0 { return }`)
-    8 |     for len(rem) > 0 {
-      |     ^^^^^^^^^^^^^^^^^^
-      = help: the start index k of `rem = rem[k:]` must be provably >= 1 without overflow: a positive constant, or a variable checked by `if k == 0 { return }`. An index like n+1 can wrap around to 0, so write `k := n + 1` and check k == 0 before `rem = rem[k:]`

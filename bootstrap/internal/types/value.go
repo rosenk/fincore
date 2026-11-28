@@ -539,7 +539,7 @@ func Equal(x, y Value) (bool, error) {
 	return false, fmt.Errorf("cannot compare %s and %s", x, y)
 }
 
-// UnaryOp evaluates !x or -x exactly.
+// UnaryOp evaluates !x, -x or ^x exactly.
 func UnaryOp(op ast.UnaryOp, x Value) (Value, error) {
 	switch op {
 	case ast.OpNot:
@@ -549,6 +549,10 @@ func UnaryOp(op ast.UnaryOp, x Value) (Value, error) {
 	case ast.OpNeg:
 		if i, ok := x.(IntVal); ok {
 			return IntVal{new(big.Int).Neg(i.V)}, nil
+		}
+	case ast.OpBitNot:
+		if i, ok := x.(IntVal); ok {
+			return IntVal{new(big.Int).Not(i.V)}, nil
 		}
 	}
 	return nil, fmt.Errorf("operator %s not defined on %s", op, x)

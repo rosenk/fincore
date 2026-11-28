@@ -1,0 +1,239 @@
+// SINCE: v0.3
+// pass_v03_effects: comprehensive test of FinCore v0.3 Algebraic Effects &
+// Linear One-Shot Delimited Continuations (zero libc, zero GC, zero malloc):
+//   1. Tier 1 tail-resumptive Yield[u64] (0 stack switches)
+//   2. Tier 1 tail-resumptive multi-op State[u64] (get/put mutating handler local)
+//   3. Tier 2 abortive Fail with deterministic LIFO defer cleanup across nested calls
+//   4. Tier 2 early return from inside a handler arm (VISION.md firstMatch pattern)
+//   5. Tier 3 true non-tail deep delimited continuation (code before & after resume + result transform)
+//   6. Nested multi-effect composition (State + Yield + Fail)
+//   7. Higher-order closure effect polymorphism with zero effect-row annotations
+package main
+
+effect Yield[T any] {
+	yield(v T)
+}
+
+effect State[T any] {
+	get() T
+	put(v T)
+}
+
+effect Fail {
+	fail(code u32)
+}
+
+effect Ask {
+	ask(x u64) u64
+}
+
+// --- Test 1: Tier 1 Tail-Resumptive Yield ---
+func emitRange(lo u64, hi u64) with Yield[u64] {
+	for i := lo; i <= hi; i++ {
+		yield(i)
+	}
+}
+
+// --- Test 2: Tier 1 Tail-Resumptive Multi-Op State ---
+func bumpState(delta u64) with State[u64] {
+	cur := get()
+	put(cur + delta)
+}
+
+func runStateProgram() u64 with State[u64] {
+	bumpState(10)
+	bumpState(25)
+	v := get()
+	put(v * 2)
+	return get()
+}
+
+// --- Test 3: Tier 2 Abortive Fail + LIFO Defer Unwind ---
+var logBuf [16]u64
+var logLen usize
+
+func pushLog(tag u64) {
+	if logLen < len(logBuf) {
+		logBuf[logLen] = tag
+		logLen++
+	}
+}
+
+func innerFail(code u32) u64 with Fail {
+	defer pushLog(101) // runs FIRST (innermost LIFO!)
+	pushLog(1)
+	fail(code)
+	pushLog(999) // unreachable after abort
+	return 0
+}
+
+func outerFail(code u32) u64 with Fail {
+	defer pushLog(202) // runs SECOND (outer LIFO!)
+	pushLog(2)
+	v := innerFail(code)
+	pushLog(888) // unreachable after abort
+	return v + 1
+}
+
+// --- Test 4: Tier 2 Early Return From Handler Arm (firstMatch) ---
+func emitTracked(hi u64) with Yield[u64] {
+	defer pushLog(303) // MUST run when handler returns early!
+	for i := u64(1); i <= hi; i++ {
+		yield(i)
+	}
+}
+
+func findFirstGt(limit u64) (u64, bool) {
+	handle emitTracked(10) {
+		yield(v) -> {
+			if v > limit {
+				return v, true
+			}
+			resume()
+		}
+	}
+	return 0, false
+}
+
+// --- Test 5: Tier 3 True Non-Tail Deep Delimited Continuation ---
+func askSum() u64 with Ask {
+	a := ask(10)
+	b := ask(20)
+	return a + b
+}
+
+// --- Test 6: Nested Multi-Effect Composition ---
+func multiEffectWork() u64 with State[u64], Yield[u64], Fail {
+	for i := u64(1); i <= 5; i++ {
+		cur := get()
+		put(cur + i)
+		yield(cur + i)
+		if i == 4 {
+			fail(7)
+		}
+	}
+	return 0
+}
+
+// --- Test 7: Higher-Order Closure Effect Polymorphism (NO `with` on forEach!) ---
+func forEach(xs []u64, f func(u64)) {
+	for i := usize(0); i < len(xs); i++ {
+		f(xs[i])
+	}
+}
+
+driver func main(io Stdio) error {
+	var buf [512]byte
+
+	// 1. Tail-resumptive Yield
+	sum := u64(0)
+	handle emitRange(1, 5) {
+		yield(v) -> {
+			sum += v
+			resume()
+		}
+	}
+	n := formatTo(buf[:], "t1 yield sum: %d\n", sum)
+	if err := io.WriteStdout(buf[:n]); err != nil {
+		return err
+	}
+
+	// 2. Tail-resumptive multi-op State
+	st := u64(5)
+	stRes := handle runStateProgram() {
+		get() -> {
+			resume(st)
+		}
+		put(v) -> {
+			st = v
+			resume()
+		}
+	}
+	n = formatTo(buf[:], "t2 state: res=%d st=%d\n", stRes, st)
+	if err := io.WriteStdout(buf[:n]); err != nil {
+		return err
+	}
+
+	// 3. Abortive Fail + LIFO defer cleanup
+	logLen = 0
+	failRes := handle outerFail(42) {
+		fail(code) -> {
+			1000 + u64(code)
+		}
+	}
+	n = formatTo(buf[:], "t3 fail: res=%d log=%d:%d,%d,%d,%d\n",
+		failRes, logLen, logBuf[0], logBuf[1], logBuf[2], logBuf[3])
+	if err := io.WriteStdout(buf[:n]); err != nil {
+		return err
+	}
+
+	// 4. Early return from handler arm + defer cleanup in suspended producer
+	logLen = 0
+	foundVal, foundOk := findFirstGt(6)
+	n = formatTo(buf[:], "t4 firstGt: val=%d ok=%v log=%d:%d\n",
+		foundVal, foundOk, logLen, logBuf[0])
+	if err := io.WriteStdout(buf[:n]); err != nil {
+		return err
+	}
+
+	// 5. True non-tail deep delimited continuation (before + resume + after + transform)
+	logLen = 0
+	deepRes := handle askSum() {
+		ask(x) -> {
+			pushLog(x)
+			r := resume(x * 2)
+			pushLog(r)
+			r + 1
+		}
+	}
+	n = formatTo(buf[:], "t5 deep: res=%d log=%d:%d,%d,%d,%d\n",
+		deepRes, logLen, logBuf[0], logBuf[1], logBuf[2], logBuf[3])
+	if err := io.WriteStdout(buf[:n]); err != nil {
+		return err
+	}
+
+	// 6. Nested multi-effect composition (State + Yield + Fail)
+	acc := u64(0)
+	ySum := u64(0)
+	mRes := u64(0)
+	handle {
+		handle {
+			mRes = handle multiEffectWork() {
+				fail(c) -> u64(c) * 10
+			}
+		} with Yield[u64] {
+			yield(v) -> {
+				ySum += v
+				resume()
+			}
+		}
+	} with State[u64] {
+		get() -> {
+			resume(acc)
+		}
+		put(v) -> {
+			acc = v
+			resume()
+		}
+	}
+	n = formatTo(buf[:], "t6 multi: res=%d acc=%d ySum=%d\n", mRes, acc, ySum)
+	if err := io.WriteStdout(buf[:n]); err != nil {
+		return err
+	}
+
+	// 7. Higher-order closure effect polymorphism (forEach has NO effect annotations!)
+	arr := [4]u64{2, 3, 5, 7}
+	hoSum := u64(0)
+	handle {
+		forEach(arr[:], func(x u64) {
+			yield(x * 10)
+		})
+	} with Yield[u64] {
+		yield(v) -> {
+			hoSum += v
+			resume()
+		}
+	}
+	n = formatTo(buf[:], "t7 closure: sum=%d\n", hoSum)
+	return io.WriteStdout(buf[:n])
+}

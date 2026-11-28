@@ -9,79 +9,7 @@ import (
 func (c *Checker) stmtList(list []ast.Stmt) {
 	for _, s := range list {
 		c.stmt(s)
-		if is, ok := s.(*ast.IfStmt); ok && is.Else == nil && !c.terminatingList(is.Then.Stmts, true) {
-			// v0.2 let-else: the resolver declared the false-outcome
-			// bindings after the if; they are bound there only if the
-			// then block cannot complete normally.
-			var syms []*resolve.Symbol
-			c.outcome(is.Cond, false, &syms)
-			for _, sym := range syms {
-				if c.unbound == nil {
-					c.unbound = map[*resolve.Symbol]bool{}
-				}
-				c.unbound[sym] = true
-			}
-		}
 	}
-}
-
-// outcome appends the variables bound by the `is` tests of e that are
-// definitely matched when e evaluates to want (v0.2 flow bindings; the
-// resolver's outcome sets): `!` swaps the outcomes, `A && B` has the true
-// bindings of both operands and the false bindings bound by both
-// (intersection), `A || B` the false bindings of both and the true
-// bindings bound by both, parentheses are transparent and every other
-// expression has none. Every binding of a pattern counts: payload names,
-// top-level and tuple-element names and `@` names.
-func (c *Checker) outcome(e ast.Expr, want bool, out *[]*resolve.Symbol) {
-	switch e := e.(type) {
-	case *ast.ParenExpr:
-		c.outcome(e.X, want, out)
-	case *ast.UnaryExpr:
-		if e.Op == ast.OpNot {
-			c.outcome(e.X, !want, out)
-		}
-	case *ast.IsExpr:
-		if !want {
-			return
-		}
-		walkPattern(e.Pattern, func(q ast.Pattern) {
-			if sym, _ := c.info.PatBinding(q); sym != nil {
-				addSym(out, sym)
-			}
-		})
-	case *ast.BinaryExpr:
-		if e.Op != ast.OpLAnd && e.Op != ast.OpLOr {
-			return
-		}
-		if (e.Op == ast.OpLAnd) == want {
-			c.outcome(e.X, want, out)
-			c.outcome(e.Y, want, out)
-			return
-		}
-		// Intersection (merged symbols are one symbol).
-		var xs, ys []*resolve.Symbol
-		c.outcome(e.X, want, &xs)
-		c.outcome(e.Y, want, &ys)
-		for _, s := range xs {
-			for _, o := range ys {
-				if o == s {
-					addSym(out, s)
-					break
-				}
-			}
-		}
-	}
-}
-
-// addSym appends sym to out unless it is already there.
-func addSym(out *[]*resolve.Symbol, sym *resolve.Symbol) {
-	for _, o := range *out {
-		if o == sym {
-			return
-		}
-	}
-	*out = append(*out, sym)
 }
 
 func (c *Checker) stmt(s ast.Stmt) {
@@ -332,6 +260,17 @@ func (c *Checker) assignStmt(s *ast.AssignStmt) {
 		}
 		if !IsInteger(l.typ) {
 			c.errorf(diag.E2002, s.Range, "operator %s not defined on %s (type %s)", s.Op, exprString(s.LHS[0]), l.typ)
+			return
+		}
+		if s.Op == ast.ShlAssign || s.Op == ast.ShrAssign {
+			if IsUntyped(r.typ) {
+				if !c.convertUntyped(&r, Typ[Usize]) {
+					return
+				}
+			} else if !IsUnsigned(r.typ) {
+				c.errorf(diag.E2002, s.RHS[0].Span(), "shift count %s (type %s) must be unsigned integer", exprString(s.RHS[0]), r.typ)
+				return
+			}
 			return
 		}
 		c.assignment(&r, l.typ, "assignment")

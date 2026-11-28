@@ -44,7 +44,7 @@ func lex(t *testing.T, src string) []Token {
 
 func TestKeywords(t *testing.T) {
 	kws := Keywords()
-	want := "package import const type var func driver comptime scope for if else return break continue defer struct enum match true false nil any decreases is"
+	want := "package import const type var func driver comptime scope for if else return break continue defer struct enum match true false nil any decreases"
 	if got := strings.Join(kws, " "); got != want {
 		t.Fatalf("keywords:\n got %s\nwant %s", got, want)
 	}
@@ -61,11 +61,11 @@ func TestKeywords(t *testing.T) {
 }
 
 func TestOperators(t *testing.T) {
-	src := "+ - * / % & | ^ << >> == != < <= > >= && || ! = := += -= *= /= ++ -- ( ) [ ] { } , . : ; -> ... .. @"
+	src := "+ - * / % & | ^ << >> == != < <= > >= && || ! = := += -= *= /= %= &= |= ^= <<= >>= ++ -- ( ) [ ] { } , . : ; -> ..."
 	toks := lex(t, src)
 	want := []Kind{ADD, SUB, MUL, QUO, REM, AND, OR, XOR, SHL, SHR, EQL, NEQ, LSS, LEQ, GTR, GEQ, LAND, LOR, NOT,
-		ASSIGN, DEFINE, ADD_ASSIGN, SUB_ASSIGN, MUL_ASSIGN, QUO_ASSIGN, INC, DEC,
-		LPAREN, RPAREN, LBRACK, RBRACK, LBRACE, RBRACE, COMMA, PERIOD, COLON, SEMICOLON, ARROW, ELLIPSIS, DOTDOT, AT}
+		ASSIGN, DEFINE, ADD_ASSIGN, SUB_ASSIGN, MUL_ASSIGN, QUO_ASSIGN, REM_ASSIGN, AND_ASSIGN, OR_ASSIGN, XOR_ASSIGN, SHL_ASSIGN, SHR_ASSIGN, INC, DEC,
+		LPAREN, RPAREN, LBRACK, RBRACK, LBRACE, RBRACE, COMMA, PERIOD, COLON, SEMICOLON, ARROW, ELLIPSIS}
 	var got []Kind
 	for _, tk := range toks {
 		if tk.Kind == EOF || tk.Kind == SEMICOLON && tk.Lit != ";" {
@@ -88,12 +88,13 @@ func TestOperators(t *testing.T) {
 
 func TestLongestMatch(t *testing.T) {
 	cases := map[string]string{
-		"a<<=b":    "a << = b ⏚",
+		"a<<=b":    "a <<= b ⏚",
+		"a>>=b":    "a >>= b ⏚",
 		"x->y":     "x -> y ⏚",
 		"a--b":     "a -- b ⏚",
 		"a- -b":    "a - - b ⏚",
 		"x....":    "x ... .",
-		"a..b":     "a .. b ⏚",
+		"a..b":     "a . . b ⏚",
 		"a:=b":     "a := b ⏚",
 		"!==":      "!= =",
 		"a&&&b":    "a && & b ⏚",

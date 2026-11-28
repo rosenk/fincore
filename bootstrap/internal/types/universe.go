@@ -15,6 +15,7 @@ const (
 	ContextWithTimeout
 	SignalsNotifyContext
 	NetListenTCP
+	NetDialTCP
 	ListenerAccept
 	ListenerAddr
 	ListenerClose
@@ -22,6 +23,8 @@ const (
 	ConnWrite
 	ConnCloseWrite
 	ConnClose
+	ClockNow
+	ClockSleep
 	ScopeAcquireSlot
 	ScopeReleaseSlot
 	ScopeGo
@@ -36,6 +39,7 @@ const (
 	EnvArgsCount
 	EnvArg
 	EnvGetEnv
+	StdioReadStdin
 	StdioWriteStdout
 	StdioWriteStderr
 	ExecRun
@@ -91,6 +95,7 @@ func (c *Checker) newUniverse() *universe {
 	add(resolve.TContext, "WithTimeout", ContextWithTimeout, ts(duration), ts(ctx), false, Total)
 	add(resolve.TSignals, "NotifyContext", SignalsNotifyContext, ts(signal), ts(ctx, T(resolve.TCancelFunc)), true, Total)
 	add(resolve.TNet, "ListenTCP", NetListenTCP, ts(str), ts(T(resolve.TListener), errT), false, Total)
+	add(resolve.TNet, "DialTCP", NetDialTCP, ts(ctx, str), ts(T(resolve.TConn), errT), false, Total)
 	add(resolve.TListener, "Accept", ListenerAccept, ts(ctx), ts(T(resolve.TConn), errT), false, Total)
 	add(resolve.TListener, "Addr", ListenerAddr, nil, ts(str), false, Total)
 	add(resolve.TListener, "Close", ListenerClose, nil, ts(errT), false, Total)
@@ -98,6 +103,8 @@ func (c *Checker) newUniverse() *universe {
 	add(resolve.TConn, "Write", ConnWrite, ts(ctx, bytes), ts(usize, errT), false, Total)
 	add(resolve.TConn, "CloseWrite", ConnCloseWrite, nil, ts(errT), false, Total)
 	add(resolve.TConn, "Close", ConnClose, nil, ts(errT), false, Total)
+	add(resolve.TClock, "Now", ClockNow, nil, ts(duration), false, Total)
+	add(resolve.TClock, "Sleep", ClockSleep, ts(ctx, duration), ts(errT), false, Total)
 	// Generic Scope methods: signatures are computed per call.
 	add(resolve.TScope, "AcquireSlot", ScopeAcquireSlot, nil, nil, false, Total)
 	add(resolve.TScope, "ReleaseSlot", ScopeReleaseSlot, nil, nil, false, Total)
@@ -113,6 +120,7 @@ func (c *Checker) newUniverse() *universe {
 	add(resolve.TEnv, "ArgsCount", EnvArgsCount, nil, ts(usize), false, Total)
 	add(resolve.TEnv, "Arg", EnvArg, ts(usize), ts(str), false, Total)
 	add(resolve.TEnv, "GetEnv", EnvGetEnv, ts(str), ts(str, boolean), false, Total)
+	add(resolve.TStdio, "ReadStdin", StdioReadStdin, ts(bytes), ts(usize, errT), false, Total)
 	add(resolve.TStdio, "WriteStdout", StdioWriteStdout, ts(bytes), ts(errT), false, Total)
 	add(resolve.TStdio, "WriteStderr", StdioWriteStderr, ts(bytes), ts(errT), false, Total)
 	strs := &Slice{Elem: str}

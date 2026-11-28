@@ -1,7 +1,0 @@
-// SINCE: v0.3
-// context: unary ^ (Go's bitwise complement) is not FinCore (E1001).
-package main
-
-func invert(x u8) u8 {
-	return ^x
-}

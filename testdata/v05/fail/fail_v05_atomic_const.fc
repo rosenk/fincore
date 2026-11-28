@@ -1,0 +1,12 @@
+// SINCE: v0.5
+package main
+
+func bad(p const *Atomic[u64]) {
+	p.Store(42) // ERROR E2014
+}
+
+driver func main() error {
+	var a Atomic[u64]
+	bad(&a)
+	return nil
+}

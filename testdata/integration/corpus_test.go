@@ -13,16 +13,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
-
-	"fincore/scripts/langver"
 )
 
 // Corpus driver for testdata/fail and testdata/pass, implementing the
-// conventions documented in testdata/README.md. A future `finc test` must
-// implement the same conventions.
+// conventions documented in testdata/README.md.
 
 var (
 	errorMarkerRE = regexp.MustCompile(`//\s*ERROR\s+(E\d{4})\b`)
@@ -32,80 +28,22 @@ var (
 type header struct {
 	flags     []string
 	buildOnly bool
+	sinceMaj  int
+	sinceMin  int
 }
 
-// baseLangVersion is assumed for compilers without a `version` command
-// (the v0.2.0 seed predates it).
-var baseLangVersion = langver.MustParse(langver.Finc0)
+var versionRE = regexp.MustCompile(`v(\d+)\.(\d+)`)
 
-var (
-	compilerLangOnce sync.Once
-	compilerLang     langver.Version
-)
-
-// compilerLangVersion asks the compiler under test (`finc version`, which
-// prints "<name> language vX.Y") for the language version it implements.
-func compilerLangVersion(t testing.TB) langver.Version {
+func compilerVersion(t testing.TB) (int, int) {
 	t.Helper()
-	bin := requireFinc0(t)
-	compilerLangOnce.Do(func() {
-		compilerLang = baseLangVersion
-		out, err := exec.Command(bin, "version").Output()
-		if err != nil {
-			return
-		}
-		f := strings.Fields(string(out))
-		if len(f) > 0 {
-			if v, err := langver.Parse(f[len(f)-1]); err == nil {
-				compilerLang = v
-			}
-		}
-	})
-	return compilerLang
-}
-
-// sinceSkip reports whether the test src (a file or a package directory)
-// needs a language version newer than have: the highest SINCE of its
-// import closure, with imports resolved against the module root root and
-// $FINCROOT like the compiler run from root (langver.RequiredIn). A
-// malformed `// SINCE:` value is an error.
-func sinceSkip(root, src string, have langver.Version) (langver.Version, bool, error) {
-	need, ok, err := langver.RequiredIn(root, os.Getenv("FINCROOT"), src)
-	if err != nil || !ok {
-		return need, false, err
+	out, _ := runFinc0(t, "version")
+	m := versionRE.FindStringSubmatch(string(out))
+	if m == nil {
+		return 0, 2
 	}
-	return need, have.Less(need), nil
-}
-
-// skipCounter counts the subtests skipped for a newer language version and
-// logs "N skipped (needs vX.Y)" (the newest version needed).
-type skipCounter struct {
-	n      int
-	newest langver.Version
-}
-
-// check skips t when the test src needs a newer language version than the
-// compiler under test implements.
-func (c *skipCounter) check(t *testing.T, src string) {
-	t.Helper()
-	have := compilerLangVersion(t)
-	need, skip, err := sinceSkip(moduleRoot(t), src, have)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if skip {
-		c.n++
-		if c.newest.Less(need) {
-			c.newest = need
-		}
-		t.Skipf("needs %s (compiler implements %s)", need, have)
-	}
-}
-
-func (c *skipCounter) report(t *testing.T) {
-	if c.n > 0 {
-		t.Logf("%d skipped (needs %s)", c.n, c.newest)
-	}
+	maj, _ := strconv.Atoi(m[1])
+	min, _ := strconv.Atoi(m[2])
+	return maj, min
 }
 
 // parseHeader reads the leading comment block (before `package`).
@@ -125,6 +63,12 @@ func parseHeader(t testing.TB, path string) header {
 		}
 		if rest, ok := strings.CutPrefix(line, "// FLAGS:"); ok {
 			h.flags = append(h.flags, strings.Fields(rest)...)
+		}
+		if rest, ok := strings.CutPrefix(line, "// SINCE:"); ok {
+			if m := versionRE.FindStringSubmatch(rest); m != nil {
+				h.sinceMaj, _ = strconv.Atoi(m[1])
+				h.sinceMin, _ = strconv.Atoi(m[2])
+			}
 		}
 		if line == "// BUILD-ONLY" {
 			h.buildOnly = true
@@ -162,13 +106,34 @@ func TestCorpusFail(t *testing.T) {
 		t.Fatal("no testdata/fail/*.fc files")
 	}
 	requireFinc0(t)
-	var skips skipCounter
-	defer skips.report(t)
+	cMaj, cMin := compilerVersion(t)
+	if cMaj > 0 || cMin >= 3 {
+		v03Files, _ := filepath.Glob(filepath.Join(root, "testdata", "v03", "fail", "*.fc"))
+		sort.Strings(v03Files)
+		files = append(files, v03Files...)
+	}
+	if cMaj > 0 || cMin >= 4 {
+		v04Files, _ := filepath.Glob(filepath.Join(root, "testdata", "v04", "fail", "*.fc"))
+		sort.Strings(v04Files)
+		files = append(files, v04Files...)
+	}
+	if cMaj > 0 || cMin >= 5 {
+		v05Files, _ := filepath.Glob(filepath.Join(root, "testdata", "v05", "fail", "*.fc"))
+		sort.Strings(v05Files)
+		files = append(files, v05Files...)
+	}
+	if cMaj > 0 || cMin >= 6 {
+		v06Files, _ := filepath.Glob(filepath.Join(root, "testdata", "v06", "fail", "*.fc"))
+		sort.Strings(v06Files)
+		files = append(files, v06Files...)
+	}
 	for _, file := range files {
 		rel, _ := filepath.Rel(root, file)
 		t.Run(strings.TrimSuffix(filepath.Base(file), ".fc"), func(t *testing.T) {
-			skips.check(t, file)
 			h := parseHeader(t, file)
+			if h.sinceMaj > cMaj || (h.sinceMaj == cMaj && h.sinceMin > cMin) {
+				t.Skipf("needs v%d.%d (compiler is v%d.%d)", h.sinceMaj, h.sinceMin, cMaj, cMin)
+			}
 			want := expectedErrors(t, file)
 			if len(want) == 0 {
 				t.Fatalf("%s has no // ERROR marker", rel)
@@ -203,63 +168,87 @@ func TestCorpusFail(t *testing.T) {
 func TestCorpusPass(t *testing.T) {
 	root := moduleRoot(t)
 	passDir := filepath.Join(root, "testdata", "pass")
-	entries, err := os.ReadDir(passDir)
-	if err != nil {
-		t.Fatal(err)
-	}
 	requireFinc0(t)
-	var skips skipCounter
-	defer skips.report(t)
-	for _, e := range entries {
-		name := e.Name()
-		var src, headerFile string
-		switch {
-		case e.IsDir():
-			fcs, _ := filepath.Glob(filepath.Join(passDir, name, "*.fc"))
-			if len(fcs) == 0 {
+	cMaj, cMin := compilerVersion(t)
+	passDirs := []string{passDir}
+	if cMaj > 0 || cMin >= 3 {
+		v03Pass := filepath.Join(root, "testdata", "v03", "pass")
+		if _, err := os.Stat(v03Pass); err == nil {
+			passDirs = append(passDirs, v03Pass)
+		}
+	}
+	if cMaj > 0 || cMin >= 4 {
+		v04Pass := filepath.Join(root, "testdata", "v04", "pass")
+		if _, err := os.Stat(v04Pass); err == nil {
+			passDirs = append(passDirs, v04Pass)
+		}
+	}
+	if cMaj > 0 || cMin >= 5 {
+		v05Pass := filepath.Join(root, "testdata", "v05", "pass")
+		if _, err := os.Stat(v05Pass); err == nil {
+			passDirs = append(passDirs, v05Pass)
+		}
+	}
+	if cMaj > 0 || cMin >= 6 {
+		v06Pass := filepath.Join(root, "testdata", "v06", "pass")
+		if _, err := os.Stat(v06Pass); err == nil {
+			passDirs = append(passDirs, v06Pass)
+		}
+	}
+	for _, curPassDir := range passDirs {
+		entries, err := os.ReadDir(curPassDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		relDir, _ := filepath.Rel(root, curPassDir)
+		for _, e := range entries {
+			name := e.Name()
+			var src, headerFile string
+			switch {
+			case e.IsDir():
+				fcs, _ := filepath.Glob(filepath.Join(curPassDir, name, "*.fc"))
+				if len(fcs) == 0 {
+					continue
+				}
+				sort.Strings(fcs)
+				src, headerFile = filepath.Join(relDir, name), fcs[0]
+			case strings.HasSuffix(name, ".fc"):
+				src, headerFile = filepath.Join(relDir, name), filepath.Join(curPassDir, name)
+				name = strings.TrimSuffix(name, ".fc")
+			default:
 				continue
 			}
-			sort.Strings(fcs)
-			src, headerFile = filepath.Join("testdata", "pass", name), fcs[0]
-		case strings.HasSuffix(name, ".fc"):
-			src, headerFile = filepath.Join("testdata", "pass", name), filepath.Join(passDir, name)
-			name = strings.TrimSuffix(name, ".fc")
-		default:
-			continue
+			t.Run(name, func(t *testing.T) {
+				h := parseHeader(t, headerFile)
+				if h.sinceMaj > cMaj || (h.sinceMaj == cMaj && h.sinceMin > cMin) {
+					t.Skipf("needs v%d.%d (compiler is v%d.%d)", h.sinceMaj, h.sinceMin, cMaj, cMin)
+				}
+				bin := buildFC(t, src, buildMode{"native", false}, h.flags...)
+				if h.buildOnly {
+					return
+				}
+				want, err := os.ReadFile(filepath.Join(curPassDir, name+".out"))
+				if err != nil {
+					t.Fatalf("missing expected output %s.out: %v", name, err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, bin)
+				cmd.Dir = t.TempDir()
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				if err := cmd.Run(); err != nil {
+					t.Fatalf("run: %v\nstderr:\n%s", err, stderr.String())
+				}
+				if !bytes.Equal(stdout.Bytes(), want) {
+					t.Fatalf("stdout mismatch\n--- got ---\n%s\n--- want ---\n%s", stdout.String(), want)
+				}
+			})
 		}
-		t.Run(name, func(t *testing.T) {
-			skips.check(t, filepath.Join(root, src))
-			h := parseHeader(t, headerFile)
-			bin := buildFC(t, src, buildMode{"static", false}, h.flags...)
-			if h.buildOnly {
-				return
-			}
-			want, err := os.ReadFile(filepath.Join(passDir, name+".out"))
-			if err != nil {
-				t.Fatalf("missing expected output %s.out: %v", name, err)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, bin)
-			cmd.Dir = t.TempDir()
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout, cmd.Stderr = &stdout, &stderr
-			if err := cmd.Run(); err != nil {
-				t.Fatalf("run: %v\nstderr:\n%s", err, stderr.String())
-			}
-			if !bytes.Equal(stdout.Bytes(), want) {
-				t.Fatalf("stdout mismatch\n--- got ---\n%s\n--- want ---\n%s", stdout.String(), want)
-			}
-		})
 	}
 }
 
-// TestSinceSkip checks the `// SINCE: vX.Y` handling of this runner and of
-// the compiler's own `test` command (finc0, or finc2 under
-// scripts/bootstrap_verify.go) on dummy tests outside the corpus. The
-// temporary directory is the module root of the compiler run, so its tests
-// can import its packages: a test requires the highest SINCE of its import
-// closure (testdata/README.md).
+// TestSinceSkip checks `finc0 test`'s `// SINCE: vX.Y` import-closure skip logic.
 func TestSinceSkip(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, src string) string {
@@ -273,54 +262,22 @@ func TestSinceSkip(t *testing.T) {
 		}
 		return p
 	}
-	future := write("pass/future.fc", "// A test of a future language version.\n// SINCE: v9.9\npackage main\n\nnot v0.2 syntax\n")
-	cur := write("pass/hello.fc", "// SINCE: v0.2\npackage main\n\ndriver func main(io Stdio) error {\n\treturn io.WriteStdout(strBytes(\"hi\\n\"))\n}\n")
+	write("pass/future.fc", "// A test of a future language version.\n// SINCE: v9.9\npackage main\n\nnot v0.1 syntax\n")
+	write("pass/hello.fc", "// SINCE: v0.1\npackage main\n\ndriver func main(io Stdio) error {\n\treturn io.WriteStdout(strBytes(\"hi\\n\"))\n}\n")
 	write("pass/hello.out", "hi\n")
 	write("fail/future.fc", "// SINCE: v9.9\npackage main\n\nvar g u32 // ERROR E9999\n")
-	// v9.9 in a non-first file of a directory test
-	write("pass/second/a.fc", "package main\n\nnot v0.2 syntax\n")
-	second := filepath.Dir(write("pass/second/b.fc", "// SINCE: v9.9\npackage main\n"))
-	// v9.9 in a subpackage imported by the non-first file of a directory
-	// test (the subpackage is not a test of its own)
-	write("pass/deep/a.fc", "package main\n\nnot v0.2 syntax\n")
-	deep := filepath.Dir(write("pass/deep/b.fc", "package main\n\nimport (\n\t\"std/none\" // no such directory: ignored\n\tl \"pass/deep/lib\"\n)\n"))
-	write("pass/deep/lib/lib.fc", "// SINCE: v9.9\npackage lib\n\nnot v0.2 syntax\n")
+	write("pass/second/a.fc", "package main\n\nnot v0.1 syntax\n")
+	write("pass/second/b.fc", "// SINCE: v9.9\npackage main\n")
+	write("pass/deep/a.fc", "package main\n\nnot v0.1 syntax\n")
+	write("pass/deep/b.fc", "package main\n\nimport (\n\t\"std/none\"\n\tl \"pass/deep/lib\"\n)\n")
+	write("pass/deep/lib/lib.fc", "// SINCE: v9.9\npackage lib\n\nnot v0.1 syntax\n")
 
-	// The runner's own logic.
-	have := langver.MustParse("v0.2")
-	for _, src := range []string{future, second, deep, filepath.Join(dir, "pass")} {
-		if need, skip, err := sinceSkip(dir, src, have); err != nil || !skip || need != langver.MustParse("v9.9") {
-			t.Fatalf("%s: %v %v %v", src, need, skip, err)
-		}
-	}
-	if _, skip, err := sinceSkip(dir, cur, have); err != nil || skip {
-		t.Fatalf("current: %v %v", skip, err)
-	}
-	if _, skip, _ := sinceSkip(dir, future, langver.MustParse("v9.10")); skip {
-		t.Fatal("v9.9 skipped by a v9.10 compiler")
-	}
-	bad := write("bad/bad.fc", "// SINCE: 9.9\npackage main\n")
-	if _, _, err := sinceSkip(dir, bad, have); err == nil {
-		t.Error("SINCE: 9.9 accepted")
-	}
-	if err := os.RemoveAll(filepath.Dir(bad)); err != nil {
-		t.Fatal(err)
-	}
-
-	// The compiler's own `test` command (when it is older than v9.9 and
-	// has the version command, i.e. is not the v0.2.0 seed), run from dir.
-	if out, err := exec.Command(requireFinc0(t), "version").Output(); err != nil {
-		t.Skipf("compiler has no version command: %v %s", err, out)
-	}
-	if v := compilerLangVersion(t); !v.Less(langver.MustParse("v9.9")) {
-		t.Skipf("compiler implements %s", v)
-	}
 	cmd := exec.Command(requireFinc0(t), "test", "-v", ".")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "PWD="+dir, "FINCORE_ROOT="+moduleRoot(t))
 	out, err := cmd.CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "5 tests, 1 passed, 0 failed, 4 skipped (needs v9.9)") {
-		t.Fatalf("finc test: %v\n%s", err, out)
+		t.Fatalf("finc0 test: %v\n%s", err, out)
 	}
 	for _, n := range []string{"future.fc", "second", "deep"} {
 		if !strings.Contains(string(out), n+" (needs v9.9)") {

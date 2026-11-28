@@ -1,4 +1,0 @@
-testdata/context/scope_escape.fc:24:4: error[E3002]: scope escape: a value referring to the storage of parameter buf (depth 2) cannot be stored in storage at depth 1, which outlives it
-   24 |             saved = buf
-      |             ^^^^^^^^^^^
-      = help: the value refers to memory that dies first: copy the data into a longer-lived value, or declare the target inside the inner scope

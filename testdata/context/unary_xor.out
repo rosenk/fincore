@@ -1,3 +1,0 @@
-testdata/context/unary_xor.fc:6:9: error[E1001]: unary ^ (bitwise complement) is not supported; write x ^ M, where M is the all-ones value of its type (0xFF for u8, 0xFFFF_FFFF for u32)
-    6 |     return ^x
-      |            ^

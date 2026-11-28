@@ -1,0 +1,115 @@
+// SINCE: v0.6
+package main
+
+import "std/datalog"
+
+type Tag struct {
+	id u32
+}
+
+func contains[T Equal](xs const []T, target T) bool {
+	for i := usize(0); i < len(xs); i++ {
+		if xs[i] == target {
+			return true
+		}
+	}
+	return false
+}
+
+func minVal[T Ordered](a T, b T) T {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func sortSlice[T Ordered](xs []T) {
+	for i := usize(1); i < len(xs); i++ {
+		key := xs[i]
+		j := i
+		for step := usize(0); step < i; step++ {
+			if j == 0 || xs[j-1] <= key {
+				break
+			}
+			xs[j] = xs[j-1]
+			j--
+		}
+		xs[j] = key
+	}
+}
+
+func sumAll[T Numeric](xs const []T) T {
+	var acc T
+	for i := usize(0); i < len(xs); i++ {
+		acc += xs[i]
+	}
+	return acc
+}
+
+driver func main(io Stdio) error {
+	// 1. Shallow generic constraints: Equal, Ordered, Numeric (0 vtables, 100% monomorphized)
+	var nums [5]u32 = [5]u32{40, 10, 50, 20, 30}
+	sortSlice[u32](nums[:])
+	sU32 := sumAll[u32](nums[:])
+	var flts [3]f64 = [3]f64{1.5, 2.25, 0.25}
+	sF64 := sumAll[f64](flts[:])
+	minS := minVal[string]("zebra", "alpha")
+	tags := [2]Tag{Tag{id: 7}, Tag{id: 9}}
+	has9 := contains[Tag](tags[:], Tag{id: 9})
+	has8 := contains[Tag](tags[:], Tag{id: 8})
+
+	// 2. Stratified Bounded Datalog (std/datalog): Call-Graph Analysis!
+	// Functions: 1=main, 2=parse, 3=check, 4=evalA, 5=evalB, 6=deadHelper
+	var defined datalog.Unary[16, u32]
+	for f := u32(1); f <= 6; f++ {
+		_ = defined.Insert(f)
+	}
+	var roots datalog.Unary[16, u32]
+	_ = roots.Insert(1)
+
+	var calls datalog.Binary[32, u32, u32]
+	_ = calls.Insert(1, 2) // main -> parse
+	_ = calls.Insert(1, 3) // main -> check
+	_ = calls.Insert(3, 4) // check -> evalA
+	_ = calls.Insert(4, 5) // evalA -> evalB
+	_ = calls.Insert(5, 4) // evalB -> evalA (mutual recursion cycle!)
+
+	var reachable datalog.Unary[16, u32]
+	_ = datalog.ProjectReach[16, 32, u32](&roots, &calls, &reachable)
+
+	var dead datalog.Unary[16, u32]
+	datalog.AntiJoin[16, u32](&defined, &reachable, &dead)
+
+	var closure datalog.Binary[32, u32, u32]
+	_ = datalog.TransitiveClosure[32, u32](&calls, &closure)
+
+	var cyclic datalog.Unary[16, u32]
+	datalog.SelfLoops[32, 16, u32](&closure, &cyclic)
+
+	// Stream cyclic functions through Tier-1 v0.3 algebraic effect handler!
+	var cycSum u32 = 0
+	handle datalog.StreamUnary[16, u32](&cyclic) with datalog.Emit[u32] {
+		emit(fnID) -> {
+			cycSum += fnID
+			resume()
+		}
+	}
+
+	// 3. RBAC Join rule: UserPerm(u, p) :- UserRole(u, r), RolePerm(r, p)
+	var userRole datalog.Binary[8, string, string]
+	_ = userRole.Insert("alice", "admin")
+	_ = userRole.Insert("bob", "viewer")
+	var rolePerm datalog.Binary[8, string, string]
+	_ = rolePerm.Insert("admin", "write")
+	_ = rolePerm.Insert("admin", "read")
+	_ = rolePerm.Insert("viewer", "read")
+	var userPerm datalog.Binary[16, string, string]
+	_ = datalog.Join[8, 8, 16, string, string, string](&userRole, &rolePerm, &userPerm)
+
+	var out [256]byte
+	n := formatTo(out[:], "sort=%d,%d sum=%d,%f min=%s tag=%v,%v reach=%d dead=%d,%v cyc=%d,%d rbac=%v,%v\n",
+		nums[0], nums[4], sU32, sF64, minS, has9, has8,
+		reachable.Len(), dead.Len(), dead.Has(6), cyclic.Len(), cycSum,
+		userPerm.Has("alice", "write"), userPerm.Has("bob", "write"))
+	return io.WriteStdout(out[:n])
+}

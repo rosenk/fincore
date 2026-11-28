@@ -1,6 +1,0 @@
-// sum_syntax2 (v0.2): arms of a match expression are separated by a newline,
-// ';' or ','; a match expression needs at least one arm.
-package main
-
-var a = match 1 { _ -> 2, }
-var b = match 1 { 1 -> 2 _ -> 3 }

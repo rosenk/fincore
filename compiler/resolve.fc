@@ -1,1354 +1,1218 @@
-// resolve.fc — name resolution (port of finc0's bootstrap/internal/resolve:
-// universe.go, resolve.go). The loader that reads imported packages lives
-// in main.fc (it needs FS); this file builds the universe, declares the
-// package-level symbols of every package and binds every identifier use
-// (defs/uses side tables, function-literal captures).
-//
-// The binder is one recursive SCC (bindExpr, bindType, stmt, ...): every
-// member carries decreases(depth) and is entered with SemaDepth.
 package main
 
-// Predeclared entities (resolve.Builtin), in universe insertion order.
+// Multi-package loader, Universe table, package-level declaration resolver,
+// and type-expression resolver.
+
 const (
-	BNone        = 0
-	BTBool       = 1
-	BTU8         = 2
-	BTU16        = 3
-	BTU32        = 4
-	BTU64        = 5
-	BTI8         = 6
-	BTI16        = 7
-	BTI32        = 8
-	BTI64        = 9
-	BTInt        = 10
-	BTUsize      = 11
-	BTByte       = 12
-	BTString     = 13
-	BTError      = 14
-	BTDuration   = 15
-	BTSignal     = 16
-	BTExitStatus = 17
-	BTNet        = 18
-	BTSignals    = 19
-	BTClock      = 20
-	BTListener   = 21
-	BTConn       = 22
-	BTContext    = 23
-	BTCancelFunc = 24
-	BTScope      = 25
-	BTSlot       = 26
-	BTFS         = 27
-	BTEnv        = 28
-	BTStdio      = 29
-	BTExec       = 30
-	BTCode       = 31
-	BTEl         = 32
-	BTFieldCode  = 33
-
-	BCNanosecond   = 34
-	BCMicrosecond  = 35
-	BCMillisecond  = 36
-	BCSecond       = 37
-	BCSIGINT       = 38
-	BCSIGTERM      = 39
-	BCErrEOF       = 40
-	BCErrTimeout   = 41
-	BCErrCancelled = 42
-	BCErrZeroWrite = 43
-	BCErrClosed    = 44
-	BCErrIO        = 45
-	BCErrNotFound  = 46
-	BCErrMaxDepth  = 47
-	BCErrArenaFull = 48
-	BCErrExec      = 49
-	BCErrParse     = 50
-
-	BFLen        = 51
-	BFCap        = 52
-	BFCopy       = 53
-	BFBytesEqual = 54
-	BFStrBytes   = 55
-	BFBytesToStr = 56
-	BFFormatUint = 57
-	BFParseUint  = 58
-	BFNewContext = 59
-	BFNewScope   = 60
-	BFPanic      = 61
-	BFFormatTo   = 62 // v0.2
-	BFCodeEmpty  = 63
-	BFCodeUnit   = 64
-	BFCodeBool   = 65
-	BFCodeU8     = 66
-	BFCodeU16    = 67
-	BFCodeU32    = 68
-	BFCodeU64    = 69
-	BFCodeI8     = 70
-	BFCodeI16    = 71
-	BFCodeI32    = 72
-	BFCodeI64    = 73
-	BFCodeArray  = 74
-	BFCodeSlice  = 75
-	BFCodeStruct = 76
-	BFCodeField  = 77
-	BFCodeUniv   = 78
-	BFMin        = 79 // v0.3
-	BFMax        = 80 // v0.3
-
-	BCErrReported = 81 // v0.3: the failure has been reported (exit 1 silently)
-
-	NumBuiltins = 82
+	MaxUniSyms = 128
+	MaxFileImps = 512
 )
 
-func builtinName(b u8) string {
-	if b <= BTFieldCode {
-		return builtinTypeName(b)
+type FileImport struct {
+	fileID   u32
+	aliasStr u32 // local package name in this file
+	pkgID    u32
+}
+
+var uniSyms [MaxUniSyms]u32
+var uniSymCount u32
+var fileImports [MaxFileImps]FileImport
+var fileImportCount u32
+
+var fincRootBuf [512]byte
+var fincRootLen usize
+
+func resolveInit(env Env) {
+	uniSymCount = 0
+	fileImportCount = 0
+	fincRootLen = 0
+	fr, ok := env.GetEnv("FINCROOT")
+	if !ok || len(fr) == 0 {
+		fr, ok = env.GetEnv("FINCORE_ROOT")
 	}
-	if b <= BCErrParse || b == BCErrReported {
-		return builtinConstName(b)
-	}
-	return builtinFuncName(b)
-}
-
-func builtinTypeName(b u8) string {
-	return match b {
-		BTBool -> "bool"
-		BTU8 -> "u8"
-		BTU16 -> "u16"
-		BTU32 -> "u32"
-		BTU64 -> "u64"
-		BTI8 -> "i8"
-		BTI16 -> "i16"
-		BTI32 -> "i32"
-		BTI64 -> "i64"
-		BTInt -> "int"
-		BTUsize -> "usize"
-		BTByte -> "byte"
-		BTString -> "string"
-		BTError -> "error"
-		BTDuration -> "Duration"
-		BTSignal -> "Signal"
-		BTExitStatus -> "ExitStatus"
-		BTNet -> "Net"
-		BTSignals -> "Signals"
-		BTClock -> "Clock"
-		BTListener -> "Listener"
-		BTConn -> "Conn"
-		BTContext -> "Context"
-		BTCancelFunc -> "CancelFunc"
-		BTScope -> "Scope"
-		BTSlot -> "Slot"
-		BTFS -> "FS"
-		BTEnv -> "Env"
-		BTStdio -> "Stdio"
-		BTExec -> "Exec"
-		BTCode -> "Code"
-		BTEl -> "El"
-		BTFieldCode -> "FieldCode"
-		_ -> "?"
-	}
-}
-
-func builtinConstName(b u8) string {
-	return match b {
-		BCNanosecond -> "Nanosecond"
-		BCMicrosecond -> "Microsecond"
-		BCMillisecond -> "Millisecond"
-		BCSecond -> "Second"
-		BCSIGINT -> "SIGINT"
-		BCSIGTERM -> "SIGTERM"
-		BCErrEOF -> "ErrEOF"
-		BCErrTimeout -> "ErrTimeout"
-		BCErrCancelled -> "ErrCancelled"
-		BCErrZeroWrite -> "ErrZeroWrite"
-		BCErrClosed -> "ErrClosed"
-		BCErrIO -> "ErrIO"
-		BCErrNotFound -> "ErrNotFound"
-		BCErrMaxDepth -> "ErrMaxDepth"
-		BCErrArenaFull -> "ErrArenaFull"
-		BCErrExec -> "ErrExec"
-		BCErrParse -> "ErrParse"
-		BCErrReported -> "ErrReported"
-		_ -> "?"
-	}
-}
-
-func builtinFuncName(b u8) string {
-	return match b {
-		BFLen -> "len"
-		BFCap -> "cap"
-		BFCopy -> "copy"
-		BFBytesEqual -> "bytesEqual"
-		BFStrBytes -> "strBytes"
-		BFBytesToStr -> "bytesToStr"
-		BFFormatUint -> "formatUint"
-		BFParseUint -> "parseUint"
-		BFNewContext -> "NewContext"
-		BFNewScope -> "NewScope"
-		BFPanic -> "panic"
-		BFFormatTo -> "formatTo"
-		BFCodeEmpty -> "CodeEmpty"
-		BFCodeUnit -> "CodeUnit"
-		BFCodeBool -> "CodeBool"
-		BFCodeU8 -> "CodeU8"
-		BFCodeU16 -> "CodeU16"
-		BFCodeU32 -> "CodeU32"
-		BFCodeU64 -> "CodeU64"
-		BFCodeI8 -> "CodeI8"
-		BFCodeI16 -> "CodeI16"
-		BFCodeI32 -> "CodeI32"
-		BFCodeI64 -> "CodeI64"
-		BFCodeArray -> "CodeArray"
-		BFCodeSlice -> "CodeSlice"
-		BFCodeStruct -> "CodeStruct"
-		BFCodeField -> "CodeField"
-		BFCodeUniv -> "CodeUniv"
-		BFMin -> "min"
-		BFMax -> "max"
-		_ -> "?"
-	}
-}
-
-func builtinIsType(b u8) bool {
-	return b >= BTBool && b <= BTFieldCode
-}
-
-func builtinIsConst(b u8) bool {
-	return b >= BCNanosecond && b <= BCErrParse || b == BCErrReported
-}
-
-func builtinIsErrorSentinel(b u8) bool {
-	return b >= BCErrEOF && b <= BCErrParse || b == BCErrReported
-}
-
-func builtinIsFunc(b u8) bool {
-	return b >= BFLen && b <= BFMax
-}
-
-func builtinIsCodeCtor(b u8) bool {
-	return b >= BFCodeEmpty && b <= BFCodeUniv
-}
-
-func builtinKind(b u8) u8 {
-	if builtinIsType(b) {
-		return SymType
-	}
-	if builtinIsConst(b) {
-		return SymConst
-	}
-	if builtinIsFunc(b) {
-		return SymBuiltin
-	}
-	return SymBad
-}
-
-// ---------------------------------------------------------------------------
-// Universe
-
-var universe u32
-var builtinSym [NumBuiltins]u32
-
-func newUniverse() {
-	universe = newScope(0, ScopeUniverse, 0)
-	for b := u8(1); b < NumBuiltins; b++ {
-		s := newSym(builtinKind(b), internStr(builtinName(b)), 0, 0, 0)
-		if s == 0 {
-			return
+	if ok && len(fr) > 0 && len(fr) <= len(fincRootBuf) {
+		for i := usize(0); i < len(fr); i++ {
+			fincRootBuf[i] = fr[i]
 		}
-		syms.items[usize(s)].builtin = b
-		_ = scopeInsert(universe, s)
-		builtinSym[usize(b)] = s
+		fincRootLen = len(fr)
 	}
+	initUniverse()
 }
 
-// ---------------------------------------------------------------------------
-// Binder state
-
-var bPkg u32
-var bScope u32
-var bFuncs [MaxFuncNest]u32
-var bNFuncs usize
-
-func bPushFunc(n u32) {
-	if bNFuncs >= MaxFuncNest {
-		setFull("function nesting")
-		return
-	}
-	bFuncs[bNFuncs] = n
-	bNFuncs++
-}
-
-func bPopFunc() {
-	if bNFuncs > 0 {
-		bNFuncs--
-	}
-}
-
-// resolveProgram builds the universe and binds all loaded packages (in
-// dependency order). Diagnostics go to `diags`.
-func resolveProgram() {
-	newUniverse()
-	nn := nodes.count
-	for i := usize(1); i < nn; i++ {
-		if nodes.items[i].kind == NkVariant {
-			nm := idName(na(u32(i)))
-			if usize(nm) < MaxNames {
-				bVariantName[usize(nm)] = true
-			}
-		}
-	}
-	n := pkgs.norder
-	for i := usize(0); i < n; i++ {
-		declarePackage(pkgs.order[i])
-	}
-	for i := usize(0); i < n; i++ {
-		bindPackage(pkgs.order[i], SemaDepth)
-	}
-	bApplyMerges()
-}
-
-// pkgAddDecl declares one package-level symbol (resolve's `add`).
-func pkgAddDecl(pkg u32, kind u8, id u32, decl u32) {
-	sym := newSym(kind, idName(id), id, decl, pkg)
-	if sym == 0 {
-		return
-	}
-	if kind == SymVar {
-		syms.items[usize(sym)].varKind = VarGlobal
-	}
-	upush(sym)
-	defs[usize(id)] = sym
-	if isBlank(id) {
-		return
-	}
-	old := scopeInsert(pkgs.items[usize(pkg)].scp, sym)
-	if old != 0 {
-		errAt(E2001, id, formatTo(mbuf[:], "%v redeclared in this package (previous declaration at %v)", NameRef(idName(id)), PosRef(syms.items[usize(old)].ident)))
-	}
-}
-
-func declarePackage(pkg u32) {
-	sc := newScope(universe, ScopePackage, 0)
-	pkgs.items[usize(pkg)].scp = sc
-	f0 := pkgs.items[usize(pkg)].f0
-	f1 := pkgs.items[usize(pkg)].f1
-	mark := umark()
-	for fi := f0; fi < f1; fi++ {
-		if !sources.files[fi].ok {
-			continue
-		}
-		root := sources.files[fi].root
-		nd := l2len(root)
-		for i := usize(0); i < nd; i++ {
-			d := l2at(root, i)
-			k := nkind(d)
-			if k == NkConstDecl {
-				ns := l1len(d)
-				for j := usize(0); j < ns; j++ {
-					s := l1at(d, j)
-					pkgAddDecl(pkg, SymConst, na(s), s)
-				}
-			} else if k == NkTypeDecl {
-				pkgAddDecl(pkg, SymType, na(d), d)
-			} else if k == NkVarDecl {
-				pkgAddDecl(pkg, SymVar, na(d), d)
-			} else if k == NkFuncDecl {
-				if na(d) != 0 {
-					name := nb(d)
-					sym := newSym(SymFunc, idName(name), name, d, pkg)
-					if sym == 0 {
-						return
-					}
-					syms.items[usize(sym)].recvType = idName(nb(na(d)))
-					upush(sym)
-					defs[usize(name)] = sym
-				} else {
-					pkgAddDecl(pkg, SymFunc, nb(d), d)
-				}
-			}
-		}
-	}
-	ds, dn := ucommit(mark)
-	pkgs.items[usize(pkg)].declS = ds
-	pkgs.items[usize(pkg)].declN = dn
-	// Methods (redeclared ones are reported and left out).
-	mark2 := umark()
-	for i := usize(0); i < usize(dn); i++ {
-		s := uat(ds, i)
-		if syms.items[usize(s)].recvType == 0 {
-			continue
-		}
-		old := u32(0)
-		prev := ulists.Pending(mark2)
-		for j := usize(0); j < len(prev); j++ {
-			m := prev[j]
-			if syms.items[usize(m)].recvType == syms.items[usize(s)].recvType && syms.items[usize(m)].name == syms.items[usize(s)].name {
-				old = m
-				break
-			}
-		}
-		if old != 0 {
-			errAt(E2001, syms.items[usize(s)].ident, formatTo(mbuf[:], "method %v.%v redeclared (previous declaration at %v)", NameRef(syms.items[usize(s)].recvType), NameRef(syms.items[usize(s)].name), PosRef(syms.items[usize(old)].ident)))
-		} else {
-			upush(s)
-		}
-	}
-	ms2, mn2 := ucommit(mark2)
-	pkgs.items[usize(pkg)].methS = ms2
-	pkgs.items[usize(pkg)].methN = mn2
-	for fi := f0; fi < f1; fi++ {
-		if !sources.files[fi].ok {
-			continue
-		}
-		fileScope[fi] = newScope(sc, ScopeFile, sources.files[fi].root)
-		filePkg[fi] = pkg
-	}
-}
-
-// importPathOf decodes the path literal of an import spec into tmpBuf and
-// returns it.
-func importPathOf(spec u32) []byte {
-	t := &tmpBuf
-	t.Reset()
-	decodeStringLit(t, ntext(nb(spec)))
-	return t.Bytes()
-}
-
-func bindPackage(pkg u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	bPkg = pkg
-	f0 := pkgs.items[usize(pkg)].f0
-	f1 := pkgs.items[usize(pkg)].f1
-	for fi := f0; fi < f1; fi++ {
-		if !sources.files[fi].ok {
-			continue
-		}
-		fs := fileScope[fi]
-		root := sources.files[fi].root
-		ni := l1len(root)
-		for i := usize(0); i < ni; i++ {
-			imp := l1at(root, i)
-			nsp := l1len(imp)
-			for j := usize(0); j < nsp; j++ {
-				spec := l1at(imp, j)
-				ip := importPathOf(spec)
-				dep := u32(0)
-				nimp := usize(pkgs.items[usize(pkg)].impN)
-				for k := usize(0); k < nimp; k++ {
-					q := uat(pkgs.items[usize(pkg)].impS, k)
-					if bytesEqual(strBytes(pkgs.items[usize(q)].path), ip) {
-						dep = q
-						break
-					}
-				}
-				if dep == 0 {
-					continue
-				}
-				name := pkgs.items[usize(dep)].name
-				id := na(spec)
-				if id != 0 {
-					name = idName(id)
-				}
-				if name == nameBlank {
-					continue
-				}
-				sym := newSym(SymPackage, name, id, spec, pkg)
-				if sym == 0 {
-					return
-				}
-				syms.items[usize(sym)].imported = dep
-				if id != 0 {
-					defs[usize(id)] = sym
-				}
-				if scopeInsert(fs, sym) != 0 {
-					errAt(E2001, spec, formatTo(mbuf[:], "%v redeclared in this file", NameRef(name)))
-				} else if lookupLocal(pkgs.items[usize(pkg)].scp, name) != 0 {
-					errAt(E2001, spec, formatTo(mbuf[:], "import name %v conflicts with a package-level declaration", NameRef(name)))
-				}
-			}
-		}
-	}
-	for fi := f0; fi < f1; fi++ {
-		if !sources.files[fi].ok {
-			continue
-		}
-		bScope = fileScope[fi]
-		root := sources.files[fi].root
-		nd := l2len(root)
-		for i := usize(0); i < nd; i++ {
-			bTopDecl(l2at(root, i), depth-1)
-		}
-	}
-	bScope = 0
-}
-
-func bTopDecl(d u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	k := nkind(d)
-	if k == NkConstDecl {
-		ns := l1len(d)
-		for j := usize(0); j < ns; j++ {
-			s := l1at(d, j)
-			bindType(nb(s), depth-1)
-			bindExpr(nc(s), depth-1)
-		}
-	} else if k == NkVarDecl {
-		bindType(nb(d), depth-1)
-		bindExpr(nc(d), depth-1)
-	} else if k == NkTypeDecl {
-		outer := bScope
-		if nb(d) != 0 {
-			bScope = newScope(outer, ScopeTypeDecl, d)
-			bTypeParams(nb(d), depth-1)
-		}
-		bindType(nc(d), depth-1)
-		bScope = outer
-	} else if k == NkFuncDecl {
-		bFuncDecl(d, depth-1)
-	}
-}
-
-func bTypeParams(l u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	n := l1len(l)
-	for i := usize(0); i < n; i++ {
-		bindType(na(l1at(l, i)), depth-1)
-	}
-	for i := usize(0); i < n; i++ {
-		tp := l1at(l, i)
-		m := l1len(tp)
-		for j := usize(0); j < m; j++ {
-			_ = bDeclare(SymTypeParam, VarNone, l1at(tp, j), tp)
-		}
-	}
-}
-
-// bDeclare defines a new local symbol in the current scp.
-func bDeclare(kind u8, vk u8, id u32, decl u32) u32 {
-	sym := newSym(kind, idName(id), id, decl, bPkg)
-	if sym == 0 {
+func addSym(s Sym) u32 {
+	if symCount >= MaxSyms {
 		return 0
 	}
-	syms.items[usize(sym)].varKind = vk
-	if bNFuncs > 0 {
-		syms.items[usize(sym)].fn = bFuncs[bNFuncs-1]
-	}
-	if isBlank(id) {
-		return sym
-	}
-	defs[usize(id)] = sym
-	if scopeInsert(bScope, sym) != 0 {
-		errAt(E2001, id, formatTo(mbuf[:], "%v redeclared in this block", NameRef(idName(id))))
-	}
-	return sym
+	id := symCount
+	symCount++
+	syms[id] = s
+	return id
 }
 
-func bFuncDecl(d u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
+func addUniType(name string, ty u32) {
+	s := addSym(Sym{kind: SymType, nameStr: internStr(name), typeID: ty})
+	if uniSymCount < MaxUniSyms {
+		uniSyms[uniSymCount] = s
+		uniSymCount++
 	}
-	outer := bScope
-	bScope = newScope(outer, ScopeFunc, d)
-	bPushFunc(d)
-	r := na(d)
-	if r != 0 {
-		tn := nb(r)
-		tsym := lookupLocal(pkgs.items[usize(bPkg)].scp, idName(tn))
-		if tsym == 0 || symKind(tsym) != SymType {
-			errAt(E2001, tn, formatTo(mbuf[:], "undefined receiver type %v (must be a type declared in package %v)", NameRef(idName(tn)), NameRef(pkgs.items[usize(bPkg)].name)))
-		} else {
-			uses[usize(tn)] = tsym
+}
+
+func addUniConst(name string, ty u32, valID u32, untyped bool) {
+	var fl u8 = 0
+	if untyped {
+		fl = 1
+	}
+	s := addSym(Sym{kind: SymConst, flags: fl, nameStr: internStr(name), typeID: ty, valID: valID})
+	if uniSymCount < MaxUniSyms {
+		uniSyms[uniSymCount] = s
+		uniSymCount++
+	}
+}
+
+func addUniBuiltin(name string, bid u16) {
+	s := addSym(Sym{kind: SymBuiltin, builtin: bid, nameStr: internStr(name)})
+	if uniSymCount < MaxUniSyms {
+		uniSyms[uniSymCount] = s
+		uniSymCount++
+	}
+}
+
+func initUniverse() {
+	// Basic types
+	addUniType("bool", TYBool)
+	addUniType("u8", TYU8)
+	addUniType("byte", TYU8)
+	addUniType("u16", TYU16)
+	addUniType("u32", TYU32)
+	addUniType("u64", TYU64)
+	addUniType("usize", TYUsize)
+	addUniType("i8", TYI8)
+	addUniType("i16", TYI16)
+	addUniType("i32", TYI32)
+	addUniType("i64", TYI64)
+	addUniType("int", TYInt)
+	addUniType("f32", TYF32)
+	addUniType("f64", TYF64)
+	addUniType("string", TYString)
+	addUniType("error", TYError)
+	addUniType("any", TYAny)
+
+	// Builtin resource & capability types
+	addUniType("Net", TYNet)
+	addUniType("Listener", TYListener)
+	addUniType("Conn", TYConn)
+	addUniType("Signals", TYSignals)
+	addUniType("Clock", TYClock)
+	addUniType("Context", TYContext)
+	addUniType("CancelFunc", TYCancelFunc)
+	addUniType("Scope", TYScope)
+	addUniType("Slot", TYSlotOrigin)
+	addUniType("FS", TYFS)
+	addUniType("Env", TYEnv)
+	addUniType("Stdio", TYStdio)
+	addUniType("Exec", TYExec)
+	addUniType("FieldCode", TYFieldCode)
+	addUniType("ExitStatus", TYExitStatus)
+	addUniType("Arena", TYArena)
+	addUniType("Atomic", TYAtomicOrigin)
+
+	// Predeclared error sentinels
+	addUniConst("ErrEOF", TYError, makeErrVal(ErrIDEOF), false)
+	addUniConst("ErrTimeout", TYError, makeErrVal(ErrIDTimeout), false)
+	addUniConst("ErrCancelled", TYError, makeErrVal(ErrIDCancelled), false)
+	addUniConst("ErrZeroWrite", TYError, makeErrVal(ErrIDZeroWrite), false)
+	addUniConst("ErrClosed", TYError, makeErrVal(ErrIDClosed), false)
+	addUniConst("ErrIO", TYError, makeErrVal(ErrIDIO), false)
+	addUniConst("ErrNotFound", TYError, makeErrVal(ErrIDNotFound), false)
+	addUniConst("ErrMaxDepth", TYError, makeErrVal(ErrIDMaxDepth), false)
+	addUniConst("ErrArenaFull", TYError, makeErrVal(ErrIDArenaFull), false)
+	addUniConst("ErrExec", TYError, makeErrVal(ErrIDExec), false)
+	addUniConst("ErrParse", TYError, makeErrVal(ErrIDParse), false)
+
+	// Predeclared durations (untyped int nanoseconds) & signals
+	addUniConst("Nanosecond", TYUntypedInt, makeIntVal(1, false, TYUntypedInt), true)
+	addUniConst("Microsecond", TYUntypedInt, makeIntVal(1000, false, TYUntypedInt), true)
+	addUniConst("Millisecond", TYUntypedInt, makeIntVal(1_000_000, false, TYUntypedInt), true)
+	addUniConst("Second", TYUntypedInt, makeIntVal(1_000_000_000, false, TYUntypedInt), true)
+	addUniConst("Minute", TYUntypedInt, makeIntVal(60_000_000_000, false, TYUntypedInt), true)
+	addUniConst("Hour", TYUntypedInt, makeIntVal(3600_000_000_000, false, TYUntypedInt), true)
+	addUniConst("SIGINT", TYU32, makeIntVal(2, false, TYU32), false)
+	addUniConst("SIGTERM", TYU32, makeIntVal(15, false, TYU32), false)
+
+	// Builtin functions
+	addUniBuiltin("len", BFLen)
+	addUniBuiltin("cap", BFCap)
+	addUniBuiltin("copy", BFCopy)
+	addUniBuiltin("bytesEqual", BFBytesEqual)
+	addUniBuiltin("strBytes", BFStrBytes)
+	addUniBuiltin("bytesToStr", BFBytesToStr)
+	addUniBuiltin("formatUint", BFFormatUint)
+	addUniBuiltin("parseUint", BFParseUint)
+	addUniBuiltin("NewContext", BFNewContext)
+	addUniBuiltin("NewScope", BFNewScope)
+	addUniBuiltin("NewFiberScope", BFNewFiberScope)
+	addUniBuiltin("FiberYield", BFFiberYield)
+	addUniBuiltin("NewArena", BFNewArena)
+	addUniBuiltin("strView", BFStrView)
+	addUniBuiltin("panic", BFPanic)
+	addUniBuiltin("formatTo", BFFormatTo)
+	addUniBuiltin("CodeBool", BFCodeBool)
+	addUniBuiltin("CodeU8", BFCodeU8)
+	addUniBuiltin("CodeU16", BFCodeU16)
+	addUniBuiltin("CodeU32", BFCodeU32)
+	addUniBuiltin("CodeU64", BFCodeU64)
+	addUniBuiltin("CodeUsize", BFCodeUsize)
+	addUniBuiltin("CodeI8", BFCodeI8)
+	addUniBuiltin("CodeI16", BFCodeI16)
+	addUniBuiltin("CodeI32", BFCodeI32)
+	addUniBuiltin("CodeI64", BFCodeI64)
+	addUniBuiltin("CodeInt", BFCodeInt)
+	addUniBuiltin("CodeString", BFCodeString)
+	addUniBuiltin("CodeArray", BFCodeArray)
+	addUniBuiltin("CodeStruct", BFCodeStruct)
+	addUniBuiltin("CodeField", BFCodeField)
+	addUniBuiltin("CodeUniv", BFCodeUniv)
+}
+
+func lookupUniverse(nameStr u32) u32 {
+	for i := u32(0); i < uniSymCount; i++ {
+		if syms[uniSyms[i]].nameStr == nameStr {
+			return uniSyms[i]
 		}
-		n := l1len(r)
-		for i := usize(0); i < n; i++ {
-			_ = bDeclare(SymTypeParam, VarNone, l1at(r, i), r)
-		}
 	}
-	if nc(d) != 0 {
-		bTypeParams(nc(d), depth-1)
-	}
-	bSignatureTypes(nd(d), depth-1)
-	if r != 0 {
-		_ = bDeclare(SymVar, VarRecv, na(r), r)
-	}
-	bParams(nd(d))
-	if ne(d) != 0 {
-		bindExpr(na(ne(d)), depth-1)
-	}
-	if nf(d) != 0 {
-		bStmts(nf(d), depth-1)
-	}
-	bPopFunc()
-	bScope = outer
+	return 0
 }
 
-func bSignatureTypes(s u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	n := l1len(s)
-	for i := usize(0); i < n; i++ {
-		bindType(na(l1at(s, i)), depth-1)
-	}
-	m := l2len(s)
-	for i := usize(0); i < m; i++ {
-		bindType(l2at(s, i), depth-1)
-	}
-}
-
-func bParams(s u32) {
-	n := l1len(s)
-	for i := usize(0); i < n; i++ {
-		p := l1at(s, i)
-		m := l1len(p)
-		for j := usize(0); j < m; j++ {
-			_ = bDeclare(SymVar, VarParam, l1at(p, j), p)
-		}
-	}
-}
-
-func bindType(t u32, depth usize) decreases(depth) {
-	if depth == 0 || t == 0 {
-		return
-	}
-	k := nkind(t)
-	if k == NkNamedType {
-		bNamedType(t, depth-1)
-	} else if k == NkArrayType {
-		bindExpr(na(t), depth-1)
-		bindType(nb(t), depth-1)
-	} else if k is NkSliceType | NkPointerType {
-		bindType(na(t), depth-1)
-	} else if k == NkStructType {
-		n := l1len(t)
-		for i := usize(0); i < n; i++ {
-			bindType(na(l1at(t, i)), depth-1)
-		}
-	} else if k == NkEnumType {
-		n := l1len(t)
-		for i := usize(0); i < n; i++ {
-			v := l1at(t, i)
-			m := l1len(v)
-			for j := usize(0); j < m; j++ {
-				bindType(l1at(v, j), depth-1)
-			}
-		}
-	} else if k == NkFuncType {
-		bSignatureTypes(na(t), depth-1)
-	} else if k is NkCodeType | NkElType {
-		bindExpr(na(t), depth-1)
-	}
-}
-
-func bNamedType(t u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	if na(t) != 0 {
-		_ = bQualified(na(t), nb(t))
-	} else {
-		_ = bLookup(nb(t))
-	}
-	n := l1len(t)
-	for i := usize(0); i < n; i++ {
-		bindExpr(l1at(t, i), depth-1)
-	}
-}
-
-// bQualified resolves pkg.Name; it returns false if pkg is not a package.
-func bQualified(pkg u32, name u32) bool {
-	ps := bLookup(pkg)
-	if ps == 0 {
-		return true
-	}
-	if symKind(ps) != SymPackage {
-		return false
-	}
-	nm := idName(name)
-	imp := syms.items[usize(ps)].imported
-	member := lookupLocal(pkgs.items[usize(imp)].scp, nm)
-	if member == 0 {
-		errAt(E2001, name, formatTo(mbuf[:], "undefined: %v.%v", NameRef(idName(pkg)), NameRef(nm)))
-	} else if !isExportedName(nm) {
-		errAt(E2001, name, formatTo(mbuf[:], "%v.%v is not exported", NameRef(idName(pkg)), NameRef(nm)))
-	} else {
-		uses[usize(name)] = member
-	}
-	return true
-}
-
-// bLookup resolves an identifier use, reporting E2001 if undefined.
-func bLookup(id u32) u32 {
-	if isBlank(id) {
-		errAt(E2001, id, formatTo(mbuf[:], "cannot use _ as value"))
+func lookupPkgSym(pkgID u32, nameStr u32) u32 {
+	if pkgID >= pkgCount {
 		return 0
 	}
-	sym := lookupChain(bScope, idName(id))
-	if sym == 0 {
-		errAt(E2001, id, formatTo(mbuf[:], "undefined: %v", NameRef(idName(id))))
-		return 0
-	}
-	uses[usize(id)] = sym
-	bNoteCapture(sym)
-	return sym
-}
-
-// bNoteCapture records sym as captured by every function literal between
-// the current function and the function declaring sym.
-func bNoteCapture(sym u32) {
-	sf := syms.items[usize(sym)].fn
-	if sf == 0 || bNFuncs == 0 || symKind(sym) == SymTypeParam {
-		return
-	}
-	n := bNFuncs
-	for k := usize(0); k < n; k++ {
-		fn := bFuncs[n-1-k]
-		if fn == sf {
-			return
-		}
-		if nkind(fn) != NkFuncLit {
-			return
-		}
-		dup := false
-		c := litCapHead[usize(fn)]
-		for g := usize(0); g < MaxCells; g++ {
-			if c == 0 {
-				break
-			}
-			if cellVal(c) == sym {
-				dup = true
-				break
-			}
-			c = cellNext(c)
-		}
-		if !dup {
-			h, t := cellAppend(litCapHead[usize(fn)], litCapTail[usize(fn)], sym)
-			litCapHead[usize(fn)] = h
-			litCapTail[usize(fn)] = t
-		}
-	}
-}
-
-func bindExpr(e u32, depth usize) decreases(depth) {
-	if depth == 0 || e == 0 {
-		return
-	}
-	k := nkind(e)
-	if k == NkIdent {
-		_ = bLookup(e)
-	} else if k == NkBinaryExpr && nop(e) is OpLAnd | OpLOr || k == NkIsExpr {
-		// v0.2: `is` bindings flow into the right operand of && / ||.
-		mark := bFlowTop
-		_, _ = bFlow(e, depth-1)
-		bFlowTop = mark
-	} else if k == NkBinaryExpr {
-		bindExpr(na(e), depth-1)
-		bindExpr(nb(e), depth-1)
-	} else if k is NkUnaryExpr | NkParenExpr {
-		bindExpr(na(e), depth-1)
-	} else if k is NkCallExpr | NkIndexExpr {
-		bindExpr(na(e), depth-1)
-		n := l1len(e)
-		for i := usize(0); i < n; i++ {
-			bindExpr(l1at(e, i), depth-1)
-		}
-	} else if k == NkSliceExpr {
-		bindExpr(na(e), depth-1)
-		bindExpr(nb(e), depth-1)
-		bindExpr(nc(e), depth-1)
-	} else if k == NkSelectorExpr {
-		x := na(e)
-		if nkind(x) == NkIdent && !isBlank(x) {
-			_ = bQualified(x, nb(e))
-			return
-		}
-		bindExpr(x, depth-1)
-	} else if k == NkFuncLit {
-		outer := bScope
-		bScope = newScope(outer, ScopeFunc, e)
-		bSignatureTypes(na(e), depth-1)
-		bPushFunc(e)
-		bParams(na(e))
-		bStmts(nb(e), depth-1)
-		bPopFunc()
-		bScope = outer
-	} else if k == NkStructLit {
-		bNamedType(na(e), depth-1)
-		n := l1len(e)
-		for i := usize(0); i < n; i++ {
-			bindExpr(nb(l1at(e, i)), depth-1)
-		}
-	} else if k == NkTypeExpr {
-		bindType(na(e), depth-1)
-	} else if k == NkMatchExpr {
-		bindExpr(na(e), depth-1)
-		n := l1len(e)
-		for i := usize(0); i < n; i++ {
-			bMatchArm(l1at(e, i), depth-1)
-		}
-	} else if k == NkTupleExpr {
-		n := l1len(e)
-		for i := usize(0); i < n; i++ {
-			bindExpr(l1at(e, i), depth-1)
-		}
-	}
-}
-
-// bStmts binds the statements of a block without opening a scp.
-func bStmts(bl u32, depth usize) decreases(depth) {
-	if depth == 0 || bl == 0 {
-		return
-	}
-	n := l1len(bl)
-	for i := usize(0); i < n; i++ {
-		s := l1at(bl, i)
-		if nkind(s) == NkIfStmt {
-			bIfStmt(s, true, depth-1)
-		} else {
-			bStmt(s, depth-1)
-		}
-	}
-}
-
-func bBlock(bl u32, depth usize) decreases(depth) {
-	if depth == 0 || bl == 0 {
-		return
-	}
-	outer := bScope
-	bScope = newScope(outer, ScopeBlock, bl)
-	bStmts(bl, depth-1)
-	bScope = outer
-}
-
-func bStmt(s u32, depth usize) decreases(depth) {
-	if depth == 0 || s == 0 {
-		return
-	}
-	k := nkind(s)
-	if k == NkBlockStmt {
-		bBlock(s, depth-1)
-	} else if k == NkDeclStmt {
-		d := na(s)
-		if nkind(d) == NkConstDecl {
-			n := l1len(d)
-			for i := usize(0); i < n; i++ {
-				sp := l1at(d, i)
-				bindType(nb(sp), depth-1)
-				bindExpr(nc(sp), depth-1)
-				_ = bDeclare(SymConst, VarNone, na(sp), sp)
-			}
-		} else if nkind(d) == NkVarDecl {
-			bindType(nb(d), depth-1)
-			bindExpr(nc(d), depth-1)
-			_ = bDeclare(SymVar, VarLocal, na(d), d)
-		}
-	} else if k == NkShortVarDecl {
-		nv := l2len(s)
-		for i := usize(0); i < nv; i++ {
-			bindExpr(l2at(s, i), depth-1)
-		}
-		fresh := 0
-		nn := l1len(s)
-		for i := usize(0); i < nn; i++ {
-			id := l1at(s, i)
-			if isBlank(id) {
-				continue
-			}
-			old := lookupLocal(bScope, idName(id))
-			if old != 0 {
-				uses[usize(id)] = old
-				continue
-			}
-			fresh++
-			_ = bDeclare(SymVar, VarLocal, id, s)
-		}
-		if fresh == 0 {
-			errAt(E2002, s, formatTo(mbuf[:], "no new variables on left side of :="))
-		}
-	} else if k == NkAssignStmt {
-		nl := l1len(s)
-		for i := usize(0); i < nl; i++ {
-			l := l1at(s, i)
-			if nkind(l) == NkIdent && isBlank(l) && nop(s) == AsgAssign {
-				continue
-			}
-			bindExpr(l, depth-1)
-		}
-		nr := l2len(s)
-		for i := usize(0); i < nr; i++ {
-			bindExpr(l2at(s, i), depth-1)
-		}
-	} else if k is NkIncDecStmt | NkExprStmt | NkDeferStmt {
-		bindExpr(na(s), depth-1)
-	} else if k == NkReturnStmt {
-		n := l1len(s)
-		for i := usize(0); i < n; i++ {
-			bindExpr(l1at(s, i), depth-1)
-		}
-	} else if k == NkIfStmt {
-		bIfStmt(s, false, depth-1)
-	} else if k == NkForStmt {
-		outer := bScope
-		bScope = newScope(outer, ScopeBlock, s)
-		bStmt(na(s), depth-1)
-		mark := bFlowTop
-		nt, _ := bFlow(nb(s), depth-1)
-		bStmt(nc(s), depth-1)
-		if nd(s) != 0 {
-			bindExpr(na(nd(s)), depth-1)
-		}
-		// v0.2: the condition's true-outcome bindings are visible in the body.
-		bVisible(mark, mark+nt)
-		bBlock(ne(s), depth-1)
-		bScope = outer
-		bFlowTop = mark
-	} else if k == NkMatchStmt {
-		bindExpr(na(s), depth-1)
-		n := l1len(s)
-		for i := usize(0); i < n; i++ {
-			bMatchArm(l1at(s, i), depth-1)
-		}
-	} else if k == NkScopeStmt {
-		bindExpr(nb(s), depth-1)
-		outer := bScope
-		bScope = newScope(outer, ScopeBlock, s)
-		_ = bDeclare(SymVar, VarScope, na(s), s)
-		bBlock(nc(s), depth-1)
-		bScope = outer
-	}
-}
-
-// bCtorPattern resolves the qualifier of a qualified constructor pattern:
-// Qual.Name is a package member (an imported constant), or Type.Variant
-// (the variant is resolved by the type checker).
-func bCtorPattern(cp u32) {
-	if na(cp) != 0 {
-		_ = bQualified(na(cp), nb(cp))
-	}
-}
-
-func bMatchArm(arm u32, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	outer := bScope
-	bScope = newScope(outer, ScopeBlock, arm)
-	bPatternNames(na(arm), true, depth-1)
-	// v0.2: the guard's true-outcome bindings are visible in the body.
-	mark := bFlowTop
-	nt, _ := bFlow(nd(arm), depth-1)
-	bVisible(mark, mark+nt)
-	if nb(arm) != 0 {
-		bindExpr(nb(arm), depth-1)
-	}
-	if nc(arm) != 0 {
-		bStmts(nc(arm), depth-1)
-	}
-	bScope = outer
-	bFlowTop = mark
-}
-
-// MaxPatternBindings bounds the distinct names one pattern binds (more are
-// declared without unifying repeated names).
-const MaxPatternBindings = 256
-
-// bVariantName marks the names (interned name IDs) of the variants of every
-// enum type of the program: such a bare pattern name is declared hidden
-// (see bPatternNames).
-var bVariantName [MaxNames]bool
-
-// bPatSeen holds the symbols declared by the pattern being bound.
-var bPatSeen [MaxPatternBindings]u32
-var bPatN usize
-
-// bPatternNames resolves the names of a pattern and, if declare is set,
-// declares its bindings in the current scope (v0.2). A bare identifier in
-// any pattern position (top level, tuple element or payload: an Ident in
-// payloads, an unqualified CtorPattern without parentheses elsewhere) that
-// resolves to a constant is a constant pattern (a use of the constant);
-// any other bare identifier is declared as a binding. The type checker
-// later classifies a bare name that is a variant of the expected enum type
-// as that variant (the binding, if declared, is then bound to the value,
-// which is that variant). A name bound in several places of one pattern
-// (or-pattern alternatives) is one symbol; the type checker checks that
-// the alternatives agree and that no alternative binds a name twice. A
-// name that is the name of a variant of some enum type of the program is
-// declared hidden: it gets a symbol (a binding if the type checker finds
-// no such variant in the expected type) but is not inserted into the
-// scope, so variant names shadow nothing and cannot be referenced.
-// Bindings of an undeclared pattern keep no symbol (E2002 in the type
-// checker unless the name is a variant).
-func bPatternNames(p u32, declare bool, depth usize) decreases(depth) {
-	bPatN = 0
-	bPatWalk(p, declare, depth-1)
-}
-
-func bPatWalk(p u32, declare bool, depth usize) decreases(depth) {
-	if depth == 0 || p == 0 {
-		return
-	}
-	k := nkind(p)
-	if k == NkIdent {
-		bPatBare(p, declare)
-	} else if k == NkCtorPattern {
-		if na(p) == 0 && !nflag(p) {
-			bPatBare(nb(p), declare)
-			return
-		}
-		bCtorPattern(p)
-		n := l1len(p)
-		for i := usize(0); i < n; i++ {
-			bPatWalk(l1at(p, i), declare, depth-1)
-		}
-	} else if k is NkOrPattern | NkTuplePattern {
-		n := l1len(p)
-		for i := usize(0); i < n; i++ {
-			bPatWalk(l1at(p, i), declare, depth-1)
-		}
-	} else if k == NkAtPattern {
-		// v0.2: the name before '@' is always a binding.
-		id := na(p)
-		nm := idName(id)
-		csym := lookupChain(bScope, nm)
-		if isBlank(id) {
-			errAt(E2002, id, formatTo(mbuf[:], "cannot bind _ with '@' (write the pattern alone)"))
-		} else if csym != 0 && symKind(csym) == SymConst {
-			errAt(E2002, id, formatTo(mbuf[:], "cannot bind %v with '@': %v is a constant", NameRef(nm), NameRef(nm)))
-		} else if usize(nm) < MaxNames && bVariantName[usize(nm)] {
-			errAt(E2002, id, formatTo(mbuf[:], "cannot bind %v with '@': %v is the name of a variant", NameRef(nm), NameRef(nm)))
-		} else {
-			bPatBare(id, declare)
-		}
-		bPatWalk(nb(p), declare, depth-1)
-	}
-}
-
-// bPatBare resolves the bare pattern name id: a constant in scope (a use),
-// else, if declare is set, a binding (one symbol per name per pattern).
-func bPatBare(id u32, declare bool) {
-	if isBlank(id) {
-		return
-	}
-	csym := lookupChain(bScope, idName(id))
-	if csym != 0 && symKind(csym) == SymConst {
-		uses[usize(id)] = csym
-		return
-	}
-	if !declare {
-		return
-	}
-	nseen := bPatN
-	for i := usize(0); i < nseen; i++ {
-		if symName(bPatSeen[i]) == idName(id) {
-			defs[usize(id)] = bPatSeen[i]
-			return
-		}
-	}
-	sym := u32(0)
-	if usize(idName(id)) < MaxNames && bVariantName[usize(idName(id))] {
-		// Probably a variant of the expected enum type: declared but not
-		// visible, so it shadows nothing (and two `is` tests of one &&
-		// chain may name the same variant).
-		sym = newSym(SymVar, idName(id), id, id, bPkg)
-		if sym != 0 {
-			syms.items[usize(sym)].varKind = VarBinding
-			if bNFuncs > 0 {
-				syms.items[usize(sym)].fn = bFuncs[bNFuncs-1]
-			}
-			defs[usize(id)] = sym
-		}
-	} else {
-		sym = bDeclare(SymVar, VarBinding, id, id)
-	}
-	if bPatN < MaxPatternBindings && sym != 0 {
-		bPatSeen[bPatN] = sym
-		bPatN++
-	}
-}
-
-// ---------------------------------------------------------------------------
-// v0.2 flow-scoped `is` bindings (finc0's binder.flow, ifStmt, visible,
-// union).
-
-// MaxFlowSyms bounds the symbols of the outcome sets under construction.
-const MaxFlowSyms = 4096
-
-// bFlowSyms is a LIFO stack of outcome sets: bFlow leaves the true set
-// followed by the false set on top of it.
-var bFlowSyms [MaxFlowSyms]u32
-var bFlowTop usize
-var bFlowTmp [MaxFlowSyms]u32
-
-func bFlowPush(sym u32) {
-	if bFlowTop >= MaxFlowSyms {
-		setFull("flow bindings")
-		return
-	}
-	bFlowSyms[bFlowTop] = sym
-	bFlowTop++
-}
-
-// bIfStmt binds an if statement: the bindings of the condition's true
-// outcome are visible in the then block, those of its false outcome in
-// the else branch. If the if statement is directly in a statement list
-// (inList) and has no else branch, the false-outcome bindings are
-// declared in the enclosing block after it, like a `:=` at the if
-// statement (let-else; the type checker requires the then block to
-// terminate where they are used).
-func bIfStmt(s u32, inList bool, depth usize) decreases(depth) {
-	if depth == 0 {
-		return
-	}
-	outer := bScope
-	bScope = newScope(outer, ScopeBlock, s)
-	bStmt(na(s), depth-1)
-	mark := bFlowTop
-	nt, nf := bFlow(nb(s), depth-1)
-	ifScope := bScope
-	bVisible(mark, mark+nt)
-	bBlock(nc(s), depth-1)
-	bScope = ifScope
-	bVisible(mark+nt, mark+nt+nf)
-	bStmt(nd(s), depth-1)
-	bScope = outer
-	if inList && nd(s) == 0 {
-		for i := mark + nt; i < mark+nt+nf; i++ {
-			sym := bFlowSyms[i]
-			if scopeInsert(bScope, sym) != 0 {
-				errAt(E2001, syms.items[usize(sym)].ident, formatTo(mbuf[:], "%v redeclared in this block", NameRef(symName(sym))))
-			}
-		}
-	}
-	bFlowTop = mark
-}
-
-// bFlow binds a boolean expression and pushes its outcome sets: the
-// variables bound by `is` tests that are definitely matched when e is
-// true (the first nt symbols) and when e is false (the next nf), in
-// source order.
-//
-//	e is P      t = bindings of P, f = {}
-//	!A          t = f(A), f = t(A)
-//	A && B      t = t(A) + t(B), f = f(A) * (t(A) + f(B)); t(A) is visible in B
-//	A || B      t = t(A) * (f(A) + t(B)), f = f(A) + f(B); f(A) is visible in B
-//	(A)         those of A
-//	otherwise   {}, {}
-//
-// where + is a union and * an intersection by name. The symbols of an
-// `is` pattern are declared in a scope of their own and become visible
-// only where flow makes them visible. A name in both operand sets of a
-// union is E2001. The true and false set of an expression never share a
-// name, so the intersections are f(A) * f(B) and t(A) * t(B)
-// (bFlowIntersect).
-func bFlow(e u32, depth usize) (usize, usize) decreases(depth) {
-	if depth == 0 || e == 0 {
-		return 0, 0
-	}
-	k := nkind(e)
-	if k == NkParenExpr {
-		return bFlow(na(e), depth-1)
-	}
-	if k == NkUnaryExpr && nop(e) == OpNot {
-		base := bFlowTop
-		t, f := bFlow(na(e), depth-1)
-		n := t + f
-		for i := usize(0); i < n; i++ {
-			bFlowTmp[i] = bFlowSyms[base+i]
-		}
-		for i := usize(0); i < f; i++ {
-			bFlowSyms[base+i] = bFlowTmp[t+i]
-		}
-		for i := usize(0); i < t; i++ {
-			bFlowSyms[base+f+i] = bFlowTmp[i]
-		}
-		return f, t
-	}
-	if k == NkIsExpr {
-		bindExpr(na(e), depth-1)
-		outer := bScope
-		ps := newScope(outer, ScopeBlock, e)
-		bScope = ps
-		bPatternNames(nb(e), true, depth-1)
-		bScope = outer
-		// hidden variant-name symbols (never inserted) take no part
-		np := bPatN
-		n := usize(0)
-		for i := usize(0); i < np; i++ {
-			if syms.items[usize(bPatSeen[i])].scp == ps {
-				bFlowPush(bPatSeen[i])
-				n++
-			}
-		}
-		return n, 0
-	}
-	if k == NkBinaryExpr && nop(e) is OpLAnd | OpLOr {
-		and := nop(e) == OpLAnd
-		base := bFlowTop
-		ta, fa := bFlow(na(e), depth-1)
-		outer := bScope
-		if and {
-			bVisible(base, base+ta)
-		} else {
-			bVisible(base+ta, base+ta+fa)
-		}
-		tb, fb := bFlow(nb(e), depth-1)
-		bScope = outer
-		// the four sets ta, fa, tb, fb are copied to bFlowTmp (in that
-		// order) and replaced by the result sets
-		n4 := ta + fa + tb + fb
-		for i := usize(0); i < n4; i++ {
-			bFlowTmp[i] = bFlowSyms[base+i]
-		}
-		bFlowTop = base
-		if and {
-			nt := bFlowUnion(0, ta, ta+fa, tb)
-			nf := bFlowIntersect(ta, fa, ta+fa+tb, fb)
-			return nt, nf
-		}
-		nt := bFlowIntersect(0, ta, ta+fa, tb)
-		nf := bFlowUnion(ta, fa, ta+fa+tb, fb)
-		return nt, nf
-	}
-	bindExpr(e, depth-1)
-	return 0, 0
-}
-
-// bFlowUnion pushes the union of the sets bFlowTmp[xs:xs+xn] and
-// bFlowTmp[ys:ys+yn]: x followed by the symbols of y; a name of y already
-// in x is E2001 (one outcome set binds it twice) and is dropped.
-func bFlowUnion(xs usize, xn usize, ys usize, yn usize) usize {
-	for i := usize(0); i < xn; i++ {
-		bFlowPush(bFlowTmp[xs+i])
-	}
-	n := xn
-	for i := usize(0); i < yn; i++ {
-		sym := bFlowTmp[ys+i]
-		dup := false
-		for j := usize(0); j < xn; j++ {
-			if symName(bFlowTmp[xs+j]) == symName(sym) {
-				dup = true
-				break
-			}
-		}
-		if dup {
-			errAt(E2001, syms.items[usize(sym)].ident, formatTo(mbuf[:], "%v redeclared in this condition", NameRef(symName(sym))))
-			continue
-		}
-		bFlowPush(sym)
-		n++
-	}
-	return n
-}
-
-// bFlowIntersect pushes the symbols of bFlowTmp[xs:xs+xn] whose name is
-// also bound in bFlowTmp[ys:ys+yn], in the order of x (v0.2 flow
-// intersections: a name is bound in an outcome if it is bound on every
-// path to it). The binding of y is merged into the one of x: both name
-// one variable, which either `is` test assigns (bApplyMerges). The type
-// checker requires identical types.
-func bFlowIntersect(xs usize, xn usize, ys usize, yn usize) usize {
-	n := usize(0)
-	for i := usize(0); i < xn; i++ {
-		sym := bFlowTmp[xs+i]
-		for j := usize(0); j < yn; j++ {
-			o := bFlowTmp[ys+j]
-			if symName(o) == symName(sym) {
-				bMerged[usize(o)] = sym
-				bNMerged++
-				bFlowPush(sym)
-				n++
-				break
-			}
-		}
-	}
-	return n
-}
-
-// bMerged maps an `is` binding to the binding of the same name it was
-// intersected with (0: none); bApplyMerges unifies them.
-var bMerged [MaxSyms]u32
-var bNMerged usize
-
-// bMergedRoot returns the symbol sym was (transitively) merged into.
-func bMergedRoot(sym u32) u32 {
-	s := sym
-	for k := usize(0); k < MaxSyms; k++ {
-		m := bMerged[usize(s)]
-		if m == 0 {
+	p := pkgs[pkgID]
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].nameStr == nameStr {
 			return s
 		}
-		s = m
+	}
+	return 0
+}
+
+func lookupPkgOrUniverse(pkgID u32, nameStr u32) u32 {
+	if s := lookupPkgSym(pkgID, nameStr); s != 0 {
+		return s
+	}
+	return lookupUniverse(nameStr)
+}
+
+func lookupFileImport(fileID u32, aliasStr u32) (u32, bool) {
+	for i := u32(0); i < fileImportCount; i++ {
+		if fileImports[i].fileID == fileID && fileImports[i].aliasStr == aliasStr {
+			return fileImports[i].pkgID, true
+		}
+	}
+	return 0, false
+}
+
+// ---------------------------------------------------------------------------
+// Multi-package loader (loads root + transitive imports in topological order)
+
+driver func loadProgram(fs FS, target []byte) error {
+	pid, err := loadPkg(fs, target, true, 0, 0)
+	if err != nil {
+		return err
+	}
+	rootPkgID = pid
+	assignPkgPrefixes()
+	// Register declarations of all packages in topological order
+	poc := pkgOrderCount
+	for i := u32(0); i < poc; i++ {
+		registerPkgDecls(pkgOrder[i])
+	}
+	// Resolve all type declarations & function signatures in topological order
+	for i := u32(0); i < poc; i++ {
+		resolvePkgSignatures(pkgOrder[i])
+	}
+	return nil
+}
+
+driver func loadPkg(fs FS, path []byte, isRoot bool, impFileID u32, impOff u32) (u32, error) {
+	pathStr := internBytes(path)
+	// Check if already loaded or currently loading (cycle!)
+	if !isRoot {
+		pc := pkgCount
+		for i := u32(0); i < pc; i++ {
+			if pkgs[i].importPathStr == pathStr {
+				if pkgs[i].state == 1 {
+					addDiagStr(E2006, impFileID, impOff, "import cycle detected")
+					return i, nil
+				}
+				return i, nil
+			}
+		}
+	}
+	if pkgCount >= MaxPkgs {
+		return 0, ErrArenaFull
+	}
+	pid := pkgCount
+	pkgCount++
+	pkgs[pid] = Pkg{importPathStr: pathStr, state: 1}
+
+	// Resolve filesystem directory for imported package
+	var dirBuf [512]byte
+	var dirLen usize = 0
+	if isRoot {
+		dirLen = copy(dirBuf[:], path)
+	} else {
+		if fincRootLen > 0 && isStdImport(path) {
+			dirLen = bufAppend(dirBuf[:], 0, fincRootBuf[:fincRootLen])
+			dirLen = bufAppendByte(dirBuf[:], dirLen, '/')
+			dirLen = bufAppend(dirBuf[:], dirLen, path)
+		} else {
+			dirLen = copy(dirBuf[:], path)
+		}
+		if !fs.IsDir(bytesToStr(dirBuf[:dirLen])) {
+			addDiagStr(E2001, impFileID, impOff, "imported package directory not found")
+			pkgs[pid].state = 2
+			return pid, nil
+		}
+	}
+
+	// Load and parse source file(s) of this package
+	var localFids [64]u32
+	nf := usize(0)
+	if fs.IsDir(bytesToStr(dirBuf[:dirLen])) {
+		var names [64]string
+		n, err := fs.ListSourceFiles(bytesToStr(dirBuf[:dirLen]), names[:])
+		if err != nil {
+			return pid, err
+		}
+		var fpBuf [512]byte
+		for i := usize(0); i < n; i++ {
+			p := bufAppend(fpBuf[:], 0, dirBuf[:dirLen])
+			if p > 0 && fpBuf[p-1] != '/' {
+				p = bufAppendByte(fpBuf[:], p, '/')
+			}
+			p = bufAppendStr(fpBuf[:], p, names[i])
+			fid, lerr := loadAndParseFile(fs, fpBuf[:p])
+			if lerr != nil {
+				return pid, lerr
+			}
+			if nf < len(localFids) {
+				localFids[nf] = fid
+				nf++
+			}
+		}
+	} else {
+		fid, lerr := loadAndParseFile(fs, dirBuf[:dirLen])
+		if lerr != nil {
+			return pid, lerr
+		}
+		localFids[0] = fid
+		nf = 1
+	}
+
+	// Record files for this package (contiguously in pkgFiles)
+	fsStart := pkgFileCount
+	for i := usize(0); i < nf; i++ {
+		if pkgFileCount < MaxFiles {
+			pkgFiles[pkgFileCount] = localFids[i]
+			pkgFileCount++
+		}
+	}
+	pkgs[pid].fileStart = fsStart
+	pkgs[pid].fileCount = u32(nf)
+	if nf > 0 {
+		pkgs[pid].nameStr = nodes[files[localFids[0]].astNode].a
+	}
+
+	// Load imported packages of each file
+	for i := usize(0); i < nf; i++ {
+		fid := localFids[i]
+		fn := nodes[files[fid].astNode]
+		for j := u32(0); j < fn.c; j++ {
+			impNode := nodes[listPool[fn.b+j]]
+			impPath := strSlice(impNode.b)
+			depID, derr := loadPkg(fs, impPath, false, fid, impNode.off)
+			if derr != nil {
+				return pid, derr
+			}
+			alias := impNode.a
+			if alias == 0 {
+				alias = pkgs[depID].nameStr
+			}
+			if fileImportCount < MaxFileImps {
+				fileImports[fileImportCount] = FileImport{fileID: fid, aliasStr: alias, pkgID: depID}
+				fileImportCount++
+			}
+		}
+	}
+
+	pkgs[pid].state = 2
+	if pkgOrderCount < MaxPkgs {
+		pkgOrder[pkgOrderCount] = pid
+		pkgOrderCount++
+	}
+	return pid, nil
+}
+
+func isStdImport(path []byte) bool {
+	if len(path) == 3 && path[0] == 's' && path[1] == 't' && path[2] == 'd' {
+		return true
+	}
+	return len(path) >= 4 && path[0] == 's' && path[1] == 't' && path[2] == 'd' && path[3] == '/'
+}
+
+driver func loadAndParseFile(fs FS, path []byte) (u32, error) {
+	off := srcUsed
+	if usize(off) >= MaxSrcBytes {
+		return 0, ErrArenaFull
+	}
+	n, err := fs.ReadFileInto(bytesToStr(path), srcBuf[usize(off):])
+	if err != nil {
+		return 0, err
+	}
+	srcUsed += u32(n)
+	fid := addSourceFile(path, off, u32(n))
+	lexFile(fid)
+	_ = parseFile(fid)
+	return fid, nil
+}
+
+func assignPkgPrefixes() {
+	var buf [128]byte
+	poc := pkgOrderCount
+	for i := u32(0); i < poc; i++ {
+		pid := pkgOrder[i]
+		if pid == rootPkgID {
+			pkgs[pid].prefixStr = 0
+			continue
+		}
+		p := bufAppendStr(buf[:], 0, "_pkg_")
+		p = bufAppend(buf[:], p, strSlice(pkgs[pid].nameStr))
+		p = bufAppendByte(buf[:], p, '_')
+		if i > 0 {
+			// Ensure uniqueness across same-named packages
+			dup := false
+			for j := u32(0); j < i; j++ {
+				if pkgs[pkgOrder[j]].nameStr == pkgs[pid].nameStr && pkgOrder[j] != rootPkgID {
+					dup = true
+				}
+			}
+			if dup {
+				p += formatTo(buf[p:], "%d_", i)
+			}
+		}
+		pkgs[pid].prefixStr = internBytes(buf[:p])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Package declaration registration & type/signature resolution
+
+func registerPkgDecls(pkgID u32) {
+	p := pkgs[pkgID]
+	symStart := pkgSymCount
+	for fi := u32(0); fi < p.fileCount; fi++ {
+		fid := pkgFiles[p.fileStart+fi]
+		fn := nodes[files[fid].astNode]
+		for di := u32(0); di < fn.e; di++ {
+			dn := listPool[fn.d+di]
+			d := nodes[dn]
+			if d.kind == NKTypeDecl {
+				s := addSym(Sym{
+					kind:     SymType,
+					nameStr:  d.a,
+					pkgID:    pkgID,
+					fileID:   fid,
+					off:      d.off,
+					declNode: dn,
+				})
+				if d.flags == 0 {
+					// Pre-allocate Named type so self/mutual references resolve cleanly!
+					ty := newType(Type{kind: TKindNamed, a: s})
+					syms[s].typeID = ty
+				}
+				nodeSym[dn] = s
+				if pkgSymCount < MaxSyms {
+					pkgSyms[pkgSymCount] = s
+					pkgSymCount++
+				}
+			} else if d.kind == NKConstDecl {
+				s := addSym(Sym{
+					kind:     SymConst,
+					nameStr:  d.a,
+					pkgID:    pkgID,
+					fileID:   fid,
+					off:      d.off,
+					declNode: dn,
+				})
+				nodeSym[dn] = s
+				if pkgSymCount < MaxSyms {
+					pkgSyms[pkgSymCount] = s
+					pkgSymCount++
+				}
+			} else if d.kind == NKVarDecl {
+				s := addSym(Sym{
+					kind:     SymVar,
+					nameStr:  d.a,
+					pkgID:    pkgID,
+					fileID:   fid,
+					off:      d.off,
+					declNode: dn,
+				})
+				nodeSym[dn] = s
+				if pkgSymCount < MaxSyms {
+					pkgSyms[pkgSymCount] = s
+					pkgSymCount++
+				}
+			} else if d.kind == NKFuncDecl {
+				if d.b == 0 {
+					// Plain function
+					s := addSym(Sym{
+						kind:     SymFunc,
+						nameStr:  d.a,
+						pkgID:    pkgID,
+						fileID:   fid,
+						off:      d.off,
+						declNode: dn,
+					})
+					nodeSym[dn] = s
+					if pkgSymCount < MaxSyms {
+						pkgSyms[pkgSymCount] = s
+						pkgSymCount++
+					}
+					if pkgID == rootPkgID && d.a == kwMain {
+						mainFuncSym = s
+					}
+				} else {
+					// Method (not in package namespace; registered in methods table later)
+					rn := nodes[d.b]
+					var fl u8 = 0
+					if rn.flags != 0 {
+						fl = 8 // ptrRecv
+					}
+					s := addSym(Sym{
+						kind:     SymMethod,
+						flags:    fl,
+						nameStr:  d.a,
+						pkgID:    pkgID,
+						fileID:   fid,
+						off:      d.off,
+						declNode: dn,
+					})
+					nodeSym[dn] = s
+				}
+			} else if d.kind == NKEffectDecl {
+				s := addSym(Sym{
+					kind:     SymEffect,
+					nameStr:  d.a,
+					pkgID:    pkgID,
+					fileID:   fid,
+					off:      d.off,
+					declNode: dn,
+				})
+				ty := newType(Type{kind: TKindEffect, a: s})
+				types[ty].origin = ty
+				syms[s].typeID = ty
+				nodeSym[dn] = s
+				nodeType[dn] = ty
+				if pkgSymCount < MaxSyms {
+					pkgSyms[pkgSymCount] = s
+					pkgSymCount++
+				}
+			}
+		}
+	}
+	pkgs[pkgID].symStart = symStart
+	pkgs[pkgID].symCount = pkgSymCount - symStart
+}
+
+// Active type-parameter scope during signature/body checking.
+var activeTPSyms [32]u32
+var activeTPCount u32
+
+driver func pushTypeParam(tpNode u32, pkgID u32) u32 {
+	tn := nodes[tpNode]
+	var cty u32 = TYAny
+	if (tn.flags&1) != 0 && tn.b != 0 {
+		cty = resolveTypeNode(pkgID, tn.b)
+	}
+	s := addSym(Sym{
+		kind:     SymTypeParam,
+		flags:    u8(tn.flags),
+		nameStr:  tn.a,
+		pkgID:    pkgID,
+		fileID:   tn.fileID,
+		off:      tn.off,
+		declNode: tpNode,
+	})
+	ty := newType(Type{kind: TKindTypeParam, flags: tn.flags, a: s, b: cty})
+	syms[s].typeID = ty
+	nodeSym[tpNode] = s
+	nodeType[tpNode] = ty
+	if activeTPCount < 32 {
+		activeTPSyms[activeTPCount] = s
+		activeTPCount++
 	}
 	return s
 }
 
-// bApplyMerges replaces every merged `is` binding by its root in defs,
-// uses and the captures of function literals, so the intersected
-// bindings of a name are one symbol for every later pass (like the
-// alternatives of an or-pattern).
-func bApplyMerges() {
-	if bNMerged == 0 {
-		return
+func lookupActiveTP(nameStr u32) u32 {
+	if activeTPCount == 0 {
+		return 0
 	}
-	nn := nodes.count
-	for i := usize(1); i < nn; i++ {
-		if defs[i] != 0 {
-			defs[i] = bMergedRoot(defs[i])
-		}
-		if uses[i] != 0 {
-			uses[i] = bMergedRoot(uses[i])
-		}
-		if nodes.items[i].kind == NkFuncLit && litCapHead[i] != 0 {
-			bRemapCaptures(i)
-		}
-	}
-}
-
-// bRemapCaptures rebuilds the capture list of function literal lit with
-// merged symbols replaced by their roots (without duplicates).
-func bRemapCaptures(lit usize) {
-	h := u32(0)
-	t := u32(0)
-	c := litCapHead[lit]
-	for g := usize(0); g < MaxCells; g++ {
-		if c == 0 {
+	i := activeTPCount
+	for step := u32(0); step < 32; step++ {
+		if i == 0 {
 			break
 		}
-		sym := bMergedRoot(cellVal(c))
-		dup := false
-		d := h
-		for g2 := usize(0); g2 < MaxCells; g2++ {
-			if d == 0 {
-				break
-			}
-			if cellVal(d) == sym {
-				dup = true
-				break
-			}
-			d = cellNext(d)
+		i--
+		if syms[activeTPSyms[i]].nameStr == nameStr {
+			return activeTPSyms[i]
 		}
-		if !dup {
-			h, t = cellAppend(h, t, sym)
-		}
-		c = cellNext(c)
 	}
-	litCapHead[lit] = h
-	litCapTail[lit] = t
+	return 0
 }
 
-// bVisible opens a scope holding bFlowSyms[from:to] (none if empty); the
-// caller restores bScope.
-func bVisible(from usize, to usize) {
-	if to <= from {
+driver func resolvePkgSignatures(pkgID u32) {
+	p := pkgs[pkgID]
+	// 1. Register type parameters on generic type & effect declarations first
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].kind == SymType || syms[s].kind == SymEffect {
+			dn := syms[s].declNode
+			d := nodes[dn]
+			if d.c > 0 {
+				saved := activeTPCount
+				var tps [16]u32
+				for j := u32(0); j < d.c; j++ {
+					tps[j] = pushTypeParam(listPool[d.b+j], pkgID)
+				}
+				ts, tc := pushTypeList(tps[:usize(d.c)])
+				syms[s].extra = ts
+				syms[s].extra2 = tc
+				activeTPCount = saved
+			}
+		}
+	}
+	// 2. Evaluate constants
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].kind == SymConst {
+			evalConstSym(s)
+		}
+	}
+	// 3. Resolve underlying types of all type declarations & effect operations
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].kind == SymType {
+			resolveTypeDeclSym(s)
+		}
+	}
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].kind == SymEffect {
+			resolveEffectDeclSym(s)
+		}
+	}
+	// 4. Resolve package-level var types & check E3001 (no global scoped/linear)
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].kind == SymVar {
+			dn := syms[s].declNode
+			d := nodes[dn]
+			var ty u32 = 0
+			if d.b != 0 {
+				ty = resolveTypeNode(pkgID, d.b)
+			} else if d.c != 0 {
+				v, ok := evalConstExpr(pkgID, d.c, 0)
+				if ok && v != 0 {
+					ty = defaultType(vals[v].typeID)
+					syms[s].valID = v
+				}
+			}
+			if d.c != 0 && syms[s].valID == 0 {
+				v, ok := evalConstExpr(pkgID, d.c, 0)
+				if ok && v != 0 {
+					syms[s].valID = v
+				}
+			}
+			syms[s].typeID = ty
+			nodeType[dn] = ty
+			if ty != 0 && classOf(ty) != ClsValue {
+				addDiagStr(E3001, d.fileID, d.off, "package-level variable cannot have Scoped or Linear type")
+			}
+		}
+	}
+	// 5. Resolve all function and method signatures & register methods
+	for fi := u32(0); fi < p.fileCount; fi++ {
+		fid := pkgFiles[p.fileStart+fi]
+		fn := nodes[files[fid].astNode]
+		for di := u32(0); di < fn.e; di++ {
+			dn := listPool[fn.d+di]
+			if nodes[dn].kind == NKFuncDecl {
+				resolveFuncDeclSig(pkgID, dn)
+			}
+		}
+	}
+	// 6. Retry any constants that depended on types/methods resolved in steps 3-5
+	for i := u32(0); i < p.symCount; i++ {
+		s := pkgSyms[p.symStart+i]
+		if syms[s].kind == SymConst && syms[s].valID == 0 {
+			syms[s].flags = syms[s].flags & ^u8(4)
+			evalConstSym(s)
+		}
+	}
+}
+
+driver func evalConstSym(sym u32) {
+	if (syms[sym].flags & 4) != 0 {
 		return
 	}
-	bScope = newScope(bScope, ScopeBlock, 0)
-	for i := from; i < to; i++ {
-		_ = scopeInsert(bScope, bFlowSyms[i])
+	if (syms[sym].flags & 2) != 0 {
+		addDiagStr(E2001, syms[sym].fileID, syms[sym].off, "cyclic constant definition")
+		return
 	}
+	syms[sym].flags |= 2 // checking
+	dn := syms[sym].declNode
+	d := nodes[dn]
+	pkgID := syms[sym].pkgID
+	var declTy u32 = 0
+	if d.b != 0 {
+		declTy = resolveTypeNode(pkgID, d.b)
+	}
+	v, ok := evalConstExpr(pkgID, d.c, d.d)
+	if ok && v != 0 {
+		if declTy != 0 {
+			syms[sym].typeID = declTy
+			if vals[v].kind == VKInt {
+				v = makeIntVal(valMaskInt(vals[v].u64Val, declTy), isSignedInt(declTy), declTy)
+			}
+			syms[sym].valID = v
+		} else {
+			vt := vals[v].typeID
+			if isUntyped(vt) {
+				syms[sym].flags |= 1 // untypedConst
+				syms[sym].typeID = defaultType(vt)
+			} else {
+				syms[sym].typeID = vt
+			}
+			syms[sym].valID = v
+		}
+		nodeVal[d.c] = syms[sym].valID
+		nodeType[dn] = syms[sym].typeID
+	} else {
+		if declTy != 0 {
+			syms[sym].typeID = declTy
+		}
+	}
+	syms[sym].flags = (syms[sym].flags & ^u8(2)) | 4 // checked
+}
+
+driver func resolveTypeDeclSym(sym u32) {
+	if (syms[sym].flags & 4) != 0 {
+		return
+	}
+	if (syms[sym].flags & 2) != 0 {
+		return
+	}
+	syms[sym].flags |= 2
+	dn := syms[sym].declNode
+	d := nodes[dn]
+	pkgID := syms[sym].pkgID
+
+	saved := activeTPCount
+	tpCnt := syms[sym].extra2
+	for i := u32(0); i < tpCnt; i++ {
+		if activeTPCount < 32 {
+			activeTPSyms[activeTPCount] = typeList[syms[sym].extra+i]
+			activeTPCount++
+		}
+	}
+	rhs := resolveTypeNode(pkgID, d.d)
+	activeTPCount = saved
+
+	if d.flags != 0 {
+		// Type alias `type A = T`
+		syms[sym].typeID = rhs
+	} else {
+		// Defined named type `type T ...`
+		ty := syms[sym].typeID
+		types[ty].b = rhs
+		types[ty].origin = ty
+	}
+	nodeType[dn] = syms[sym].typeID
+	syms[sym].flags = (syms[sym].flags & ^u8(2)) | 4
+}
+
+driver func resolveEffectDeclSym(sym u32) {
+	if (syms[sym].flags & 4) != 0 {
+		return
+	}
+	syms[sym].flags |= 4
+	dn := syms[sym].declNode
+	d := nodes[dn]
+	pkgID := syms[sym].pkgID
+
+	saved := activeTPCount
+	tpCnt := syms[sym].extra2
+	for i := u32(0); i < tpCnt; i++ {
+		if activeTPCount < 32 {
+			activeTPSyms[activeTPCount] = typeList[syms[sym].extra+i]
+			activeTPCount++
+		}
+	}
+	opStart := effOpCount
+	for i := u32(0); i < d.e; i++ {
+		opn := listPool[d.d+i]
+		op := nodes[opn]
+		sn := nodes[op.b]
+		var ptypes [32]u32
+		for j := u32(0); j < sn.d; j++ {
+			pn := listPool[sn.c+j]
+			pt := resolveTypeNode(pkgID, nodes[pn].b)
+			nodeType[pn] = pt
+			ptypes[j] = pt
+		}
+		var rtypes [16]u32
+		nr := u32(0)
+		if sn.e != 0 {
+			rl := nodes[sn.e]
+			nr = rl.b
+			for j := u32(0); j < nr; j++ {
+				rtypes[j] = resolveTypeNode(pkgID, listPool[rl.a+j])
+			}
+		}
+		ps, pc := pushTypeList(ptypes[:usize(sn.d)])
+		rs, rc := pushTypeList(rtypes[:usize(nr)])
+		opSig := newType(Type{kind: TKindSig, op: EffTotal, a: ps, b: pc, c: rs, d: rc})
+		nodeType[opn] = opSig
+		if effOpCount < MaxEffOps {
+			effOps[effOpCount] = EffectOp{effSym: sym, nameStr: op.a, sigType: opSig, opIdx: i}
+			effOpCount++
+		}
+	}
+	symEffOpStart[sym] = opStart
+	symEffOpCount[sym] = effOpCount - opStart
+	activeTPCount = saved
+}
+
+driver func resolveFuncDeclSig(pkgID u32, dn u32) {
+	d := nodes[dn]
+	sym := nodeSym[dn]
+	saved := activeTPCount
+
+	var allTPs [16]u32
+	nTP := usize(0)
+
+	// Method receiver?
+	if d.b != 0 {
+		rn := nodes[d.b]
+		recvTypeSym := lookupPkgSym(pkgID, rn.b)
+		if recvTypeSym == 0 || syms[recvTypeSym].kind != SymType {
+			addDiagStr(E2001, rn.fileID, rn.off, "undefined receiver type")
+		} else {
+			syms[sym].extra = recvTypeSym
+			// Register receiver type parameters aligned with recvTypeSym's type params!
+			for i := u32(0); i < rn.d; i++ {
+				tpn := listPool[rn.c+i]
+				// Inherit isConst & constType from recvTypeSym's corresponding type param
+				if i < syms[recvTypeSym].extra2 {
+					origTP := syms[typeList[syms[recvTypeSym].extra+i]]
+					nodes[tpn].flags = u16(origTP.flags)
+					tpSym := addSym(Sym{
+						kind:     SymTypeParam,
+						flags:    origTP.flags,
+						nameStr:  nodes[tpn].a,
+						pkgID:    pkgID,
+						fileID:   nodes[tpn].fileID,
+						off:      nodes[tpn].off,
+						declNode: tpn,
+					})
+					tpTy := newType(Type{kind: TKindTypeParam, flags: u16(origTP.flags), a: tpSym, b: types[origTP.typeID].b})
+					syms[tpSym].typeID = tpTy
+					nodeSym[tpn] = tpSym
+					nodeType[tpn] = tpTy
+					if activeTPCount < 32 {
+						activeTPSyms[activeTPCount] = tpSym
+						activeTPCount++
+					}
+					if nTP < len(allTPs) {
+						allTPs[nTP] = tpSym
+						nTP++
+					}
+				}
+			}
+			// Build instantiated receiver type
+			rty := syms[recvTypeSym].typeID
+			if nTP > 0 {
+				var rargs [16]u32
+				for i := usize(0); i < nTP; i++ {
+					rargs[i] = syms[allTPs[i]].typeID
+				}
+				rty = instantiateNamed(rty, rargs[:nTP])
+			}
+			if rn.flags != 0 {
+				rty = makePtrType(rty)
+			}
+			nodeType[d.b] = rty
+			if methodCount < MaxMethods {
+				methods[methodCount] = MethodEntry{
+					recvTypeSym: recvTypeSym,
+					nameStr:     d.a,
+					funcSym:     sym,
+					ptrRecv:     rn.flags != 0,
+				}
+				methodCount++
+			}
+		}
+	}
+
+	// Function's own type parameters
+	sn := nodes[d.c]
+	for i := u32(0); i < sn.b; i++ {
+		tps := pushTypeParam(listPool[sn.a+i], pkgID)
+		if nTP < len(allTPs) {
+			allTPs[nTP] = tps
+			nTP++
+		}
+	}
+	if nTP > 0 {
+		ts, tc := pushTypeList(allTPs[:nTP])
+		// Store func type params on nodeInstStart/Count of func decl (so extra stays recvTypeSym for methods!)
+		nodeInstStart[dn] = ts
+		nodeInstCount[dn] = tc
+	}
+
+	// Parameters
+	var ptypes [32]u32
+	var variadic u16 = 0
+	for i := u32(0); i < sn.d; i++ {
+		pn := listPool[sn.c+i]
+		pt := resolveTypeNode(pkgID, nodes[pn].b)
+		if nodes[pn].flags != 0 {
+			variadic = 1
+			pt = makeSliceType(pt)
+		}
+		nodeType[pn] = pt
+		ptypes[i] = pt
+	}
+	// Results
+	var rtypes [16]u32
+	nr := u32(0)
+	if sn.e != 0 {
+		rl := nodes[sn.e]
+		nr = rl.b
+		for i := u32(0); i < nr; i++ {
+			rt := resolveTypeNode(pkgID, listPool[rl.a+i])
+			rtypes[i] = rt
+		}
+	}
+	ps, pc := pushTypeList(ptypes[:usize(sn.d)])
+	rs, rc := pushTypeList(rtypes[:usize(nr)])
+	sigTy := newType(Type{kind: TKindSig, op: d.op, flags: variadic, a: ps, b: pc, c: rs, d: rc})
+	// Resolve `with E1, E2, ...` effect capabilities on signature
+	ec := sigEffCount[d.c]
+	if ec > 0 {
+		var effs [16]u32
+		ne := usize(0)
+		driver for i := u32(0); i < ec && i < 16; i++ {
+			et := resolveTypeNode(pkgID, listPool[sigEffStart[d.c]+i])
+			if et != 0 && types[et].kind != TKindEffect {
+				addDiagStr(E2002, nodes[listPool[sigEffStart[d.c]+i]].fileID, nodes[listPool[sigEffStart[d.c]+i]].off, "with clause requires an effect type")
+			}
+			effs[ne] = et
+			ne++
+		}
+		es, ec2 := pushTypeList(effs[:ne])
+		sigTypeEffStart[sigTy] = es
+		sigTypeEffCount[sigTy] = ec2
+	}
+	syms[sym].typeID = sigTy
+	nodeType[dn] = sigTy
+	activeTPCount = saved
+}
+
+driver func resolveTypeNode(pkgID u32, tn u32) u32 {
+	if tn == 0 {
+		return TYInvalid
+	}
+	if nodeType[tn] != 0 {
+		return nodeType[tn]
+	}
+	n := nodes[tn]
+	var res u32 = TYInvalid
+	if n.kind == NKTypePtr {
+		res = newType(Type{kind: TKindPtr, flags: n.flags, a: resolveTypeNode(pkgID, n.a)})
+	} else if n.kind == NKTypeSlice {
+		res = newType(Type{kind: TKindSlice, flags: n.flags, a: resolveTypeNode(pkgID, n.a)})
+	} else if n.kind == NKTypeArray {
+		elem := resolveTypeNode(pkgID, n.b)
+		// Resolve symbolic QTT 0-multiplicity dimension expression (`[N]T`, `[m + n]T`, `[n * 2]T`)!
+		dimID, dimVal, dimOk := resolveDimExpr(pkgID, n.a)
+		if dimOk {
+			res = newType(Type{kind: TKindArray, a: elem, b: dimID, lenVal: dimVal})
+		} else {
+			addDiagStr(E2002, n.fileID, n.off, "array length must be a constant or indexed dimension expression")
+			res = makeArrayType(elem, 0)
+		}
+	} else if n.kind == NKTypeStruct {
+		var fbuf [128]Field
+		for i := u32(0); i < n.b; i++ {
+			fn := nodes[listPool[n.a+i]]
+			ft := resolveTypeNode(pkgID, fn.b)
+			fbuf[i] = Field{nameStr: fn.a, typeID: ft}
+		}
+		fs := fieldCount
+		for i := u32(0); i < n.b; i++ {
+			if fieldCount < MaxFields {
+				fields[fieldCount] = fbuf[i]
+				fieldCount++
+			}
+		}
+		res = newType(Type{kind: TKindStruct, a: fs, b: n.b})
+	} else if n.kind == NKTypeEnum {
+		var vbuf [64]Variant
+		for i := u32(0); i < n.b; i++ {
+			vn := nodes[listPool[n.a+i]]
+			var pbuf [16]u32
+			for j := u32(0); j < vn.c; j++ {
+				pbuf[j] = resolveTypeNode(pkgID, listPool[vn.b+j])
+			}
+			ps, pc := pushTypeList(pbuf[:usize(vn.c)])
+			vbuf[i] = Variant{nameStr: vn.a, payStart: ps, payCount: pc}
+		}
+		vs := variantCount
+		for i := u32(0); i < n.b; i++ {
+			if variantCount < MaxVariants {
+				variants[variantCount] = vbuf[i]
+				variantCount++
+			}
+		}
+		res = newType(Type{kind: TKindEnum, a: vs, b: n.b})
+	} else if n.kind == NKTypeFunc {
+		var ptypes [32]u32
+		for i := u32(0); i < n.b; i++ {
+			pn := nodes[listPool[n.a+i]]
+			ptypes[i] = resolveTypeNode(pkgID, pn.b)
+		}
+		var rtypes [16]u32
+		for i := u32(0); i < n.d; i++ {
+			rtypes[i] = resolveTypeNode(pkgID, listPool[n.c+i])
+		}
+		ps, pc := pushTypeList(ptypes[:usize(n.b)])
+		rs, rc := pushTypeList(rtypes[:usize(n.d)])
+		res = newType(Type{kind: TKindSig, op: n.op, a: ps, b: pc, c: rs, d: rc})
+	} else if n.kind == NKTypeCode {
+		res = newType(Type{kind: TKindCode, a: n.a})
+	} else if n.kind == NKTypeEl {
+		v, ok := evalConstExpr(pkgID, n.a, 0)
+		if !ok || v == 0 || vals[v].kind != VKCode {
+			addDiagStr(E2010, n.fileID, n.off, "El argument must evaluate to a compile-time Code value")
+			res = TYInvalid
+		} else {
+			res = decodeCodeType(v)
+		}
+	} else if n.kind == NKTypeName {
+		var sym u32 = 0
+		if n.a != 0 {
+			// Package-qualified type `pkg.T`
+			if targetPkg, ok := lookupFileImport(n.fileID, n.a); ok {
+				sym = lookupPkgSym(targetPkg, n.b)
+			}
+		} else {
+			sym = lookupActiveTP(n.b)
+			if sym == 0 {
+				sym = lookupPkgOrUniverse(pkgID, n.b)
+			}
+		}
+		if sym == 0 || (syms[sym].kind != SymType && syms[sym].kind != SymTypeParam && syms[sym].kind != SymEffect) {
+			addDiagStr(E2001, n.fileID, n.off, "undefined type")
+			return TYInvalid
+		}
+		if syms[sym].kind == SymType && syms[sym].declNode != 0 && syms[sym].typeID == 0 {
+			resolveTypeDeclSym(sym)
+		}
+		res = syms[sym].typeID
+		if n.d > 0 {
+			// Generic instantiation `T[arg0, arg1, ...]` or `Eff[arg0, ...]`
+			if syms[sym].kind == SymType && syms[sym].declNode != 0 {
+				resolveTypeDeclSym(sym)
+			}
+			var args [16]u32
+			for i := u32(0); i < n.d; i++ {
+				an := listPool[n.c+i]
+				args[i] = resolveGenericArg(pkgID, an, sym, i)
+			}
+			if syms[sym].kind == SymEffect {
+				res = instantiateEffect(res, args[:usize(n.d)])
+			} else {
+				res = instantiateNamed(res, args[:usize(n.d)])
+			}
+		}
+	} else if n.kind == NKTypeExpr {
+		res = resolveTypeNode(pkgID, n.a)
+	}
+	nodeType[tn] = res
+	return res
+}
+
+// resolveGenericArg resolves a type or const argument inside `[...]` for generic sym's argIdx-th param.
+driver func resolveGenericArg(pkgID u32, argNode u32, targetSym u32, argIdx u32) u32 {
+	var tpSym u32 = 0
+	isConstParam := false
+	if targetSym != 0 && syms[targetSym].kind == SymType && argIdx < syms[targetSym].extra2 {
+		tpSym = typeList[syms[targetSym].extra+argIdx]
+		isConstParam = (syms[tpSym].flags & 1) != 0
+	} else if targetSym != 0 && syms[targetSym].kind == SymFunc {
+		dn := syms[targetSym].declNode
+		if argIdx < nodeInstCount[dn] {
+			tpSym = typeList[nodeInstStart[dn]+argIdx]
+			isConstParam = (syms[tpSym].flags & 1) != 0
+		}
+	}
+	if nodes[argNode].kind == NKTypeExpr {
+		rty := resolveTypeNode(pkgID, nodes[argNode].a)
+		if tpSym != 0 && !isConstParam {
+			needC := u16(syms[tpSym].flags >> 1)
+			if needC != 0 && !satisfiesConstraint(rty, needC) {
+				addDiagStr(E2011, nodes[argNode].fileID, nodes[argNode].off, "type argument does not satisfy generic constraint")
+			}
+		}
+		return rty
+	}
+	if isConstParam {
+		if nodes[argNode].kind == NKIdent {
+			if tps := lookupActiveTP(nodes[argNode].a); tps != 0 {
+				return syms[tps].typeID
+			}
+		}
+		dimID, dimVal, dimOk := resolveDimExpr(pkgID, argNode)
+		if dimOk {
+			if dimID == 0 {
+				return makeConstArgType(dimVal)
+			}
+			// Symbolic const arg (e.g. f[m + n, T])
+			return newType(Type{kind: TKindConstArg, a: dimID})
+		}
+		addDiagStr(E2002, nodes[argNode].fileID, nodes[argNode].off, "const type argument must be a compile-time integer or dimension expression")
+		return makeConstArgType(0)
+	}
+	// Type argument parsed as expr (NKIdent / NKSelector / NKIndex)
+	rty := resolveExprAsType(pkgID, argNode)
+	if tpSym != 0 {
+		needC := u16(syms[tpSym].flags >> 1)
+		if needC != 0 && !satisfiesConstraint(rty, needC) {
+			addDiagStr(E2011, nodes[argNode].fileID, nodes[argNode].off, "type argument does not satisfy generic constraint")
+		}
+	}
+	return rty
+}
+
+driver func resolveExprAsType(pkgID u32, en u32) u32 {
+	if en == 0 {
+		return TYInvalid
+	}
+	n := nodes[en]
+	if n.kind == NKTypeExpr {
+		return resolveTypeNode(pkgID, n.a)
+	}
+	if n.kind == NKIdent {
+		sym := lookupActiveTP(n.a)
+		if sym == 0 {
+			sym = lookupPkgOrUniverse(pkgID, n.a)
+		}
+		if sym != 0 && (syms[sym].kind == SymType || syms[sym].kind == SymTypeParam) {
+			if syms[sym].kind == SymType && syms[sym].declNode != 0 && syms[sym].typeID == 0 {
+				resolveTypeDeclSym(sym)
+			}
+			return syms[sym].typeID
+		}
+		return TYInvalid
+	}
+	if n.kind == NKSelector && nodes[n.a].kind == NKIdent {
+		if targetPkg, ok := lookupFileImport(n.fileID, nodes[n.a].a); ok {
+			sym := lookupPkgSym(targetPkg, n.b)
+			if sym != 0 && syms[sym].kind == SymType {
+				if syms[sym].declNode != 0 && syms[sym].typeID == 0 {
+					resolveTypeDeclSym(sym)
+				}
+				return syms[sym].typeID
+			}
+		}
+		return TYInvalid
+	}
+	if n.kind == NKUnary && n.op == TKMul {
+		return makePtrType(resolveExprAsType(pkgID, n.a))
+	}
+	if n.kind == NKIndex {
+		baseTy := resolveExprAsType(pkgID, n.a)
+		if baseTy == 0 {
+			return TYInvalid
+		}
+		origSym := typeOriginSym(baseTy)
+		var args [16]u32
+		for i := u32(0); i < n.c; i++ {
+			args[i] = resolveGenericArg(pkgID, listPool[n.b+i], origSym, i)
+		}
+		return instantiateNamed(baseTy, args[:usize(n.c)])
+	}
+	return TYInvalid
+}
+
+// resolveDimExpr resolves a QTT 0-multiplicity array dimension expression (`N`, `m + n`, `n * 2`, `n - 1`, or const expr).
+// Returns (dimID, constVal, ok); dimID == 0 means pure constant `constVal`.
+driver func resolveDimExpr(pkgID u32, en u32) (u32, u64, bool) {
+	if en == 0 {
+		return 0, 0, false
+	}
+	n := nodes[en]
+	if n.kind == NKIdent {
+		if tps := lookupActiveTP(n.a); tps != 0 && syms[tps].flags != 0 {
+			return makeDimParam(tps), 0, true
+		}
+	}
+	if n.kind == NKBinary && (n.op == TKAdd || n.op == TKSub || n.op == TKMul) {
+		ld, lv, lok := resolveDimExpr(pkgID, n.a)
+		rd, rv, rok := resolveDimExpr(pkgID, n.b)
+		if lok && rok {
+			if ld == 0 && rd == 0 {
+				if n.op == TKAdd {
+					return 0, lv + rv, true
+				}
+				if n.op == TKSub {
+					if lv >= rv {
+						return 0, lv - rv, true
+					}
+					return 0, 0, true
+				}
+				return 0, lv * rv, true
+			}
+			var la u32 = ld
+			if la == 0 {
+				la = makeDimConst(lv)
+			}
+			var rb u32 = rd
+			if rb == 0 {
+				rb = makeDimConst(rv)
+			}
+			var d u32 = 0
+			if n.op == TKAdd {
+				d = makeDimAdd(la, rb)
+			} else if n.op == TKSub {
+				d = makeDimSub(la, rb)
+			} else {
+				d = makeDimMul(la, rb)
+			}
+			if dimExprs[d].kind == DimConst {
+				return 0, dimExprs[d].val, true
+			}
+			return d, 0, true
+		}
+	}
+	v, ok := evalConstExpr(pkgID, en, 0)
+	if ok && v != 0 && vals[v].kind == VKInt {
+		return 0, vals[v].u64Val, true
+	}
+	return 0, 0, false
 }

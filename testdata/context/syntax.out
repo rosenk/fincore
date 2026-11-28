@@ -1,3 +1,0 @@
-testdata/context/syntax.fc:6:11: error[E1001]: unexpected integer literal 2 after statement; expected ';' or newline
-    6 |     return x 2
-      |              ^

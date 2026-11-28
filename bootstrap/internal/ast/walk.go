@@ -194,7 +194,6 @@ func Children(n Node) []Node {
 		if n.Pattern != nil {
 			add(n.Pattern)
 		}
-		addE(n.Guard)
 		addE(n.Expr)
 		add(n.Block)
 	case *WildcardPattern:
@@ -209,14 +208,6 @@ func Children(n Node) []Node {
 		for _, a := range n.Alts {
 			add(a)
 		}
-	case *TuplePattern:
-		for _, a := range n.Elems {
-			add(a)
-		}
-	case *RestPattern:
-	case *AtPattern:
-		add(n.Name)
-		add(n.Pattern)
 	case *ForStmt:
 		addS(n.Init)
 		addE(n.Cond)
@@ -260,6 +251,9 @@ func Children(n Node) []Node {
 		for _, f := range n.Fields {
 			add(f)
 		}
+	case *ArrayLit:
+		add(n.Type)
+		exprs(n.Elems)
 	case *FieldInit:
 		add(n.Name)
 		addE(n.Value)
@@ -270,11 +264,6 @@ func Children(n Node) []Node {
 		for _, a := range n.Arms {
 			add(a)
 		}
-	case *TupleExpr:
-		exprs(n.Elems)
-	case *IsExpr:
-		addE(n.X)
-		add(n.Pattern)
 	}
 	return out
 }

@@ -1,0 +1,12 @@
+// SINCE: v0.5
+package main
+
+func bad() {
+	var a Atomic[string]
+	_ = a.Load() // ERROR E2002
+}
+
+driver func main() error {
+	bad()
+	return nil
+}

@@ -1,9 +1,0 @@
-// msg_compound_assign (v0.2 input, v0.3 message): `c >>= 1` is E1001 at
-// the '=' in both compilers; finc1 names the operator (decision 157,
-// allowlisted in scripts/diffcheck/allow.txt and scripts/diffprev/allow.txt).
-package main
-
-func halve(c u64) u64 {
-	c >>= 1
-	return c
-}

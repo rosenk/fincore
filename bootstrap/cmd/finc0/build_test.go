@@ -38,22 +38,22 @@ func writeFile(t *testing.T, p, s string) {
 
 func TestBuildAndRun(t *testing.T) {
 	if testing.Short() {
-		t.Skip("invokes go build")
+		t.Skip("invokes as and ld")
 	}
 	dir := t.TempDir()
 	src := filepath.Join(dir, "args.fc")
 	writeFile(t, src, argsProg)
 	bin := filepath.Join(dir, "args")
-	emit := filepath.Join(dir, "args.go")
-	if code, out, errs := run("build", "-o", bin, "--emit-go="+emit, src); code != ExitOK {
+	emit := filepath.Join(dir, "args.s")
+	if code, out, errs := run("build", "-o", bin, "--emit-asm="+emit, src); code != ExitOK {
 		t.Fatalf("build: %d %q %q", code, out, errs)
 	}
 	if _, err := os.Stat(bin); err != nil {
 		t.Fatal(err)
 	}
-	goSrc, err := os.ReadFile(emit)
-	if err != nil || !strings.Contains(string(goSrc), "func _fc_main(io fincrt.Stdio, env fincrt.Env) error") {
-		t.Fatalf("emitted Go: %v\n%s", err, goSrc)
+	asmSrc, err := os.ReadFile(emit)
+	if err != nil || !strings.Contains(string(asmSrc), "_fc_entry:") {
+		t.Fatalf("emitted asm: %v\n%s", err, asmSrc)
 	}
 	code, out, errs := run("run", src, "--", "a", "b c")
 	if code != ExitOK || out != "a\nb c\n" {
@@ -99,14 +99,14 @@ func TestTestCommand(t *testing.T) {
 // are skipped (they would fail: no .out file, invalid code) and reported.
 func TestTestSince(t *testing.T) {
 	if testing.Short() {
-		t.Skip("invokes go build")
+		t.Skip("invokes as and ld")
 	}
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "pass", "hello.fc"), "// SINCE: v0.2\npackage main\n\ndriver func main(io Stdio) error {\n\treturn io.WriteStdout(strBytes(\"hi\\n\"))\n}\n")
+	writeFile(t, filepath.Join(dir, "pass", "hello.fc"), "// SINCE: v0.1\npackage main\n\ndriver func main(io Stdio) error {\n\treturn io.WriteStdout(strBytes(\"hi\\n\"))\n}\n")
 	writeFile(t, filepath.Join(dir, "pass", "hello.out"), "hi\n")
-	writeFile(t, filepath.Join(dir, "pass", "future.fc"), "// A test of a future language version.\n// SINCE: v9.9\npackage main\n\nnot v0.2 syntax\n")
-	writeFile(t, filepath.Join(dir, "pass", "future2", "a.fc"), "// SINCE: v1.0\npackage main\n\nnot v0.2 syntax\n")
-	writeFile(t, filepath.Join(dir, "fail", "future.fc"), "// SINCE: v0.3\npackage main\n\nvar g u32 // ERROR E9999\n")
+	writeFile(t, filepath.Join(dir, "pass", "future.fc"), "// A test of a future language version.\n// SINCE: v9.9\npackage main\n\nnot v0.1 syntax\n")
+	writeFile(t, filepath.Join(dir, "pass", "future2", "a.fc"), "// SINCE: v1.0\npackage main\n\nnot v0.1 syntax\n")
+	writeFile(t, filepath.Join(dir, "fail", "future.fc"), "// SINCE: v0.2\npackage main\n\nvar g u32 // ERROR E9999\n")
 	code, out, errs := run("test", "-v", dir)
 	if code != ExitOK || !strings.Contains(out, "4 tests, 1 passed, 0 failed, 3 skipped (needs v9.9)") ||
 		!strings.Contains(out, "future.fc (needs v9.9)") {
@@ -118,7 +118,7 @@ func TestTestSince(t *testing.T) {
 	if code != ExitError || !strings.Contains(out, `bad // SINCE: "9.9"`) {
 		t.Fatalf("bad since: %d %q", code, out)
 	}
-	if v, ok := parseLangVersion("v9.9"); !ok || !(langVersion{0, 2}).less(v) || v.String() != "v9.9" {
+	if v, ok := parseLangVersion("v9.9"); !ok || !(langVersion{0, 1}).less(v) || v.String() != "v9.9" {
 		t.Fatal(v, ok)
 	}
 	for _, bad := range []string{"", "v", "v1", "v1.", "v.1", "v1.x", "v1.2.3", "v-1.2", "v+1.2", "v12345.0", "v1.2 x"} {

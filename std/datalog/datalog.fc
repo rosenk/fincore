@@ -1,0 +1,213 @@
+// Package datalog provides a finitist, stratified, allocation-free Datalog
+// engine written in 100% Layer-2 total FinCore (v0.6):
+//   - Bounded fixed-capacity deduplicated relations (Unary[N, T], Binary[N, A, B])
+//   - Zero GC, zero malloc, zero libc, zero backtracking
+//   - Stratified negation (AntiJoin) and least-fixed-point Horn rules
+//     (Join, ProjectReach, TransitiveClosure, SelfLoops) with provable termination
+//   - Zero-copy const []T views and Tier-1 algebraic effect streaming (Emit[T])
+package datalog
+
+effect Emit[T any] {
+	emit(v T)
+}
+
+type Pair[A Equal, B Equal] struct {
+	a A
+	b B
+}
+
+// Unary[N, T] is a bounded deduplicated unary relation P(x) holding at most N facts.
+type Unary[N usize, T Equal] struct {
+	data [N]T
+	n    usize
+}
+
+func (u *Unary[N, T]) Len() usize {
+	return u.n
+}
+
+func (u *Unary[N, T]) Has(x T) bool {
+	for i := usize(0); i < u.n; i++ {
+		if u.data[i] == x {
+			return true
+		}
+	}
+	return false
+}
+
+// Insert adds fact x. Returns true iff x was not already present and fit within N.
+func (u *Unary[N, T]) Insert(x T) bool {
+	if u.Has(x) {
+		return false
+	}
+	if u.n >= N {
+		return false
+	}
+	u.data[u.n] = x
+	u.n++
+	return true
+}
+
+func (u *Unary[N, T]) Slice() const []T {
+	return u.data[:u.n]
+}
+
+// Binary[N, A, B] is a bounded deduplicated binary relation R(a, b) holding at most N tuples.
+type Binary[N usize, A Equal, B Equal] struct {
+	data [N]Pair[A, B]
+	n    usize
+}
+
+func (r *Binary[N, A, B]) Len() usize {
+	return r.n
+}
+
+func (r *Binary[N, A, B]) Has(a A, b B) bool {
+	for i := usize(0); i < r.n; i++ {
+		if r.data[i].a == a && r.data[i].b == b {
+			return true
+		}
+	}
+	return false
+}
+
+// Insert adds tuple (a, b). Returns true iff it was newly added.
+func (r *Binary[N, A, B]) Insert(a A, b B) bool {
+	if r.Has(a, b) {
+		return false
+	}
+	if r.n >= N {
+		return false
+	}
+	r.data[r.n] = Pair[A, B]{a: a, b: b}
+	r.n++
+	return true
+}
+
+func (r *Binary[N, A, B]) Slice() const []Pair[A, B] {
+	return r.data[:r.n]
+}
+
+// Join evaluates the Horn rule: out(a, c) :- r1(a, b), r2(b, c).
+// Returns true iff at least one new tuple was derived.
+func Join[N1 usize, N2 usize, NO usize, A Equal, B Equal, C Equal](
+	r1 const *Binary[N1, A, B],
+	r2 const *Binary[N2, B, C],
+	out *Binary[NO, A, C],
+) bool {
+	changed := false
+	for i := usize(0); i < r1.n; i++ {
+		p1 := r1.data[i]
+		for j := usize(0); j < r2.n; j++ {
+			p2 := r2.data[j]
+			if p1.b == p2.a {
+				if out.Insert(p1.a, p2.b) {
+					changed = true
+				}
+			}
+		}
+	}
+	return changed
+}
+
+// TransitiveClosure computes the least fixed point of:
+//   out(x, y) :- edges(x, y).
+//   out(x, z) :- out(x, y), edges(y, z).
+// Guaranteed to terminate in at most N rounds (Layer-2 total!).
+func TransitiveClosure[N usize, T Equal](edges const *Binary[N, T, T], out *Binary[N, T, T]) u32 {
+	for i := usize(0); i < edges.n; i++ {
+		_ = out.Insert(edges.data[i].a, edges.data[i].b)
+	}
+	var rounds u32 = 1
+	for step := usize(0); step < N; step++ {
+		changed := false
+		curN := out.n
+		for i := usize(0); i < curN; i++ {
+			p := out.data[i]
+			for j := usize(0); j < edges.n; j++ {
+				e := edges.data[j]
+				if p.b == e.a {
+					if out.Insert(p.a, e.b) {
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+		rounds++
+	}
+	return rounds
+}
+
+// ProjectReach computes the least fixed point of:
+//   out(x) :- roots(x).
+//   out(y) :- out(x), edges(x, y).
+func ProjectReach[NU usize, NB usize, T Equal](
+	roots const *Unary[NU, T],
+	edges const *Binary[NB, T, T],
+	out *Unary[NU, T],
+) u32 {
+	for i := usize(0); i < roots.n; i++ {
+		_ = out.Insert(roots.data[i])
+	}
+	var rounds u32 = 1
+	for step := usize(0); step < NU; step++ {
+		changed := false
+		curN := out.n
+		for i := usize(0); i < curN; i++ {
+			x := out.data[i]
+			for j := usize(0); j < edges.n; j++ {
+				e := edges.data[j]
+				if e.a == x {
+					if out.Insert(e.b) {
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+		rounds++
+	}
+	return rounds
+}
+
+// AntiJoin evaluates stratified negation: out(x) :- all(x), not exclude(x).
+func AntiJoin[N usize, T Equal](
+	all const *Unary[N, T],
+	exclude const *Unary[N, T],
+	out *Unary[N, T],
+) {
+	for i := usize(0); i < all.n; i++ {
+		x := all.data[i]
+		found := false
+		for j := usize(0); j < exclude.n; j++ {
+			if exclude.data[j] == x {
+				found = true
+				break
+			}
+		}
+		if !found {
+			_ = out.Insert(x)
+		}
+	}
+}
+
+// SelfLoops evaluates: out(x) :- rel(x, x). (Detects cycles on a transitive closure!)
+func SelfLoops[NB usize, NU usize, T Equal](rel const *Binary[NB, T, T], out *Unary[NU, T]) {
+	for i := usize(0); i < rel.n; i++ {
+		if rel.data[i].a == rel.data[i].b {
+			_ = out.Insert(rel.data[i].a)
+		}
+	}
+}
+
+// StreamUnary streams every fact in u via the Tier-1 Emit[T] effect (zero allocations!).
+func StreamUnary[N usize, T Equal](u const *Unary[N, T]) with Emit[T] {
+	for i := usize(0); i < u.n; i++ {
+		emit(u.data[i])
+	}
+}

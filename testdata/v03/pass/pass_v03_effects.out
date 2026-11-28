@@ -1,0 +1,7 @@
+t1 yield sum: 15
+t2 state: res=80 st=80
+t3 fail: res=1042 log=4:2,1,101,202
+t4 firstGt: val=7 ok=true log=1:303
+t5 deep: res=62 log=4:10,20,60,61
+t6 multi: res=70 acc=10 ySum=20
+t7 closure: sum=170

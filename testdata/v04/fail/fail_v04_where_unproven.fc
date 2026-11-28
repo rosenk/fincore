@@ -1,0 +1,16 @@
+// SINCE: v0.4
+package main
+
+func at[n usize, T any](a *[n]T, i usize where i < n) T {
+	return a[i]
+}
+
+func bad(a *[4]u32, i usize) u32 {
+	return at[4, u32](a, i) // ERROR E2013
+}
+
+driver func main() error {
+	var arr [4]u32 = [4]u32{1, 2, 3, 4}
+	_ = bad(&arr, 2)
+	return nil
+}

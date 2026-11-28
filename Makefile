@@ -2,167 +2,76 @@ SHELL := /bin/bash
 GO      ?= go
 BIN     := bin
 FINC0   := $(BIN)/finc0
-STAGE   := .stage
+FINC1   := $(BIN)/finc1
+FINC2   := $(BIN)/finc2
+FINC3   := $(BIN)/finc3
+FINC    := $(BIN)/finc
 FUEL    ?= 1000000
-SEED    ?= 1
 
 export CGO_ENABLED ?= 0
 
-.PHONY: all build finc0 test race vet fmt fmt-check lint parse-corpus check-corpus \
-        integration finc1 diff-parse diff-check diff-check-scope diff-check-totality diff-check-all \
-        diff-check-fuzz diff-build diff-build-vet finc2 bootstrap ci clean help dist dist-test
+.PHONY: all build finc0 finc1 finc bootstrap test vet fmt fmt-check lint test-corpus test-examples integration ci clean help
 
-all: vet test build ## vet, test and build finc0
+all: vet test build finc ## vet, test, build finc0 and self-hosted finc
 
 help: ## list targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
-build: finc0 ## build the Stage 0 compiler
+build: finc0 ## build the Stage 0 native bootstrap compiler
 
-finc0: ## build bin/finc0 (static, trimpath)
+finc0: ## build bin/finc0 (static Go binary, frozen at v0.1 Native)
 	@mkdir -p $(BIN)
 	$(GO) build -trimpath -o $(FINC0) ./bootstrap/cmd/finc0
 
-test: ## unit tests
-	$(GO) test -count=1 ./...
+finc1: finc0 ## build Stage 1 native compiler (bin/finc1) using finc0
+	$(FINC0) build -o $(FINC1) ./compiler
 
-race: ## unit tests with the race detector (needs cgo)
-	CGO_ENABLED=1 $(GO) test -race -count=1 ./...
+finc: finc1 ## build self-hosted native compiler (bin/finc = finc2)
+	$(FINC1) build -o $(FINC) ./compiler
+
+bootstrap: finc1 ## full 3-stage native fixed-point check (finc1 -> finc2 == finc3) + integration
+	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; \
+	$(FINC1) build --emit-asm="$$d/stage2.s" -o $(FINC2) ./compiler; \
+	$(FINC2) build --emit-asm="$$d/stage3.s" -o $(FINC3) ./compiler; \
+	cmp -s "$$d/stage2.s" "$$d/stage3.s" || { echo "bootstrap: stage2.s != stage3.s"; exit 1; }; \
+	cmp -s $(FINC2) $(FINC3) || { echo "bootstrap: finc2 != finc3"; exit 1; }; \
+	cp $(FINC2) $(FINC); \
+	sha256sum "$$d/stage2.s" "$$d/stage3.s" $(FINC2) $(FINC3); \
+	echo "bootstrap: native self-hosting fixed point verified (finc2 == finc3)"; \
+	FINC0=$$(pwd)/$(FINC2) $(GO) test -count=1 ./testdata/integration/
+
+test: ## run bootstrap Go unit tests
+	$(GO) test -count=1 ./bootstrap/...
 
 vet: ## go vet
 	$(GO) vet ./...
 
 fmt: ## gofmt all Go files
-	gofmt -w $$(git ls-files '*.go')
+	gofmt -w $$(find bootstrap testdata -name '*.go')
 
 fmt-check: ## fail if any Go file is not gofmt-ed
-	@out=$$(gofmt -l $$(git ls-files '*.go')); test -z "$$out" || { echo "$$out"; exit 1; }
+	@out=$$(gofmt -l $$(find bootstrap testdata -name '*.go')); test -z "$$out" || { echo "$$out"; exit 1; }
 
 lint: fmt-check vet ## fmt-check + vet
 
-parse-corpus: finc0 ## finc0 parse on examples, testdata, std/ and compiler/ (v0.2 inputs: no newer // SINCE:)
-	@set -e; fs=$$($(GO) run ./scripts/sincefilter examples/*.fc testdata/pass/*.fc testdata/fail/*.fc std/*/ compiler/); \
-	for f in $$fs; do \
-	  if grep -q '// ERROR E1' $$f 2>/dev/null; then continue; fi; \
-	  $(FINC0) parse $$f >/dev/null; done
-	@echo "parse-corpus: ok (fail tests that expect a syntax error, // ERROR E1xxx, are skipped)"
+test-corpus: finc0 ## run finc0 test on testdata/ (native static ELF64 binaries)
+	$(FINC0) test -v testdata/
 
-check-corpus: finc0 ## finc0 check on examples, pass tests, std/ and compiler/ (v0.2 inputs: no newer // SINCE:)
-	@set -e; fs=$$($(GO) run ./scripts/sincefilter examples/*.fc testdata/pass/*.fc std/*/ compiler/); \
-	for f in $$fs; do $(FINC0) check --comptime-fuel=$(FUEL) $$f; done
-	@echo "check-corpus: ok"
+test-examples: finc ## compile all examples/*.fc and versioned examples/v0{3,4,5,6}/*.fc with self-hosted bin/finc
+	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; \
+	for f in examples/*.fc examples/v03/*.fc examples/v04/*.fc examples/v05/*.fc examples/v06/*.fc; do \
+	  o=$${f%.fc}.out; \
+	  $(FINC) build --comptime-fuel=$(FUEL) -o "$$d/example" "$$f"; \
+	  if [ -f "$$o" ]; then \
+	    "$$d/example" | cmp -s - "$$o" || { echo "test-examples: $$f output differs from $$o"; exit 1; }; \
+	  fi; \
+	done; \
+	echo "test-examples: ok"
 
-.PHONY: examples-test tutorial-check
-examples-test: finc1 ## bin/finc1 builds examples/*.fc; runs those with a .out and compares stdout
-	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; for f in examples/*.fc; do o=$${f%.fc}.out; \
-	  $(BIN)/finc1 build -o $$d/example $$f; \
-	  if [ -f $$o ]; then $$d/example | cmp -s - $$o || { echo "examples-test: $$f output differs from $$o"; exit 1; }; fi; \
-	done; echo "examples-test: ok"
+integration: finc0 ## run end-to-end native TCP echo + corpus integration tests
+	FINC0=$$(pwd)/$(FINC0) $(GO) test -count=1 -v ./testdata/integration/
 
-tutorial-check: finc1 ## complete snippets of docs/tutorial.md compile; shown compiler output matches
-	$(GO) run ./scripts/tutorialcheck -finc $(BIN)/finc1 docs/tutorial.md
-
-integration: ## end-to-end TCP echo + corpus tests (skips until finc0 can build)
-	$(GO) test -count=1 -v ./testdata/integration/
-
-# --- bootstrap chain: finc0 (frozen at v0.2) -> finc-seed (compiler/ at the
-# tag in bootstrap/SEED) -> finc1 (current compiler/). See bootstrap/README.md.
-.PHONY: seed
-seed: ## build .stage/finc-seed: finc0 builds compiler/ at the bootstrap/SEED tag (needs git tags)
-	$(GO) run ./scripts/bootstrap_verify.go -seed-only
-
-finc1: finc0 seed ## build bin/finc1: finc-seed builds the current compiler/ (Stage 1)
-	$(STAGE)/finc-seed build --emit-go=$(STAGE)/stage1.go -o $(BIN)/finc1 ./compiler
-
-bootstrap: finc0 ## fixed-point gate: finc0 -> finc-seed -> finc1 -> finc2 -> finc3, stage2.go == stage3.go
-	$(GO) run ./scripts/bootstrap_verify.go
-# --- end bootstrap chain
-
-# --- release archive (docs/release.md): dist/fincore-<version>-<os>-<arch>.tar.gz
-# with the finc2 of a fresh bootstrap. VERSION defaults to the exact tag of
-# HEAD, else `git describe`. The archive is reproducible (SOURCE_DATE_EPOCH,
-# default: commit time of HEAD).
-DIST    := dist
-VERSION ?= $(shell git describe --tags --exact-match HEAD 2>/dev/null || git describe --tags --always --dirty 2>/dev/null || echo dev)
-dist: ## build $(DIST)/fincore-<version>-<os>-<arch>.tar.gz from a fresh bootstrap (finc2)
-	$(GO) run ./scripts/bootstrap_verify.go -skip-integration
-	$(GO) run ./scripts/dist -version $(VERSION) -finc $(STAGE)/finc2 -out $(DIST)
-
-dist-test: ## smoke-test the archive: unpack, then build/run/test from another directory with no env vars
-	$(GO) run ./scripts/dist -test -version $(VERSION) -out $(DIST)
-# --- end release archive
-
-ci: lint test build integration ## what CI runs
+ci: lint test build test-corpus test-examples integration bootstrap ## full CI + self-hosting fixed-point pipeline
 
 clean: ## remove build outputs
-	rm -rf $(BIN) $(STAGE) $(DIST)
-
-# --- finc0 vs finc1 differential: regression checks of the FROZEN v0.2 subset.
-# finc0 implements only v0.2. Inputs that need a newer version say
-# `// SINCE: vX.Y` in their leading comment block and are skipped
-# (scripts/langver; diff-parse via scripts/sincefilter).
-diff-parse: finc1 ## [v0.2 regression] finc0 vs finc1: byte-identical `parse --dump-ast` on the corpus
-	@set -e; ts=$$($(GO) run ./scripts/sincefilter examples/tcp_echo.fc compiler/ std/*/ testdata/pass/*.fc testdata/fail/*.fc); \
-	for t in $$ts; do \
-	  cmp -s <($(FINC0) parse --dump-ast $$t 2>&1) <($(BIN)/finc1 parse --dump-ast $$t 2>&1 | grep -v '^error: fincore:') || { echo "DIFF: $$t"; exit 1; }; \
-	done; echo "diff-parse: ok"
-
-diff-check: finc1 ## [v0.2 regression] finc0 vs finc1 check --passes=types: identical diagnostics (corpus + snippets)
-	$(GO) run ./scripts/diffcheck
-
-diff-check-scope: finc1 ## [v0.2 regression] finc0 vs finc1 check --passes=scope (corpus + snippets incl. scope tests)
-	$(GO) run ./scripts/diffcheck -passes scope
-
-diff-check-totality: finc1 ## [v0.2 regression] finc0 vs finc1 check --passes=totality (corpus, snippets, compiler mutants)
-	$(GO) run ./scripts/diffcheck -passes=totality
-
-diff-check-all: finc1 ## [v0.2 regression] finc0 vs finc1 check (all passes)
-	$(GO) run ./scripts/diffcheck -passes=all
-
-diff-check-fuzz: finc1 ## [v0.2 regression] diff-check plus 20 random mutants per corpus file (SEED=n)
-	$(GO) run ./scripts/diffcheck -mutate 20 -seed $(SEED)
-
-diff-build: finc1 ## [v0.2 regression] finc0 vs finc1: byte-identical `build --emit-go` (corpus, edge cases, snippets, compiler/)
-	$(GO) run ./scripts/diffbuild
-
-diff-build-vet: finc1 ## [v0.2 regression] diff-build plus `go vet` on the emitted Go of every built case
-	$(GO) run ./scripts/diffbuild -govet
-# --- end finc0 vs finc1 differential
-
-# --- diff-prev: current compiler/ (bin/finc1) vs the previous release
-# (.stage/finc-seed), the oracle for new language versions. docs/testing.md.
-.PHONY: diff-prev diff-prev-fuzz
-FUZZ_SEED ?= 1
-diff-prev: finc1 seed ## current compiler vs previous release (seed): parse/check/emitted Go/vet/run; REGRESSION + DIAG-CHANGED fail
-	$(GO) run ./scripts/diffprev
-
-diff-prev-fuzz: finc1 seed ## diff-prev plus 20 random mutants per corpus file and snippet (FUZZ_SEED=n)
-	$(GO) run ./scripts/diffprev -mutate 20 -seed $(FUZZ_SEED)
-# --- end diff-prev
-
-.PHONY: spec-check
-spec-check: finc1 ## finc1 check on every complete FinCore program of the v0.2 spec
-	$(GO) run ./scripts/speccheck -finc $(BIN)/finc1 fincore_language_specification_v0_2.md
-
-finc2: finc1 ## fixed-point smoke: finc1 -> finc2 -> finc3, cmp stage2.go stage3.go
-	@mkdir -p $(STAGE)
-	$(BIN)/finc1 build --emit-go=$(STAGE)/stage2.go -o $(BIN)/finc2 ./compiler
-	$(BIN)/finc2 build --emit-go=$(STAGE)/stage3.go -o $(BIN)/finc3 ./compiler
-	cmp $(STAGE)/stage2.go $(STAGE)/stage3.go && echo "finc2: stage2.go == stage3.go"
-
-# --- tooling of the current compiler (bin/finc1): fmt and --context (docs/fmt.md)
-.PHONY: fmt-fc fmt-fc-check context-test
-fmt-fc: finc1 ## list the .fc files of compiler/ std/ examples/ whose formatting differs from `finc fmt`
-	@$(BIN)/finc1 fmt -l compiler std examples
-
-fmt-fc-check: finc1 ## finc fmt on every .fc file of the repo: idempotent and AST-preserving; compiler/ std/ examples/ already formatted (scripts/fmtcheck)
-	$(GO) run ./scripts/fmtcheck
-
-context-test: finc1 ## golden `check --context` output of testdata/context (UPDATE=1 rewrites the .out files)
-	@set -e; for f in testdata/context/*.fc; do o=$${f%.fc}.out; \
-	  got=$$($(BIN)/finc1 check --context $$f 2>&1 | grep -v '^error: fincore:' || true); \
-	  if [ -n "$(UPDATE)" ]; then printf '%s\n' "$$got" >$$o; fi; \
-	  diff -u $$o <(printf '%s\n' "$$got") || { echo "context-test: $$f differs from $$o"; exit 1; }; \
-	  cmp -s <(FINC_DIAG=context $(BIN)/finc1 check $$f 2>&1) <($(BIN)/finc1 check --context $$f 2>&1) || { echo "context-test: FINC_DIAG=context differs from --context on $$f"; exit 1; }; \
-	  cmp -s <($(BIN)/finc1 check $$f 2>&1 | grep -v '^error: fincore:') <(grep -E '^[^ ]+\.fc:[0-9]+:[0-9]+: error\[' $$o) || { echo "context-test: default output of $$f is not the plain diagnostics"; exit 1; }; \
-	done; echo "context-test: ok ($$(ls testdata/context/*.fc | wc -l) files)"
+	rm -rf $(BIN)

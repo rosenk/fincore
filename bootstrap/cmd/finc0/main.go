@@ -1,11 +1,11 @@
-// Command finc0 is the Stage 0 (Go) bootstrap compiler for FinCore.
+// Command finc0 is the Stage 0 (Go) bootstrap compiler for FinCore v0.1 Native.
 //
-// CLI (spec 9.6):
+// CLI:
 //
 //	finc0 parse [--dump-ast] <file.fc | dir>
 //	finc0 check [--comptime-fuel=N] <file.fc | dir>
-//	finc0 build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>
-//	finc0 run   [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]
+//	finc0 build [-o out_bin] [--emit-asm=out.s] [--comptime-fuel=N] <file.fc | dir>
+//	finc0 run   [--comptime-fuel=N] <file.fc | dir> [-- args...]
 //	finc0 test  [-v] <dir>
 //	finc0 version
 //
@@ -23,10 +23,10 @@ import (
 )
 
 // LangVersion is the FinCore language version finc0 implements. finc0 is
-// frozen at v0.2 (the bootstrap seed, tag v0.2.0); newer versions exist
-// only in compiler/. `finc0 test` skips tests whose `// SINCE: vX.Y`
-// header names a newer version.
-const LangVersion = "0.2"
+// the Stage 0 Go bootstrap compiler frozen at v0.1 Native; v0.2+ compilers
+// are written in FinCore itself. `finc0 test` skips tests whose
+// `// SINCE: vX.Y` header names a newer version.
+const LangVersion = "0.1"
 
 // Exit codes.
 const (
@@ -53,8 +53,8 @@ type Command struct {
 var commands = []*Command{
 	{Name: "parse", Usage: "parse [--dump-ast] <file.fc | dir>", Summary: "parse sources and optionally dump the AST", Run: runParse},
 	{Name: "check", Usage: "check [--comptime-fuel=N] <file.fc | dir>", Summary: "type, scope and totality check", Run: runCheck},
-	{Name: "build", Usage: "build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>", Summary: "compile to a Go program and binary", Run: runBuild},
-	{Name: "run", Usage: "run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]", Summary: "build and run", Run: runRun},
+	{Name: "build", Usage: "build [-o out_bin] [--emit-asm=out.s] [--comptime-fuel=N] <file.fc | dir>", Summary: "compile to a static Linux x86_64 ELF64 binary (no libc, no GC)", Run: runBuild},
+	{Name: "run", Usage: "run [--comptime-fuel=N] <file.fc | dir> [-- args...]", Summary: "build and run", Run: runRun},
 	{Name: "test", Usage: "test <dir>", Summary: "run conformance tests in a directory", Run: runTest},
 	{Name: "version", Usage: "version", Summary: "print the FinCore language version", Run: runVersion},
 }

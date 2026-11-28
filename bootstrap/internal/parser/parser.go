@@ -41,9 +41,8 @@ type parser struct {
 	pos     int
 	tok     lexer.Token
 	prevEnd diag.Pos
-	exprLev int // < 0: in control clause (no struct literals)
+	exprLev int // < 0: in control clause (no struct/array literals)
 	nest    int
-	tupleOK bool // the next operand may be a tuple (match scrutinee, v0.2)
 }
 
 // ParseFile parses one source file. On error it returns a nil file and a
@@ -784,7 +783,8 @@ func (p *parser) simpleStmtOrExpr() (s ast.Stmt, x ast.Expr) {
 		p.next()
 		rhs := p.exprList()
 		return finish(p, &ast.ShortVarDecl{Names: names, Values: rhs}, start), nil
-	case lexer.ASSIGN, lexer.ADD_ASSIGN, lexer.SUB_ASSIGN, lexer.MUL_ASSIGN, lexer.QUO_ASSIGN:
+	case lexer.ASSIGN, lexer.ADD_ASSIGN, lexer.SUB_ASSIGN, lexer.MUL_ASSIGN, lexer.QUO_ASSIGN,
+		lexer.REM_ASSIGN, lexer.AND_ASSIGN, lexer.OR_ASSIGN, lexer.XOR_ASSIGN, lexer.SHL_ASSIGN, lexer.SHR_ASSIGN:
 		var op ast.AssignOp
 		switch p.tok.Kind {
 		case lexer.ASSIGN:
@@ -797,6 +797,18 @@ func (p *parser) simpleStmtOrExpr() (s ast.Stmt, x ast.Expr) {
 			op = ast.MulAssign
 		case lexer.QUO_ASSIGN:
 			op = ast.QuoAssign
+		case lexer.REM_ASSIGN:
+			op = ast.RemAssign
+		case lexer.AND_ASSIGN:
+			op = ast.AndAssign
+		case lexer.OR_ASSIGN:
+			op = ast.OrAssign
+		case lexer.XOR_ASSIGN:
+			op = ast.XorAssign
+		case lexer.SHL_ASSIGN:
+			op = ast.ShlAssign
+		case lexer.SHR_ASSIGN:
+			op = ast.ShrAssign
 		}
 		opTok := p.tok
 		p.next()
@@ -952,7 +964,7 @@ func (p *parser) matchStmt() *ast.MatchStmt {
 	m := &ast.MatchStmt{}
 	old := p.exprLev
 	p.exprLev = -1
-	m.X = p.scrutinee()
+	m.X = p.expr()
 	p.exprLev = 0
 	p.expectOpenBrace("a match statement")
 	for p.tok.Kind != lexer.RBRACE {
@@ -964,22 +976,10 @@ func (p *parser) matchStmt() *ast.MatchStmt {
 	return finish(p, m, start)
 }
 
-// scrutinee parses the scrutinee of a match: an expression or (v0.2) a
-// tuple `(X1, X2, ...)` of two or more expressions.
-func (p *parser) scrutinee() ast.Expr {
-	p.tupleOK = true
-	x := p.expr()
-	p.tupleOK = false
-	return x
-}
-
-// matchArm parses a statement arm (v0.2: optional guard; the body may be
-// a block, an expression, a simple statement, return, break or continue;
-// a statement body is wrapped in a Block).
+// matchArm parses a statement arm: `Pattern -> (Block | Expr | SimpleStmt | return | break | continue)`.
 func (p *parser) matchArm() *ast.MatchArm {
 	start := p.start()
 	a := &ast.MatchArm{Pattern: p.pattern()}
-	a.Guard = p.guard()
 	p.expect(lexer.ARROW)
 	switch p.tok.Kind {
 	case lexer.LBRACE:
@@ -1005,68 +1005,29 @@ func (p *parser) armBlock(s ast.Stmt) *ast.BlockStmt {
 	return finish(p, &ast.BlockStmt{Stmts: []ast.Stmt{s}}, s.Span().Start)
 }
 
-// guard parses an optional `if Expr` after an arm's pattern (v0.2).
-func (p *parser) guard() ast.Expr {
-	if p.tok.Kind != lexer.IF {
-		return nil
-	}
-	p.next()
-	return p.expr()
-}
-
-// pattern parses `Pattern { "|" Pattern }` (v0.2 or-patterns); a single
-// alternative is returned unwrapped.
+// pattern parses `PatternAlt { "|" PatternAlt }`; a single alternative is returned unwrapped.
 func (p *parser) pattern() ast.Pattern {
-	return p.patterns(false)
-}
-
-// patterns parses alternatives separated by '|'. In a payload position
-// (payload) a bare identifier is a binding (or a variant of the payload's
-// enum type, decided by the type checker).
-func (p *parser) patterns(payload bool) ast.Pattern {
 	start := p.start()
-	bare := p.tok.Kind == lexer.IDENT
-	first := p.patternAlt(payload)
+	first := p.patternAlt()
 	if p.tok.Kind != lexer.OR {
 		return first
 	}
-	p.bareAt(first, bare)
 	op := &ast.OrPattern{Alts: []ast.Pattern{first}}
 	for p.tok.Kind == lexer.OR {
 		p.next()
-		bare = p.tok.Kind == lexer.IDENT
-		alt := p.patternAlt(payload)
-		p.bareAt(alt, bare)
-		op.Alts = append(op.Alts, alt)
+		op.Alts = append(op.Alts, p.patternAlt())
 	}
 	return finish(p, op, start)
 }
 
-// bareAt rejects an unparenthesized `x @ P` alternative of an or-pattern
-// (v0.2): `x @ A | B` must be written `x @ (A | B)` or `(x @ A) | B`.
-// bare is set if the alternative started with an identifier.
-func (p *parser) bareAt(alt ast.Pattern, bare bool) {
-	if at, ok := alt.(*ast.AtPattern); ok && bare {
-		p.errorAt(at.Range, "ambiguous '@' pattern in an or-pattern: write %s @ (P | Q) or (%s @ P) | Q", at.Name.Name, at.Name.Name)
-	}
-}
-
-// payloadList parses the patterns between the parentheses of a variant
-// pattern: `[ PayloadPattern { "," PayloadPattern } ]` where a payload
-// pattern is `..` (at most once, checked by the type checker) or Patterns.
+// payloadList parses identifier bindings `a, b, _` inside a variant pattern.
 func (p *parser) payloadList() []ast.Pattern {
 	if p.tok.Kind == lexer.RPAREN {
 		return nil
 	}
 	var out []ast.Pattern
 	for {
-		if p.tok.Kind == lexer.DOTDOT {
-			start := p.start()
-			p.next()
-			out = append(out, finish(p, &ast.RestPattern{}, start))
-		} else {
-			out = append(out, p.patterns(true))
-		}
+		out = append(out, p.ident())
 		if p.tok.Kind != lexer.COMMA {
 			return out
 		}
@@ -1074,7 +1035,7 @@ func (p *parser) payloadList() []ast.Pattern {
 	}
 }
 
-// matchExpr parses a match expression (v0.2):
+// matchExpr parses a match expression:
 //
 //	MatchExpr = "match" Expr "{" ExprArm { ( ";" | "," ) ExprArm } [ ";" | "," ] "}" .
 //	ExprArm   = Patterns "->" Expr .
@@ -1084,13 +1045,12 @@ func (p *parser) matchExpr() *ast.MatchExpr {
 	m := &ast.MatchExpr{}
 	old := p.exprLev
 	p.exprLev = -1
-	m.X = p.scrutinee()
+	m.X = p.expr()
 	p.exprLev = 0
 	p.expectOpenBrace("a match expression")
 	for {
 		armStart := p.start()
 		a := &ast.MatchArm{Pattern: p.pattern()}
-		a.Guard = p.guard()
 		p.expect(lexer.ARROW)
 		a.Expr = p.expr()
 		m.Arms = append(m.Arms, finish(p, a, armStart))
@@ -1110,33 +1070,15 @@ func (p *parser) matchExpr() *ast.MatchExpr {
 	return finish(p, m, start)
 }
 
-// patternAlt parses one alternative (v0.2 grammar):
+// patternAlt parses one flat pattern alternative:
 //
-//	PatternAlt = "_" | IDENT [ "." IDENT ] [ "(" [ PayloadList ] ")" ]
-//	           | IDENT "@" PatternAlt
-//	           | [ "-" ] Literal | "(" Patterns { "," Patterns } ")" .
-//
-// In a payload position a bare IDENT (not followed by '.' or '(') is an
-// *ast.Ident. A parenthesized single pattern is returned unwrapped.
-func (p *parser) patternAlt(payload bool) ast.Pattern {
+//	PatternAlt = "_" | IDENT [ "." IDENT ] [ "(" [ IdentList ] ")" ] | [ "-" ] Literal .
+func (p *parser) patternAlt() ast.Pattern {
 	p.enter()
 	defer p.leave()
 	start := p.start()
 	switch p.tok.Kind {
 	case lexer.IDENT:
-		if p.peek(1).Kind == lexer.AT {
-			// v0.2: `name @ PatternAlt` binds name to the value matched
-			// by the pattern.
-			at := &ast.AtPattern{Name: p.ident()}
-			p.next()
-			at.Pattern = p.patternAlt(payload)
-			return finish(p, at, start)
-		}
-		if payload {
-			if k := p.peek(1).Kind; k != lexer.PERIOD && k != lexer.LPAREN {
-				return p.ident()
-			}
-		}
 		if p.tok.Lit == "_" {
 			p.next()
 			return finish(p, &ast.WildcardPattern{}, start)
@@ -1164,20 +1106,6 @@ func (p *parser) patternAlt(payload bool) ast.Pattern {
 			neg := finish(p, &ast.UnaryExpr{Op: ast.OpNeg, X: lit}, start)
 			return finish(p, &ast.LiteralPattern{Lit: neg}, start)
 		}
-	case lexer.LPAREN:
-		p.next()
-		first := p.patterns(payload)
-		if p.tok.Kind != lexer.COMMA {
-			p.expect(lexer.RPAREN)
-			return first
-		}
-		tp := &ast.TuplePattern{Elems: []ast.Pattern{first}}
-		for p.tok.Kind == lexer.COMMA {
-			p.next()
-			tp.Elems = append(tp.Elems, p.patterns(payload))
-		}
-		p.expect(lexer.RPAREN)
-		return finish(p, tp, start)
 	}
 	p.errorExpected("pattern ('_', identifier, variant or literal)")
 	return nil
@@ -1248,13 +1176,6 @@ func (p *parser) binary(prec int) ast.Expr {
 	start := p.start()
 	x := p.unary()
 	for {
-		if p.tok.Kind == lexer.IS && ast.OpLt.Precedence() >= prec {
-			// v0.2: `X is Pattern` has the precedence of the relational
-			// operators.
-			p.next()
-			x = finish(p, &ast.IsExpr{X: x, Pattern: p.pattern()}, start)
-			continue
-		}
 		op, ok := binOp(p.tok.Kind)
 		if !ok || op.Precedence() < prec {
 			return x
@@ -1274,6 +1195,8 @@ func (p *parser) unary() ast.Expr {
 		op = ast.OpNot
 	case lexer.SUB:
 		op = ast.OpNeg
+	case lexer.XOR:
+		op = ast.OpBitNot
 	case lexer.AND:
 		op = ast.OpAddr
 	case lexer.MUL:
@@ -1444,11 +1367,32 @@ func (p *parser) basicLit() *ast.BasicLit {
 	return finish(p, lit, start)
 }
 
+func (p *parser) arrayLit(at *ast.ArrayType, start diag.Pos) *ast.ArrayLit {
+	p.expect(lexer.LBRACE)
+	old := p.exprLev
+	p.exprLev = 0
+	al := &ast.ArrayLit{Type: at}
+	for p.tok.Kind != lexer.RBRACE {
+		al.Elems = append(al.Elems, p.expr())
+		if p.tok.Kind != lexer.COMMA {
+			if p.tok.Kind != lexer.RBRACE {
+				if p.tok.Kind == lexer.SEMICOLON && p.tok.Lit == "\n" {
+					p.errorAt(p.tok.Span, "unexpected newline in array literal; possibly missing comma or '}'")
+				}
+				p.errorExpected("',' or '}' in array literal")
+			}
+			break
+		}
+		p.next()
+	}
+	p.exprLev = old
+	p.expect(lexer.RBRACE)
+	return finish(p, al, start)
+}
+
 // operand parses a Primary.
 func (p *parser) operand() ast.Expr {
 	start := p.start()
-	tuple := p.tupleOK
-	p.tupleOK = false
 	switch p.tok.Kind {
 	case lexer.INT, lexer.STRING, lexer.CHAR:
 		return p.basicLit()
@@ -1469,16 +1413,6 @@ func (p *parser) operand() ast.Expr {
 		p.next()
 		p.exprLev++
 		x := p.expr()
-		if tuple && p.tok.Kind == lexer.COMMA {
-			t := &ast.TupleExpr{Elems: []ast.Expr{x}}
-			for p.tok.Kind == lexer.COMMA {
-				p.next()
-				t.Elems = append(t.Elems, p.expr())
-			}
-			p.exprLev--
-			p.expect(lexer.RPAREN)
-			return finish(p, t, start)
-		}
 		p.exprLev--
 		p.expect(lexer.RPAREN)
 		return finish(p, &ast.ParenExpr{X: x}, start)
@@ -1500,6 +1434,9 @@ func (p *parser) operand() ast.Expr {
 		return finish(p, &ast.TypeExpr{Type: ft}, start)
 	case lexer.LBRACK, lexer.STRUCT, lexer.ENUM:
 		t := p.parseType()
+		if at, ok := t.(*ast.ArrayType); ok && p.exprLev >= 0 && p.tok.Kind == lexer.LBRACE {
+			return p.arrayLit(at, start)
+		}
 		return finish(p, &ast.TypeExpr{Type: t}, start)
 	case lexer.MATCH:
 		return p.matchExpr()

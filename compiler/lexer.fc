@@ -1,1088 +1,761 @@
-// lexer.fc — total lexer for FinCore (spec section 2), a port of
-// bootstrap/internal/lexer.
-//
-// Go-style semicolon insertion (spec 2.2): when a newline (or EOF, or a
-// block comment spanning a newline) follows an identifier, a literal,
-// true/false/nil, break/continue/return, ++/-- or a closing ')' ']' '}', a
-// SEMICOLON token (semi = SemiNewline / SemiEOF) is produced.
-//
-// Lexical errors never abort scanning: each produces an ILLEGAL token that
-// records the reason (errKind), the diagnostic position and the offending
-// byte; the message is rendered on demand by lexErrMessage. Identifiers are
-// ASCII-only; non-ASCII bytes are allowed only in strings and comments.
-//
-// Totality: every loop is a T1 counting loop whose bound is a local copy of
-// the source length (each iteration consumes at least one byte or exits).
 package main
 
-import "std/vec"
+// FinCore v0.1 Native Lexer with Go-style automatic semicolon insertion.
+
+const (
+	MaxTokens = 262144
+)
 
 // Token kinds.
 const (
-	TkIllegal = 0
-	TkEOF     = 1
-	TkIdent   = 2
-	TkInt     = 3
-	TkString  = 4
-	TkChar    = 5
+	TKIllegal u8 = 0
+	TKEof     u8 = 1
 
-	// keywords (TkKeywordFirst..TkKeywordLast)
-	TkPackage   = 10
-	TkImport    = 11
-	TkConst     = 12
-	TkType      = 13
-	TkVar       = 14
-	TkFunc      = 15
-	TkDriver    = 16
-	TkComptime  = 17
-	TkScope     = 18
-	TkFor       = 19
-	TkIf        = 20
-	TkElse      = 21
-	TkReturn    = 22
-	TkBreak     = 23
-	TkContinue  = 24
-	TkDefer     = 25
-	TkStruct    = 26
-	TkEnum      = 27
-	TkMatch     = 28
-	TkTrue      = 29
-	TkFalse     = 30
-	TkNil       = 31
-	TkAny       = 32
-	TkDecreases = 33
-	TkIs        = 34 // v0.2 variant tests
+	TKIdent  u8 = 2
+	TKInt    u8 = 3
+	TKString u8 = 4
+	TKChar   u8 = 5
+	TKFloat  u8 = 6
 
-	// operators and punctuation
-	TkAdd       = 40 // +
-	TkSub       = 41 // -
-	TkMul       = 42 // *
-	TkQuo       = 43 // /
-	TkRem       = 44 // %
-	TkAnd       = 45 // &
-	TkOr        = 46 // |
-	TkXor       = 47 // ^
-	TkShl       = 48 // <<
-	TkShr       = 49 // >>
-	TkEql       = 50 // ==
-	TkNeq       = 51 // !=
-	TkLss       = 52 // <
-	TkLeq       = 53 // <=
-	TkGtr       = 54 // >
-	TkGeq       = 55 // >=
-	TkLAnd      = 56 // &&
-	TkLOr       = 57 // ||
-	TkNot       = 58 // !
-	TkAssign    = 59 // =
-	TkDefine    = 60 // :=
-	TkAddAssign = 61 // +=
-	TkSubAssign = 62 // -=
-	TkMulAssign = 63 // *=
-	TkQuoAssign = 64 // /=
-	TkInc       = 65 // ++
-	TkDec       = 66 // --
-	TkLParen    = 67 // (
-	TkRParen    = 68 // )
-	TkLBrack    = 69 // [
-	TkRBrack    = 70 // ]
-	TkLBrace    = 71 // {
-	TkRBrace    = 72 // }
-	TkComma     = 73 // ,
-	TkPeriod    = 74 // .
-	TkColon     = 75 // :
-	TkSemicolon = 76 // ;
-	TkArrow     = 77 // ->
-	TkEllipsis  = 78 // ...
-	TkDotDot    = 79 // .. (v0.2 rest pattern)
-	TkAt        = 80 // @ (v0.2 `name @ pattern` binding)
+	// Keywords
+	TKPackage   u8 = 10
+	TKImport    u8 = 11
+	TKConst     u8 = 12
+	TKType      u8 = 13
+	TKVar       u8 = 14
+	TKFunc      u8 = 15
+	TKDriver    u8 = 16
+	TKComptime  u8 = 17
+	TKScope     u8 = 18
+	TKFor       u8 = 19
+	TKIf        u8 = 20
+	TKElse      u8 = 21
+	TKReturn    u8 = 22
+	TKBreak     u8 = 23
+	TKContinue  u8 = 24
+	TKDefer     u8 = 25
+	TKStruct    u8 = 26
+	TKEnum      u8 = 27
+	TKMatch     u8 = 28
+	TKTrue      u8 = 29
+	TKFalse     u8 = 30
+	TKNil       u8 = 31
+	TKAny       u8 = 32
+	TKDecreases u8 = 33
+	TKEffect    u8 = 34
+	TKWith      u8 = 35
+	TKHandle    u8 = 36
+	TKWhere     u8 = 37
+
+	// Operators & punctuation
+	TKAdd       u8 = 40 // +
+	TKSub       u8 = 41 // -
+	TKMul       u8 = 42 // *
+	TKQuo       u8 = 43 // /
+	TKRem       u8 = 44 // %
+	TKAnd       u8 = 45 // &
+	TKOr        u8 = 46 // |
+	TKXor       u8 = 47 // ^
+	TKShl       u8 = 48 // <<
+	TKShr       u8 = 49 // >>
+	TKEql       u8 = 50 // ==
+	TKNeq       u8 = 51 // !=
+	TKLss       u8 = 52 // <
+	TKLeq       u8 = 53 // <=
+	TKGtr       u8 = 54 // >
+	TKGeq       u8 = 55 // >=
+	TKLAnd      u8 = 56 // &&
+	TKLOr       u8 = 57 // ||
+	TKNot       u8 = 58 // !
+	TKAssign    u8 = 59 // =
+	TKDefine    u8 = 60 // :=
+	TKAddAssign u8 = 61 // +=
+	TKSubAssign u8 = 62 // -=
+	TKMulAssign u8 = 63 // *=
+	TKQuoAssign u8 = 64 // /=
+	TKRemAssign u8 = 65 // %=
+	TKAndAssign u8 = 66 // &=
+	TKOrAssign  u8 = 67 // |=
+	TKXorAssign u8 = 68 // ^=
+	TKShlAssign u8 = 69 // <<=
+	TKShrAssign u8 = 70 // >>=
+	TKInc       u8 = 71 // ++
+	TKDec       u8 = 72 // --
+	TKLParen    u8 = 73 // (
+	TKRParen    u8 = 74 // )
+	TKLBrack    u8 = 75 // [
+	TKRBrack    u8 = 76 // ]
+	TKLBrace    u8 = 77 // {
+	TKRBrace    u8 = 78 // }
+	TKComma     u8 = 79 // ,
+	TKPeriod    u8 = 80 // .
+	TKColon     u8 = 81 // :
+	TKSemi      u8 = 82 // ;
+	TKArrow     u8 = 83 // ->
+	TKEllipsis  u8 = 84 // ...
 )
-
-// Lexical error reasons (Token.errKind of ILLEGAL tokens).
-const (
-	LexErrNone          = 0
-	LexErrUntermComment = 1  // E1002 unterminated block comment
-	LexErrBadUTF8       = 2  // E1001 invalid UTF-8 byte 0x%02X
-	LexErrBadChar       = 3  // E1001 invalid character ...
-	LexErrBadInt        = 4  // E1001 (message from checkIntLit)
-	LexErrUntermString  = 5  // E1002 unterminated string literal
-	LexErrBadEscape     = 6  // E1001 invalid escape sequence \%c
-	LexErrBadHexEscape  = 7  // E1001 invalid \x escape
-	LexErrUntermChar    = 8  // E1002 unterminated char literal
-	LexErrEmptyChar     = 9  // E1001 empty char literal
-	LexErrCharMultiByte = 10 // E1001 char literal must be a single byte
-	LexErrCharLen       = 11 // E1001 char literal must contain exactly one byte
-)
-
-// Escape decoding results.
-// Esc is the result of scanning one escape sequence.
-type Esc enum {
-	Ok(u8)      // the decoded byte
-	EOF         // end of input after the backslash
-	Newline     // a newline after the backslash
-	Invalid(u8) // an unknown escape: the offending byte
-	BadHex      // \x without two hex digits
-}
 
 const (
+	TokFlagAutoSemi u8 = 1
 )
 
-// Integer literal check results (checkIntLit).
-const (
-	IntOK         = 0
-	IntNoDigits   = 1
-	IntLeadZero   = 2
-	IntUnderscore = 3
-	IntBadDigit   = 4
-	IntOverflow   = 5
-)
-
-func isKeyword(k u8) bool {
-	return k >= TkPackage && k <= TkIs
+type Token struct {
+	kind  u8
+	flags u8
+	pad   u16
+	off   u32 // byte offset in file
+	end   u32 // end byte offset in file
+	strID u32 // interned spelling (for IDENT/INT) or decoded value (for STRING/CHAR)
 }
 
-// kindString returns the source spelling of keywords and operators and the
-// class name of other kinds (lexer.Kind.String in finc0).
-func kindString(k u8) string {
-	return match k {
-		TkIllegal -> "ILLEGAL"
-		TkEOF -> "EOF"
-		TkIdent -> "IDENT"
-		TkInt -> "INT"
-		TkString -> "STRING"
-		TkChar -> "CHAR"
-		_ if k < TkAdd -> keywordString(k)
-		_ -> operatorString(k)
-	}
+var toks [MaxTokens]Token
+var tokCount u32
+
+// Pre-interned keyword StrIDs for O(1) keyword recognition.
+var kwPackage u32
+var kwImport u32
+var kwConst u32
+var kwType u32
+var kwVar u32
+var kwFunc u32
+var kwDriver u32
+var kwComptime u32
+var kwScope u32
+var kwFor u32
+var kwIf u32
+var kwElse u32
+var kwReturn u32
+var kwBreak u32
+var kwContinue u32
+var kwDefer u32
+var kwStruct u32
+var kwEnum u32
+var kwMatch u32
+var kwTrue u32
+var kwFalse u32
+var kwNil u32
+var kwAny u32
+var kwDecreases u32
+var kwEffect u32
+var kwWith u32
+var kwHandle u32
+var kwResume u32
+var kwWhere u32
+var kwBlank u32
+var kwMain u32
+var kwCode u32
+var kwEl u32
+var kwIota u32
+
+func lexerInit() {
+	tokCount = 0
+	kwPackage = internStr("package")
+	kwImport = internStr("import")
+	kwConst = internStr("const")
+	kwType = internStr("type")
+	kwVar = internStr("var")
+	kwFunc = internStr("func")
+	kwDriver = internStr("driver")
+	kwComptime = internStr("comptime")
+	kwScope = internStr("scope")
+	kwFor = internStr("for")
+	kwIf = internStr("if")
+	kwElse = internStr("else")
+	kwReturn = internStr("return")
+	kwBreak = internStr("break")
+	kwContinue = internStr("continue")
+	kwDefer = internStr("defer")
+	kwStruct = internStr("struct")
+	kwEnum = internStr("enum")
+	kwMatch = internStr("match")
+	kwTrue = internStr("true")
+	kwFalse = internStr("false")
+	kwNil = internStr("nil")
+	kwAny = internStr("any")
+	kwDecreases = internStr("decreases")
+	kwEffect = internStr("effect")
+	kwWith = internStr("with")
+	kwHandle = internStr("handle")
+	kwResume = internStr("resume")
+	kwWhere = internStr("where")
+	kwBlank = internStr("_")
+	kwMain = internStr("main")
+	kwCode = internStr("Code")
+	kwEl = internStr("El")
+	kwIota = internStr("iota")
 }
 
-func keywordString(k u8) string {
-	return match k {
-		TkPackage -> "package"
-		TkImport -> "import"
-		TkConst -> "const"
-		TkType -> "type"
-		TkVar -> "var"
-		TkFunc -> "func"
-		TkDriver -> "driver"
-		TkComptime -> "comptime"
-		TkScope -> "scope"
-		TkFor -> "for"
-		TkIf -> "if"
-		TkElse -> "else"
-		TkReturn -> "return"
-		TkBreak -> "break"
-		TkContinue -> "continue"
-		TkDefer -> "defer"
-		TkStruct -> "struct"
-		TkEnum -> "enum"
-		TkMatch -> "match"
-		TkTrue -> "true"
-		TkFalse -> "false"
-		TkNil -> "nil"
-		TkAny -> "any"
-		TkDecreases -> "decreases"
-		TkIs -> "is"
-		_ -> "Kind(?)"
+func lookupKeyword(id u32) u8 {
+	if id == kwPackage {
+		return TKPackage
 	}
+	if id == kwImport {
+		return TKImport
+	}
+	if id == kwConst {
+		return TKConst
+	}
+	if id == kwType {
+		return TKType
+	}
+	if id == kwVar {
+		return TKVar
+	}
+	if id == kwFunc {
+		return TKFunc
+	}
+	if id == kwDriver {
+		return TKDriver
+	}
+	if id == kwComptime {
+		return TKComptime
+	}
+	if id == kwScope {
+		return TKScope
+	}
+	if id == kwFor {
+		return TKFor
+	}
+	if id == kwIf {
+		return TKIf
+	}
+	if id == kwElse {
+		return TKElse
+	}
+	if id == kwReturn {
+		return TKReturn
+	}
+	if id == kwBreak {
+		return TKBreak
+	}
+	if id == kwContinue {
+		return TKContinue
+	}
+	if id == kwDefer {
+		return TKDefer
+	}
+	if id == kwStruct {
+		return TKStruct
+	}
+	if id == kwEnum {
+		return TKEnum
+	}
+	if id == kwMatch {
+		return TKMatch
+	}
+	if id == kwTrue {
+		return TKTrue
+	}
+	if id == kwFalse {
+		return TKFalse
+	}
+	if id == kwNil {
+		return TKNil
+	}
+	if id == kwAny {
+		return TKAny
+	}
+	if id == kwDecreases {
+		return TKDecreases
+	}
+	if id == kwEffect {
+		return TKEffect
+	}
+	if id == kwWith {
+		return TKWith
+	}
+	if id == kwHandle {
+		return TKHandle
+	}
+	if id == kwWhere {
+		return TKWhere
+	}
+	return TKIdent
 }
 
-func operatorString(k u8) string {
-	return match k {
-		TkAdd -> "+"
-		TkSub -> "-"
-		TkMul -> "*"
-		TkQuo -> "/"
-		TkRem -> "%"
-		TkAnd -> "&"
-		TkOr -> "|"
-		TkXor -> "^"
-		TkShl -> "<<"
-		TkShr -> ">>"
-		TkEql -> "=="
-		TkNeq -> "!="
-		TkLss -> "<"
-		TkLeq -> "<="
-		TkGtr -> ">"
-		TkGeq -> ">="
-		TkLAnd -> "&&"
-		TkLOr -> "||"
-		TkNot -> "!"
-		TkAssign -> "="
-		TkDefine -> ":="
-		TkAddAssign -> "+="
-		TkSubAssign -> "-="
-		TkMulAssign -> "*="
-		TkQuoAssign -> "/="
-		TkInc -> "++"
-		TkDec -> "--"
-		TkLParen -> "("
-		TkRParen -> ")"
-		TkLBrack -> "["
-		TkRBrack -> "]"
-		TkLBrace -> "{"
-		TkRBrace -> "}"
-		TkComma -> ","
-		TkPeriod -> "."
-		TkColon -> ":"
-		TkSemicolon -> ";"
-		TkArrow -> "->"
-		TkEllipsis -> "..."
-		TkDotDot -> ".."
-		TkAt -> "@"
-		_ -> "Kind(?)"
-	}
+func triggersSemi(k u8) bool {
+	return k == TKIdent || k == TKInt || k == TKFloat || k == TKString || k == TKChar ||
+		k == TKTrue || k == TKFalse || k == TKNil || k == TKAny ||
+		k == TKReturn || k == TKBreak || k == TKContinue ||
+		k == TKInc || k == TKDec ||
+		k == TKRParen || k == TKRBrack || k == TKRBrace
 }
 
-// lookupKeyword maps an identifier spelling to its keyword kind, or TkIdent.
-func lookupKeyword(w []byte) u8 {
-	n := len(w)
-	if n < 2 || n > 9 {
-		return TkIdent
-	}
-	c := w[0]
-	if c < 'a' || c > 'v' {
-		return TkIdent
-	}
-	for k := u8(TkPackage); k < TkIs+1; k++ {
-		if bytesEqual(w, strBytes(keywordString(k))) {
-			return k
-		}
-	}
-	return TkIdent
+func isIdentStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
 }
 
-// describeToken renders t for error messages, Go style ("newline", "EOF",
-// "identifier x", "'{'"); text is the token's source spelling.
-func describeToken(o *OutBuf, t Token, text []byte) {
-	k := t.kind
-	if k == TkSemicolon {
-		o.WriteString(match t.semi {
-			SemiNewline -> "newline"
-			SemiEOF -> "EOF"
-			_ -> "';'"
-		})
-		return
-	}
-	if k == TkEOF {
-		o.WriteString("EOF")
-		return
-	}
-	if k == TkIdent {
-		o.WriteString("identifier ")
-		o.WriteBytes(text)
-		return
-	}
-	if k == TkInt {
-		o.WriteString("integer literal ")
-		o.WriteBytes(text)
-		return
-	}
-	if k == TkString {
-		o.WriteString("string literal ")
-		o.WriteBytes(text)
-		return
-	}
-	if k == TkChar {
-		o.WriteString("char literal ")
-		o.WriteBytes(text)
-		return
-	}
-	if k == TkIllegal {
-		o.WriteString("invalid token")
-		return
-	}
-	if isKeyword(k) {
-		o.WriteString("keyword ")
-		o.WriteString(kindString(k))
-		return
-	}
-	o.WriteByte('\'')
-	o.WriteString(kindString(k))
-	o.WriteByte('\'')
-}
-
-func isLetter(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+func isIdentCont(c byte) bool {
+	return isIdentStart(c) || (c >= '0' && c <= '9')
 }
 
 func isDigit(c byte) bool {
 	return c >= '0' && c <= '9'
 }
 
-func isHex(c byte) bool {
-	return isDigit(c) || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
-}
-
-func hexVal(c byte) byte {
-	if isDigit(c) {
-		return c - '0'
+func hexVal(c byte) (u8, bool) {
+	if c >= '0' && c <= '9' {
+		return c - '0', true
 	}
 	if c >= 'a' && c <= 'f' {
-		return c - 'a' + 10
+		return c - 'a' + 10, true
 	}
-	return c - 'A' + 10
+	if c >= 'A' && c <= 'F' {
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
-// checkIntLit validates and decodes an integer literal (decimal, 0x hex,
-// 0b binary, '_' separators between digits), like finc0's lexer.ParseInt.
-// It returns the value, a status (Int*), and for IntBadDigit the offending
-// byte and the base.
-func checkIntLit(lit []byte) (u64, u8, byte, u64) {
-	n := len(lit)
-	base := u64(10)
-	ds := usize(0)
-	if n >= 2 && lit[0] == '0' && (lit[1] == 'x' || lit[1] == 'X') {
-		base = 16
-		ds = 2
-	} else if n >= 2 && lit[0] == '0' && (lit[1] == 'b' || lit[1] == 'B') {
-		base = 2
-		ds = 2
+func emitTok(kind u8, flags u8, off u32, end u32, strID u32) {
+	if tokCount < MaxTokens {
+		toks[tokCount] = Token{kind: kind, flags: flags, off: off, end: end, strID: strID}
+		tokCount++
 	}
-	if ds >= n {
-		return 0, IntNoDigits, 0, base
-	}
-	if base == 10 && n-ds > 1 && lit[ds] == '0' {
-		return 0, IntLeadZero, 0, base
-	}
-	v := u64(0)
-	prevDigit := false
-	for i := ds; i < n; i++ {
-		c := lit[i]
-		if c == '_' {
-			if !prevDigit && !(i == ds && base != 10) {
-				return 0, IntUnderscore, 0, base
+}
+
+// lexFile tokenizes files[fileID] into toks[tokStart : tokStart+tokCount].
+func lexFile(fileID u32) {
+	f := files[fileID]
+	base := usize(f.srcOff)
+	n := usize(f.srcLen)
+	startTok := tokCount
+	insertSemi := false
+
+	i := usize(0)
+	for step := usize(0); step < n+2; step++ {
+		// Skip spaces, tabs, CR, comments; handle newlines for ASI.
+		for ws := usize(0); ws < n+1; ws++ {
+			if i >= n {
+				break
 			}
-			if i+1 >= n || lit[i+1] == '_' {
-				return 0, IntUnderscore, 0, base
+			c := srcBuf[base+i]
+			if c == ' ' || c == '\t' || c == '\r' {
+				i++
+				continue
 			}
-			prevDigit = false
-			continue
-		}
-		d := u64(99)
-		if isDigit(c) {
-			d = u64(c - '0')
-		} else if c >= 'a' && c <= 'f' {
-			d = u64(c-'a') + 10
-		} else if c >= 'A' && c <= 'F' {
-			d = u64(c-'A') + 10
-		}
-		if d >= base {
-			return 0, IntBadDigit, c, base
-		}
-		if v > (0xFFFF_FFFF_FFFF_FFFF-d)/base {
-			return 0, IntOverflow, 0, base
-		}
-		v = v*base + d
-		prevDigit = true
-	}
-	return v, IntOK, 0, base
-}
-
-// putIntLitError writes the finc0 message for a malformed integer literal.
-func putIntLitError(o *OutBuf, lit []byte) {
-	_, st, c, base := checkIntLit(lit)
-	if st == IntBadDigit {
-		o.WriteString("invalid digit ")
-		putQuotedByte(o, c)
-		o.WriteString(" in base-")
-		o.WriteUint(base)
-		o.WriteString(" literal ")
-		putQuoted(o, lit)
-		return
-	}
-	if st == IntOverflow {
-		o.WriteString("integer literal ")
-		putQuoted(o, lit)
-		o.WriteString(" overflows u64")
-		return
-	}
-	o.WriteString("invalid integer literal ")
-	putQuoted(o, lit)
-	o.WriteString(match st {
-		IntNoDigits -> ": no digits"
-		IntLeadZero -> ": leading zero (octal literals are not supported)"
-		_ -> ": '_' must separate digits"
-	})
-}
-
-// lexErrCode returns the diagnostic code of an ILLEGAL token.
-func lexErrCode(t Token) u32 {
-	k := t.errKind
-	if k is LexErrUntermComment | LexErrUntermString | LexErrUntermChar {
-		return E1002
-	}
-	return E1001
-}
-
-// putLexError writes the message of an ILLEGAL token; text is its spelling.
-func putLexError(o *OutBuf, t Token, text []byte) {
-	k := t.errKind
-	if k == LexErrUntermComment {
-		o.WriteString("unterminated block comment")
-	} else if k == LexErrBadUTF8 {
-		o.WriteString("invalid UTF-8 byte 0x")
-		o.WriteHex(u64(t.errByte), 2, true)
-	} else if k == LexErrBadChar {
-		o.WriteString("invalid character ")
-		r := t.val
-		if r >= 0x20 && r < 0x7F {
-			putQuotedByte(o, byte(r))
-			o.WriteString(" (U+")
-			putHexMin(o, r, 4)
-			o.WriteByte(')')
-		} else {
-			o.WriteString("U+")
-			putHexMin(o, r, 4)
-		}
-	} else if k == LexErrBadInt {
-		putIntLitError(o, text)
-	} else if k == LexErrUntermString {
-		o.WriteString("unterminated string literal")
-	} else if k == LexErrBadEscape {
-		o.WriteString("invalid escape sequence \\")
-		putCharVerb(o, t.errByte)
-	} else if k == LexErrBadHexEscape {
-		o.WriteString("invalid \\x escape: need exactly two hex digits")
-	} else if k == LexErrUntermChar {
-		o.WriteString("unterminated char literal")
-	} else if k == LexErrEmptyChar {
-		o.WriteString("empty char literal")
-	} else if k == LexErrCharMultiByte {
-		o.WriteString("char literal must be a single byte (ASCII character or escape)")
-	} else if k == LexErrCharLen {
-		o.WriteString("char literal must contain exactly one byte")
-	} else {
-		o.WriteString("invalid token")
-	}
-}
-
-// decodeEscapeAt decodes the escape sequence of a VALID literal whose
-// backslash is at raw[i]; it returns the byte and the sequence length.
-func decodeEscapeAt(raw []byte, i usize) (byte, usize) {
-	n := len(raw)
-	if i+1 >= n {
-		return 0, 1
-	}
-	c := raw[i+1]
-	match c {
-		'n' -> return '\n', 2
-		'r' -> return '\r', 2
-		't' -> return '\t', 2
-		'x' if i+3 < n -> return (hexVal(raw[i+2]) << 4) | hexVal(raw[i+3]), 4
-		_ -> return c, 2
-	}
-}
-
-// decodeStringLit writes the decoded contents of a valid STRING literal
-// (spelling raw, including the quotes) into o.
-func decodeStringLit(o *OutBuf, raw []byte) {
-	n := len(raw)
-	if n < 2 {
-		return
-	}
-	end := n - 1
-	i := usize(1)
-	for g := usize(0); g < n; g++ {
-		if i >= end {
-			break
-		}
-		if raw[i] == '\\' {
-			b, w := decodeEscapeAt(raw, i)
-			o.WriteByte(b)
-			i += w
-		} else {
-			o.WriteByte(raw[i])
-			i++
-		}
-	}
-}
-
-// stringLitEmpty reports whether a valid STRING literal decodes to "".
-func stringLitEmpty(raw []byte) bool {
-	return len(raw) <= 2
-}
-
-// ---------------------------------------------------------------------------
-// Lexer
-
-type Lexer struct {
-	src          []byte
-	n            usize
-	off          usize
-	line         u32
-	lineStart    usize
-	insertSemi   bool
-	keepComments bool // record comments in the side table (finc fmt)
-}
-
-// newLexer creates a lexer over one file; a UTF-8 BOM is skipped.
-func newLexer(src []byte) Lexer {
-	var l Lexer
-	l.src = src
-	l.n = len(src)
-	l.line = 1
-	if l.n >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
-		l.off = 3
-		l.lineStart = 3
-	}
-	return l
-}
-
-func (l *Lexer) col() u32 {
-	return u32(l.off-l.lineStart) + 1
-}
-
-func (l *Lexer) peekByte(k usize) byte {
-	if l.off+k < l.n {
-		return l.src[l.off+k]
-	}
-	return 0
-}
-
-// advance consumes one byte, tracking newlines.
-func (l *Lexer) advance() {
-	if l.off < l.n {
-		if l.src[l.off] == '\n' {
-			l.line++
-			l.lineStart = l.off + 1
-		}
-		l.off++
-	}
-}
-
-// advanceTo consumes bytes up to (excluding) offset target.
-func (l *Lexer) advanceTo(target usize) {
-	if target <= l.off {
-		return
-	}
-	cnt := target - l.off
-	for k := usize(0); k < cnt; k++ {
-		l.advance()
-	}
-}
-
-// tokAt makes a zero-length token at the given position.
-func tokAt(kind u8, off usize, line u32, col u32) Token {
-	var t Token
-	t.kind = kind
-	t.off = u32(off)
-	t.end = u32(off)
-	t.line = line
-	t.col = col
-	t.eline = line
-	t.ecol = col
-	return t
-}
-
-// finishTok sets the end of t to the current position.
-func (l *Lexer) finishTok(t Token) Token {
-	t.end = u32(l.off)
-	t.eline = l.line
-	t.ecol = l.col()
-	return t
-}
-
-// illegal returns an ILLEGAL token spanning start..current whose
-// diagnostic is at the token start.
-func (l *Lexer) illegal(start Token, reason u8) Token {
-	t := l.finishTok(start)
-	t.kind = TkIllegal
-	t.errKind = reason
-	t.errLine = start.line
-	t.errCol = start.col
-	l.insertSemi = false
-	return t
-}
-
-// illegalAt is illegal with the diagnostic at an explicit position.
-func (l *Lexer) illegalAt(start Token, reason u8, line u32, col u32, b byte) Token {
-	t := l.illegal(start, reason)
-	t.errLine = line
-	t.errCol = col
-	t.errByte = b
-	return t
-}
-
-// nextToken returns the next token.
-func (l *Lexer) nextToken() Token {
-	lim := l.n + 1
-	for g := usize(0); g < lim; g++ {
-		if l.off >= l.n {
-			t := tokAt(TkEOF, l.off, l.line, l.col())
-			if l.insertSemi {
-				l.insertSemi = false
-				t.kind = TkSemicolon
-				t.semi = SemiEOF
+			if c == '\n' {
+				if insertSemi {
+					emitTok(TKSemi, TokFlagAutoSemi, u32(i), u32(i+1), 0)
+					insertSemi = false
+				}
+				i++
+				continue
 			}
-			return t
-		}
-		c := l.src[l.off]
-		if c == '\n' {
-			if l.insertSemi {
-				t := tokAt(TkSemicolon, l.off, l.line, l.col())
-				t.semi = SemiNewline
-				l.advance()
-				l.insertSemi = false
-				return t
-			}
-			l.advance()
-			continue
-		}
-		if c is ' ' | '\t' | '\r' {
-			l.advance()
-			continue
-		}
-		if c == '/' && l.peekByte(1) == '/' {
-			cs := tokAt(TkIllegal, l.off, l.line, l.col())
-			l.skipLineComment()
-			l.recordComment(cs, false)
-			continue
-		}
-		if c == '/' && l.peekByte(1) == '*' {
-			start := tokAt(TkIllegal, l.off, l.line, l.col())
-			l.advance()
-			l.advance()
-			sawNewline, closed := l.skipBlockComment()
-			if !closed {
-				return l.illegal(start, LexErrUntermComment)
-			}
-			l.recordComment(start, true)
-			if sawNewline && l.insertSemi {
-				l.insertSemi = false
-				start.kind = TkSemicolon
-				start.semi = SemiNewline
-				return start
-			}
-			continue
-		}
-		return l.scan()
-	}
-	return tokAt(TkEOF, l.off, l.line, l.col())
-}
-
-// Comment side table. The parser never sees comments (nextToken skips
-// them); `finc fmt` needs them, so a lexer with keepComments set appends
-// every comment (span and position, in source order) to the package-level
-// table `comments`. Overflow sets commentsFull.
-
-const MaxComments = 65_536
-
-type Comment struct {
-	off   u32 // file-relative offset of the "//" or "/*"
-	end   u32 // just past the comment (a line comment excludes the newline)
-	line  u32
-	col   u32
-	eline u32 // line of the last byte
-	block bool
-}
-
-type CommentTable = vec.Vec[MaxComments, Comment]
-
-var comments CommentTable
-var commentsFull bool
-
-// recordComment appends the comment from start to the current offset.
-func (l *Lexer) recordComment(start Token, block bool) {
-	if !l.keepComments {
-		return
-	}
-	var c Comment
-	c.off = start.off
-	c.end = u32(l.off)
-	c.line = start.line
-	c.col = start.col
-	c.eline = l.line
-	c.block = block
-	if !comments.Push(c) {
-		commentsFull = true
-	}
-}
-
-func (l *Lexer) skipLineComment() {
-	lim := l.n
-	for g := usize(0); g < lim; g++ {
-		if l.off >= l.n || l.src[l.off] == '\n' {
-			return
-		}
-		l.advance()
-	}
-}
-
-// skipBlockComment consumes the body of a block comment after "/*". It
-// returns whether a newline was seen and whether "*/" was found.
-func (l *Lexer) skipBlockComment() (bool, bool) {
-	sawNewline := false
-	lim := l.n
-	for g := usize(0); g < lim; g++ {
-		if l.off >= l.n {
-			return sawNewline, false
-		}
-		if l.src[l.off] == '*' && l.peekByte(1) == '/' {
-			l.advance()
-			l.advance()
-			return sawNewline, true
-		}
-		if l.src[l.off] == '\n' {
-			sawNewline = true
-		}
-		l.advance()
-	}
-	return sawNewline, false
-}
-
-// scan lexes one token starting at a non-blank, non-comment byte.
-func (l *Lexer) scan() Token {
-	start := tokAt(TkIllegal, l.off, l.line, l.col())
-	c := l.src[l.off]
-	if isLetter(c) {
-		l.skipWord()
-		t := l.finishTok(start)
-		k := lookupKeyword(l.src[start.off:l.off])
-		t.kind = k
-		l.insertSemi = k is TkIdent | TkTrue | TkFalse | TkNil | TkBreak | TkContinue | TkReturn
-		return t
-	}
-	if isDigit(c) {
-		l.skipWord()
-		t := l.finishTok(start)
-		v, st, _, _ := checkIntLit(l.src[start.off:l.off])
-		if st != IntOK {
-			return l.illegal(start, LexErrBadInt)
-		}
-		t.kind = TkInt
-		t.val = v
-		l.insertSemi = true
-		return t
-	}
-	if c == '"' {
-		return l.scanString(start)
-	}
-	if c == '\'' {
-		return l.scanChar(start)
-	}
-	return l.scanOperator(start)
-}
-
-// skipWord consumes a maximal run of letters and digits.
-func (l *Lexer) skipWord() {
-	lim := l.n
-	for g := usize(0); g < lim; g++ {
-		if l.off >= l.n {
-			return
-		}
-		c := l.src[l.off]
-		if !isLetter(c) && !isDigit(c) {
-			return
-		}
-		l.advance()
-	}
-}
-
-// opKind classifies the operator at the current offset; it returns the kind
-// (TkIllegal if none) and its size in bytes.
-func (l *Lexer) opKind() (u8, usize) {
-	c := l.src[l.off]
-	n1 := l.peekByte(1)
-	n2 := l.peekByte(2)
-	if c == '+' {
-		if n1 == '+' {
-			return TkInc, 2
-		}
-		if n1 == '=' {
-			return TkAddAssign, 2
-		}
-		return TkAdd, 1
-	}
-	if c == '-' {
-		match n1 {
-			'-' -> return TkDec, 2
-			'=' -> return TkSubAssign, 2
-			'>' -> return TkArrow, 2
-			_ -> return TkSub, 1
-		}
-	}
-	match c {
-		'*' -> {
-			if n1 == '=' {
-				return TkMulAssign, 2
-			}
-			return TkMul, 1
-		}
-		'/' -> {
-			if n1 == '=' {
-				return TkQuoAssign, 2
-			}
-			return TkQuo, 1
-		}
-		'%' -> return TkRem, 1
-		'&' -> {
-			if n1 == '&' {
-				return TkLAnd, 2
-			}
-			return TkAnd, 1
-		}
-		'|' -> {
-			if n1 == '|' {
-				return TkLOr, 2
-			}
-			return TkOr, 1
-		}
-		'^' -> return TkXor, 1
-		'<' -> {
-			if n1 == '<' {
-				return TkShl, 2
-			}
-			if n1 == '=' {
-				return TkLeq, 2
-			}
-			return TkLss, 1
-		}
-		'>' -> {
-			if n1 == '>' {
-				return TkShr, 2
-			}
-			if n1 == '=' {
-				return TkGeq, 2
-			}
-			return TkGtr, 1
-		}
-		'=' -> {
-			if n1 == '=' {
-				return TkEql, 2
-			}
-			return TkAssign, 1
-		}
-		'!' -> {
-			if n1 == '=' {
-				return TkNeq, 2
-			}
-			return TkNot, 1
-		}
-		':' -> {
-			if n1 == '=' {
-				return TkDefine, 2
-			}
-			return TkColon, 1
-		}
-		'(' -> return TkLParen, 1
-		')' -> return TkRParen, 1
-		'[' -> return TkLBrack, 1
-		']' -> return TkRBrack, 1
-		'{' -> return TkLBrace, 1
-		'}' -> return TkRBrace, 1
-		',' -> return TkComma, 1
-		'@' -> return TkAt, 1
-		';' -> return TkSemicolon, 1
-		'.' -> {
-			if n1 == '.' && n2 == '.' {
-				return TkEllipsis, 3
-			}
-			if n1 == '.' {
-				return TkDotDot, 2
-			}
-			return TkPeriod, 1
-		}
-		_ -> return TkIllegal, 1
-	}
-}
-
-func (l *Lexer) scanOperator(start Token) Token {
-	k, size := l.opKind()
-	if k == TkIllegal {
-		c := l.src[l.off]
-		r, w := decodeRune(l.src, l.off)
-		l.advanceTo(l.off + w)
-		if r == RuneError && w <= 1 {
-			t := l.illegal(start, LexErrBadUTF8)
-			t.errByte = c
-			return t
-		}
-		t := l.illegal(start, LexErrBadChar)
-		t.val = u64(r)
-		return t
-	}
-	l.advanceTo(l.off + size)
-	t := l.finishTok(start)
-	t.kind = k
-	l.insertSemi = k is TkRParen | TkRBrack | TkRBrace | TkInc | TkDec
-	return t
-}
-
-// escape scans one escape sequence starting at the backslash.
-func (l *Lexer) escape(quote byte) Esc {
-	l.advance() // backslash
-	if l.off >= l.n {
-		return Esc.EOF
-	}
-	c := l.src[l.off]
-	if c == 'n' {
-		l.advance()
-		return Esc.Ok('\n')
-	}
-	if c == 'r' {
-		l.advance()
-		return Esc.Ok('\r')
-	}
-	if c == 't' {
-		l.advance()
-		return Esc.Ok('\t')
-	}
-	if c == '\\' {
-		l.advance()
-		return Esc.Ok('\\')
-	}
-	if c is '"' | '\'' {
-		if c != quote {
-			return Esc.Invalid(c)
-		}
-		l.advance()
-		return Esc.Ok(c)
-	}
-	if c == 'x' {
-		l.advance()
-		h1 := l.peekByte(0)
-		h2 := l.peekByte(1)
-		if !isHex(h1) || !isHex(h2) {
-			return Esc.BadHex
-		}
-		l.advance()
-		l.advance()
-		return Esc.Ok((hexVal(h1) << 4) | hexVal(h2))
-	}
-	if c == '\n' {
-		return Esc.Newline
-	}
-	return Esc.Invalid(c)
-}
-
-func (l *Lexer) scanString(start Token) Token {
-	l.advance() // opening quote
-	badKind := u8(LexErrNone)
-	badLine := u32(0)
-	badCol := u32(0)
-	badByte := byte(0)
-	closed := false
-	lim := l.n
-	for g := usize(0); g < lim; g++ {
-		if l.off >= l.n || l.src[l.off] == '\n' {
-			return l.illegal(start, LexErrUntermString)
-		}
-		c := l.src[l.off]
-		if c == '"' {
-			l.advance()
-			closed = true
-			break
-		}
-		if c == '\\' {
-			pl := l.line
-			pc := l.col()
-			bad := u8(LexErrNone)
-			match l.escape('"') {
-				EOF | Newline -> return l.illegal(start, LexErrUntermString)
-				Ok(_) -> {}
-				BadHex -> bad = LexErrBadHexEscape
-				Invalid(bb) -> {
-					bad = LexErrBadEscape
-					if badKind == LexErrNone {
-						badByte = bb
+			if c == '/' && i+1 < n && srcBuf[base+i+1] == '/' {
+				i += 2
+				for lc := usize(0); lc < n; lc++ {
+					if i >= n || srcBuf[base+i] == '\n' {
+						break
 					}
+					i++
+				}
+				continue
+			}
+			if c == '/' && i+1 < n && srcBuf[base+i+1] == '*' {
+				cstart := u32(i)
+				i += 2
+				sawNL := false
+				closed := false
+				for bc := usize(0); bc < n; bc++ {
+					if i >= n {
+						break
+					}
+					if srcBuf[base+i] == '\n' {
+						sawNL = true
+					}
+					if srcBuf[base+i] == '*' && i+1 < n && srcBuf[base+i+1] == '/' {
+						i += 2
+						closed = true
+						break
+					}
+					i++
+				}
+				if !closed {
+					addDiagStr(E1002, fileID, cstart, "unterminated block comment")
+				}
+				if sawNL && insertSemi {
+					emitTok(TKSemi, TokFlagAutoSemi, u32(i), u32(i), 0)
+					insertSemi = false
+				}
+				continue
+			}
+			break
+		}
+
+		if i >= n {
+			if insertSemi {
+				emitTok(TKSemi, TokFlagAutoSemi, u32(n), u32(n), 0)
+			}
+			emitTok(TKEof, 0, u32(n), u32(n), 0)
+			break
+		}
+
+		start := i
+		c := srcBuf[base+i]
+
+		// Identifier or keyword
+		if isIdentStart(c) {
+			i++
+			for id := usize(0); id < n; id++ {
+				if i >= n || !isIdentCont(srcBuf[base+i]) {
+					break
+				}
+				i++
+			}
+			sid := internBytes(srcBuf[base+start : base+i])
+			k := lookupKeyword(sid)
+			emitTok(k, 0, u32(start), u32(i), sid)
+			insertSemi = triggersSemi(k)
+			continue
+		}
+
+		// Integer or Float literal
+		if isDigit(c) {
+			isHex := c == '0' && i+1 < n && (srcBuf[base+i+1] == 'x' || srcBuf[base+i+1] == 'X')
+			isBin := c == '0' && i+1 < n && (srcBuf[base+i+1] == 'b' || srcBuf[base+i+1] == 'B')
+			isOct := c == '0' && i+1 < n && (srcBuf[base+i+1] == 'o' || srcBuf[base+i+1] == 'O')
+			isFloat := false
+			i++
+			for dg := usize(0); dg < n; dg++ {
+				if i >= n {
+					break
+				}
+				ch := srcBuf[base+i]
+				if !isHex && !isBin && !isOct && !isFloat && ch == '.' && i+1 < n && isDigit(srcBuf[base+i+1]) {
+					isFloat = true
+					i++
+					continue
+				}
+				if !isHex && !isBin && !isOct && (ch == 'e' || ch == 'E') {
+					isFloat = true
+					i++
+					if i < n && (srcBuf[base+i] == '+' || srcBuf[base+i] == '-') {
+						i++
+					}
+					continue
+				}
+				if isIdentCont(ch) {
+					i++
+				} else {
+					break
 				}
 			}
-			if bad != LexErrNone && badKind == LexErrNone {
-				badLine = pl
-				badCol = pc
-				badKind = bad
+			sid := internBytes(srcBuf[base+start : base+i])
+			if isFloat {
+				emitTok(TKFloat, 0, u32(start), u32(i), sid)
+			} else {
+				emitTok(TKInt, 0, u32(start), u32(i), sid)
 			}
+			insertSemi = true
 			continue
 		}
-		l.advance()
-	}
-	if !closed {
-		return l.illegal(start, LexErrUntermString)
-	}
-	if badKind != LexErrNone {
-		return l.illegalAt(start, badKind, badLine, badCol, badByte)
-	}
-	l.insertSemi = true
-	t := l.finishTok(start)
-	t.kind = TkString
-	return t
-}
 
-func (l *Lexer) scanChar(start Token) Token {
-	l.advance() // opening quote
-	if l.off >= l.n || l.src[l.off] == '\n' {
-		return l.illegal(start, LexErrUntermChar)
-	}
-	c := l.src[l.off]
-	v := byte(0)
-	if c == '\'' {
-		l.advance()
-		return l.illegal(start, LexErrEmptyChar)
-	} else if c == '\\' {
-		pl := l.line
-		pc := l.col()
-		match l.escape('\'') {
-			EOF | Newline -> return l.illegal(start, LexErrUntermChar)
-			BadHex -> {
-				l.skipCharRest()
-				return l.illegalAt(start, LexErrBadHexEscape, pl, pc, 0)
+		// String literal
+		if c == '"' {
+			i++
+			var decoded [4096]byte
+			dlen := usize(0)
+			closed := false
+			for sc := usize(0); sc < n; sc++ {
+				if i >= n {
+					break
+				}
+				ch := srcBuf[base+i]
+				if ch == '\n' {
+					break
+				}
+				if ch == '"' {
+					i++
+					closed = true
+					break
+				}
+				if ch == '\\' {
+					i++
+					if i >= n {
+						break
+					}
+					ec := srcBuf[base+i]
+					i++
+					var b byte
+					if ec == 'n' {
+						b = '\n'
+					} else if ec == 'r' {
+						b = '\r'
+					} else if ec == 't' {
+						b = '\t'
+					} else if ec == '\\' {
+						b = '\\'
+					} else if ec == '"' {
+						b = '"'
+					} else if ec == '\'' {
+						b = '\''
+					} else if ec == '0' {
+						b = 0
+					} else if ec == 'x' && i+1 < n {
+						hi, ok1 := hexVal(srcBuf[base+i])
+						lo, ok2 := hexVal(srcBuf[base+i+1])
+						if ok1 && ok2 {
+							b = (hi << 4) | lo
+							i += 2
+						} else {
+							addDiagStr(E1001, fileID, u32(i-2), "invalid hex escape in string literal")
+						}
+					} else {
+						addDiagStr(E1001, fileID, u32(i-2), "unknown escape sequence in string literal")
+						b = ec
+					}
+					if dlen < len(decoded) {
+						decoded[dlen] = b
+						dlen++
+					}
+					continue
+				}
+				if dlen < len(decoded) {
+					decoded[dlen] = ch
+					dlen++
+				}
+				i++
 			}
-			Invalid(bb) -> {
-				l.skipCharRest()
-				return l.illegalAt(start, LexErrBadEscape, pl, pc, bb)
+			if !closed {
+				addDiagStr(E1002, fileID, u32(start), "unterminated string literal")
 			}
-			Ok(b) -> v = b
+			sid := internBytes(decoded[:dlen])
+			emitTok(TKString, 0, u32(start), u32(i), sid)
+			insertSemi = true
+			continue
 		}
-	} else if c >= 0x80 {
-		l.skipCharRest()
-		return l.illegal(start, LexErrCharMultiByte)
-	} else {
-		v = c
-		l.advance()
-	}
-	if l.off >= l.n || l.src[l.off] == '\n' {
-		return l.illegal(start, LexErrUntermChar)
-	}
-	if l.src[l.off] != '\'' {
-		l.skipCharRest()
-		return l.illegal(start, LexErrCharLen)
-	}
-	l.advance()
-	l.insertSemi = true
-	t := l.finishTok(start)
-	t.kind = TkChar
-	t.val = u64(v)
-	return t
-}
 
-// skipCharRest skips to just past the closing quote on the same line, if any.
-func (l *Lexer) skipCharRest() {
-	n := l.n
-	for i := l.off; i < n; i++ {
-		if l.src[i] == '\n' {
-			return
+		// Character literal
+		if c == '\'' {
+			i++
+			var cb [1]byte
+			clen := usize(0)
+			closed := false
+			for cc := usize(0); cc < 16; cc++ {
+				if i >= n {
+					break
+				}
+				ch := srcBuf[base+i]
+				if ch == '\n' {
+					break
+				}
+				if ch == '\'' {
+					i++
+					closed = true
+					break
+				}
+				var b byte
+				if ch == '\\' {
+					i++
+					if i >= n {
+						break
+					}
+					ec := srcBuf[base+i]
+					i++
+					if ec == 'n' {
+						b = '\n'
+					} else if ec == 'r' {
+						b = '\r'
+					} else if ec == 't' {
+						b = '\t'
+					} else if ec == '\\' {
+						b = '\\'
+					} else if ec == '\'' {
+						b = '\''
+					} else if ec == '"' {
+						b = '"'
+					} else if ec == '0' {
+						b = 0
+					} else if ec == 'x' && i+1 < n {
+						hi, ok1 := hexVal(srcBuf[base+i])
+						lo, ok2 := hexVal(srcBuf[base+i+1])
+						if ok1 && ok2 {
+							b = (hi << 4) | lo
+							i += 2
+						}
+					} else {
+						b = ec
+					}
+				} else {
+					b = ch
+					i++
+				}
+				if clen == 0 {
+					cb[0] = b
+				}
+				clen++
+			}
+			if !closed || clen != 1 {
+				addDiagStr(E1002, fileID, u32(start), "invalid or unterminated character literal")
+			}
+			sid := internBytes(cb[:1])
+			emitTok(TKChar, 0, u32(start), u32(i), sid)
+			insertSemi = true
+			continue
 		}
-		if l.src[i] == '\'' {
-			l.advanceTo(i + 1)
-			return
-		}
-	}
-}
 
-// tokenize scans a whole file into ta. The token list always ends with
-// EOF. It returns false if the token arena overflowed.
-func tokenize(l *Lexer, ta *TokenArena) bool {
-	ta.Reset()
-	lim := l.n + 2
-	for g := usize(0); g < lim; g++ {
-		t := l.nextToken()
-		if !ta.Push(t) {
-			return false
+		// Operators & punctuation
+		var next byte
+		if i+1 < n {
+			next = srcBuf[base+i+1]
 		}
-		if t.kind == TkEOF {
-			return true
+		var next2 byte
+		if i+2 < n {
+			next2 = srcBuf[base+i+2]
 		}
+		i++
+		var kind u8 = TKIllegal
+		if c == '+' {
+			if next == '+' {
+				i++
+				kind = TKInc
+			} else if next == '=' {
+				i++
+				kind = TKAddAssign
+			} else {
+				kind = TKAdd
+			}
+		} else if c == '-' {
+			if next == '-' {
+				i++
+				kind = TKDec
+			} else if next == '=' {
+				i++
+				kind = TKSubAssign
+			} else if next == '>' {
+				i++
+				kind = TKArrow
+			} else {
+				kind = TKSub
+			}
+		} else if c == '*' {
+			if next == '=' {
+				i++
+				kind = TKMulAssign
+			} else {
+				kind = TKMul
+			}
+		} else if c == '/' {
+			if next == '=' {
+				i++
+				kind = TKQuoAssign
+			} else {
+				kind = TKQuo
+			}
+		} else if c == '%' {
+			if next == '=' {
+				i++
+				kind = TKRemAssign
+			} else {
+				kind = TKRem
+			}
+		} else if c == '&' {
+			if next == '&' {
+				i++
+				kind = TKLAnd
+			} else if next == '=' {
+				i++
+				kind = TKAndAssign
+			} else {
+				kind = TKAnd
+			}
+		} else if c == '|' {
+			if next == '|' {
+				i++
+				kind = TKLOr
+			} else if next == '=' {
+				i++
+				kind = TKOrAssign
+			} else {
+				kind = TKOr
+			}
+		} else if c == '^' {
+			if next == '=' {
+				i++
+				kind = TKXorAssign
+			} else {
+				kind = TKXor
+			}
+		} else if c == '<' {
+			if next == '<' {
+				i++
+				if next2 == '=' {
+					i++
+					kind = TKShlAssign
+				} else {
+					kind = TKShl
+				}
+			} else if next == '=' {
+				i++
+				kind = TKLeq
+			} else {
+				kind = TKLss
+			}
+		} else if c == '>' {
+			if next == '>' {
+				i++
+				if next2 == '=' {
+					i++
+					kind = TKShrAssign
+				} else {
+					kind = TKShr
+				}
+			} else if next == '=' {
+				i++
+				kind = TKGeq
+			} else {
+				kind = TKGtr
+			}
+		} else if c == '=' {
+			if next == '=' {
+				i++
+				kind = TKEql
+			} else {
+				kind = TKAssign
+			}
+		} else if c == '!' {
+			if next == '=' {
+				i++
+				kind = TKNeq
+			} else {
+				kind = TKNot
+			}
+		} else if c == ':' {
+			if next == '=' {
+				i++
+				kind = TKDefine
+			} else {
+				kind = TKColon
+			}
+		} else if c == '(' {
+			kind = TKLParen
+		} else if c == ')' {
+			kind = TKRParen
+		} else if c == '[' {
+			kind = TKLBrack
+		} else if c == ']' {
+			kind = TKRBrack
+		} else if c == '{' {
+			kind = TKLBrace
+		} else if c == '}' {
+			kind = TKRBrace
+		} else if c == ',' {
+			kind = TKComma
+		} else if c == '.' {
+			if next == '.' && next2 == '.' {
+				i += 2
+				kind = TKEllipsis
+			} else {
+				kind = TKPeriod
+			}
+		} else if c == ';' {
+			kind = TKSemi
+		} else {
+			addDiagStr(E1001, fileID, u32(start), "unexpected character")
+		}
+		emitTok(kind, 0, u32(start), u32(i), 0)
+		insertSemi = triggersSemi(kind)
 	}
-	return false
+	files[fileID].tokStart = startTok
+	files[fileID].tokCount = tokCount - startTok
 }

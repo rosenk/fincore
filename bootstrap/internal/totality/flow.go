@@ -195,7 +195,6 @@ func (w *walker) stmt(s ast.Stmt, st *state) *state {
 		for _, arm := range s.Arms {
 			a := st.clone()
 			w.killPattern(arm.Pattern, a)
-			w.expr(arm.Guard, a)
 			if arm.Expr != nil {
 				w.expr(arm.Expr, a)
 				if w.isPanic(arm.Expr) {
@@ -240,16 +239,11 @@ func (w *walker) stmt(s ast.Stmt, st *state) *state {
 	return st
 }
 
-// killPattern forgets the facts about the bindings of a pattern (v0.2:
-// nested, or- and tuple patterns; `is` expressions).
 func (w *walker) killPattern(p ast.Pattern, st *state) {
 	switch p := p.(type) {
 	case *ast.Ident:
 		w.kill(w.c.info.SymbolOf(p), st)
 	case *ast.CtorPattern:
-		if p.Qual == nil && !p.HasParens {
-			w.killPattern(p.Name, st) // v0.2: top-level/tuple binding
-		}
 		for _, a := range p.Args {
 			w.killPattern(a, st)
 		}
@@ -257,13 +251,6 @@ func (w *walker) killPattern(p ast.Pattern, st *state) {
 		for _, a := range p.Alts {
 			w.killPattern(a, st)
 		}
-	case *ast.TuplePattern:
-		for _, a := range p.Elems {
-			w.killPattern(a, st)
-		}
-	case *ast.AtPattern:
-		w.killPattern(p.Name, st) // v0.2: `x @ P`
-		w.killPattern(p.Pattern, st)
 	}
 }
 
@@ -306,18 +293,12 @@ func (w *walker) expr(e ast.Expr, st *state) {
 	case *ast.FuncLit:
 		return
 	case *ast.MatchExpr:
-		// v0.2: the arms are branches; the payload bindings are fresh.
 		w.expr(x.X, st)
 		for _, arm := range x.Arms {
 			a := st.clone()
 			w.killPattern(arm.Pattern, a)
-			w.expr(arm.Guard, a)
 			w.expr(arm.Expr, a)
 		}
-		return
-	case *ast.IsExpr:
-		w.expr(x.X, st)
-		w.killPattern(x.Pattern, st)
 		return
 	case *ast.BinaryExpr:
 		if x.Op == ast.OpLAnd || x.Op == ast.OpLOr {

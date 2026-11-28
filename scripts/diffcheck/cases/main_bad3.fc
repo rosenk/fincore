@@ -1,5 +1,0 @@
-package main
-
-driver func main[T any](xs ...Net) (error, u32) {
-	return nil, 0
-}

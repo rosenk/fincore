@@ -356,10 +356,6 @@ func (p *printer) node(n Node) {
 		p.w("}")
 	case *MatchArm:
 		p.node(n.Pattern)
-		if n.Guard != nil {
-			p.w(" if ")
-			p.node(n.Guard)
-		}
 		p.w(" -> ")
 		if n.Block != nil {
 			p.node(n.Block)
@@ -390,52 +386,7 @@ func (p *printer) node(n Node) {
 			if i > 0 {
 				p.w(" | ")
 			}
-			if _, ok := a.(*AtPattern); ok {
-				p.w("(")
-				p.node(a)
-				p.w(")")
-			} else {
-				p.node(a)
-			}
-		}
-	case *TuplePattern:
-		p.w("(")
-		for i, a := range n.Elems {
-			if i > 0 {
-				p.w(", ")
-			}
 			p.node(a)
-		}
-		p.w(")")
-	case *RestPattern:
-		p.w("..")
-	case *AtPattern:
-		p.w(n.Name.Name, " @ ")
-		if _, ok := n.Pattern.(*OrPattern); ok {
-			p.w("(")
-			p.node(n.Pattern)
-			p.w(")")
-		} else {
-			p.node(n.Pattern)
-		}
-	case *TupleExpr:
-		p.w("(")
-		for i, a := range n.Elems {
-			if i > 0 {
-				p.w(", ")
-			}
-			p.node(a)
-		}
-		p.w(")")
-	case *IsExpr:
-		if p.opts.FullParens {
-			p.w("(")
-		}
-		p.node(n.X)
-		p.w(" is ")
-		p.node(n.Pattern)
-		if p.opts.FullParens {
-			p.w(")")
 		}
 	case *MatchExpr:
 		// one line, so that diagnostics embedding it stay single-line
@@ -563,6 +514,11 @@ func (p *printer) node(n Node) {
 			}
 			p.node(f)
 		}
+		p.w("}")
+	case *ArrayLit:
+		p.node(n.Type)
+		p.w("{")
+		p.exprs(n.Elems)
 		p.w("}")
 	case *FieldInit:
 		p.w(n.Name.Name, ": ")

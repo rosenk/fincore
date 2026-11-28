@@ -176,16 +176,11 @@ func (f *flow) collectVars(body *ast.BlockStmt) {
 		case *ast.VarDecl:
 			ids = []*ast.Ident{n.Name}
 		case *ast.CtorPattern:
-			if n.Qual == nil && !n.HasParens {
-				ids = append(ids, n.Name) // v0.2: top-level/tuple binding
-			}
 			for _, a := range n.Args {
 				if id, ok := a.(*ast.Ident); ok {
 					ids = append(ids, id)
 				}
 			}
-		case *ast.AtPattern:
-			ids = append(ids, n.Name) // v0.2: `x @ P`
 		}
 		for _, id := range ids {
 			if s := c.varSym(id); s != nil && isDef(c.info, id, s) && types.IsLinear(c.info.SymType(s)) {
@@ -455,7 +450,6 @@ func (f *flow) stmt(s ast.Stmt, e *env) *env {
 			a := e.clone()
 			f.frames = append(f.frames, nil)
 			f.borrowBindings(arm.Pattern, a)
-			f.expr(arm.Guard, a)
 			if arm.Expr != nil {
 				f.expr(arm.Expr, a)
 				if call, ok := unparen(arm.Expr).(*ast.CallExpr); ok {
@@ -588,9 +582,6 @@ func (f *flow) borrowBindings(p ast.Pattern, a *env) {
 			}
 		}
 	case *ast.CtorPattern:
-		if p.Qual == nil && !p.HasParens {
-			f.borrowBindings(p.Name, a) // v0.2: top-level/tuple binding
-		}
 		for _, x := range p.Args {
 			f.borrowBindings(x, a)
 		}
@@ -598,21 +589,9 @@ func (f *flow) borrowBindings(p ast.Pattern, a *env) {
 		for _, x := range p.Alts {
 			f.borrowBindings(x, a)
 		}
-	case *ast.TuplePattern:
-		for _, x := range p.Elems {
-			f.borrowBindings(x, a)
-		}
-	case *ast.AtPattern:
-		// v0.2: x and the bindings of P are all borrowed, so x @ P
-		// never owns a Linear value twice.
-		f.borrowBindings(p.Name, a)
-		f.borrowBindings(p.Pattern, a)
 	}
 }
 
-// matchExpr handles a match expression (v0.2): the arms are branches,
-// payload bindings are borrowed, and an arm that is a Linear variable
-// moves it (like the right-hand side of an assignment).
 func (f *flow) matchExpr(x *ast.MatchExpr, e *env) {
 	c := f.c
 	f.expr(x.X, e)
@@ -620,7 +599,6 @@ func (f *flow) matchExpr(x *ast.MatchExpr, e *env) {
 	for _, arm := range x.Arms {
 		a := e.clone()
 		f.borrowBindings(arm.Pattern, a)
-		f.expr(arm.Guard, a)
 		if i := f.linVar(arm.Expr); i >= 0 && types.IsLinear(c.info.TypeOf(arm.Expr)) {
 			f.consume(a, i, rootIdent(arm.Expr), kMove)
 		} else {
@@ -724,19 +702,20 @@ func (f *flow) expr(x ast.Expr, e *env) {
 				f.expr(fi.Value, e)
 			}
 		}
+	case *ast.ArrayLit:
+		for _, el := range x.Elems {
+			if i := f.linVar(el); i >= 0 && types.IsLinear(f.c.info.TypeOf(el)) {
+				f.consume(e, i, rootIdent(el), kMove)
+			} else {
+				f.expr(el, e)
+			}
+		}
 	case *ast.CallExpr:
 		f.call(x, e, false)
 	case *ast.FuncLit:
 		f.lit(x, e, false)
 	case *ast.MatchExpr:
 		f.matchExpr(x, e)
-	case *ast.TupleExpr:
-		for _, y := range x.Elems {
-			f.expr(y, e)
-		}
-	case *ast.IsExpr:
-		f.expr(x.X, e)
-		f.borrowBindings(x.Pattern, e)
 	}
 }
 

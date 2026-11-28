@@ -1,0 +1,12 @@
+// SINCE: v0.4
+package main
+
+func bad(s string) {
+	var m []byte = strView(s) // ERROR E2002
+	_ = m
+}
+
+driver func main() error {
+	bad("hello")
+	return nil
+}

@@ -1,0 +1,387 @@
+package main
+
+// Fast, deterministic, conservative x86_64 peephole optimizer for FinCore v0.6.
+// Runs in linear O(N) time with O(1) first-byte opcode dispatch over fnBodyBuf:
+//   1. Drops redundant `movq`/`movl` store-to-slot -> immediate reload-from-slot
+//      and forwards cross-register reloads (`movq %rax, slot; movq slot, %rcx` -> `movq %rax, %rcx`).
+//   2. Strength-reduces `movabsq $imm, %rax` (10B) to `xorl %eax, %eax` (2B),
+//      `movl $imm, %eax` (5B), or `movq $imm, %rax` (7B).
+//   3. Eliminates identity ops (`imulq $1`, `addq $0`, `subq $0`, `movq %rax, %rax`)
+//      and converts power-of-2 `imulq` strides ($2/$4/$8/$16/$32) to `shlq`.
+//   4. Eliminates dead fallthrough jumps (`jmp .L_x` right before `.L_x:`) and
+//      inverts `je .L_A; jmp .L_B; .L_A:` into `jne .L_B`.
+
+const MaxOptLines = 65536
+
+var optLineStart [MaxOptLines]u32
+var optLineLen [MaxOptLines]u32
+
+func bytesStartsWith(b []byte, prefix string) bool {
+	pn := len(prefix)
+	if len(b) < pn {
+		return false
+	}
+	for i := usize(0); i < pn; i++ {
+		if b[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func bytesEndsWith(b []byte, suffix string) bool {
+	sn := len(suffix)
+	if len(b) < sn {
+		return false
+	}
+	off := len(b) - sn
+	for i := usize(0); i < sn; i++ {
+		if b[off+i] != suffix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func bytesEqStr(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := usize(0); i < len(s); i++ {
+		if b[i] != s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func parseSignedDec64(b []byte) (i64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	neg := false
+	i := usize(0)
+	if b[0] == '-' {
+		neg = true
+		i = 1
+		if len(b) == 1 {
+			return 0, false
+		}
+	}
+	var acc u64 = 0
+	for step := usize(0); step < len(b); step++ {
+		if i >= len(b) {
+			break
+		}
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := u64(c - '0')
+		if acc > (9223372036854775808-d)/10 {
+			return 0, false
+		}
+		acc = acc*10 + d
+		i++
+	}
+	if neg {
+		if acc > 9223372036854775808 {
+			return 0, false
+		}
+		return i64(0 - acc), true
+	}
+	if acc > 9223372036854775807 {
+		return 0, false
+	}
+	return i64(acc), true
+}
+
+func nextUsesFlags(line []byte) bool {
+	if len(line) < 6 || line[0] != ' ' {
+		return false
+	}
+	c := line[4]
+	if c == 's' {
+		return bytesStartsWith(line, "    set")
+	}
+	if c == 'c' {
+		return bytesStartsWith(line, "    cmov")
+	}
+	if c == 'j' {
+		return !(len(line) >= 8 && line[5] == 'm' && line[6] == 'p' && line[7] == ' ')
+	}
+	return false
+}
+
+func isFrameSlot(s []byte) bool {
+	n := len(s)
+	return n >= 7 && s[n-1] == ')' && s[n-2] == 'p' && s[n-3] == 'b' && s[n-4] == 'r' && s[n-5] == '%' && s[n-6] == '('
+}
+
+driver func emitOptimizedFnBody() {
+	if fnBodyLen == 0 {
+		return
+	}
+	nLines := u32(0)
+	pos := usize(0)
+	for step := usize(0); step < fnBodyLen; step++ {
+		if pos >= fnBodyLen || nLines >= MaxOptLines {
+			break
+		}
+		ls := pos
+		for scan := usize(0); scan < fnBodyLen; scan++ {
+			if pos >= fnBodyLen || fnBodyBuf[pos] == '\n' {
+				break
+			}
+			pos++
+		}
+		optLineStart[nLines] = u32(ls)
+		optLineLen[nLines] = u32(pos - ls)
+		nLines++
+		if pos < fnBodyLen && fnBodyBuf[pos] == '\n' {
+			pos++
+		}
+	}
+	if pos < fnBodyLen {
+		secWrite(SecText, fnBodyBuf[:fnBodyLen])
+		return
+	}
+
+	// Track last emitted frame store:
+	// 0=none, 1=movq %rax->slot, 2=movl %eax->slot, 3=movq %rcx->slot, 4=movl %ecx->slot
+	var lastStoreKind u8 = 0
+	var lastSlotStart u32 = 0
+	var lastSlotLen u32 = 0
+	skipNext := false
+
+	for i := u32(0); i < nLines; i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		ls := usize(optLineStart[i])
+		ll := usize(optLineLen[i])
+		line := fnBodyBuf[ls : ls+ll]
+
+		if ll < 6 || line[0] != ' ' {
+			// Label or blank line resets store tracking
+			secWrite(SecText, line)
+			secWriteByte(SecText, '\n')
+			lastStoreKind = 0
+			continue
+		}
+
+		c4 := line[4]
+
+		// Fast path: Jump peepholes (`jmp` / `je`)
+		if c4 == 'j' {
+			if i+1 < nLines {
+				nls := usize(optLineStart[i+1])
+				nll := usize(optLineLen[i+1])
+				nextLine := fnBodyBuf[nls : nls+nll]
+				// Rule 4a: `    jmp .L_x` immediately followed by `.L_x:`
+				if ll > 8 && line[5] == 'm' && line[6] == 'p' && line[7] == ' ' && nll > 1 && nextLine[nll-1] == ':' {
+					if sliceEq(line[8:], nextLine[:nll-1]) {
+						lastStoreKind = 0
+						continue
+					}
+				}
+				// Rule 4b: `    je .L_A` + `    jmp .L_B` + `.L_A:` -> `    jne .L_B` + `.L_A:`
+				if i+2 < nLines && ll > 7 && line[5] == 'e' && line[6] == ' ' && nll > 8 && nextLine[0] == ' ' && nextLine[4] == 'j' && nextLine[5] == 'm' && nextLine[6] == 'p' && nextLine[7] == ' ' {
+					ls2 := usize(optLineStart[i+2])
+					ll2 := usize(optLineLen[i+2])
+					line2 := fnBodyBuf[ls2 : ls2+ll2]
+					if ll2 > 1 && line2[ll2-1] == ':' && sliceEq(line[7:], line2[:ll2-1]) {
+						secWriteStr(SecText, "    jne ")
+						secWrite(SecText, nextLine[8:])
+						secWriteByte(SecText, '\n')
+						lastStoreKind = 0
+						skipNext = true // skip the `jmp .L_B`
+						continue
+					}
+				}
+			}
+			secWrite(SecText, line)
+			secWriteByte(SecText, '\n')
+			lastStoreKind = 0
+			continue
+		}
+
+		// Fast path: `imulq` identity & power-of-2 strength reduction
+		if c4 == 'i' && ll >= 22 && line[5] == 'm' {
+			if bytesEqStr(line, "    imulq $1, %rcx, %rcx") || bytesEqStr(line, "    imulq $1, %rax, %rax") {
+				continue
+			}
+			var nextLine []byte
+			if i+1 < nLines {
+				nextLine = fnBodyBuf[usize(optLineStart[i+1]) : usize(optLineStart[i+1])+usize(optLineLen[i+1])]
+			}
+			if !nextUsesFlags(nextLine) {
+				if bytesEqStr(line, "    imulq $2, %rcx, %rcx") {
+					secWriteStr(SecText, "    shlq $1, %rcx\n")
+					lastStoreKind = 0
+					continue
+				}
+				if bytesEqStr(line, "    imulq $4, %rcx, %rcx") {
+					secWriteStr(SecText, "    shlq $2, %rcx\n")
+					lastStoreKind = 0
+					continue
+				}
+				if bytesEqStr(line, "    imulq $8, %rcx, %rcx") {
+					secWriteStr(SecText, "    shlq $3, %rcx\n")
+					lastStoreKind = 0
+					continue
+				}
+				if bytesEqStr(line, "    imulq $16, %rcx, %rcx") {
+					secWriteStr(SecText, "    shlq $4, %rcx\n")
+					lastStoreKind = 0
+					continue
+				}
+				if bytesEqStr(line, "    imulq $32, %rcx, %rcx") {
+					secWriteStr(SecText, "    shlq $5, %rcx\n")
+					lastStoreKind = 0
+					continue
+				}
+				if bytesEqStr(line, "    imulq $8, %rax, %rax") {
+					secWriteStr(SecText, "    shlq $3, %rax\n")
+					lastStoreKind = 0
+					continue
+				}
+			}
+			secWrite(SecText, line)
+			secWriteByte(SecText, '\n')
+			lastStoreKind = 0
+			continue
+		}
+
+		// Fast path: `addq $0` / `subq $0`
+		if (c4 == 'a' || c4 == 's') && ll == 17 && line[9] == '$' && line[10] == '0' {
+			if bytesEqStr(line, "    addq $0, %rax") ||
+				bytesEqStr(line, "    addq $0, %rcx") ||
+				bytesEqStr(line, "    addq $0, %rsp") ||
+				bytesEqStr(line, "    subq $0, %rsp") {
+				continue
+			}
+		}
+
+		// Fast path: `mov*` peepholes (redundant reloads, identity moves, movabsq reduction)
+		if c4 == 'm' && line[5] == 'o' && line[6] == 'v' {
+			// Identity reg-to-reg `movq %r, %r`
+			if ll == 19 && line[7] == 'q' && line[9] == '%' && line[15] == '%' {
+				if line[10] == line[16] && line[11] == line[17] && line[12] == line[18] {
+					continue
+				}
+			}
+
+			// Rule 1: Redundant store-to-slot -> immediate reload from same slot
+			if lastStoreKind != 0 && ll > 15 && (line[7] == 'q' || line[7] == 'l') && line[8] == ' ' && line[ll-6] == ',' && line[ll-4] == '%' {
+				prevSlot := fnBodyBuf[usize(lastSlotStart) : usize(lastSlotStart)+usize(lastSlotLen)]
+				src := line[9 : ll-6]
+				if sliceEq(src, prevSlot) {
+					r1 := line[ll-3]
+					r2 := line[ll-2]
+					r3 := line[ll-1]
+					if lastStoreKind == 1 && line[7] == 'q' {
+						if r1 == 'r' && r2 == 'a' && r3 == 'x' {
+							continue
+						}
+						if r1 == 'r' && ((r2 == 'c' && r3 == 'x') || (r2 == 'd' && r3 == 'x') || (r2 == 'd' && r3 == 'i') || (r2 == 's' && r3 == 'i')) {
+							secWriteStr(SecText, "    movq %rax, %")
+							secWrite(SecText, line[ll-3:ll])
+							secWriteByte(SecText, '\n')
+							continue
+						}
+					} else if lastStoreKind == 2 && line[7] == 'l' && r1 == 'e' && r2 == 'a' && r3 == 'x' {
+						continue
+					} else if lastStoreKind == 3 && line[7] == 'q' {
+						if r1 == 'r' && r2 == 'c' && r3 == 'x' {
+							continue
+						}
+						if r1 == 'r' && r2 == 'a' && r3 == 'x' {
+							secWriteStr(SecText, "    movq %rcx, %rax\n")
+							continue
+						}
+					} else if lastStoreKind == 4 && line[7] == 'l' {
+						if r1 == 'e' && r2 == 'c' && r3 == 'x' {
+							continue
+						}
+						if r1 == 'e' && r2 == 'a' && r3 == 'x' {
+							secWriteStr(SecText, "    movl %ecx, %eax\n")
+							continue
+						}
+					}
+				}
+			}
+
+			// Rule 2: `    movabsq $IMM, %rax` strength reduction
+			if ll > 19 && line[7] == 'a' && line[12] == '$' && bytesEndsWith(line, ", %rax") {
+				immSlice := line[13 : ll-6]
+				if val, ok := parseSignedDec64(immSlice); ok {
+					var nextLine []byte
+					if i+1 < nLines {
+						nextLine = fnBodyBuf[usize(optLineStart[i+1]) : usize(optLineStart[i+1])+usize(optLineLen[i+1])]
+					}
+					if val == 0 && !nextUsesFlags(nextLine) {
+						secWriteStr(SecText, "    xorl %eax, %eax\n")
+						lastStoreKind = 0
+						continue
+					}
+					if val > 0 && val <= 2147483647 {
+						secWriteStr(SecText, "    movl $")
+						secWriteI64(SecText, val)
+						secWriteStr(SecText, ", %eax\n")
+						lastStoreKind = 0
+						continue
+					}
+					if val < 0 && val >= -2147483648 {
+						secWriteStr(SecText, "    movq $")
+						secWriteI64(SecText, val)
+						secWriteStr(SecText, ", %rax\n")
+						lastStoreKind = 0
+						continue
+					}
+				}
+			}
+
+			// Emit mov line & update store tracker
+			secWrite(SecText, line)
+			secWriteByte(SecText, '\n')
+			if ll > 21 && line[8] == ' ' && line[9] == '%' && line[13] == ',' && line[14] == ' ' {
+				dst := line[15:]
+				if isFrameSlot(dst) {
+					if line[7] == 'q' && line[10] == 'r' && line[11] == 'a' && line[12] == 'x' {
+						lastStoreKind = 1
+						lastSlotStart = u32(ls + 15)
+						lastSlotLen = u32(len(dst))
+						continue
+					}
+					if line[7] == 'l' && line[10] == 'e' && line[11] == 'a' && line[12] == 'x' {
+						lastStoreKind = 2
+						lastSlotStart = u32(ls + 15)
+						lastSlotLen = u32(len(dst))
+						continue
+					}
+					if line[7] == 'q' && line[10] == 'r' && line[11] == 'c' && line[12] == 'x' {
+						lastStoreKind = 3
+						lastSlotStart = u32(ls + 15)
+						lastSlotLen = u32(len(dst))
+						continue
+					}
+					if line[7] == 'l' && line[10] == 'e' && line[11] == 'c' && line[12] == 'x' {
+						lastStoreKind = 4
+						lastSlotStart = u32(ls + 15)
+						lastSlotLen = u32(len(dst))
+						continue
+					}
+				}
+			}
+			lastStoreKind = 0
+			continue
+		}
+
+		// Default: emit line verbatim and clear store tracking
+		secWrite(SecText, line)
+		secWriteByte(SecText, '\n')
+		lastStoreKind = 0
+	}
+}

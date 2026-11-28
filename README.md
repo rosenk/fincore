@@ -1,27 +1,36 @@
 # FinCore
 
-**FinCore** is an experimental systems programming language with **Go ergonomics** built on the principles of **mathematical finitism**. It has a Go backend and is designed to compile itself.
+**FinCore** is a finitist systems programming language with **Go ergonomics** that compiles directly to **standalone static machine code** — **no `libc`, no garbage collector, no runtime VM**.
 
-The three classic hard limits of type systems become three simple compiler rules:
+Read the full language manifesto, mathematical foundations, and roadmap in [`VISION.md`](VISION.md).
 
-| Limit | FinCore rule |
+## Core Principles
+
+| Classical limit | FinCore rule |
 | :--- | :--- |
-| Girard–Hurkens paradox (`Type : Type`) | Strict split between **total functions** (`func`, provably terminating), a **fuel-bounded `comptime`**, and an explicit **OS layer** (`driver func` / `driver for`). |
-| Cantor-style diagonal limits | **Intensional type codes** `Code n` / `El` stratified by level, and **statically bounded capacity** (fixed arenas, `NewScope(MaxConns)`). |
-| Parametricity vs. uniformity | **Second-class scoped resources** (`Conn`, `Listener`, `Scope`, `FS`, `Exec`, …) that cannot escape their scope, and linear resources that must be closed exactly once. |
+| Girard–Hurkens paradox (`Type : Type`) | Strict split between **total functions** (`func`, provably terminating), **fuel-bounded `comptime`**, and an explicit **OS/effect layer** (`driver func` / `driver for`). |
+| Cantor-style diagonalization | **Stratified intensional type codes** (`Code n` / `El`) and **statically bounded capacity** (fixed arenas, `NewScope(MaxConns)`). |
+| Parametricity vs. ambient authority | **Second-class scoped resources** (`Conn`, `Listener`, `Scope`, `Context`, `FS`, `Exec`, …) that cannot escape their scope, and **linear resources** closed exactly once. |
 
-In practice this means:
+In practice:
 
-- **No ambient authority.** `main` declares the capabilities it uses, e.g. `driver func main(net Net, sig Signals) error`.
-- **No `nil` resources.**
-- **No unbounded allocation.** There is no `make`, `append`, `new` or `map`.
-- **Structured concurrency only.** There is no free `go f()`.
-- **Every non-`driver` loop and recursion must be proven to terminate.** This uses rules T1–T3 plus `decreases(...)`.
+- **Direct static ELF64 machine code (Linux x86_64):** compiles directly to GAS assembly (`as` + `ld -static`) against a tiny raw Linux syscall runtime (`runtime/linux_amd64/`). Zero `libc`, zero `libpthread`, zero GC, zero `malloc`. A full concurrent multicore TCP echo server with graceful shutdown compiles to **~24 KB** (`not a dynamic executable`).
+- **No ambient authority:** `main` declares every OS capability it uses (e.g. `driver func main(net Net, sig Signals) error`).
+- **No `nil` resources, no unbounded heap allocation, no free `go f()`.**
+- **Provable termination:** every non-`driver` loop and recursion terminates (rules T1–T3 + `decreases(...)`).
 
-The full specification (in Bulgarian) is [`fincore_language_specification_v0_2.md`](fincore_language_specification_v0_2.md): the consolidated language v0.2, self-contained (it folds in every decision of `docs/semantics_decisions.md` and `docs/v0_2.md`). Its complete examples are checked by `make spec-check`. The v0.1 specification is kept for history.
-New to FinCore? Start with the tutorial for Go programmers,
-[`docs/tutorial.md`](docs/tutorial.md), and the example programs in
-[`examples/`](examples).
+## Clear Stage-0 Go Bootstrap Boundary & Self-Hosting Fixed Point
+
+`bootstrap/` (`finc0`, written in Go) exists **strictly to bootstrap FinCore v0.1 Native** and is **permanently frozen**.
+
+`compiler/` (`finc`, FinCore v0.6) is a **100% FinCore self-hosted native compiler** (~19k LOC across 18 files) that compiles directly to standalone static Linux x86_64 ELF64 binaries — **zero `libc`, zero GC, zero Go runtime**, including **algebraic effects (`effect`/`with`/`handle`) & linear one-shot continuations (`resume`)**, **indexed dependent types (`[m + n]T`) with `where` refinement proofs & zero-overhead bounds-check elimination**, **immutable views (`const []T`, `const *T`, zero-copy `strView`)**, **bounded scoped `Arena` allocation**, **M:N `epoll` Fiber Scheduler (`NewFiberScope` + `Spawn`/`Ready` — FinCore's zero-GC Eio equivalent)**, **SSE2 `f32`/`f64`**, **lock-free `Atomic[T]`**, **shallow static generic constraints (`Equal`/`Ordered`/`Numeric`)**, **x86_64 peephole optimizer** (self-compiles in **~0.35s**), and **finitist stratified Datalog (`std/datalog`)**:
+
+```text
+bootstrap/ (Go, FROZEN at v0.1 Native) ──► finc0 ──► static Linux x86_64 ELF64 (no libc, no GC)
+compiler/  (100% FinCore, v0.6 Native) ──► finc1 ──► finc2 == finc3 (bit-for-bit fixed point in ~0.35s!)
+```
+
+**No more Go is written beyond Stage 0.** Every version of the language and compiler (v0.2 self-hosting; v0.3 algebraic effects & one-shot continuations; v0.4 dependent types, `where` bounds-check elimination, `const []T`, `Arena`; v0.5 M:N `epoll` fibers, `Spawn`/`Ready`, SSE2 `f32`/`f64`, lock-free `Atomic[T]`; v0.6 `Equal`/`Ordered`/`Numeric` constraints, x86_64 peephole optimizer, `std/datalog`) is implemented strictly in FinCore itself. See [`bootstrap/README.md`](bootstrap/README.md).
 
 ## Example
 
@@ -42,133 +51,35 @@ func writeAll(ctx Context, conn Conn, data []byte) error {
 }
 ```
 
-The full TCP echo server with graceful shutdown is in [`examples/tcp_echo.fc`](examples/tcp_echo.fc).
-
-## Install
-
-Download the archive for your platform from the
-[GitHub Releases](https://github.com/rosenk/fincore/releases) page, e.g.
-`fincore-0.2.0-linux-amd64.tar.gz` (also `linux-arm64`, `darwin-arm64`,
-and `darwin-amd64` when available), check it against `SHA256SUMS`, unpack
-it anywhere and put its `bin/` on `PATH`:
-
-```sh
-sha256sum --ignore-missing -c SHA256SUMS      # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
-tar -xzf fincore-0.2.0-linux-amd64.tar.gz -C "$HOME/.local"   # creates ~/.local/fincore
-export PATH="$HOME/.local/fincore/bin:$PATH"
-
-finc run hello.fc                              # from any directory
-finc build -o echo examples/tcp_echo.fc
-```
-
-**finc needs a Go toolchain** (Go 1.27 or newer, `go` on `PATH`): it
-compiles FinCore to Go and runs `go build` and gofmt. The archive holds
-`bin/finc`, the runtime (`go.mod` + `runtime/fincrt`), `std/`, the
-examples and the docs; finc finds the runtime and `std/` next to its own
-executable (also through a symlink), so no environment variables are
-needed. `FINCORE_ROOT` (runtime) and `FINCROOT` (std) still override.
-Layout, reproducibility and the release workflow:
-[`docs/release.md`](docs/release.md); changes: [`CHANGELOG.md`](CHANGELOG.md).
-
-To build from source instead, see Bootstrap and Build and test below.
-
-## Bootstrap
-
-```text
-bootstrap/ (Go) ──go build──► finc0                         (frozen at language v0.2)
-finc0     build compiler/ @ seed tag (bootstrap/SEED) ──► finc-seed   (v0.3.0)
-finc-seed build ./compiler (current) ──► finc1
-finc1     build ./compiler ──► finc2
-finc2     build ./compiler ──► finc3
-fixed point: sha256(stage2.go) == sha256(stage3.go)
-```
-
-- **finc0 is frozen at v0.2.** New language features are implemented only
-  in `compiler/`. finc0 gets only the bug fixes it needs to keep building
-  the seed (see [`bootstrap/README.md`](bootstrap/README.md)).
-- **compiler/ may use a feature once the seed tag has it.** To use one, a
-  release tag that implements it must exist first; then `bootstrap/SEED` is
-  bumped to that tag. Go and Rust bootstrap from their previous releases
-  the same way.
-- The seed is built from `git archive <seed>`, so the bootstrap needs a git
-  checkout with tags (`git fetch --tags`). `make seed` builds
-  `.stage/finc-seed`.
-- `make diff-*` (finc0 vs finc1) are regression checks of the frozen v0.2
-  subset; inputs marked `// SINCE: v0.3` (or later) are skipped.
-
-## Status
-
-| Milestone | What | Status |
-| :--- | :--- | :--- |
-| M0 | Lexer, AST, parser (Go) — `finc0 parse` | ✅ |
-| M1 | Resolver, fuel-bounded comptime, type checker — `finc0 check` | ✅ |
-| M2 | Scope/linearity checker (S1–S5) and totality/effect checker (T1–T4) | ✅ |
-| M3 | Go runtime `runtime/fincrt` (interruptible I/O, structured concurrency, OS caps) | ✅ |
-| M4 | IR + deterministic Go codegen — `finc0 build/run/test` | ✅ |
-| M5 | `tcp_echo.fc` end-to-end (static and `--race`) | ✅ |
-| M6 | Self-hosted front end in FinCore (`compiler/`: arenas, lexer, parser, AST dump); `finc1 parse` byte-identical to finc0 | ✅ |
-| M7 | Self-hosted checker (resolve, types, comptime, scope, totality) + Go codegen in FinCore; `finc1 check/build` byte-identical to finc0 | ✅ |
-| M8 | Fixed-point bootstrap gate: `sha256(stage2.go) == sha256(stage3.go)`, finc2 passes all tests | ✅ |
-| v0.2 | Language v0.2 (sum types, patterns, `is`, ergonomics; [`docs/v0_2.md`](docs/v0_2.md)) in both compilers; release tag `v0.2.0` | ✅ |
-| Seed | finc0 frozen at v0.2; bootstrap goes finc0 → finc-seed (`v0.2.0`) → current `compiler/` | ✅ |
-| v0.3 | `min`/`max`, `match` on `[]byte`, multi-value `match`, `ErrReported` ([`docs/v0_3.md`](docs/v0_3.md)), only in `compiler/`; `finc fmt`, `--context`, release archives; tag `v0.3.0`, now the seed | ✅ |
-
-Reproduce the bootstrap (about 15 seconds):
-
-```sh
-make bootstrap   # go run ./scripts/bootstrap_verify.go
-```
-
-```text
-==> 2. finc0 build compiler/@v0.3.0 → finc-seed
-...
-==> 6. fixed point: sha256(stage2.go) == sha256(stage3.go)
-   stage2.go 7c526a7ec71e564eaad8f0a8d25f3ff9506c01e3535073d5595cd0ffe39d208a
-   stage3.go 7c526a7ec71e564eaad8f0a8d25f3ff9506c01e3535073d5595cd0ffe39d208a
-BOOTSTRAP OK: finc0 → finc-seed (v0.3.0) → finc1 → finc2 → finc3; fixed point reached (stage2.go == stage3.go)
-```
+See the complete concurrent TCP echo server with backpressure and graceful `SIGTERM` shutdown in [`examples/tcp_echo.fc`](examples/tcp_echo.fc).
 
 ## Layout
 
 ```text
-bootstrap/        Stage 0 compiler in Go (finc0, frozen at v0.2): diag, lexer, ast, parser,
-                  resolve, comptime, types, check, scope, totality, ir, codegen/golang;
-                  SEED names the seed tag
-compiler/         Self-hosting compiler written in FinCore (data-oriented, fixed arenas)
-runtime/fincrt/   Go runtime used by generated code
-std/              Finitist standard library in FinCore: vec, maps, bytes, strconv, path,
-                  sort (total, bounded, allocation-free; see docs/stdlib.md)
-examples/         tcp_echo.fc (the reference program) and tutorial examples with .out files
-testdata/         pass/ fail/ integration/ conformance suite (see testdata/README.md)
-docs/             Tutorial, resolved spec ambiguities, runtime API, stdlib reference, self-hosting requirements
+VISION.md            Language manifesto, type-theoretic foundations, and roadmap
+compiler/            Stage 1+ self-hosted native compiler in 100% FinCore (v0.2, fixed point finc2 == finc3)
+bootstrap/           Stage 0 compiler in Go (finc0, FROZEN at v0.1 Native)
+runtime/linux_amd64/ Pure x86_64 Linux syscall runtime (sys, fmt, net, scope — zero libc, zero GC)
+std/                 Finitist standard library in FinCore (vec, maps, bytes, strconv, path, sort)
+examples/            Native example programs (tcp_echo, calc, wordfreq, state_machine, worker_pool, comptime_tables)
+testdata/            Conformance suite (pass/, fail/, integration/)
+docs/                Design decisions, stdlib reference, runtime API
 ```
 
-## Build and test
+## Build and Test
 
-Requires Go 1.27+ and has no external dependencies.
+Requires Linux x86_64, GNU binutils (`as`, `ld`), and Go 1.24+ (to build Stage-0 `finc0` once).
 
 ```sh
-make            # vet + test + build bin/finc0
-make race       # unit tests with the race detector
-make check-corpus
-make integration
-make seed       # .stage/finc-seed: finc0 builds compiler/ at the bootstrap/SEED tag
-make bootstrap  # finc0 → finc-seed → finc1 → finc2 → finc3, fixed-point gate
-make dist       # release archive dist/fincore-<version>-<os>-<arch>.tar.gz (finc2)
-make dist-test  # smoke-test it from another directory, no env vars
-make spec-check # finc1 check on every complete example of the v0.2 spec
-make help       # all targets
+make                # vet + unit tests + build bin/finc0 and self-hosted bin/finc
+make bootstrap      # 3-stage native fixed point (finc1 -> finc2 == finc3) + full integration suite
+make test-corpus    # run finc0 test -v testdata/ (all 58 pass/fail tests as static ELF64)
+make test-examples  # build and verify all examples/*.fc
+make integration    # end-to-end native TCP echo + corpus integration tests
+make ci             # run everything (including self-hosting fixed point!)
 
-bin/finc0 parse --dump-ast examples/tcp_echo.fc
-bin/finc0 check examples/tcp_echo.fc
-bin/finc1 fmt -l compiler std examples   # formatter (docs/fmt.md)
-bin/finc1 check --context testdata/fail/fail_conn_leak.fc   # diagnostics with source context
+# Build and run a static native ELF64 binary with the self-hosted FinCore compiler:
+bin/finc build -o /tmp/echo examples/tcp_echo.fc
+file /tmp/echo      # ELF 64-bit LSB executable, x86-64, statically linked
+bin/finc run examples/calc.fc
 ```
-
-## Design notes
-
-- [`fincore_language_specification_v0_2.md`](fincore_language_specification_v0_2.md) is the main reference; the documents below are the detailed record it was consolidated from.
-- [`docs/semantics_decisions.md`](docs/semantics_decisions.md) lists every place where the spec was ambiguous and how it was resolved. The compilers and tests follow it.
-- [`docs/runtime_api.md`](docs/runtime_api.md) describes the `fincrt` API that generated code targets.
-- [`docs/stdlib.md`](docs/stdlib.md) is the reference for the `std/` packages (`import "std/maps"`; resolved against `$FINCROOT` when set, else the module root; an installed finc uses its install directory).
-- [`docs/compiler_requirements.md`](docs/compiler_requirements.md) lists the language features the self-hosted compiler relies on.

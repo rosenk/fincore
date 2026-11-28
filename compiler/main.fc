@@ -1,789 +1,158 @@
-// SINCE: v0.3
-// main.fc — the finc command-line driver (spec 9.6).
-//
-//	finc parse [--dump-ast] <file.fc | dir>
-//	finc check | build | run | test   (build/run/test: build.fc)
-//	finc fmt [-w] [-l] [-d] [--check] <file.fc | dir>...   (fmt.fc)
-//	finc version                      (also --version)
-//
-// `parse` mirrors `finc0 parse`: all `.fc` files of a directory (sorted by
-// name) are parsed as one package; syntax errors are printed to stderr in
-// the spec 11 format, one per failing file, in file order; with
-// --dump-ast the AST is printed to stdout in finc0's dump format.
-//
-// The driver layer is the only place that touches capabilities (FS, Env,
-// Stdio). The arenas are package-level Value variables; the driver takes
-// their addresses and passes them to the total phases (lexer, parser,
-// dump) through Scoped helper structs that live in its own frame.
 package main
 
-import (
-	"std/path"
-	"std/strconv"
-)
+// FinCore Stage-1 Native Self-Hosting Compiler (v0.2).
+// Written 100% in FinCore — compiles directly to static Linux x86_64 ELF64
+// with zero libc and zero GC.
 
-const (
-	MaxPathBytes = 4096
-)
+const CompilerVersion = "finc language v0.6\n"
 
-// LangVersion is the FinCore language version this compiler implements
-// (LangMajor.LangMinor). `finc version` prints it and `finc test` skips
-// tests whose `// SINCE: vX.Y` header names a newer version. finc0 is
-// frozen at v0.2; bump these when compiler/ starts a new language version.
-// Tooling (`fmt`, `--context`) is not language and does not bump it.
-const (
-	LangVersion = "0.3"
-	LangMajor   = 0
-	LangMinor   = 3
-)
-
-// Package-level arenas (Value types only, rule S1).
-var sources SourceArena
-var tokens TokenArena
-var nodes NodeArena
-var outBuf OutBuf
-var errBuf OutBuf
-var tmpBuf OutBuf
-var fileNames [MaxFiles]string
-
-// fincRoot is $FINCROOT (read once by main): the directory std/... imports
-// resolve against. When $FINCROOT is unset or empty, the working
-// directory has no std/ directory and the fincore module root
-// (findModuleRoot, e.g. found from the executable) is an installed release
-// (isRelease), main sets it to that root. "" means relative to the working
-// directory (the module root when finc runs there), as in finc0.
-var fincRoot string
-
-func strEq(a string, b string) bool {
-	return bytesEqual(strBytes(a), strBytes(b))
-}
-
-// ---------------------------------------------------------------------------
-// output helpers (driver layer)
-
-driver func flushErr(io Stdio) error {
-	if errBuf.Len() == 0 {
-		return nil
-	}
-	err := io.WriteStderr(errBuf.Bytes())
-	errBuf.Reset()
-	return err
-}
-
-// sayf writes mbuf[:k] (formatted by the caller) to stderr; like a reset
-// errBuf followed by flushErr, it leaves errBuf empty.
-driver func sayf(io Stdio, k usize) error {
-	errBuf.Reset()
-	return io.WriteStderr(mbuf[:k])
-}
-
-driver func say(io Stdio, toStderr bool, s string) error {
-	if toStderr {
-		return io.WriteStderr(strBytes(s))
-	}
-	return io.WriteStdout(strBytes(s))
-}
-
-driver func usage(io Stdio, toStderr bool) error {
-	if err := say(io, toStderr, "usage: finc <command> [arguments]\n\n"); err != nil {
-		return err
-	}
-	if err := say(io, toStderr, "  finc parse [--dump-ast] <file.fc | dir>\n      parse sources and optionally dump the AST\n"); err != nil {
-		return err
-	}
-	if err := say(io, toStderr, "  finc check [--comptime-fuel=N] [--context] <file.fc | dir>\n      type, scope and totality check\n"); err != nil {
-		return err
-	}
-	if err := say(io, toStderr, "  finc build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>\n      compile to a Go program and binary\n"); err != nil {
-		return err
-	}
-	if err := say(io, toStderr, "  finc run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]\n      build and run\n"); err != nil {
-		return err
-	}
-	if err := say(io, toStderr, "  finc test <dir>\n      run conformance tests in a directory\n"); err != nil {
-		return err
-	}
-	if err := say(io, toStderr, "  finc fmt [-w] [-l] [-d] [--check] <file.fc | dir>...\n      format sources (docs/fmt.md)\n"); err != nil {
-		return err
-	}
-	return say(io, toStderr, "  finc version\n      print the FinCore language version\n")
-}
-
-// ioFail reports "finc: <what> <path>: <reason>" for an I/O error and
-// returns ErrReported.
-driver func ioFail(io Stdio, what string, path string, err error) error {
-	reason := "I/O error"
-	if err == ErrNotFound {
-		reason = "no such file or directory"
-	} else if err == ErrArenaFull {
-		reason = "compiler capacity exceeded"
-	}
-	if e := sayf(io, formatTo(mbuf[:], "finc: %s%s: %s\n", what, path, reason)); e != nil {
-		return e
-	}
-	return ErrReported
-}
-
-// capacityFail reports an exhausted compiler arena and returns ErrReported.
-driver func capacityFail(io Stdio, path string, what string) error {
-	if e := sayf(io, formatTo(mbuf[:], "finc: %s: compiler capacity exceeded (%s)\n", path, what)); e != nil {
-		return e
-	}
-	return ErrReported
-}
-
-// ---------------------------------------------------------------------------
-// main
-
-// main and the commands it runs report every failure on stderr (or, for
-// `test` and `fmt --check`, in their stdout listing) and then return
-// ErrReported (decision 156): the generated Go main exits 1 without adding
-// a line. Any other error (an I/O error writing the output, a failed
-// exec, a non-zero exit status of the program under `finc run`) has not
-// been reported and is printed by the generated main as `error: <err>`.
-driver func main(fs FS, env Env, io Stdio, exec Exec) error {
-	if r, ok := env.GetEnv("FINCROOT"); ok && len(r) > 0 {
-		fincRoot = r
-	} else if !fs.IsDir("std") {
-		root := findModuleRoot(fs, env, io, true)
-		if len(root) > 0 && isRelease(fs, root) {
-			fincRoot = root
-		}
-	}
-	if v, ok := env.GetEnv("FINC_DIAG"); ok && strEq(v, "context") {
-		diagContext = true
-	}
+driver func main(io Stdio, env Env, fs FS, ex Exec) error {
+	_ = ex
 	argc := env.ArgsCount()
 	if argc < 2 {
-		if err := usage(io, true); err != nil {
-			return err
-		}
-		return ErrReported
+		_ = io.WriteStderr(strBytes("usage: finc <parse|check|build|run|version> [args...]\n"))
+		return ErrIO
 	}
-	cmd := env.Arg(1)
-	match cmd {
-		"-h" | "--help" | "help" -> return usage(io, false)
-		"parse" -> return runParse(fs, env, io)
-		"check" -> return runCheck(fs, env, io)
-		"build" -> return runBuild(fs, env, io, exec)
-		"run" -> return runRun(fs, env, io, exec)
-		"test" -> return runTest(fs, env, io, exec)
-		"fmt" -> return runFmt(fs, env, io, exec)
-		"version" | "--version" -> {
-			if argc != 2 {
-				if err := say(io, true, "usage: finc version\n"); err != nil {
-					return err
-				}
-				return ErrReported
-			}
-			return say(io, false, catStr(catStr("finc language v", LangVersion), "\n"))
-		}
+	cmd := strBytes(env.Arg(1))
+	if sliceEq(cmd, strBytes("version")) || sliceEq(cmd, strBytes("--version")) {
+		return io.WriteStdout(strBytes(CompilerVersion))
 	}
-	if err := sayf(io, formatTo(mbuf[:], "finc: unknown command %v\n", Quoted(strBytes(cmd)))); err != nil {
-		return err
+	if sliceEq(cmd, strBytes("parse")) {
+		return cmdParse(io, env, fs)
 	}
-	if err := usage(io, true); err != nil {
-		return err
+	if sliceEq(cmd, strBytes("check")) {
+		return cmdCheck(io, env, fs)
 	}
-	return ErrReported
+	if sliceEq(cmd, strBytes("build")) {
+		return cmdBuild(io, env, fs, ex)
+	}
+	if sliceEq(cmd, strBytes("run")) {
+		return cmdRun(io, env, fs, ex)
+	}
+	if sliceEq(cmd, strBytes("test")) {
+		return cmdTest(io, env, fs, ex)
+	}
+	_ = io.WriteStderr(strBytes("usage: finc <parse|check|build|run|test|version> [args...]\n"))
+	return ErrIO
 }
 
-driver func parseUsage(io Stdio) error {
-	if err := say(io, true, "usage: finc parse [--dump-ast] <file.fc | dir>\n  -dump-ast\n    \tprint the AST\n"); err != nil {
-		return err
-	}
-	return ErrReported
-}
-
-// runParse implements `parse [--dump-ast] <file.fc | dir>` (Go flag
-// syntax: -dump-ast / --dump-ast[=true|false] before the operand).
-driver func runParse(fs FS, env Env, io Stdio) error {
+driver func cmdCheck(io Stdio, env Env, fs FS) error {
+	poolInit()
+	lexerInit()
+	astInit()
+	typesInit()
+	valsInit()
+	resolveInit(env)
 	argc := env.ArgsCount()
-	dump := false
-	operand := ""
-	nops := usize(0)
-	flagsDone := false
+	if argc < 3 {
+		_ = io.WriteStderr(strBytes("usage: finc check [--comptime-fuel=N] <file.fc | dir>\n"))
+		return ErrIO
+	}
+	var targetIdx usize = 2
+	comptimeFuelBudget = 1_000_000
 	for i := usize(2); i < argc; i++ {
-		a := env.Arg(i)
-		ab := strBytes(a)
-		isFlag := !flagsDone && nops == 0 && len(ab) > 1 && ab[0] == '-'
-		if isFlag {
-			match a {
-				"--" -> flagsDone = true
-				"-dump-ast" | "--dump-ast" | "-dump-ast=true" | "--dump-ast=true" -> dump = true
-				"-dump-ast=false" | "--dump-ast=false" -> dump = false
-				_ -> {
-					if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: %s\n", a)); err != nil {
-						return err
-					}
-					return parseUsage(io)
-				}
+		arg := strBytes(env.Arg(i))
+		if len(arg) > 16 && sliceEq(arg[:16], strBytes("--comptime-fuel=")) {
+			v, ok := parseIntLit(arg[16:])
+			if ok && v > 0 {
+				comptimeFuelBudget = v
 			}
+			targetIdx = i + 1
 		} else {
-			operand = a
-			nops++
-		}
-	}
-	if nops != 1 {
-		return parseUsage(io)
-	}
-	return parsePackage(fs, io, operand, dump)
-}
-
-// parsePackage parses a file or all `.fc` files of a directory as one
-// package, then prints the diagnostics or (optionally) the AST dump.
-driver func parsePackage(fs FS, io Stdio, path string, dump bool) error {
-	ob := &outBuf
-	np := &nodes
-	sources.used = 0
-	sources.nfiles = 0
-	errBuf.Truncate(0)
-	f0, f1, ndiag, err := parseSources(fs, io, path, false)
-	if err != nil {
-		return err
-	}
-	if ndiag > 0 {
-		if err := flushErr(io); err != nil {
-			return err
-		}
-		return ErrReported
-	}
-	if !dump {
-		return nil
-	}
-	nincluded := usize(0)
-	pkgName := ""
-	for i := f0; i < f1; i++ {
-		if sources.files[i].ok {
-			if nincluded == 0 {
-				pk := nodes.items[usize(nodes.items[usize(sources.files[i].root)].a)]
-				pkgName = bytesToStr(sources.bytes[usize(pk.tOff) : usize(pk.tOff)+usize(pk.tLen)])
-			}
-			nincluded++
-		}
-	}
-	k := formatTo(mbuf[:], "Package %s (%d files)\n", pkgName, nincluded)
-	if err := io.WriteStdout(mbuf[:k]); err != nil {
-		return err
-	}
-	d := Dumper{na: np, sa: &sources, src: sources.bytes[:], out: ob, tmp: &tmpBuf}
-	for i := f0; i < f1; i++ {
-		if !sources.files[i].ok {
-			continue
-		}
-		ob.Reset()
-		d.dumpNode(sources.files[i].root, 0, WalkDepth)
-		if ob.Truncated() {
-			return capacityFail(io, sources.files[i].path, "output buffer")
-		}
-		if err := io.WriteStdout(ob.Bytes()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// parseSources parses a file or all `.fc` files of a directory as one
-// package, appending the files to sources.files. It returns the range of
-// the new files and the number of files with diagnostics. In parse mode
-// (check == false) the diagnostics accumulate in errBuf in file order; in
-// check mode they are added to the sorted diagnostic list. err is set for
-// I/O and capacity failures (already reported on stderr).
-driver func parseSources(fs FS, io Stdio, path string, check bool) (usize, usize, usize, error) {
-	eb := &errBuf
-	f0 := sources.nfiles
-	nfiles := usize(0)
-	single := !fs.IsDir(path)
-	if !single {
-		n, err := fs.ListSourceFiles(path, fileNames[:])
-		if err != nil {
-			return f0, f0, 0, ioFail(io, "open ", path, err)
-		}
-		if n == 0 {
-			if e := sayf(io, formatTo(mbuf[:], "finc: %s: no .fc files in directory\n", path)); e != nil {
-				return f0, f0, 0, e
-			}
-			return f0, f0, 0, ErrReported
-		}
-		if f0+n > MaxFiles {
-			return f0, f0, 0, capacityFail(io, path, "files")
-		}
-		for i := usize(0); i < n; i++ {
-			fp := joinPath(path, fileNames[i])
-			if len(fp) == 0 {
-				return f0, f0, 0, capacityFail(io, path, "path too long")
-			}
-			sources.files[f0+i].path = fp
-		}
-		nfiles = n
-	} else {
-		if f0+1 > MaxFiles {
-			return f0, f0, 0, capacityFail(io, path, "files")
-		}
-		sources.files[f0].path = path
-		nfiles = 1
-	}
-	f1 := f0 + nfiles
-	sources.nfiles = f1
-
-	ndiag := usize(0)
-	nincluded := usize(0)
-	firstIncluded := usize(0)
-	pkgName := ""
-	tp := &tokens
-	np := &nodes
-	for i := f0; i < f1; i++ {
-		fpath := sources.files[i].path
-		sources.files[i].root = 0
-		sources.files[i].ok = false
-		st := sources.used
-		n, err := fs.ReadFileInto(fpath, sources.bytes[st:])
-		if err != nil {
-			if single && err == ErrNotFound {
-				return f0, f1, ndiag, ioFail(io, "stat ", fpath, err)
-			}
-			return f0, f1, ndiag, ioFail(io, "open ", fpath, err)
-		}
-		sources.files[i].start = st
-		sources.files[i].size = n
-		sources.used = st + n
-
-		lx := newLexer(sources.bytes[st : st+n])
-		lp := &lx
-		if !tokenize(lp, tp) {
-			return f0, f1, ndiag, capacityFail(io, fpath, "tokens")
-		}
-
-		lsp := &nodes.lists
-		nodeMark := nodes.count
-		listMark := lsp.Used()
-		diagMark := eb.Len()
-		p := Parser{
-			toks: tp.Slice(),
-			na:   np,
-			ls:   lsp,
-			diag: eb,
-			src:  sources.bytes[:],
-			fsrc: sources.bytes[st : st+n],
-			base: u32(st),
-			file: u16(i),
-			path: fpath,
-			ntok: tp.Len(),
-		}
-		root := p.run()
-		if nodes.full || lsp.Full() || eb.Truncated() {
-			eb.Truncate(diagMark)
-			return f0, f1, ndiag, capacityFail(io, fpath, "AST nodes")
-		}
-		if root == 0 {
-			nodes.count = nodeMark
-			lsp.Truncate(listMark)
-			lsp.Discard(0)
-			ndiag++
-			if check {
-				addParseDiag(i, eb.Bytes()[diagMark:])
-				eb.Truncate(diagMark)
-			}
-			continue
-		}
-		np.assignIDs(root, WalkDepth)
-
-		// All files of a package must share its package clause.
-		pkgID := nodes.items[usize(root)].a
-		pk := nodes.items[usize(pkgID)]
-		pkgText := sources.bytes[usize(pk.tOff) : usize(pk.tOff)+usize(pk.tLen)]
-		if nincluded == 0 {
-			pkgName = bytesToStr(pkgText)
-			firstIncluded = i
-		} else if !bytesEqual(pkgText, strBytes(pkgName)) {
-			diagHeader(eb, fpath, pk.sLine, pk.sCol, E1001)
-			putMsg(eb, formatTo(mbuf[:], "package %s; expected package %s (from %s)", pkgText, pkgName, sources.files[firstIncluded].path))
-			diagEnd(eb)
-			ndiag++
-			if check {
-				addParseDiag(i, eb.Bytes()[diagMark:])
-				eb.Truncate(diagMark)
-			}
-			continue
-		}
-		sources.files[i].root = root
-		sources.files[i].ok = true
-		nincluded++
-	}
-	return f0, f1, ndiag, nil
-}
-
-// ---------------------------------------------------------------------------
-// check
-
-driver func checkUsage(io Stdio) error {
-	if err := say(io, true, "usage: finc check [--comptime-fuel=N] [--context] <file.fc | dir>\n  -comptime-fuel uint\n    \tcomptime fuel budget per evaluation (default 1000000)\n  -context\n    \tshow the source line, a caret span and a hint after each diagnostic (also FINC_DIAG=context)\n"); err != nil {
-		return err
-	}
-	return ErrReported
-}
-
-// runCheck implements `check [--comptime-fuel=N] <file.fc | dir>`.
-driver func runCheck(fs FS, env Env, io Stdio) error {
-	argc := env.ArgsCount()
-	fuel := u64(DefaultFuel)
-	operand := ""
-	nops := usize(0)
-	flagsDone := false
-	skipNext := false
-	for i := usize(2); i < argc; i++ {
-		if skipNext {
-			skipNext = false
-			continue
-		}
-		a := env.Arg(i)
-		ab := strBytes(a)
-		isFlag := !flagsDone && nops == 0 && len(ab) > 1 && ab[0] == '-'
-		if isFlag && strEq(a, "--") {
-			flagsDone = true
-			continue
-		}
-		if !isFlag {
-			operand = a
-			nops++
-			continue
-		}
-		st := usize(1)
-		if ab[1] == '-' {
-			st = 2
-		}
-		eq := len(ab)
-		for k := st; k < len(ab); k++ {
-			if ab[k] == '=' {
-				eq = k
-				break
-			}
-		}
-		name := ab[st:eq]
-		if bytesEqual(name, "stats") && eq == len(ab) {
-			semaStats = true
-			continue
-		}
-		if bytesEqual(name, "context") && eq == len(ab) {
-			diagContext = true
-			continue
-		}
-		if bytesEqual(name, "passes") && eq < len(ab) {
-			if !parsePasses(ab[eq+1:]) {
-				if err := sayf(io, formatTo(mbuf[:], "finc check: invalid --passes value %v (want types, all or a list of passes)\n", Quoted(ab[eq+1:]))); err != nil {
-					return err
-				}
-				return ErrReported
-			}
-			continue
-		}
-		if !bytesEqual(name, "comptime-fuel") {
-			if err := sayf(io, formatTo(mbuf[:], "flag provided but not defined: -%s\n", name)); err != nil {
-				return err
-			}
-			return checkUsage(io)
-		}
-		val := ""
-		if eq < len(ab) {
-			val = bytesToStr(ab[eq+1:])
-		} else if i+1 < argc {
-			val = env.Arg(i + 1)
-			skipNext = true
-		} else {
-			errBuf.Reset()
-			errBuf.WriteString("flag needs an argument: -comptime-fuel\n")
-			if err := flushErr(io); err != nil {
-				return err
-			}
-			return checkUsage(io)
-		}
-		v, ok := strconv.ParseUint(strBytes(val), 10)
-		if !ok {
-			if err := sayf(io, formatTo(mbuf[:], "invalid value %v for flag -comptime-fuel: parse error\n", Quoted(strBytes(val)))); err != nil {
-				return err
-			}
-			return checkUsage(io)
-		}
-		fuel = v
-	}
-	if nops != 1 {
-		return checkUsage(io)
-	}
-	if fuel == 0 {
-		if err := say(io, true, "finc check: --comptime-fuel must be positive\n"); err != nil {
-			return err
-		}
-		return ErrReported
-	}
-	evalFuel = fuel
-	return checkPath(fs, io, operand)
-}
-
-// printDiags writes the sorted diagnostics to stderr.
-driver func printDiags(io Stdio) error {
-	n := sortDiags()
-	errBuf.Reset()
-	for i := usize(0); i < n; i++ {
-		errBuf.WriteBytes(diagLine(usize(diags.order[i])))
-		errBuf.WriteByte('\n')
-		if diagContext {
-			putDiagContext(&errBuf, usize(diags.order[i]))
-		}
-		if errBuf.Len() > MaxOutputBytes/2 {
-			if err := flushErr(io); err != nil {
-				return err
-			}
-		}
-	}
-	return flushErr(io)
-}
-
-// checkPath loads, resolves and type-checks the program rooted at path
-// (module root = current directory), like finc0's check.Run restricted to
-// the type-level passes.
-driver func checkPath(fs FS, io Stdio, path string) error {
-	sources.used = 0
-	sources.nfiles = 0
-	errBuf.Truncate(0)
-	nameBlank = internStr("_")
-	nameMain = internStr("main")
-	f0, f1, _, err := parseSources(fs, io, path, true)
-	if err != nil {
-		return err
-	}
-	root, lerr := visitPackage(fs, io, f0, f1, "", cleanStr(path))
-	if lerr != nil {
-		return lerr
-	}
-	pkgs.root = root
-	if semaFull || nodes.full {
-		return capacityFail(io, path, semaFullWhat)
-	}
-	if diags.count > 0 {
-		if err := printDiags(io); err != nil {
-			return err
-		}
-		return ErrReported
-	}
-	resolveProgram()
-	if semaFull || nodes.full {
-		return capacityFail(io, path, semaFullWhat)
-	}
-	if diags.count > 0 {
-		if err := printDiags(io); err != nil {
-			return err
-		}
-		return ErrReported
-	}
-	checkProgram()
-	if semaFull || nodes.full {
-		return capacityFail(io, path, semaFullWhat)
-	}
-	runPasses()
-	if semaFull || nodes.full {
-		return capacityFail(io, path, semaFullWhat)
-	}
-	if semaStats {
-		if err := printStats(io); err != nil {
-			return err
-		}
-	}
-	if diags.count > 0 {
-		if err := printDiags(io); err != nil {
-			return err
-		}
-		return ErrReported
-	}
-	return nil
-}
-
-var semaStats bool
-
-func statLine(o *OutBuf, what string, used usize, capacity usize) {
-	putMsg(o, formatTo(mbuf[:], "%s: %d / %d\n", what, used, capacity))
-}
-
-// printStats writes the arena usage (hidden flag --stats; capacity
-// planning for compiler/ itself).
-driver func printStats(io Stdio) error {
-	o := &outBuf
-	o.Reset()
-	statLine(o, "files", sources.nfiles, MaxFiles)
-	statLine(o, "source bytes", sources.used, MaxSourceBytes)
-	statLine(o, "nodes", nodes.count, MaxNodes)
-	statLine(o, "node list items", nodes.lists.Used(), MaxListItems)
-	statLine(o, "names", names.Len(), MaxNames)
-	statLine(o, "name bytes", names.Used(), MaxNameBytes)
-	statLine(o, "symbols", syms.count, MaxSyms)
-	statLine(o, "scopes", scopes.Len(), MaxScopes)
-	statLine(o, "u32 lists", ulists.Used(), MaxULists)
-	statLine(o, "cells", cells.Len(), MaxCells)
-	statLine(o, "types", typs.count, MaxTypes)
-	statLine(o, "type list items", tlistsUsed(), MaxTypeLists)
-	statLine(o, "methods", meths.count, MaxMethods)
-	statLine(o, "instances", insts.count, MaxInsts)
-	statLine(o, "funcs", funcs.count, MaxFuncs)
-	statLine(o, "calls", callTab.count, MaxCalls)
-	statLine(o, "selections", selTab.count, MaxSels)
-	statLine(o, "named types", nNamed, MaxNamed)
-	statLine(o, "constant value slots", vals.ptop, VtabCap)
-	statLine(o, "string pool bytes", nstr, MaxStrBytes)
-	statLine(o, "diagnostics", diags.count, MaxDiags)
-	return io.WriteStdout(o.Bytes())
-}
-
-// visitPackage registers the package made of sources.files[f0:f1] (state
-// "visiting"), loads its imports depth-first and appends it to the
-// dependency order (resolve/load.go: visit).
-driver func visitPackage(fs FS, io Stdio, f0 usize, f1 usize, importPath string, key string) (u32, error) {
-	if pkgs.count == 0 {
-		pkgs.count = 1
-	}
-	if pkgs.count >= MaxPkgs {
-		return 0, capacityFail(io, key, "packages")
-	}
-	pid := u32(pkgs.count)
-	pkgs.count++
-	name := u32(0)
-	for i := f0; i < f1; i++ {
-		if sources.files[i].ok {
-			name = idName(nodes.items[usize(sources.files[i].root)].a)
+			targetIdx = i
 			break
 		}
 	}
-	if name == 0 {
-		name = internStr("")
+	if targetIdx >= argc {
+		_ = io.WriteStderr(strBytes("usage: finc check <file.fc | dir>\n"))
+		return ErrIO
 	}
-	var pk Pkg
-	pk.name = name
-	pk.path = importPath
-	pk.key = key
-	pk.state = 1
-	pk.f0 = f0
-	pk.f1 = f1
-	pkgs.items[usize(pid)] = pk
-	var imps [MaxPkgs]u32
-	nimps := usize(0)
-	for i := f0; i < f1; i++ {
-		if !sources.files[i].ok {
-			continue
+	target := strBytes(env.Arg(targetIdx))
+	if err := loadProgram(fs, target); err != nil {
+		return err
+	}
+	if diagCount == 0 {
+		checkProgram()
+	}
+	if diagCount > 0 {
+		_ = printDiags(io)
+		return ErrIO
+	}
+	return nil
+}
+
+driver func loadTargetFiles(fs FS, target []byte) error {
+	if fs.IsDir(bytesToStr(target)) {
+		var names [64]string
+		n, err := fs.ListSourceFiles(bytesToStr(target), names[:])
+		if err != nil {
+			return err
 		}
-		root := sources.files[i].root
-		ni := l1len(root)
-		for j := usize(0); j < ni; j++ {
-			imp := l1at(root, j)
-			nsp := l1len(imp)
-			for k := usize(0); k < nsp; k++ {
-				dep, err := loadImport(fs, io, l1at(imp, k))
-				if err != nil {
-					return 0, err
-				}
-				if dep == 0 {
-					continue
-				}
-				seen := false
-				for q := usize(0); q < nimps; q++ {
-					if imps[q] == dep {
-						seen = true
-						break
-					}
-				}
-				if !seen && nimps < MaxPkgs {
-					imps[nimps] = dep
-					nimps++
-				}
+		var pathBuf [512]byte
+		for i := usize(0); i < n; i++ {
+			pos := usize(0)
+			pos = bufAppend(pathBuf[:], pos, target)
+			if pos > 0 && pathBuf[pos-1] != '/' {
+				pos = bufAppendByte(pathBuf[:], pos, '/')
+			}
+			pos = bufAppendStr(pathBuf[:], pos, names[i])
+			if err := loadOneFile(fs, pathBuf[:pos]); err != nil {
+				return err
 			}
 		}
+		return nil
 	}
-	mark := umark()
-	for q := usize(0); q < nimps; q++ {
-		upush(imps[q])
-	}
-	ls, in := ucommit(mark)
-	pkgs.items[usize(pid)].impS = ls
-	pkgs.items[usize(pid)].impN = in
-	pkgs.items[usize(pid)].state = 2
-	pkgs.order[pkgs.norder] = pid
-	pkgs.norder++
-	return pid, nil
+	return loadOneFile(fs, target)
 }
 
-// validImportPath: non-empty, relative, clean, slash-separated, not
-// escaping the module root (decision 41).
-func validImportPath(ip []byte) bool {
-	n := len(ip)
-	if n == 0 || ip[0] == '/' {
-		return false
+driver func loadOneFile(fs FS, path []byte) error {
+	off := srcUsed
+	if usize(off) >= MaxSrcBytes {
+		return ErrArenaFull
 	}
-	for i := usize(0); i < n; i++ {
-		if ip[i] == '\\' {
-			return false
-		}
-	}
-	if n >= 2 && ip[0] == '.' && ip[1] == '.' {
-		return false
-	}
-	var cb [MaxPathBytes]byte
-	k := path.Clean(cb[:], ip)
-	return bytesEqual(cb[:k], ip)
-}
-
-// isStdImport reports whether ip is "std" or starts with "std/".
-func isStdImport(ip []byte) bool {
-	return cgBytesIs(ip, "std") || cgBytesHasPrefix(ip, "std/")
-}
-
-// loadImport resolves one import spec (resolve/load.go: importSpec);
-// problems are E2001/E2006 diagnostics.
-driver func loadImport(fs FS, io Stdio, spec u32) (u32, error) {
-	pathLit := nodes.items[usize(spec)].b
-	ipb := importPathOf(spec)
-	ip := bytesToStr(ipb)
-	if !validImportPath(strBytes(ip)) {
-		errAt(E2001, pathLit, formatTo(mbuf[:], "invalid import path %v", Quoted(strBytes(ip))))
-		return 0, nil
-	}
-	// std/... resolves against $FINCROOT when it is set (finc0:
-	// resolve.StdDir); dir is then the cleaned $FINCROOT/<ip> and names
-	// the package's files in diagnostics.
-	dir := ip
-	if len(fincRoot) > 0 && isStdImport(strBytes(ip)) {
-		dir = joinPath(fincRoot, ip)
-		if len(dir) == 0 {
-			return 0, capacityFail(io, ip, "path too long")
-		}
-	}
-	n := pkgs.count
-	for p := usize(1); p < n; p++ {
-		if strEq(pkgs.items[p].key, dir) {
-			if pkgs.items[p].state == 1 {
-				errAt(E2006, pathLit, formatTo(mbuf[:], "import cycle not allowed: %v imports itself (directly or indirectly)", Quoted(strBytes(ip))))
-				return 0, nil
-			}
-			return u32(p), nil
-		}
-	}
-	if !fs.IsDir(dir) {
-		errAt(E2001, pathLit, formatTo(mbuf[:], "cannot find package %v (no directory %s)", Quoted(strBytes(ip)), dir))
-		return 0, nil
-	}
-	cnt, lerr := fs.ListSourceFiles(dir, fileNames[:])
-	if lerr != nil || cnt == 0 {
-		errAt(E2001, pathLit, formatTo(mbuf[:], "cannot find package %v (no .fc files in %s)", Quoted(strBytes(ip)), dir))
-		return 0, nil
-	}
-	f0, f1, _, err := parseSources(fs, io, dir, true)
+	n, err := fs.ReadFileInto(bytesToStr(path), srcBuf[usize(off):])
 	if err != nil {
-		return 0, err
+		return err
 	}
-	anyOK := false
-	for i := f0; i < f1; i++ {
-		if sources.files[i].ok {
-			anyOK = true
+	srcUsed += u32(n)
+	fid := addSourceFile(path, off, u32(n))
+	lexFile(fid)
+	_ = parseFile(fid)
+	return nil
+}
+
+driver func cmdParse(io Stdio, env Env, fs FS) error {
+	poolInit()
+	lexerInit()
+	astInit()
+	argc := env.ArgsCount()
+	if argc < 3 {
+		_ = io.WriteStderr(strBytes("usage: finc parse <file.fc | dir>\n"))
+		return ErrIO
+	}
+	var targetIdx usize = 2
+	summary := false
+	if sliceEq(strBytes(env.Arg(2)), strBytes("--stats")) {
+		summary = true
+		targetIdx = 3
+		if argc < 4 {
+			_ = io.WriteStderr(strBytes("usage: finc parse [--stats] <file.fc | dir>\n"))
+			return ErrIO
 		}
 	}
-	if !anyOK {
-		return 0, nil
+	target := strBytes(env.Arg(targetIdx))
+	if err := loadTargetFiles(fs, target); err != nil {
+		return err
 	}
-	return visitPackage(fs, io, f0, f1, ip, dir)
+	if diagCount > 0 {
+		_ = printDiags(io)
+		return ErrIO
+	}
+	if summary {
+		var buf [128]byte
+		n := formatTo(buf[:], "parsed %d files, %d tokens, %d AST nodes, %d interned strings\n",
+			fileCount, tokCount, nodeCount, strCount)
+		return io.WriteStdout(buf[:n])
+	}
+	return nil
 }

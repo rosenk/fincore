@@ -1,0 +1,107 @@
+// SINCE: v0.3
+// effects_pipeline: FinCore v0.3 showcase implementing VISION.md Section 3.2:
+//   - effect Yield[[]byte] for zero-allocation streaming line iteration
+//   - countNonEmpty (Tier 1 tail-resumptive: 0 stack switches, direct call)
+//   - firstMatch (Tier 2 abortive early return from handler arm, LIFO defer cleanup)
+//   - effect Fail + effect State composed cleanly without monads or effect rows
+package main
+
+import "std/bytes"
+
+effect Yield[T any] {
+	yield(v T)
+}
+
+effect Fail {
+	fail(code u32)
+}
+
+func nextNewline(s []byte) usize {
+	for i := usize(0); i < len(s); i++ {
+		if s[i] == '\n' {
+			return i
+		}
+	}
+	return len(s)
+}
+
+// Total streaming producer: emits each line without allocating a slice of slices.
+func scanLines(data []byte) with Yield[[]byte] {
+	for rem := data; len(rem) > 0; {
+		n := nextNewline(rem)
+		yield(rem[:n])
+		if n == len(rem) {
+			break
+		}
+		rem = rem[n+1:]
+	}
+}
+
+// Tier 1 (tail-resumptive): direct call through stack evidence, 0 stack switches.
+func countNonEmpty(data []byte) usize {
+	count := usize(0)
+	handle scanLines(data) {
+		yield(line) -> {
+			if len(line) > 0 {
+				count++
+			}
+			resume()
+		}
+	}
+	return count
+}
+
+// Tier 2 (abortive early return): stops immediately on first matching line!
+func firstMatch(data []byte, prefix []byte) ([]byte, bool) {
+	handle scanLines(data) {
+		yield(line) -> {
+			if bytes.HasPrefix(line, prefix) {
+				return line, true
+			}
+			resume()
+		}
+	}
+	return nil, false
+}
+
+// Parsing with Fail effect and deterministic defer cleanup.
+func parsePositive(s []byte) u64 with Fail {
+	if len(s) == 0 {
+		fail(1)
+	}
+	acc := u64(0)
+	for i := usize(0); i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			fail(2)
+		}
+		acc = acc*10 + u64(c-'0')
+	}
+	return acc
+}
+
+driver func main(io Stdio) error {
+	input := strBytes("alpha\n\nwarn: disk 90%\nerror: socket closed\ninfo: ok\n")
+	var out [256]byte
+
+	nonEmpty := countNonEmpty(input)
+	n := formatTo(out[:], "non-empty lines: %d\n", nonEmpty)
+	if err := io.WriteStdout(out[:n]); err != nil {
+		return err
+	}
+
+	line, ok := firstMatch(input, strBytes("error: "))
+	n = formatTo(out[:], "first error: ok=%v line=%q\n", ok, line)
+	if err := io.WriteStdout(out[:n]); err != nil {
+		return err
+	}
+
+	good := handle parsePositive(strBytes("4096")) {
+		fail(code) -> u64(code) * 1000
+	}
+	bad := handle parsePositive(strBytes("12x4")) {
+		fail(code) -> u64(code) * 1000
+	}
+	n = formatTo(out[:], "parsed: good=%d bad=%d\n", good, bad)
+	return io.WriteStdout(out[:n])
+}

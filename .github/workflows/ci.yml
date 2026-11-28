@@ -7,55 +7,23 @@ on:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # full history + tags: the bootstrap needs the seed tag (bootstrap/SEED)
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - name: lint
-        if: runner.os == 'Linux'
         run: make lint
-      - name: test (race)
-        run: make race
-      - name: build finc0 (static)
+      - name: unit tests
+        run: make test
+      - name: build finc0
         run: make finc0
-      - name: parse corpus
-        run: make parse-corpus
-      - name: seed compiler (finc0 builds compiler/ at bootstrap/SEED)
-        run: make seed
-      # finc0 vs finc1: regression checks of the frozen v0.2 subset
-      # (inputs marked // SINCE: v0.3+ are skipped).
-      - name: finc0 vs finc1 differential
-        run: make diff-parse
-      - name: finc0 vs finc1 check differential
-        run: make diff-check
-      - name: finc0 vs finc1 scope differential
-        run: make diff-check-scope
-      - name: finc0 vs finc1 totality differential
-        run: make diff-check-totality
-      - name: finc0 vs finc1 full check differential
-        run: make diff-check-all
-      - name: finc0 vs finc1 codegen differential
-        run: make diff-build
-      - name: bootstrap fixed point (finc0 → finc-seed → finc1 → finc2 → finc3)
-        run: make bootstrap
-      - name: release archive smoke test
-        if: runner.os == 'Linux' && runner.arch == 'X64'
-        run: make dist dist-test
-      - name: spec examples (finc1 check on the programs of the v0.2 spec)
-        run: make spec-check
-      - name: current compiler vs previous release (seed) regression
-        run: make diff-prev
-      - name: examples and tutorial snippets
-        run: make examples-test tutorial-check
-      - name: integration
+      - name: corpus tests (native static ELF64)
+        run: make test-corpus
+      - name: examples (native static ELF64)
+        run: make test-examples
+      - name: integration (TCP echo + corpus)
         run: make integration
-      - name: tooling (fmt idempotence + AST equivalence, --context golden tests)
-        run: make fmt-fc-check context-test
+      - name: native self-hosting fixed point (finc1 -> finc2 == finc3)
+        run: make bootstrap

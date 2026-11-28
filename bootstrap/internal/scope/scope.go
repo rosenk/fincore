@@ -373,6 +373,14 @@ func (c *checker) origin(e ast.Expr) origin {
 			}
 		}
 		return o
+	case *ast.ArrayLit:
+		var o origin
+		for _, el := range e.Elems {
+			if c.tracked(c.info.TypeOf(el)) {
+				o = join(o, c.origin(el))
+			}
+		}
+		return o
 	case *ast.MatchExpr:
 		// v0.2: the join of the arm values (bindings carry the
 		// scrutinee's origin, see walker.expr).
@@ -555,7 +563,6 @@ func (w *walker) stmt(s ast.Stmt) {
 		w.expr(s.X)
 		for _, arm := range s.Arms {
 			w.patternBindings(arm.Pattern, s.X)
-			w.expr(arm.Guard)
 			if arm.Expr != nil {
 				w.expr(arm.Expr)
 				if t := c.info.TypeOf(arm.Expr); !w.collect && t != nil && types.IsLinear(t) {
@@ -672,11 +679,15 @@ func (w *walker) expr(e ast.Expr) {
 		for _, f := range e.Fields {
 			w.expr(f.Value)
 		}
+	case *ast.ArrayLit:
+		for _, el := range e.Elems {
+			w.expr(el)
+		}
 	case *ast.CallExpr:
 		if w.collect {
 			if ci := c.info.CallOf(e); ci != nil && ci.AutoAddr {
 				if r := c.rootVar(ci.Recv); r != nil {
-					c.fn.addr[r] = true // implicit & of the receiver (v0.2)
+					c.fn.addr[r] = true // implicit & of the receiver
 				}
 			}
 		}
@@ -693,22 +704,11 @@ func (w *walker) expr(e ast.Expr) {
 		w.expr(e.X)
 		for _, arm := range e.Arms {
 			w.patternBindings(arm.Pattern, e.X)
-			w.expr(arm.Guard)
 			w.expr(arm.Expr)
 		}
-	case *ast.TupleExpr:
-		for _, x := range e.Elems {
-			w.expr(x)
-		}
-	case *ast.IsExpr:
-		w.expr(e.X)
-		w.patternBindings(e.Pattern, e.X)
 	}
 }
 
-// patternBindings defines the payload bindings of a pattern (match arm or
-// `is` expression); their values flow from the scrutinee x (v0.2: from
-// the matching element of a tuple scrutinee).
 func (w *walker) patternBindings(p ast.Pattern, x ast.Expr) {
 	switch p := p.(type) {
 	case *ast.Ident:
@@ -716,11 +716,6 @@ func (w *walker) patternBindings(p ast.Pattern, x ast.Expr) {
 			w.flow(w.define(p), x)
 		}
 	case *ast.CtorPattern:
-		if p.Qual == nil && !p.HasParens {
-			// v0.2: a bare name at the top level or in a tuple element
-			// (a binding, or a variant or constant without a definition).
-			w.flow(w.define(p.Name), x)
-		}
 		for _, a := range p.Args {
 			w.patternBindings(a, x)
 		}
@@ -728,17 +723,6 @@ func (w *walker) patternBindings(p ast.Pattern, x ast.Expr) {
 		for _, a := range p.Alts {
 			w.patternBindings(a, x)
 		}
-	case *ast.TuplePattern:
-		te, ok := x.(*ast.TupleExpr)
-		for i, a := range p.Elems {
-			if ok && i < len(te.Elems) {
-				w.patternBindings(a, te.Elems[i])
-			}
-		}
-	case *ast.AtPattern:
-		// v0.2: `x @ P` binds x to the same value as P's position.
-		w.patternBindings(p.Name, x)
-		w.patternBindings(p.Pattern, x)
 	}
 }
 

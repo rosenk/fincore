@@ -38,7 +38,6 @@ import (
 	"fincore/bootstrap/internal/diag"
 	"fincore/bootstrap/internal/resolve"
 	"fincore/bootstrap/internal/types"
-	"fincore/runtime/fincrt"
 )
 
 // DefaultFuel is the default per-root fuel budget (spec 5.3).
@@ -286,7 +285,18 @@ func (in *interp) stmt(s ast.Stmt) ctl {
 		if s.Op != ast.Assign {
 			r := in.lvalue(s.LHS[0])
 			y := in.eval(s.RHS[0])
-			op := map[ast.AssignOp]ast.BinaryOp{ast.AddAssign: ast.OpAdd, ast.SubAssign: ast.OpSub, ast.MulAssign: ast.OpMul, ast.QuoAssign: ast.OpDiv}[s.Op]
+			op := map[ast.AssignOp]ast.BinaryOp{
+				ast.AddAssign: ast.OpAdd,
+				ast.SubAssign: ast.OpSub,
+				ast.MulAssign: ast.OpMul,
+				ast.QuoAssign: ast.OpDiv,
+				ast.RemAssign: ast.OpRem,
+				ast.AndAssign: ast.OpAnd,
+				ast.OrAssign:  ast.OpOr,
+				ast.XorAssign: ast.OpXor,
+				ast.ShlAssign: ast.OpShl,
+				ast.ShrAssign: ast.OpShr,
+			}[s.Op]
 			r.set(in.arith(op, r.get(), y, in.info.TypeOf(s.LHS[0])))
 			return ctlNone
 		}
@@ -396,30 +406,15 @@ func (in *interp) matchExpr(e *ast.MatchExpr) types.Value {
 	return in.eval(arm.Expr)
 }
 
-// scrutinee evaluates the scrutinee of a match (a tuple scrutinee to a
-// TupleVal, v0.2).
 func (in *interp) scrutinee(e ast.Expr) types.Value {
-	if te, ok := e.(*ast.TupleExpr); ok {
-		tv := types.TupleVal{}
-		for _, x := range te.Elems {
-			tv.Elems = append(tv.Elems, in.eval(x))
-		}
-		return tv
-	}
 	return in.eval(e)
 }
 
-// selectArm returns the first arm whose pattern matches x and whose guard
-// (evaluated after the bindings are defined) holds; nil if none.
 func (in *interp) selectArm(x types.Value, arms []*ast.MatchArm) *ast.MatchArm {
 	for _, arm := range arms {
-		if !types.MatchValue(in.info, arm.Pattern, x, in.define) {
-			continue
+		if types.MatchValue(in.info, arm.Pattern, x, in.define) {
+			return arm
 		}
-		if arm.Guard != nil && !in.cond(arm.Guard) {
-			continue
-		}
-		return arm
 	}
 	return nil
 }
@@ -588,12 +583,21 @@ func (in *interp) eval(e ast.Expr) types.Value {
 			}
 		}
 		return sv
+	case *ast.ArrayLit:
+		av, ok := in.zero(in.info.TypeOf(e)).(*types.ArrayVal)
+		if !ok {
+			in.fail(diag.E2002, "invalid array literal")
+		}
+		for i, el := range e.Elems {
+			if i < len(av.Elems) {
+				av.Elems[i] = types.CopyValue(in.eval(el))
+			}
+		}
+		return av
 	case *ast.FuncLit:
 		in.fail(diag.E2002, "function literals are not supported at compile time")
 	case *ast.MatchExpr:
 		return in.matchExpr(e)
-	case *ast.IsExpr:
-		return types.BoolVal(types.MatchValue(in.info, e.Pattern, in.eval(e.X), in.define))
 	}
 	in.fail(diag.E2002, "unsupported expression at compile time")
 	return nil
@@ -931,7 +935,7 @@ func (in *interp) formatTo(e *ast.CallExpr, ci *types.Call, args []types.Value, 
 	}
 	d, _ := args[0].(types.SliceVal)
 	buf := bytesOf(d)
-	w := fincrt.NewFmt(buf)
+	w := NewFmt(buf)
 	k := 0
 	for _, p := range fi.Pieces {
 		if p.Verb == 0 {

@@ -1,0 +1,297 @@
+package main
+
+// Pure-integer IEEE-754 soft-float utilities for FinCore v0.5.
+// Written strictly in FinCore v0.1 integer subset so frozen finc0 can always
+// bootstrap finc1 -> finc2 == finc3 with zero host float dependencies.
+
+func mul64x10(hi u64, lo u64) (u64, u64, u64) {
+	// Computes 128-bit (hi, lo) * 10 = (carry_out, res_hi, res_lo)
+	// Multiply low 64 bits by 10 using 32-bit halves
+	l0 := (lo & 0xffffffff) * 10
+	l1 := (lo >> 32) * 10 + (l0 >> 32)
+	resLo := (l0 & 0xffffffff) | ((l1 & 0xffffffff) << 32)
+	c := l1 >> 32
+
+	h0 := (hi & 0xffffffff) * 10 + c
+	h1 := (hi >> 32) * 10 + (h0 >> 32)
+	resHi := (h0 & 0xffffffff) | ((h1 & 0xffffffff) << 32)
+	carry := h1 >> 32
+	return carry, resHi, resLo
+}
+
+func div128By10(hi u64, lo u64) (u64, u64) {
+	// Divides 128-bit (hi, lo) by 10 using 32-bit chunks
+	q3 := (hi >> 32) / 10
+	r := (hi >> 32) % 10
+	v2 := (r << 32) | (hi & 0xffffffff)
+	q2 := v2 / 10
+	r = v2 % 10
+	v1 := (r << 32) | (lo >> 32)
+	q1 := v1 / 10
+	r = v1 % 10
+	v0 := (r << 32) | (lo & 0xffffffff)
+	q0 := v0 / 10
+	return (q3 << 32) | q2, (q1 << 32) | q0
+}
+
+// parseFloatLit parses a decimal floating-point literal (e.g. "3.14159", "0.5", "1e-6", "2.5e10")
+// into its IEEE-754 binary64 bit pattern (u64).
+func parseFloatLit(bs []byte) (u64, bool) {
+	n := len(bs)
+	if n == 0 {
+		return 0, false
+	}
+	i := usize(0)
+	var mant u64 = 0
+	var sigDigits u32 = 0
+	var exp10 i64 = 0
+	seenDot := false
+	seenDigit := false
+
+	for step := usize(0); step < n; step++ {
+		if i >= n {
+			break
+		}
+		c := bs[i]
+		if c == '_' {
+			i++
+			continue
+		}
+		if c == '.' {
+			if seenDot {
+				return 0, false
+			}
+			seenDot = true
+			i++
+			continue
+		}
+		if c == 'e' || c == 'E' {
+			i++
+			break
+		}
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		seenDigit = true
+		d := u64(c - '0')
+		if mant == 0 && d == 0 {
+			if seenDot {
+				exp10--
+			}
+			i++
+			continue
+		}
+		if sigDigits < 19 && mant <= (18446744073709551615-d)/10 {
+			mant = mant*10 + d
+			sigDigits++
+			if seenDot {
+				exp10--
+			}
+		} else {
+			if !seenDot {
+				exp10++
+			}
+		}
+		i++
+	}
+	if !seenDigit {
+		return 0, false
+	}
+	// Optional exponent part after e/E
+	if i < n {
+		expNeg := false
+		if bs[i] == '+' {
+			i++
+		} else if bs[i] == '-' {
+			expNeg = true
+			i++
+		}
+		var eVal i64 = 0
+		hasExp := false
+		for step := usize(0); step < n; step++ {
+			if i >= n {
+				break
+			}
+			c := bs[i]
+			if c == '_' {
+				i++
+				continue
+			}
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			hasExp = true
+			if eVal < 10000 {
+				eVal = eVal*10 + i64(c-'0')
+			}
+			i++
+		}
+		if !hasExp {
+			return 0, false
+		}
+		if expNeg {
+			exp10 -= eVal
+		} else {
+			exp10 += eVal
+		}
+	}
+
+	if mant == 0 {
+		return 0, true
+	}
+	if exp10 > 310 {
+		return 0x7ff0000000000000, true // +Inf
+	}
+	if exp10 < -340 {
+		return 0, true // underflow to +0.0
+	}
+
+	// Normalize 128-bit (hi, lo) so bit 63 of hi is 1
+	hi := mant
+	var lo u64 = 0
+	var exp2 i64 = 0
+	msb := u64(1) << 63
+	for s := u32(0); s < 64; s++ {
+		if (hi & msb) != 0 {
+			break
+		}
+		hi <<= 1
+		exp2--
+	}
+
+	// Scale by 10^exp10 (bounded loop: at most 350 iterations)
+	for step := u32(0); step < 350; step++ {
+		if exp10 <= 0 {
+			break
+		}
+		carry, nhi, nlo := mul64x10(hi, lo)
+		hi = nhi
+		lo = nlo
+		// Shift right while carry > 0
+		for sh := u32(0); sh < 8; sh++ {
+			if carry == 0 {
+				break
+			}
+			lo = (lo >> 1) | ((hi & 1) << 63)
+			hi = (hi >> 1) | ((carry & 1) << 63)
+			carry >>= 1
+			exp2++
+		}
+		exp10--
+	}
+	for step := u32(0); step < 350; step++ {
+		if exp10 >= 0 {
+			break
+		}
+		nhi, nlo := div128By10(hi, lo)
+		hi = nhi
+		lo = nlo
+		// Re-normalize left so bit 63 of hi is 1
+		for sh := u32(0); sh < 8; sh++ {
+			if (hi & msb) != 0 {
+				break
+			}
+			hi = (hi << 1) | (lo >> 63)
+			lo <<= 1
+			exp2--
+		}
+		exp10++
+	}
+
+	// Pack into IEEE-754 binary64 (round-to-nearest-even from 64 bits to 53 bits)
+	be := exp2 + 63 + 1023
+	if be >= 2047 {
+		return 0x7ff0000000000000, true // +Inf
+	}
+	if be <= 0 {
+		return 0, true // subnormal/underflow -> 0.0
+	}
+	rem := hi & 0x7ff
+	sig := hi >> 11 // 53 bits with implicit bit 52 == 1
+	if rem > 0x400 || (rem == 0x400 && ((sig&1) != 0 || lo != 0)) {
+		sig++
+		if sig == (u64(1) << 53) {
+			sig >>= 1
+			be++
+			if be >= 2047 {
+				return 0x7ff0000000000000, true
+			}
+		}
+	}
+	bits := (u64(be) << 52) | (sig & 0x000fffffffffffff)
+	return bits, true
+}
+
+// intToF64Bits converts an unsigned or signed 64-bit integer to IEEE-754 f64 bits.
+func intToF64Bits(v u64, signed bool) u64 {
+	if v == 0 {
+		return 0
+	}
+	var sign u64 = 0
+	mag := v
+	if signed && (v&(u64(1)<<63)) != 0 {
+		sign = u64(1) << 63
+		mag = 0 - v
+	}
+	hi := mag
+	var exp2 i64 = 0
+	msb := u64(1) << 63
+	for s := u32(0); s < 64; s++ {
+		if (hi & msb) != 0 {
+			break
+		}
+		hi <<= 1
+		exp2--
+	}
+	be := exp2 + 63 + 1023
+	rem := hi & 0x7ff
+	sig := hi >> 11
+	if rem > 0x400 || (rem == 0x400 && (sig&1) != 0) {
+		sig++
+		if sig == (u64(1) << 53) {
+			sig >>= 1
+			be++
+		}
+	}
+	return sign | (u64(be) << 52) | (sig & 0x000fffffffffffff)
+}
+
+// f64BitsToF32Bits converts IEEE-754 binary64 bits to IEEE-754 binary32 bits.
+func f64BitsToF32Bits(b u64) u32 {
+	sign := u32((b >> 63) & 1) << 31
+	exp := (b >> 52) & 0x7ff
+	frac := b & 0x000fffffffffffff
+	if exp == 0 {
+		return sign
+	}
+	if exp == 0x7ff {
+		if frac != 0 {
+			return sign | 0x7fc00000 // quiet NaN
+		}
+		return sign | 0x7f800000 // Inf
+	}
+	be := i64(exp) - 1023 + 127
+	if be >= 255 {
+		return sign | 0x7f800000
+	}
+	if be <= 0 {
+		return sign
+	}
+	rem := frac & 0x1fffffff
+	f23 := frac >> 29
+	if rem > 0x10000000 || (rem == 0x10000000 && (f23&1) != 0) {
+		f23++
+		if f23 == (u64(1) << 23) {
+			f23 = 0
+			be++
+			if be >= 255 {
+				return sign | 0x7f800000
+			}
+		}
+	}
+	return sign | (u32(be) << 23) | u32(f23&0x7fffff)
+}
+
+func f64NegBits(b u64) u64 {
+	return b ^ (u64(1) << 63)
+}

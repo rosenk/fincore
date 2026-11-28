@@ -1,0 +1,25 @@
+// SINCE: v0.3
+// fail_v03_resume_escape: `resume` is Scoped + Linear and cannot escape its
+// handle arm into an outer variable (E3002).
+package main
+
+effect Yield {
+	yield(x u64)
+}
+
+func emit() with Yield {
+	yield(1)
+}
+
+driver func main(io Stdio) error {
+	_ = io
+	var escaped func()
+	handle emit() {
+		yield(x) -> {
+			_ = x
+			escaped = resume // ERROR E3002
+		}
+	}
+	_ = escaped
+	return nil
+}

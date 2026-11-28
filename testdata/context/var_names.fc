@@ -1,8 +1,0 @@
-// SINCE: v0.3
-// context: a var declaration with several names (E1001 at the comma).
-package main
-
-func sum() u64 {
-	var a, b, c u64
-	return a + b + c
-}

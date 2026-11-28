@@ -8,27 +8,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
-	"sync"
 
 	"fincore/bootstrap/internal/check"
-	"fincore/bootstrap/internal/codegen/golang"
+	"fincore/bootstrap/internal/codegen/amd64"
 	"fincore/bootstrap/internal/ir"
 )
 
 // buildOptions are the flags shared by build, run and test.
 type buildOptions struct {
-	Out      string // -o
-	EmitGo   string // --emit-go
-	Race     bool
-	Trimpath bool
-	Fuel     uint64
+	Out     string // -o
+	EmitAsm string // --emit-asm
+	Fuel    uint64
 }
 
-// compileGo runs the front end and the Go code generator on src. On
-// compile errors the diagnostics are printed to stderr and ok is false.
-func compileGo(env *Env, src string, fuel uint64) (goSrc []byte, ok bool) {
+// compileAsm runs the front end and the Linux x86_64 code generator on src.
+// On compile errors the diagnostics are printed to stderr and ok is false.
+func compileAsm(env *Env, src string, fuel uint64) (asmSrc []byte, ok bool) {
 	res, err := check.Run(src, check.Options{Fuel: fuel})
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "finc0: %v\n", err)
@@ -43,7 +39,7 @@ func compileGo(env *Env, src string, fuel uint64) (goSrc []byte, ok bool) {
 		fmt.Fprintf(env.Stderr, "finc0: %v\n", err)
 		return nil, false
 	}
-	out, err := golang.Generate(prog)
+	out, err := amd64.Generate(prog)
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "finc0: %v\n", err)
 		return nil, false
@@ -51,15 +47,15 @@ func compileGo(env *Env, src string, fuel uint64) (goSrc []byte, ok bool) {
 	return out, true
 }
 
-// buildBinary compiles src into the binary opts.Out. It returns false
-// after printing errors to env.Stderr.
+// buildBinary compiles src into the static Linux x86_64 ELF64 binary opts.Out.
+// Zero libc, zero GC, zero Go runtime.
 func buildBinary(env *Env, src string, opts buildOptions) bool {
-	goSrc, ok := compileGo(env, src, opts.Fuel)
+	asmSrc, ok := compileAsm(env, src, opts.Fuel)
 	if !ok {
 		return false
 	}
-	if opts.EmitGo != "" {
-		if err := os.WriteFile(opts.EmitGo, goSrc, 0o644); err != nil {
+	if opts.EmitAsm != "" {
+		if err := os.WriteFile(opts.EmitAsm, asmSrc, 0o644); err != nil {
 			fmt.Fprintf(env.Stderr, "finc0: %v\n", err)
 			return false
 		}
@@ -74,148 +70,71 @@ func buildBinary(env *Env, src string, opts buildOptions) bool {
 		fmt.Fprintf(env.Stderr, "finc0: %v\n", err)
 		return false
 	}
-	if err := goBuild(env, root, goSrc, out, opts); err != nil {
+	if err := nativeBuild(root, asmSrc, out); err != nil {
 		fmt.Fprintf(env.Stderr, "finc0: %v\n", err)
 		return false
 	}
 	return true
 }
 
-var goDirectiveRE = regexp.MustCompile(`(?m)^go\s+(\S+)\s*$`)
+var runtimeAsmFiles = []string{"sys.s", "fmt.s", "net.s", "scope.s"}
 
-// goBuild writes goSrc into a temporary module that requires the fincore
-// module (via a replace directive pointing at root) and runs `go build`.
-func goBuild(env *Env, root string, goSrc []byte, out string, opts buildOptions) error {
+// nativeBuild assembles asmSrc and runtime/linux_amd64/*.s using GNU as,
+// then links them into a standalone static ELF64 executable using GNU ld.
+func nativeBuild(root string, asmSrc []byte, out string) error {
 	dir, err := os.MkdirTemp("", "finc0-build-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	goVersion := "1.22"
-	if data, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
-		if m := goDirectiveRE.FindSubmatch(data); m != nil {
-			goVersion = string(m[1])
-		}
-	}
-	mod := fmt.Sprintf("module fincprog\n\ngo %s\n\nrequire fincore v0.0.0\n\nreplace fincore => %s\n", goVersion, root)
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(mod), 0o644); err != nil {
+
+	progS := filepath.Join(dir, "prog.s")
+	if err := os.WriteFile(progS, asmSrc, 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), goSrc, 0o644); err != nil {
+	progO := filepath.Join(dir, "prog.o")
+	if err := runAssembler(progS, progO); err != nil {
+		return fmt.Errorf("assemble program: %w", err)
+	}
+
+	rtDir := filepath.Join(root, "runtime", "linux_amd64")
+	objs := make([]string, 0, len(runtimeAsmFiles)+1)
+	for _, name := range runtimeAsmFiles {
+		srcPath := filepath.Join(rtDir, name)
+		objPath := filepath.Join(dir, "rt_"+strings.TrimSuffix(name, ".s")+".o")
+		if err := runAssembler(srcPath, objPath); err != nil {
+			return fmt.Errorf("assemble runtime %s: %w", name, err)
+		}
+		objs = append(objs, objPath)
+	}
+	objs = append(objs, progO)
+
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return err
 	}
-	if opts.Race {
-		if err := os.WriteFile(filepath.Join(dir, "zz_race.go"), []byte(raceInitSrc), 0o644); err != nil {
-			return err
-		}
-	}
-	args := []string{"build", "-o", out}
-	if opts.Race {
-		args = append(args, "-race")
-	}
-	if opts.Trimpath {
-		args = append(args, "-trimpath")
-	}
-	args = append(args, ".")
-	cmd := exec.Command(goTool(root), args...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod")
-	if opts.Race {
-		cmd.Env = append(cmd.Env, "CGO_ENABLED=1")
-	} else {
-		cmd.Env = append(cmd.Env, "CGO_ENABLED=0")
-	}
+	ldArgs := append([]string{"-static", "-z", "noexecstack", "--build-id=none", "-o", out}, objs...)
+	ldCmd := exec.Command("ld", ldArgs...)
 	var stderr bytes.Buffer
-	cmd.Stdout = env.Stderr
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.ReplaceAll(stderr.String(), dir+string(filepath.Separator), "")
-		return fmt.Errorf("go build failed: %v\n%s", err, msg)
+	ldCmd.Stderr = &stderr
+	if err := ldCmd.Run(); err != nil {
+		return fmt.Errorf("ld -static failed: %v\n%s", err, stderr.String())
 	}
 	return nil
 }
 
-// raceInitSrc is added to --race builds only (it is not part of the
-// generated program, so --emit-go output does not depend on --race). The
-// race runtime sleeps atexit_sleep_ms (default 1s) at exit whenever other
-// goroutines exist, which os/signal's permanent signal loop guarantees;
-// that would break the spec 13.3 shutdown deadlines. The race runtime reads
-// GORACE before any Go code runs, so the program re-executes itself once
-// with atexit_sleep_ms=0 added (same PID; skipped if already set).
-const raceInitSrc = `//go:build race
-
-package main
-
-import (
-	"os"
-	"strings"
-	"syscall"
-)
-
-func init() {
-	gorace := os.Getenv("GORACE")
-	if strings.Contains(gorace, "atexit_sleep_ms") {
-		return
+func runAssembler(srcPath, objPath string) error {
+	cmd := exec.Command("as", "--64", "-o", objPath, srcPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("as failed: %v\n%s", err, stderr.String())
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		return
-	}
-	val := "atexit_sleep_ms=0"
-	if gorace != "" {
-		val = gorace + " " + val
-	}
-	var env []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GORACE=") {
-			env = append(env, kv)
-		}
-	}
-	env = append(env, "GORACE="+val)
-	_ = syscall.Exec(exe, os.Args, env)
-}
-`
-
-// goTool returns the go command to use. Version-manager shims (mise,
-// asdf, ...) pick the toolchain from the working directory's config, but
-// the build runs in a temporary directory; so the real binary is resolved
-// once by asking `go env GOROOT` from the module root.
-func goTool(root string) string {
-	if p := os.Getenv("FINC_GO"); p != "" {
-		return p
-	}
-	goToolOnce.Do(func() {
-		goToolPath = "go"
-		if p, err := exec.LookPath("go"); err == nil {
-			goToolPath = p
-		}
-		cmd := exec.Command(goToolPath, "env", "GOROOT")
-		cmd.Dir = root
-		if out, err := cmd.Output(); err == nil {
-			p := filepath.Join(strings.TrimSpace(string(out)), "bin", "go")
-			if _, err := os.Stat(p); err == nil {
-				goToolPath = p
-				return
-			}
-		}
-		if p := filepath.Join(runtime.GOROOT(), "bin", "go"); runtime.GOROOT() != "" {
-			if _, err := os.Stat(p); err == nil {
-				goToolPath = p
-			}
-		}
-	})
-	return goToolPath
+	return nil
 }
 
-var (
-	goToolOnce sync.Once
-	goToolPath string
-)
-
-// findModuleRoot locates the fincore module root (for the runtime
-// package): $FINCORE_ROOT, else the first directory above the working
-// directory or above the finc0 executable whose go.mod declares
-// `module fincore`.
+// findModuleRoot locates the fincore repository root (for runtime/linux_amd64):
+// $FINCORE_ROOT, else the first directory above the working directory or above
+// the finc0 executable whose go.mod declares `module fincore`.
 func findModuleRoot() (string, error) {
 	if r := os.Getenv("FINCORE_ROOT"); r != "" {
 		abs, err := filepath.Abs(r)
@@ -249,7 +168,7 @@ func findModuleRoot() (string, error) {
 			dir = parent
 		}
 	}
-	return "", errors.New("cannot find the fincore module root (go.mod with `module fincore`); set FINCORE_ROOT")
+	return "", errors.New("cannot find the fincore repository root (go.mod with `module fincore`); set FINCORE_ROOT")
 }
 
 var moduleFincoreRE = regexp.MustCompile(`(?m)^module\s+fincore\s*$`)
@@ -266,10 +185,8 @@ func parseBuildFlags(env *Env, name, usageLine string, args []string, withOut bo
 	var o buildOptions
 	if withOut {
 		fs.StringVar(&o.Out, "o", "", "output binary (default: base name of the source)")
-		fs.StringVar(&o.EmitGo, "emit-go", "", "also write the generated Go source to this file")
-		fs.BoolVar(&o.Trimpath, "trimpath", false, "pass -trimpath to go build")
+		fs.StringVar(&o.EmitAsm, "emit-asm", "", "also write the generated x86_64 assembly to this file")
 	}
-	fs.BoolVar(&o.Race, "race", false, "build with the race detector (needs cgo)")
 	fs.Uint64Var(&o.Fuel, "comptime-fuel", 1_000_000, "comptime fuel budget per evaluation")
 	if err := fs.Parse(args); err != nil {
 		return o, nil, false
@@ -282,7 +199,7 @@ func parseBuildFlags(env *Env, name, usageLine string, args []string, withOut bo
 }
 
 func runBuild(env *Env, args []string) int {
-	const usageLine = "build [-o out_bin] [--emit-go=out.go] [--race] [--trimpath] [--comptime-fuel=N] <file.fc | dir>"
+	const usageLine = "build [-o out_bin] [--emit-asm=out.s] [--comptime-fuel=N] <file.fc | dir>"
 	o, rest, ok := parseBuildFlags(env, "build", usageLine, args, true)
 	if !ok {
 		return ExitUsage
@@ -313,7 +230,7 @@ func isDir(p string) bool {
 // runRun builds to a temporary binary and executes it with the arguments
 // after `--`, forwarding stdin/stdout/stderr and the exit code.
 func runRun(env *Env, args []string) int {
-	const usageLine = "run [--race] [--comptime-fuel=N] <file.fc | dir> [-- args...]"
+	const usageLine = "run [--comptime-fuel=N] <file.fc | dir> [-- args...]"
 	var progArgs []string
 	for i, a := range args {
 		if a == "--" {

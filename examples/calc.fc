@@ -2,14 +2,13 @@
 // AST, printed back fully parenthesized and evaluated with checked
 // arithmetic.
 //
-//	bin/finc1 run examples/calc.fc                   # the built-in script
-//	bin/finc1 run examples/calc.fc -- '(1 + 2) * 3'  # one expression
+//	finc0 run examples/calc.fc                   # the built-in script
+//	finc0 run examples/calc.fc -- '(1 + 2) * 3'  # one expression
 //
 // Shows: sum types for the AST, errors and results; an arena where nodes
 // refer to each other by u32 IDs (no pointers, no allocation); mutual
 // recursion proven total with decreases(depth), so hostile input cannot
-// overflow the stack; tuple, nested and or-patterns, guards, `@`, `is`
-// with let-else; Format methods for %v.
+// overflow the stack; Format methods for %v.
 package main
 
 const (
@@ -54,14 +53,25 @@ type CalcErr enum {
 }
 
 func (e CalcErr) Format(dst []byte) usize {
+	match e {
+		Syntax(at, c) -> {
+			if c == 0 {
+				return formatTo(dst, "syntax error at column %d", at+1)
+			}
+			return formatTo(dst, "expected '%c' at column %d", c, at+1)
+		}
+		DivZero(at) -> return formatTo(dst, "division by zero at column %d", at+1)
+		Overflow(at) -> return formatTo(dst, "overflow at column %d", at+1)
+		Unbound(v) -> return formatTo(dst, "variable %c is not set", v)
+		TooDeep -> return formatTo(dst, "nested deeper than %d", MaxDepth)
+		TooBig -> return formatTo(dst, "more than %d nodes", MaxNodes)
+	}
+}
+
+func isArithErr(e CalcErr) bool {
 	return match e {
-		Syntax(at, 0) -> formatTo(dst, "syntax error at column %d", at+1)
-		Syntax(at, c) -> formatTo(dst, "expected '%c' at column %d", c, at+1)
-		DivZero(at) -> formatTo(dst, "division by zero at column %d", at+1)
-		Overflow(at) -> formatTo(dst, "overflow at column %d", at+1)
-		Unbound(v) -> formatTo(dst, "variable %c is not set", v)
-		TooDeep -> formatTo(dst, "nested deeper than %d", MaxDepth)
-		TooBig -> formatTo(dst, "more than %d nodes", MaxNodes)
+		DivZero(_) | Overflow(_) -> true
+		_ -> false
 	}
 }
 
@@ -120,19 +130,23 @@ func (p *Parser) peek() u8 {
 }
 
 func opOf(level u8, c u8) (Op, bool) {
-	match (level, c) {
-		(0, '+') -> return Op.Add, true
-		(0, '-') -> return Op.Sub, true
-		(1, '*') -> return Op.Mul, true
-		(1, '/') -> return Op.Div, true
-		(1, '%') -> return Op.Mod, true
-		_ -> return Op.Add, false
+	if level == 0 {
+		match c {
+			'+' -> return Op.Add, true
+			'-' -> return Op.Sub, true
+		}
+	} else if level == 1 {
+		match c {
+			'*' -> return Op.Mul, true
+			'/' -> return Op.Div, true
+			'%' -> return Op.Mod, true
+		}
 	}
+	return Op.Add, false
 }
 
 // binary parses level 0 (+ -) and 1 (* / %), left-associative; level 2
-// is a unary operand. Each round consumes an operator, so len(src) rounds
-// always suffice: a counting loop (T1) instead of an unbounded one.
+// is a unary operand.
 func (p *Parser) binary(level u8, depth usize) NodeID decreases(depth) {
 	if depth == 0 {
 		return p.fail(CalcErr.TooDeep)
@@ -159,24 +173,23 @@ func (p *Parser) unary(depth usize) NodeID decreases(depth) {
 		return p.fail(CalcErr.TooDeep)
 	}
 	at := p.pos
-	match p.peek() {
-		'-' -> {
-			p.pos++
-			return p.node(Node.Neg(p.unary(depth-1)), at)
+	c := p.peek()
+	if c == '-' {
+		p.pos++
+		return p.node(Node.Neg(p.unary(depth-1)), at)
+	}
+	if c == '(' {
+		p.pos++
+		e := p.binary(0, depth-1)
+		if p.peek() != ')' {
+			return p.fail(CalcErr.Syntax(u32(p.pos), ')'))
 		}
-		'(' -> {
-			p.pos++
-			e := p.binary(0, depth-1)
-			if p.peek() != ')' {
-				return p.fail(CalcErr.Syntax(u32(p.pos), ')'))
-			}
-			p.pos++
-			return e
-		}
-		c if c >= 'a' && c <= 'z' -> { // a top-level binding with a guard
-			p.pos++
-			return p.node(Node.Var(c), at)
-		}
+		p.pos++
+		return e
+	}
+	if c >= 'a' && c <= 'z' {
+		p.pos++
+		return p.node(Node.Var(c), at)
 	}
 	v := i64(0)
 	n := len(p.src)
@@ -200,17 +213,43 @@ func (p *Parser) unary(depth usize) NodeID decreases(depth) {
 // ---- checked arithmetic ----
 
 func apply(op Op, x i64, y i64, at u32) Result {
-	return match (op, y) {
-		(Div | Mod, 0) -> Result.Err(CalcErr.DivZero(at))
-		(Div | Mod, -1) if x == MinI64 -> Result.Err(CalcErr.Overflow(at))
-		(Add, _) if y > 0 && x > MaxI64-y || y < 0 && x < MinI64-y -> Result.Err(CalcErr.Overflow(at))
-		(Sub, _) if y < 0 && x > MaxI64+y || y > 0 && x < MinI64+y -> Result.Err(CalcErr.Overflow(at))
-		(Mul, _) if x != 0 && (x*y/x != y || x == -1 && y == MinI64) -> Result.Err(CalcErr.Overflow(at))
-		(Add, _) -> Result.Ok(x + y)
-		(Sub, _) -> Result.Ok(x - y)
-		(Mul, _) -> Result.Ok(x * y)
-		(Div, _) -> Result.Ok(x / y)
-		(Mod, _) -> Result.Ok(x % y)
+	match op {
+		Add -> {
+			if y > 0 && x > MaxI64-y || y < 0 && x < MinI64-y {
+				return Result.Err(CalcErr.Overflow(at))
+			}
+			return Result.Ok(x + y)
+		}
+		Sub -> {
+			if y < 0 && x > MaxI64+y || y > 0 && x < MinI64+y {
+				return Result.Err(CalcErr.Overflow(at))
+			}
+			return Result.Ok(x - y)
+		}
+		Mul -> {
+			if x != 0 && (x*y/x != y || x == -1 && y == MinI64) {
+				return Result.Err(CalcErr.Overflow(at))
+			}
+			return Result.Ok(x * y)
+		}
+		Div -> {
+			if y == 0 {
+				return Result.Err(CalcErr.DivZero(at))
+			}
+			if x == MinI64 && y == -1 {
+				return Result.Err(CalcErr.Overflow(at))
+			}
+			return Result.Ok(x / y)
+		}
+		Mod -> {
+			if y == 0 {
+				return Result.Err(CalcErr.DivZero(at))
+			}
+			if x == MinI64 && y == -1 {
+				return Result.Err(CalcErr.Overflow(at))
+			}
+			return Result.Ok(x % y)
+		}
 	}
 }
 
@@ -220,25 +259,28 @@ func eval(id NodeID, depth usize) Result decreases(depth) {
 	}
 	match nodes[id] {
 		Num(v) -> return Result.Ok(v)
-		Var(c) if isSet[c-'a'] -> return Result.Ok(vars[c-'a'])
-		Var(c) -> return Result.Err(CalcErr.Unbound(c))
-		Neg(x) -> {
-			r := eval(x, depth-1)
-			if !(r is Ok(v)) { // let-else: v is in scope after the if
-				return r
+		Var(c) -> {
+			if isSet[c-'a'] {
+				return Result.Ok(vars[c-'a'])
 			}
-			return apply(Op.Sub, 0, v, nodeAt[id])
+			return Result.Err(CalcErr.Unbound(c))
+		}
+		Neg(x) -> {
+			match eval(x, depth-1) {
+				Ok(v) -> return apply(Op.Sub, 0, v, nodeAt[id])
+				Err(e) -> return Result.Err(e)
+			}
 		}
 		Bin(op, l, r) -> {
-			a := eval(l, depth-1)
-			if !(a is Ok(x)) {
-				return a
+			match eval(l, depth-1) {
+				Err(e) -> return Result.Err(e)
+				Ok(x) -> {
+					match eval(r, depth-1) {
+						Err(e) -> return Result.Err(e)
+						Ok(y) -> return apply(op, x, y, nodeAt[id])
+					}
+				}
 			}
-			b := eval(r, depth-1)
-			if !(b is Ok(y)) {
-				return b
-			}
-			return apply(op, x, y, nodeAt[id])
 		}
 	}
 }
@@ -290,8 +332,13 @@ func run(line []byte, out []byte) usize {
 			}
 			k += formatTo(out[k:], " = %d\n", v)
 		}
-		Err(e @ (DivZero(_) | Overflow(_))) -> k += formatTo(out[k:], " = arithmetic error: %v\n", e)
-		Err(e) -> k += formatTo(out[k:], " = error: %v\n", e)
+		Err(e) -> {
+			if isArithErr(e) {
+				k += formatTo(out[k:], " = arithmetic error: %v\n", e)
+			} else {
+				k += formatTo(out[k:], " = error: %v\n", e)
+			}
+		}
 	}
 	return k
 }

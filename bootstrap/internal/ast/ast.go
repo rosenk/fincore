@@ -331,10 +331,16 @@ const (
 	SubAssign                 // -=
 	MulAssign                 // *=
 	QuoAssign                 // /=
+	RemAssign                 // %=
+	AndAssign                 // &=
+	OrAssign                  // |=
+	XorAssign                 // ^=
+	ShlAssign                 // <<=
+	ShrAssign                 // >>=
 )
 
 func (o AssignOp) String() string {
-	return [...]string{"=", "+=", "-=", "*=", "/="}[o]
+	return [...]string{"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="}[o]
 }
 
 // AssignStmt is `lhs op rhs`.
@@ -374,14 +380,11 @@ type MatchStmt struct {
 	Arms []*MatchArm
 }
 
-// MatchArm is `Pattern [if Guard] -> Expr` or `Pattern [if Guard] -> Block`.
-// Exactly one of Expr, Block is non-nil. A statement arm whose body is a
-// simple statement, return, break or continue (v0.2) is parsed as a Block
-// holding that one statement.
+// MatchArm is `Pattern -> Expr` or `Pattern -> Block`.
+// Exactly one of Expr, Block is non-nil.
 type MatchArm struct {
 	Base
 	Pattern Pattern
-	Guard   Expr // nil if absent (v0.2)
 	Expr    Expr
 	Block   *BlockStmt
 }
@@ -391,11 +394,7 @@ type WildcardPattern struct {
 	Base
 }
 
-// CtorPattern is `[Qual.]Name[(p1, p2)]`. A payload pattern (v0.2) is an
-// *Ident (a binding, `_`, or an unqualified variant of the payload's enum
-// type, decided by the type checker), a *CtorPattern, a *LiteralPattern,
-// an *OrPattern (written `(P1 | P2)` or as a whole payload `V(1 | 2)`) or
-// a *RestPattern.
+// CtorPattern is `[Qual.]Name[(a, b)]`. Payload args are *Ident bindings (`_` skips).
 type CtorPattern struct {
 	Base
 	Qual      *Ident // nil if unqualified
@@ -404,39 +403,17 @@ type CtorPattern struct {
 	Args      []Pattern
 }
 
-// LiteralPattern is a literal pattern (INT, STRING, CHAR, true, false, nil).
+// LiteralPattern is a literal pattern (INT, -INT, STRING, CHAR, true, false, nil).
 type LiteralPattern struct {
 	Base
-	Lit Expr // *BasicLit, *BoolLit or *NilLit
+	Lit Expr // *BasicLit, *UnaryExpr(-int), *BoolLit or *NilLit
 }
 
-// OrPattern is `P1 | P2 | ...` (v0.2): two or more alternatives, none of
-// which is itself an OrPattern. A single pattern is never wrapped.
+// OrPattern is `P1 | P2 | ...`: two or more alternatives, none of which is
+// itself an OrPattern.
 type OrPattern struct {
 	Base
 	Alts []Pattern
-}
-
-// TuplePattern is `(P1, P2, ...)` (v0.2): two or more element patterns,
-// matched against a tuple scrutinee of the same arity.
-type TuplePattern struct {
-	Base
-	Elems []Pattern
-}
-
-// RestPattern is `..` in a variant's payload list (v0.2): it matches the
-// remaining payloads.
-type RestPattern struct {
-	Base
-}
-
-// AtPattern is `Name @ Pattern` (v0.2): Name is bound to the value at its
-// position, which must also match Pattern. Pattern is never an
-// unparenthesized or-pattern alternative (`x @ (A | B)`).
-type AtPattern struct {
-	Base
-	Name    *Ident
-	Pattern Pattern
 }
 
 // ForStmt is `[driver] for [header] [decreases(M)] Body`.
@@ -584,13 +561,14 @@ type BinaryExpr struct {
 type UnaryOp uint8
 
 const (
-	OpNot   UnaryOp = iota // !
-	OpNeg                  // -
-	OpAddr                 // &
-	OpDeref                // *
+	OpNot    UnaryOp = iota // !
+	OpNeg                   // -
+	OpBitNot                // ^
+	OpAddr                  // &
+	OpDeref                 // *
 )
 
-func (o UnaryOp) String() string { return [...]string{"!", "-", "&", "*"}[o] }
+func (o UnaryOp) String() string { return [...]string{"!", "-", "^", "&", "*"}[o] }
 
 // UnaryExpr is `Op X`.
 type UnaryExpr struct {
@@ -656,26 +634,19 @@ type FieldInit struct {
 	Value Expr
 }
 
-// MatchExpr is `match X { arms }` in expression position (v0.2). Every arm
-// has an Expr and no Block.
+// ArrayLit is `[N]T{e1, e2, ...}`.
+type ArrayLit struct {
+	Base
+	Type  *ArrayType
+	Elems []Expr
+}
+
+// MatchExpr is `match X { arms }` in expression position. Every arm has an
+// Expr and no Block.
 type MatchExpr struct {
 	Base
 	X    Expr
 	Arms []*MatchArm
-}
-
-// TupleExpr is `(X1, X2, ...)` (v0.2): two or more expressions. It is
-// only valid as the scrutinee of a match.
-type TupleExpr struct {
-	Base
-	Elems []Expr
-}
-
-// IsExpr is `X is Pattern` (v0.2), a variant test of type bool.
-type IsExpr struct {
-	Base
-	X       Expr
-	Pattern Pattern
 }
 
 // TypeExpr is a syntactic type appearing in expression position (generic
@@ -701,10 +672,9 @@ func (*SliceExpr) exprNode()    {}
 func (*SelectorExpr) exprNode() {}
 func (*FuncLit) exprNode()      {}
 func (*StructLit) exprNode()    {}
+func (*ArrayLit) exprNode()     {}
 func (*TypeExpr) exprNode()     {}
 func (*MatchExpr) exprNode()    {}
-func (*TupleExpr) exprNode()    {}
-func (*IsExpr) exprNode()       {}
 
 func (*NamedType) typeNode()   {}
 func (*ArrayType) typeNode()   {}
@@ -741,7 +711,4 @@ func (*WildcardPattern) patternNode() {}
 func (*CtorPattern) patternNode()     {}
 func (*LiteralPattern) patternNode()  {}
 func (*OrPattern) patternNode()       {}
-func (*TuplePattern) patternNode()    {}
-func (*RestPattern) patternNode()     {}
-func (*AtPattern) patternNode()       {}
 func (*Ident) patternNode()           {}

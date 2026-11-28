@@ -221,7 +221,7 @@ func (c *Checker) builtinMethodCall(e *ast.CallExpr, m *Method, ci *Call) operan
 	ci.Kind, ci.Effect = CallBuiltinMeth, m.Effect()
 	name := m.Recv.Name + "." + m.Name
 	switch m.Builtin {
-	case NetListenTCP, ListenerAccept, ContextWithTimeout, SignalsNotifyContext:
+	case NetListenTCP, NetDialTCP, ListenerAccept, ContextWithTimeout, SignalsNotifyContext:
 		ci.ResourceCtor = true
 	case ConnClose, ListenerClose:
 		ci.ConsumesRecv = true

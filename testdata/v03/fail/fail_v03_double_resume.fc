@@ -1,0 +1,24 @@
+// SINCE: v0.3
+// fail_v03_double_resume: calling linear one-shot `resume` twice is a static
+// compile-time error E3003 (same linearity rule as double Conn.Close).
+package main
+
+effect Yield {
+	yield(x u64)
+}
+
+func emit() with Yield {
+	yield(1)
+}
+
+driver func main(io Stdio) error {
+	_ = io
+	handle emit() {
+		yield(x) -> {
+			_ = x
+			resume()
+			resume() // ERROR E3003
+		}
+	}
+	return nil
+}

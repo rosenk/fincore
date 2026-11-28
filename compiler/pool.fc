@@ -1,0 +1,374 @@
+package main
+
+// Fixed-capacity arenas, string interner, source line map, and diagnostics.
+// Zero heap allocation: all storage lives in .bss (demand-paged by Linux).
+
+const (
+	MaxFiles     = 128
+	MaxSrcBytes  = 2 * 1024 * 1024
+	MaxLines     = 131072
+	MaxStrBytes  = 512 * 1024
+	MaxStrs      = 16384
+	StrHashCap   = 32768 // power of 2, 2x MaxStrs
+	MaxDiags     = 512
+	MaxDiagBytes = 64 * 1024
+)
+
+// Diagnostic codes (matching spec section 11).
+const (
+	E1001 u16 = 1001 // SYNTAX_ERROR
+	E1002 u16 = 1002 // UNTERMINATED_LITERAL
+	E2001 u16 = 2001 // UNDEFINED_SYMBOL
+	E2002 u16 = 2002 // TYPE_MISMATCH
+	E2003 u16 = 2003 // ARITY_MISMATCH
+	E2004 u16 = 2004 // INVALID_NIL
+	E2005 u16 = 2005 // UNINITIALIZED_SCOPED
+	E2006 u16 = 2006 // IMPORT_CYCLE
+	E2010 u16 = 2010 // UNIVERSE_LEVEL_MISMATCH
+	E2011 u16 = 2011 // NON_PARAMETRIC_OP
+	E2012 u16 = 2012 // NON_EXHAUSTIVE_MATCH
+	E2013 u16 = 2013 // REFINEMENT_UNPROVEN
+	E2014 u16 = 2014 // CONST_MUTATION
+	E3001 u16 = 3001 // GLOBAL_SCOPED_VAR
+	E3002 u16 = 3002 // SCOPE_ESCAPE
+	E3003 u16 = 3003 // USE_AFTER_MOVE
+	E3004 u16 = 3004 // DISCARDED_LINEAR
+	E3005 u16 = 3005 // LINEAR_RESOURCE_LEAK
+	E4001 u16 = 4001 // COMPTIME_OUT_OF_FUEL
+	E4002 u16 = 4002 // UNPROVEN_TERMINATION
+	E4003 u16 = 4003 // ARRAY_BOUNDS_COMPTIME
+	E4004 u16 = 4004 // MUTUAL_RECURSION_NO_MEASURE
+	E5001 u16 = 5001 // DRIVER_CALL_IN_TOTAL
+	E5002 u16 = 5002 // INVALID_MAIN_SIGNATURE
+	E5003 u16 = 5003 // MISSING_EFFECT
+)
+
+type SourceFile struct {
+	pathID    u32 // StrID of display path
+	srcOff    u32 // byte offset in srcBuf
+	srcLen    u32 // byte length in srcBuf
+	lineStart u32 // first index in lineOffs
+	lineCount u32 // number of lines
+	tokStart  u32 // first index in toks
+	tokCount  u32 // number of tokens
+	astNode   u32 // NKFile node ID
+}
+
+type Diag struct {
+	code   u16
+	pad    u16
+	fileID u32
+	off    u32 // byte offset within file
+	msgOff u32
+	msgLen u32
+}
+
+var srcBuf [MaxSrcBytes]byte
+var srcUsed u32
+var files [MaxFiles]SourceFile
+var fileCount u32
+var lineOffs [MaxLines]u32
+var lineCount u32
+
+var strData [MaxStrBytes]byte
+var strDataUsed u32
+var strOffs [MaxStrs]u32
+var strLens [MaxStrs]u32
+var strCount u32
+var strHash [StrHashCap]u32 // 1-based StrID (0 = empty)
+
+var diags [MaxDiags]Diag
+var diagCount u32
+var diagMsgBuf [MaxDiagBytes]byte
+var diagMsgUsed u32
+
+// poolInit resets and initializes interned string 0 as "".
+func poolInit() {
+	srcUsed = 0
+	fileCount = 0
+	lineCount = 0
+	strDataUsed = 0
+	strCount = 1 // ID 0 is reserved for empty/none
+	strOffs[0] = 0
+	strLens[0] = 0
+	for i := usize(0); i < StrHashCap; i++ {
+		strHash[i] = 0
+	}
+	diagCount = 0
+	diagMsgUsed = 0
+}
+
+func fnv1a(b []byte) u32 {
+	var h u32 = 2166136261
+	for i := usize(0); i < len(b); i++ {
+		h ^= u32(b[i])
+		h *= 16777619
+	}
+	return h
+}
+
+func sliceEq(a []byte, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := usize(0); i < len(a); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sliceCmp(a []byte, b []byte) i32 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := usize(0); i < n; i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
+}
+
+// internBytes returns a unique StrID (>0 for non-empty, 0 for empty).
+func internBytes(b []byte) u32 {
+	if len(b) == 0 {
+		return 0
+	}
+	mask := u32(StrHashCap - 1)
+	slot := fnv1a(b) & mask
+	for step := usize(0); step < StrHashCap; step++ {
+		id := strHash[slot]
+		if id == 0 {
+			if strCount >= MaxStrs || usize(strDataUsed)+len(b) > MaxStrBytes {
+				return 0
+			}
+			newID := strCount
+			strCount++
+			off := strDataUsed
+			copy(strData[usize(off):usize(off)+len(b)], b)
+			strDataUsed += u32(len(b))
+			strOffs[newID] = off
+			strLens[newID] = u32(len(b))
+			strHash[slot] = newID
+			return newID
+		}
+		so := usize(strOffs[id])
+		sl := usize(strLens[id])
+		if sliceEq(strData[so:so+sl], b) {
+			return id
+		}
+		slot = (slot + 1) & mask
+	}
+	return 0
+}
+
+// internStr interns a compile-time/small string literal.
+func internStr(s string) u32 {
+	if len(s) == 0 {
+		return 0
+	}
+	var tmp [256]byte
+	if len(s) <= len(tmp) {
+		for i := usize(0); i < len(s); i++ {
+			tmp[i] = s[i]
+		}
+		return internBytes(tmp[:len(s)])
+	}
+	return internBytes(strBytes(s))
+}
+
+func strSlice(id u32) []byte {
+	if id == 0 || id >= strCount {
+		return strData[0:0]
+	}
+	o := usize(strOffs[id])
+	l := usize(strLens[id])
+	return strData[o : o+l]
+}
+
+// addSourceFile registers a loaded file in srcBuf and builds its line offset table.
+func addSourceFile(path []byte, srcOff u32, srcLen u32) u32 {
+	if fileCount >= MaxFiles {
+		return 0
+	}
+	fid := fileCount
+	fileCount++
+	ls := lineCount
+	if lineCount < MaxLines {
+		lineOffs[lineCount] = 0
+		lineCount++
+	}
+	for i := u32(0); i < srcLen; i++ {
+		if srcBuf[usize(srcOff+i)] == '\n' {
+			if lineCount < MaxLines {
+				lineOffs[lineCount] = i + 1
+				lineCount++
+			}
+		}
+	}
+	files[fid] = SourceFile{
+		pathID:    internBytes(path),
+		srcOff:    srcOff,
+		srcLen:    srcLen,
+		lineStart: ls,
+		lineCount: lineCount - ls,
+	}
+	return fid
+}
+
+// offsetToLineCol converts a 0-based byte offset in fileID to 1-based (line, col).
+func offsetToLineCol(fileID u32, off u32) (u32, u32) {
+	if fileID >= fileCount {
+		return 1, 1
+	}
+	f := files[fileID]
+	if f.lineCount == 0 {
+		return 1, 1
+	}
+	lo := u32(0)
+	hi := f.lineCount
+	for step := u32(0); step < 32; step++ {
+		if lo+1 >= hi {
+			break
+		}
+		mid := lo + (hi-lo)/2
+		if lineOffs[usize(f.lineStart+mid)] <= off {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	lineStartOff := lineOffs[usize(f.lineStart+lo)]
+	return lo + 1, off - lineStartOff + 1
+}
+
+func addDiag(code u16, fileID u32, off u32, msg []byte) {
+	if diagCount >= MaxDiags {
+		return
+	}
+	// Deduplicate identical (fileID, off, code) diagnostics
+	for i := u32(0); i < diagCount; i++ {
+		if diags[i].fileID == fileID && diags[i].off == off && diags[i].code == code {
+			return
+		}
+	}
+	mo := diagMsgUsed
+	ml := len(msg)
+	if usize(mo)+ml > MaxDiagBytes {
+		ml = MaxDiagBytes - usize(mo)
+	}
+	copy(diagMsgBuf[usize(mo):usize(mo)+ml], msg[:ml])
+	diagMsgUsed += u32(ml)
+	diags[diagCount] = Diag{
+		code:   code,
+		fileID: fileID,
+		off:    off,
+		msgOff: mo,
+		msgLen: u32(ml),
+	}
+	diagCount++
+}
+
+func addDiagStr(code u16, fileID u32, off u32, msg string) {
+	var tmp [256]byte
+	n := len(msg)
+	if n > len(tmp) {
+		n = len(tmp)
+	}
+	for i := usize(0); i < n; i++ {
+		tmp[i] = msg[i]
+	}
+	addDiag(code, fileID, off, tmp[:n])
+}
+
+func diagLess(a Diag, b Diag) bool {
+	if a.fileID != b.fileID {
+		return sliceCmp(strSlice(files[a.fileID].pathID), strSlice(files[b.fileID].pathID)) < 0
+	}
+	if a.off != b.off {
+		return a.off < b.off
+	}
+	return a.code < b.code
+}
+
+func sortDiags() {
+	dc := diagCount
+	for i := u32(1); i < dc; i++ {
+		cur := diags[i]
+		j := i
+		for step := u32(0); step < MaxDiags; step++ {
+			if j == 0 {
+				break
+			}
+			if !diagLess(cur, diags[j-1]) {
+				break
+			}
+			diags[j] = diags[j-1]
+			j--
+		}
+		diags[j] = cur
+	}
+}
+
+driver func printDiags(io Stdio) error {
+	sortDiags()
+	dc := diagCount
+	var lineBuf [512]byte
+	for i := u32(0); i < dc; i++ {
+		d := diags[i]
+		ln, col := offsetToLineCol(d.fileID, d.off)
+		p := strSlice(files[d.fileID].pathID)
+		m := diagMsgBuf[usize(d.msgOff) : usize(d.msgOff+d.msgLen)]
+		pos := usize(0)
+		pos += copy(lineBuf[pos:], p)
+		pos += formatTo(lineBuf[pos:], ":%d:%d: error[E%d]: ", ln, col, d.code)
+		pos += copy(lineBuf[pos:], m)
+		if pos < len(lineBuf) {
+			lineBuf[pos] = '\n'
+			pos++
+		}
+		if err := io.WriteStderr(lineBuf[:pos]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Byte-buffer writer helper for formatting diagnostics/messages without allocation.
+func bufAppend(dst []byte, pos usize, src []byte) usize {
+	if pos >= len(dst) {
+		return pos
+	}
+	return pos + copy(dst[pos:], src)
+}
+
+func bufAppendStr(dst []byte, pos usize, s string) usize {
+	for i := usize(0); i < len(s); i++ {
+		if pos >= len(dst) {
+			break
+		}
+		dst[pos] = s[i]
+		pos++
+	}
+	return pos
+}
+
+func bufAppendByte(dst []byte, pos usize, c byte) usize {
+	if pos < len(dst) {
+		dst[pos] = c
+		return pos + 1
+	}
+	return pos
+}

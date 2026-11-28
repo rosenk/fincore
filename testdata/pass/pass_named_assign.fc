@@ -86,8 +86,13 @@ driver func main(io Stdio) error {
 	r := Rec{id: wrap(u), tag: l, data: b}
 	x := Box.Full(n)
 	k := u32(0)
-	if x is Full(v) && v == Name(47) {
-		k = 1
+	match x {
+		Full(v) -> {
+			if v == Name(47) {
+				k = 1
+			}
+		}
+		Empty -> {}
 	}
 	g := id[Name](n)
 	if n == Name(u) || g == 47 {

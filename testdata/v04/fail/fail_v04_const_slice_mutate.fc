@@ -1,0 +1,14 @@
+// SINCE: v0.4
+package main
+
+func bad(xs const []u32) {
+	if len(xs) > 0 {
+		xs[0] = 99 // ERROR E2014
+	}
+}
+
+driver func main() error {
+	var arr [2]u32 = [2]u32{1, 2}
+	bad(arr[:])
+	return nil
+}

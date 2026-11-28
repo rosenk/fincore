@@ -40,7 +40,6 @@ const (
 	NIL
 	ANY
 	DECREASES
-	IS // v0.2 variant tests
 	keywordEnd
 
 	operatorBeg
@@ -69,6 +68,12 @@ const (
 	SUB_ASSIGN // -=
 	MUL_ASSIGN // *=
 	QUO_ASSIGN // /=
+	REM_ASSIGN // %=
+	AND_ASSIGN // &=
+	OR_ASSIGN  // |=
+	XOR_ASSIGN // ^=
+	SHL_ASSIGN // <<=
+	SHR_ASSIGN // >>=
 	INC        // ++
 	DEC        // --
 	LPAREN     // (
@@ -83,8 +88,6 @@ const (
 	SEMICOLON  // ; (explicit or automatically inserted)
 	ARROW      // ->
 	ELLIPSIS   // ...
-	DOTDOT     // .. (v0.2 rest pattern)
-	AT         // @ (v0.2 `name @ pattern` binding)
 	operatorEnd
 )
 
@@ -120,7 +123,6 @@ var kindStrings = [...]string{
 	NIL:       "nil",
 	ANY:       "any",
 	DECREASES: "decreases",
-	IS:        "is",
 
 	ADD:        "+",
 	SUB:        "-",
@@ -147,6 +149,12 @@ var kindStrings = [...]string{
 	SUB_ASSIGN: "-=",
 	MUL_ASSIGN: "*=",
 	QUO_ASSIGN: "/=",
+	REM_ASSIGN: "%=",
+	AND_ASSIGN: "&=",
+	OR_ASSIGN:  "|=",
+	XOR_ASSIGN: "^=",
+	SHL_ASSIGN: "<<=",
+	SHR_ASSIGN: ">>=",
 	INC:        "++",
 	DEC:        "--",
 	LPAREN:     "(",
@@ -161,8 +169,6 @@ var kindStrings = [...]string{
 	SEMICOLON:  ";",
 	ARROW:      "->",
 	ELLIPSIS:   "...",
-	DOTDOT:     "..",
-	AT:         "@",
 }
 
 // String returns the source spelling for keywords/operators and the class

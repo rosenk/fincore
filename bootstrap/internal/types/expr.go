@@ -297,7 +297,7 @@ func (c *Checker) updateType(e ast.Expr, t Type) {
 	case *ast.MatchExpr:
 		c.convertMatchArms(e, t)
 	case *ast.UnaryExpr:
-		if e.Op == ast.OpNeg || e.Op == ast.OpNot {
+		if e.Op == ast.OpNeg || e.Op == ast.OpNot || e.Op == ast.OpBitNot {
 			c.updateType(e.X, t)
 		}
 	case *ast.BinaryExpr:
@@ -353,13 +353,10 @@ func (c *Checker) expr0(e ast.Expr) operand {
 		return c.funcLit(e)
 	case *ast.StructLit:
 		return c.structLit(e)
+	case *ast.ArrayLit:
+		return c.arrayLit(e)
 	case *ast.MatchExpr:
 		return c.matchExpr(e)
-	case *ast.IsExpr:
-		return c.isExpr(e)
-	case *ast.TupleExpr:
-		c.errorf(diag.E2002, e.Range, "tuple %s can only be the scrutinee of a match", exprString(e))
-		return invalidOp(e)
 	case *ast.TypeExpr:
 		t := c.typExpr(e.Type)
 		if IsInvalid(t) {
@@ -374,10 +371,6 @@ func (c *Checker) ident(e *ast.Ident) operand {
 	sym := c.prog.Uses[e.ID()]
 	if sym == nil {
 		return invalidOp(e) // reported by the resolver
-	}
-	if c.unbound[sym] {
-		c.errorf(diag.E2002, e.Range, "cannot use %s: the then block of the if statement that binds it can complete normally", e.Name)
-		return invalidOp(e)
 	}
 	return c.symOperand(sym, e)
 }
@@ -672,9 +665,9 @@ func (c *Checker) unary(e *ast.UnaryExpr) operand {
 			c.errorf(diag.E2002, e.Span(), "operator ! not defined on %s (type %s)", exprString(e.X), x.typ)
 			return invalidOp(e)
 		}
-	case ast.OpNeg:
+	case ast.OpNeg, ast.OpBitNot:
 		if !IsInteger(x.typ) {
-			c.errorf(diag.E2002, e.Span(), "operator - not defined on %s (type %s)", exprString(e.X), x.typ)
+			c.errorf(diag.E2002, e.Span(), "operator %s not defined on %s (type %s)", e.Op, exprString(e.X), x.typ)
 			return invalidOp(e)
 		}
 	}
@@ -684,7 +677,9 @@ func (c *Checker) unary(e *ast.UnaryExpr) operand {
 			c.errorf(diag.E2002, e.Span(), "constant evaluation: %v", err)
 			return invalidOp(e)
 		}
-		if !IsUntyped(x.typ) && !Representable(v, x.typ) {
+		if e.Op == ast.OpBitNot && !IsUntyped(x.typ) {
+			v = Wrap(v, x.typ)
+		} else if !IsUntyped(x.typ) && !Representable(v, x.typ) {
 			c.errorf(diag.E2002, e.Span(), "constant %s overflows %s", v, x.typ)
 			return invalidOp(e)
 		}
@@ -979,6 +974,55 @@ func (c *Checker) structValue(e *ast.StructLit, st *Struct) Value {
 		}
 	}
 	return sv
+}
+
+func (c *Checker) arrayLit(e *ast.ArrayLit) operand {
+	t := c.typExpr(e.Type)
+	if IsInvalid(t) {
+		for _, el := range e.Elems {
+			c.rawExpr(el)
+		}
+		return invalidOp(e)
+	}
+	arr, ok := t.Underlying().(*Array)
+	if !ok {
+		c.errorf(diag.E2002, e.Type.Range, "invalid array literal type %s", t)
+		return invalidOp(e)
+	}
+	if arr.LenParam == nil && uint64(len(e.Elems)) > arr.Len {
+		c.errorf(diag.E2002, e.Range, "array literal has %d elements, array length is %d", len(e.Elems), arr.Len)
+	}
+	allConst := arr.LenParam == nil
+	for _, el := range e.Elems {
+		x := c.exprWith(el, arr.Elem, "array literal")
+		if x.mode != KindConst {
+			allConst = false
+		}
+	}
+	if arr.LenParam == nil && uint64(len(e.Elems)) < arr.Len && IsScoped(arr.Elem) {
+		c.errorf(diag.E2005, e.Range, "array literal of Scoped element type %s must initialize all %d elements", arr.Elem, arr.Len)
+	}
+	if allConst && ClassOf(t) == ClassValue {
+		if z, err := Zero(arr); err == nil {
+			av := z.(*ArrayVal)
+			okVal := true
+			for i, el := range e.Elems {
+				if uint64(i) >= arr.Len {
+					break
+				}
+				v := c.info.Values[el.ID()]
+				if v == nil {
+					okVal = false
+					break
+				}
+				av.Elems[i] = v
+			}
+			if okVal {
+				return operand{mode: KindConst, typ: t, val: av}
+			}
+		}
+	}
+	return operand{mode: KindValue, typ: t}
 }
 
 func (c *Checker) funcLit(e *ast.FuncLit) operand {

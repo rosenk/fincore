@@ -1,4 +1,0 @@
-testdata/context/param_region.fc:12:2: error[E3002]: scope escape: a value referring to the storage of parameter src cannot be stored in the storage of parameter l: each parameter is its own region, and memory reached through one parameter must not refer to another parameter's storage
-   12 |     l.src = src
-      |     ^^^^^^^^^^^
-      = help: store a copy of the data (for example in a fixed array field) instead of a reference to the other parameter's memory, or pass both values to the code that needs them

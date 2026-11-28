@@ -1,0 +1,1226 @@
+package main
+
+// Per-function x86_64 frame layout, prologue/epilogue (with scope barrier
+// cleanup and LIFO defer execution), and statement code generation.
+
+const (
+	MaxFnVars   = 512
+	MaxFnDefers = 64
+	MaxFnScopes = 32
+	MaxFnLoops  = 32
+	MaxGoLits   = 32
+)
+
+type DeferSlot struct {
+	stmtNode  u32
+	callNode  u32
+	activeOff i64
+	recvOff   i64
+	recvType  u32
+	argOffs   [16]i64
+	argTypes  [16]u32
+	nArgs     u32
+}
+
+type LoopCtx struct {
+	contLbl    u32
+	breakLbl   u32
+	scopeDepth u32
+}
+
+type FnGen struct {
+	monoIdx     u32
+	funcSym     u32
+	litNode     u32
+	isMain      bool
+	tpSyms      [16]u32
+	targs       [16]u32
+	nTP         u32
+
+	frameUsed   u64 // bytes below saved %rbx/%r12 (-16(%rbp))
+	abi         CallABI
+	recvType    u32
+	params      [32]u32
+	nParams     u32
+	results     [16]u32
+	nResults    u32
+
+	// Variable frame offsets (positive = incoming arg +off(%rbp), negative = local off(%rbp))
+	varSyms     [MaxFnVars]u32
+	varOffs     [MaxFnVars]i64
+	nVars       u32
+
+	// Captured outer variables inside closure env (%r12)
+	capSyms     [64]u32
+	capOffs     [64]i64
+	nCaps       u32
+	capByValue  bool
+	envSaveOff  i64
+
+	// Literals directly passed to Scope.Go (value-captured)
+	goLits      [MaxGoLits]u32
+	goLitEnvSz  [MaxGoLits]u64
+	nGoLits     u32
+
+	// Active scopes & all scopes in function (Scope or Arena)
+	activeScopes       [MaxFnScopes]i64
+	activeScopeIsArena [MaxFnScopes]bool
+	nActiveScope       u32
+	allScopes          [MaxFnScopes]i64
+	allScopeIsArena    [MaxFnScopes]bool
+	nAllScope          u32
+
+	// Defers
+	defers      [MaxFnDefers]DeferSlot
+	nDefers     u32
+
+	// Loops
+	loops       [MaxFnLoops]LoopCtx
+	nLoops      u32
+
+	// Algebraic effect handle helper context (v0.3)
+	parentCtxID     u32
+	isHandleArm     bool
+	isHandleBody    bool
+	isHandleDisp    bool
+	dispLabelNum    u32
+	dispContOff     i64
+	dispResOff      i64
+	dispEarlyRetOff i64
+
+	epilogueLbl u32
+}
+
+driver func (f *FnGen) subst(ty u32) u32 {
+	if f.nTP == 0 {
+		return ty
+	}
+	return substType(ty, f.tpSyms[:usize(f.nTP)], f.targs[:usize(f.nTP)])
+}
+
+driver func (f *FnGen) typeOf(n u32) u32 {
+	return f.subst(nodeType[n])
+}
+
+driver func (f *FnGen) symType(s u32) u32 {
+	return f.subst(syms[s].typeID)
+}
+
+func (f *FnGen) allocLocal(size u64, align u64) i64 {
+	if size == 0 {
+		return -16
+	}
+	if align < 1 {
+		align = 1
+	}
+	top := alignUp64Safe(16+f.frameUsed+size, align)
+	f.frameUsed = top - 16
+	return -i64(top)
+}
+
+func (f *FnGen) findVarOff(sym u32) (i64, bool) {
+	for i := u32(0); i < f.nVars; i++ {
+		if f.varSyms[i] == sym {
+			return f.varOffs[i], true
+		}
+	}
+	return 0, false
+}
+
+func (f *FnGen) setVarOff(sym u32, off i64) {
+	for i := u32(0); i < f.nVars; i++ {
+		if f.varSyms[i] == sym {
+			f.varOffs[i] = off
+			return
+		}
+	}
+	if f.nVars < MaxFnVars {
+		f.varSyms[f.nVars] = sym
+		f.varOffs[f.nVars] = off
+		f.nVars++
+	}
+}
+
+driver func (f *FnGen) ensureLocal(sym u32) i64 {
+	if off, ok := f.findVarOff(sym); ok {
+		return off
+	}
+	sz, al := layoutOf(f.symType(sym))
+	off := f.allocLocal(sz, al)
+	f.setVarOff(sym, off)
+	return off
+}
+
+func (f *FnGen) findCapOff(sym u32) (i64, bool) {
+	for i := u32(0); i < f.nCaps; i++ {
+		if f.capSyms[i] == sym {
+			return f.capOffs[i], true
+		}
+	}
+	return 0, false
+}
+
+func (f *FnGen) isGoLitNode(litNode u32) bool {
+	for i := u32(0); i < f.nGoLits; i++ {
+		if f.goLits[i] == litNode {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *FnGen) setGoLitEnvSize(litNode u32, sz u64) {
+	for i := u32(0); i < f.nGoLits; i++ {
+		if f.goLits[i] == litNode {
+			f.goLitEnvSz[i] = sz
+			return
+		}
+	}
+}
+
+func (f *FnGen) getGoLitEnvSize(litNode u32) u64 {
+	for i := u32(0); i < f.nGoLits; i++ {
+		if f.goLits[i] == litNode {
+			return f.goLitEnvSz[i]
+		}
+	}
+	return 0
+}
+
+// isNodeGoLitGlobal checks whether litNode is passed directly as arg 1 to any Scope.Go call in the AST.
+func isNodeGoLitGlobal(litNode u32) bool {
+	nc := nodeCount
+	for i := u32(1); i < nc; i++ {
+		if nodes[i].kind == NKCall && nodeCall[i] != 0 {
+			ci := calls[nodeCall[i]]
+			if ci.kind == CKBuiltinMeth && (ci.builtinID == BMScopeGo || ci.builtinID == BMScopeSpawn) && nodes[i].c == 2 {
+				if listPool[nodes[i].b+1] == litNode {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+driver func emitMonoFunc(monoIdx u32) {
+	it := monoItems[monoIdx]
+	var f FnGen
+	f.monoIdx = monoIdx
+	f.funcSym = it.funcSym
+	f.litNode = it.litNode
+	f.isMain = it.funcSym == mainFuncSym && it.funcSym != 0
+	f.nTP = it.tpCount
+	driver for i := u32(0); i < it.tpCount && i < 16; i++ {
+		f.tpSyms[i] = typeList[it.tpStart+i]
+		f.targs[i] = typeList[it.taStart+i]
+	}
+	f.epilogueLbl = freshLabel()
+
+	// Determine signature, receiver, params, results, and body
+	var bodyNode u32 = 0
+	var sigNode u32 = 0
+	var recvNode u32 = 0
+	var sigTy u32 = 0
+	if it.litNode != 0 {
+		ln := nodes[it.litNode]
+		sigNode = ln.a
+		bodyNode = ln.b
+		sigTy = f.typeOf(it.litNode)
+	} else {
+		dn := syms[it.funcSym].declNode
+		recvNode = nodes[dn].b
+		sigNode = nodes[dn].c
+		bodyNode = nodes[dn].d
+		sigTy = f.subst(syms[it.funcSym].typeID)
+	}
+	if bodyNode == 0 || sigTy == 0 {
+		return
+	}
+	sig := types[sigTy]
+	if recvNode != 0 {
+		f.recvType = f.subst(nodeType[recvNode])
+	}
+	f.nParams = sig.b
+	driver for i := u32(0); i < sig.b && i < 32; i++ {
+		f.params[i] = f.subst(typeList[sig.a+i])
+	}
+	// Append hidden effect capability evidence parameters (`with E1, E2`)
+	var evCount u32 = 0
+	var declN u32 = 0
+	if it.litNode == 0 && it.funcSym != 0 {
+		declN = syms[it.funcSym].declNode
+		evCount = fnEvCount[declN]
+		driver for i := u32(0); i < evCount && f.nParams < 32; i++ {
+			f.params[f.nParams] = TYU64
+			f.nParams++
+		}
+	}
+	f.nResults = sig.d
+	driver for i := u32(0); i < sig.d && i < 16; i++ {
+		f.results[i] = f.subst(typeList[sig.c+i])
+	}
+	f.abi = computeCallABI(f.recvType, f.params[:usize(f.nParams)], f.results[:usize(f.nResults)])
+
+	if recvNode != 0 && nodeSym[recvNode] != 0 {
+		f.setVarOff(nodeSym[recvNode], 16+i64(f.abi.recvOff))
+	}
+	sn := nodes[sigNode]
+	driver for i := u32(0); i < sn.d && i < 32; i++ {
+		psym := nodeSym[listPool[sn.c+i]]
+		if psym != 0 {
+			f.setVarOff(psym, 16+i64(f.abi.argOffs[i]))
+		}
+	}
+	if evCount > 0 {
+		driver for i := u32(0); i < evCount && sig.b+i < 32; i++ {
+			evSym := callEvSyms[fnEvStart[declN]+i]
+			f.setVarOff(evSym, 16+i64(f.abi.argOffs[sig.b+i]))
+		}
+	}
+
+	// Closure capture env layout
+	if it.litNode != 0 && litCapCount[it.litNode] > 0 {
+		f.envSaveOff = f.allocLocal(8, 8)
+		f.capByValue = isNodeGoLitGlobal(it.litNode)
+		var off u64 = 0
+		cs := litCapStart[it.litNode]
+		cc := litCapCount[it.litNode]
+		driver for i := u32(0); i < cc && i < 64; i++ {
+			csym := capPool[cs+i]
+			var sz u64 = 8
+			var al u64 = 8
+			if f.capByValue && !isAtomicType(f.symType(csym)) {
+				sz, al = layoutOf(f.symType(csym))
+			}
+			off = alignUp64Safe(off, al)
+			f.capSyms[f.nCaps] = csym
+			f.capOffs[f.nCaps] = i64(off)
+			f.nCaps++
+			off += sz
+		}
+	}
+
+	// Pre-scan body (not entering nested FuncLits) for GoLits, local vars, scopes, and defers
+	f.prescanStmt(bodyNode)
+
+	// Emit body into fnBodyBuf
+	fnBodyLen = 0
+	f.emitBlock(bodyNode)
+
+	// Flush prologue + fnBodyBuf + epilogue into textBuf!
+	f.emitFinishedFunc()
+}
+
+driver func (f *FnGen) prescanStmt(n u32) {
+	if n == 0 {
+		return
+	}
+	nd := nodes[n]
+	if nd.kind == NKBlock {
+		for i := u32(0); i < nd.b; i++ {
+			f.prescanStmt(listPool[nd.a+i])
+		}
+		return
+	}
+	if nd.kind == NKDeclStmt {
+		d := nodes[nd.a]
+		if d.kind == NKVarDecl && nodeSym[nd.a] != 0 {
+			_ = f.ensureLocal(nodeSym[nd.a])
+		}
+		return
+	}
+	if nd.kind == NKShortDecl {
+		for i := u32(0); i < nd.b; i++ {
+			ln := listPool[nd.a+i]
+			if nodeSym[ln] != 0 {
+				_ = f.ensureLocal(nodeSym[ln])
+			}
+		}
+		for i := u32(0); i < nd.d; i++ {
+			f.prescanExpr(listPool[nd.c+i])
+		}
+		return
+	}
+	if nd.kind == NKAssign {
+		for i := u32(0); i < nd.d; i++ {
+			f.prescanExpr(listPool[nd.c+i])
+		}
+		return
+	}
+	if nd.kind == NKIf {
+		f.prescanStmt(nd.a)
+		f.prescanExpr(nd.b)
+		f.prescanStmt(nd.c)
+		f.prescanStmt(nd.d)
+		return
+	}
+	if nd.kind == NKFor {
+		f.prescanStmt(nd.a)
+		f.prescanExpr(nd.b)
+		f.prescanStmt(nd.c)
+		f.prescanStmt(nd.d)
+		return
+	}
+	if nd.kind == NKMatchStmt {
+		f.prescanExpr(nd.a)
+		for i := u32(0); i < nd.c; i++ {
+			arm := nodes[listPool[nd.b+i]]
+			f.prescanPat(arm.a)
+			f.prescanStmt(arm.b)
+		}
+		return
+	}
+	if nd.kind == NKHandleStmt {
+		if nodeHandle[n] != 0 {
+			hi := handles[nodeHandle[n]]
+			_ = f.ensureLocal(hi.evLocalSym)
+			if hi.isTailResump {
+				if (nd.flags & 1) != 0 {
+					f.prescanStmt(nd.a)
+				} else {
+					f.prescanExpr(nd.a)
+				}
+			}
+		}
+		return
+	}
+	if nd.kind == NKScope {
+		if nodeSym[n] != 0 {
+			off := f.ensureLocal(nodeSym[n])
+			if f.nAllScope < MaxFnScopes {
+				f.allScopes[f.nAllScope] = off
+				f.allScopeIsArena[f.nAllScope] = (nodeType[n] == TYArena)
+				f.nAllScope++
+			}
+		}
+		f.prescanStmt(nd.c)
+		return
+	}
+	if nd.kind == NKDefer {
+		f.allocDeferSlot(n)
+		return
+	}
+	if nd.kind == NKExprStmt {
+		f.prescanExpr(nd.a)
+		return
+	}
+	if nd.kind == NKReturn {
+		for i := u32(0); i < nd.b; i++ {
+			f.prescanExpr(listPool[nd.a+i])
+		}
+		return
+	}
+}
+
+driver func (f *FnGen) prescanPat(pn u32) {
+	if pn == 0 {
+		return
+	}
+	p := nodes[pn]
+	if p.kind == NKPatCtor {
+		for i := u32(0); i < p.c; i++ {
+			bn := listPool[p.b+i]
+			if nodeSym[bn] != 0 {
+				_ = f.ensureLocal(nodeSym[bn])
+			}
+		}
+	} else if p.kind == NKPatOr {
+		for i := u32(0); i < p.b; i++ {
+			f.prescanPat(listPool[p.a+i])
+		}
+	}
+}
+
+driver func (f *FnGen) prescanExpr(en u32) {
+	if en == 0 {
+		return
+	}
+	n := nodes[en]
+	if n.kind == NKFuncLit {
+		return // don't descend into nested literals
+	}
+	if n.kind == NKCall {
+		if nodeCall[en] != 0 {
+			ci := calls[nodeCall[en]]
+			if ci.kind == CKBuiltinMeth && (ci.builtinID == BMScopeGo || ci.builtinID == BMScopeSpawn) && n.c == 2 {
+				lit := listPool[n.b+1]
+				if nodes[lit].kind == NKFuncLit && f.nGoLits < MaxGoLits {
+					f.goLits[f.nGoLits] = lit
+					f.nGoLits++
+				}
+			}
+		}
+		f.prescanExpr(n.a)
+		for i := u32(0); i < n.c; i++ {
+			f.prescanExpr(listPool[n.b+i])
+		}
+		return
+	}
+	if n.kind == NKMatchExpr {
+		f.prescanExpr(n.a)
+		for i := u32(0); i < n.c; i++ {
+			arm := nodes[listPool[n.b+i]]
+			f.prescanPat(arm.a)
+			f.prescanExpr(arm.b)
+		}
+		return
+	}
+	if n.kind == NKHandleExpr {
+		if nodeHandle[en] != 0 {
+			hi := handles[nodeHandle[en]]
+			_ = f.ensureLocal(hi.evLocalSym)
+			if hi.isTailResump {
+				if (n.flags & 1) != 0 {
+					f.prescanStmt(n.a)
+				} else {
+					f.prescanExpr(n.a)
+				}
+			}
+		}
+		return
+	}
+	if n.kind == NKBinary {
+		f.prescanExpr(n.a)
+		f.prescanExpr(n.b)
+	} else if n.kind == NKUnary || n.kind == NKSelector {
+		f.prescanExpr(n.a)
+	}
+}
+
+driver func (f *FnGen) allocDeferSlot(deferStmt u32) {
+	callNode := nodes[deferStmt].a
+	if callNode == 0 || nodes[callNode].kind != NKCall || nodeCall[callNode] == 0 {
+		return
+	}
+	if f.nDefers >= MaxFnDefers {
+		return
+	}
+	ci := calls[nodeCall[callNode]]
+	var ds DeferSlot
+	ds.stmtNode = deferStmt
+	ds.callNode = callNode
+	ds.activeOff = f.allocLocal(1, 1)
+	if ci.kind == CKMethod || ci.kind == CKBuiltinMeth {
+		rt := f.subst(ci.recvType)
+		ds.recvType = rt
+		sz, al := layoutOf(rt)
+		ds.recvOff = f.allocLocal(sz, al)
+	} else if ci.kind == CKValue {
+		ft := f.typeOf(nodes[callNode].a)
+		ds.recvType = ft
+		sz, al := layoutOf(ft)
+		ds.recvOff = f.allocLocal(sz, al)
+	}
+	cn := nodes[callNode]
+	ds.nArgs = cn.c
+	driver for i := u32(0); i < cn.c && i < 16; i++ {
+		an := listPool[cn.b+i]
+		at := f.typeOf(an)
+		if (nodeFlags[an] & NFImplicitBytes) != 0 {
+			at = makeSliceType(TYU8)
+		}
+		sz, al := layoutOf(at)
+		ds.argTypes[i] = at
+		ds.argOffs[i] = f.allocLocal(sz, al)
+	}
+	f.defers[f.nDefers] = ds
+	f.nDefers++
+}
+
+func (f *FnGen) findDeferIdx(stmtNode u32) (u32, bool) {
+	for i := u32(0); i < f.nDefers; i++ {
+		if f.defers[i].stmtNode == stmtNode {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+driver func (f *FnGen) emitFinishedFunc() {
+	frameBytes := alignUp64Safe(f.frameUsed, 16)
+	if f.isMain {
+		secWriteStr(SecText, ".global _fc_main\n")
+	}
+	emitMonoItemLabel(SecText, f.monoIdx)
+	secWriteStr(SecText, ":\n")
+	secWriteStr(SecText, "    pushq %rbp\n")
+	secWriteStr(SecText, "    movq %rsp, %rbp\n")
+	secWriteStr(SecText, "    pushq %rbx\n")
+	secWriteStr(SecText, "    pushq %r12\n")
+	if frameBytes > 0 {
+		secWriteStr(SecText, "    subq $")
+		secWriteU64(SecText, frameBytes)
+		secWriteStr(SecText, ", %rsp\n")
+		qwords := frameBytes / 8
+		if qwords <= 8 {
+			for i := u64(0); i < qwords; i++ {
+				secWriteStr(SecText, "    movq $0, ")
+				secWriteU64(SecText, i*8)
+				secWriteStr(SecText, "(%rsp)\n")
+			}
+		} else {
+			secWriteStr(SecText, "    movq %rsp, %rdi\n")
+			secWriteStr(SecText, "    xorl %eax, %eax\n")
+			secWriteStr(SecText, "    movq $")
+			secWriteU64(SecText, qwords)
+			secWriteStr(SecText, ", %rcx\n")
+			secWriteStr(SecText, "    cld\n")
+			secWriteStr(SecText, "    rep stosq\n")
+		}
+	}
+	if f.envSaveOff != 0 {
+		secWriteStr(SecText, "    movq %r12, ")
+		secWriteI64(SecText, f.envSaveOff)
+		secWriteStr(SecText, "(%rbp)\n")
+	}
+
+	// Optimize & copy generated body into .text
+	emitOptimizedFnBody()
+
+	// Epilogue label
+	secWriteStr(SecText, ".L_epi_")
+	secWriteU64(SecText, u64(f.epilogueLbl))
+	secWriteStr(SecText, ":\n")
+
+	// Destroy any still-active scopes (innermost first)
+	if f.nAllScope > 0 {
+		i := f.nAllScope
+		for step := u32(0); step < MaxFnScopes; step++ {
+			if i == 0 {
+				break
+			}
+			i--
+			off := f.allScopes[i]
+			skip := freshLabel()
+			secWriteStr(SecText, "    movq ")
+			secWriteI64(SecText, off)
+			secWriteStr(SecText, "(%rbp), %rdi\n")
+			secWriteStr(SecText, "    testq %rdi, %rdi\n")
+			secWriteStr(SecText, "    jz .L_scd_")
+			secWriteU64(SecText, u64(skip))
+			secWriteByte(SecText, '\n')
+			secWriteStr(SecText, "    movq $0, ")
+			secWriteI64(SecText, off)
+			secWriteStr(SecText, "(%rbp)\n")
+			if f.allScopeIsArena[i] {
+				secWriteStr(SecText, "    call _fc_rt_arena_destroy\n")
+			} else {
+				secWriteStr(SecText, "    call _fc_rt_scope_destroy\n")
+			}
+			secWriteStr(SecText, ".L_scd_")
+			secWriteU64(SecText, u64(skip))
+			secWriteStr(SecText, ":\n")
+		}
+	}
+
+	// Run active defers in LIFO order
+	if f.nDefers > 0 {
+		i := f.nDefers
+		for step := u32(0); step < MaxFnDefers; step++ {
+			if i == 0 {
+				break
+			}
+			i--
+			ds := f.defers[i]
+			skip := freshLabel()
+			secWriteStr(SecText, "    cmpb $0, ")
+			secWriteI64(SecText, ds.activeOff)
+			secWriteStr(SecText, "(%rbp)\n")
+			secWriteStr(SecText, "    je .L_dsk_")
+			secWriteU64(SecText, u64(skip))
+			secWriteByte(SecText, '\n')
+			secWriteStr(SecText, "    movb $0, ")
+			secWriteI64(SecText, ds.activeOff)
+			secWriteStr(SecText, "(%rbp)\n")
+			// Emit deferred call into fnBodyBuf then flush to SecText!
+			fnBodyLen = 0
+			f.emitDeferredCall(i)
+			secWrite(SecText, fnBodyBuf[:fnBodyLen])
+			secWriteStr(SecText, ".L_dsk_")
+			secWriteU64(SecText, u64(skip))
+			secWriteStr(SecText, ":\n")
+		}
+	}
+
+	if frameBytes > 0 {
+		secWriteStr(SecText, "    addq $")
+		secWriteU64(SecText, frameBytes)
+		secWriteStr(SecText, ", %rsp\n")
+	}
+	secWriteStr(SecText, "    popq %r12\n")
+	secWriteStr(SecText, "    popq %rbx\n")
+	secWriteStr(SecText, "    popq %rbp\n")
+	secWriteStr(SecText, "    ret\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Statement code generation
+
+driver func (f *FnGen) emitBlock(blkNode u32) {
+	b := nodes[blkNode]
+	for i := u32(0); i < b.b; i++ {
+		f.emitStmt(listPool[b.a+i])
+	}
+}
+
+driver func (f *FnGen) emitScopeCleanupTo(targetDepth u32) {
+	if f.nActiveScope <= targetDepth {
+		return
+	}
+	i := f.nActiveScope
+	for step := u32(0); step < MaxFnScopes; step++ {
+		if i <= targetDepth {
+			break
+		}
+		i--
+		off := f.activeScopes[i]
+		skip := freshLabel()
+		em("    movq ")
+		emI(off)
+		em("(%rbp), %rdi\n    testq %rdi, %rdi\n    jz ")
+		emLbl("scx", skip)
+		em("\n    movq $0, ")
+		emI(off)
+		if f.activeScopeIsArena[i] {
+			em("(%rbp)\n    call _fc_rt_arena_destroy\n")
+		} else {
+			em("(%rbp)\n    call _fc_rt_scope_destroy\n")
+		}
+		emLbl("scx", skip)
+		em(":\n")
+	}
+}
+
+driver func (f *FnGen) emitStmt(sn u32) {
+	if sn == 0 {
+		return
+	}
+	s := nodes[sn]
+	if s.kind == NKBlock {
+		f.emitBlock(sn)
+		return
+	}
+	if s.kind == NKDeclStmt {
+		d := nodes[s.a]
+		if d.kind == NKVarDecl && nodeSym[s.a] != 0 {
+			sym := nodeSym[s.a]
+			off := f.ensureLocal(sym)
+			ty := f.symType(sym)
+			sz, _ := layoutOf(ty)
+			if d.c != 0 {
+				f.emitExprTo(d.c, off, ty)
+			} else {
+				f.emitZero(off, sz)
+			}
+		}
+		return
+	}
+	if s.kind == NKShortDecl {
+		f.emitShortDecl(sn)
+		return
+	}
+	if s.kind == NKAssign {
+		f.emitAssign(sn)
+		return
+	}
+	if s.kind == NKIncDec {
+		ty := f.typeOf(s.a)
+		addrSlot := f.allocLocal(8, 8)
+		f.emitAddr(s.a)
+		em("    movq %rax, ")
+		emI(addrSlot)
+		em("(%rbp)\n")
+		em("    movq %rax, %rdx\n")
+		f.emitLoadScalarReg("rdx", ty)
+		if s.op == TKInc {
+			em("    addq $1, %rax\n")
+		} else {
+			em("    subq $1, %rax\n")
+		}
+		f.emitMaskScalar(ty)
+		em("    movq ")
+		emI(addrSlot)
+		em("(%rbp), %rdx\n")
+		f.emitStoreScalarReg("rdx", ty)
+		return
+	}
+	if s.kind == NKExprStmt {
+		f.emitExprDiscard(s.a)
+		return
+	}
+	if s.kind == NKIf {
+		if s.a != 0 {
+			f.emitStmt(s.a)
+		}
+		elseLbl := freshLabel()
+		endLbl := freshLabel()
+		f.emitScalar(s.b, TYBool)
+		em("    testb %al, %al\n    jz ")
+		if s.d != 0 {
+			emLbl("else", elseLbl)
+		} else {
+			emLbl("endif", endLbl)
+		}
+		em("\n")
+		f.emitBlock(s.c)
+		if s.d != 0 {
+			em("    jmp ")
+			emLbl("endif", endLbl)
+			em("\n")
+			emLbl("else", elseLbl)
+			em(":\n")
+			f.emitStmt(s.d)
+		}
+		emLbl("endif", endLbl)
+		em(":\n")
+		return
+	}
+	if s.kind == NKFor {
+		if s.a != 0 {
+			f.emitStmt(s.a)
+		}
+		condLbl := freshLabel()
+		postLbl := freshLabel()
+		endLbl := freshLabel()
+		if f.nLoops < MaxFnLoops {
+			f.loops[f.nLoops] = LoopCtx{contLbl: postLbl, breakLbl: endLbl, scopeDepth: f.nActiveScope}
+			f.nLoops++
+		}
+		emLbl("fcond", condLbl)
+		em(":\n")
+		if s.b != 0 {
+			f.emitScalar(s.b, TYBool)
+			em("    testb %al, %al\n    jz ")
+			emLbl("fend", endLbl)
+			em("\n")
+		}
+		f.emitBlock(s.d)
+		emLbl("fpost", postLbl)
+		em(":\n")
+		if s.c != 0 {
+			f.emitStmt(s.c)
+		}
+		em("    jmp ")
+		emLbl("fcond", condLbl)
+		em("\n")
+		emLbl("fend", endLbl)
+		em(":\n")
+		if f.nLoops > 0 {
+			f.nLoops--
+		}
+		return
+	}
+	if s.kind == NKBreak {
+		if f.nLoops > 0 {
+			lp := f.loops[f.nLoops-1]
+			f.emitScopeCleanupTo(lp.scopeDepth)
+			em("    jmp ")
+			emLbl("fend", lp.breakLbl)
+			em("\n")
+		}
+		return
+	}
+	if s.kind == NKContinue {
+		if f.nLoops > 0 {
+			lp := f.loops[f.nLoops-1]
+			f.emitScopeCleanupTo(lp.scopeDepth)
+			em("    jmp ")
+			emLbl("fpost", lp.contLbl)
+			em("\n")
+		}
+		return
+	}
+	if s.kind == NKScope {
+		sym := nodeSym[sn]
+		off := f.ensureLocal(sym)
+		st := nodeType[sn]
+		if st == 0 {
+			st = TYScope
+		}
+		f.emitExprTo(s.b, off, st)
+		savedDepth := f.nActiveScope
+		if f.nActiveScope < MaxFnScopes {
+			f.activeScopes[f.nActiveScope] = off
+			f.activeScopeIsArena[f.nActiveScope] = (st == TYArena)
+			f.nActiveScope++
+		}
+		f.emitBlock(s.c)
+		f.emitScopeCleanupTo(savedDepth)
+		f.nActiveScope = savedDepth
+		return
+	}
+	if s.kind == NKDefer {
+		idx, ok := f.findDeferIdx(sn)
+		if !ok {
+			return
+		}
+		ds := f.defers[idx]
+		ci := calls[nodeCall[ds.callNode]]
+		if ci.kind == CKMethod || ci.kind == CKBuiltinMeth {
+			if ci.autoAddr != 0 {
+				f.emitAddr(ci.recvExpr)
+				em("    movq %rax, ")
+				emI(ds.recvOff)
+				em("(%rbp)\n")
+			} else {
+				f.emitExprTo(ci.recvExpr, ds.recvOff, ds.recvType)
+			}
+		} else if ci.kind == CKValue {
+			f.emitExprTo(nodes[ds.callNode].a, ds.recvOff, ds.recvType)
+		}
+		cn := nodes[ds.callNode]
+		for i := u32(0); i < ds.nArgs; i++ {
+			f.emitExprTo(listPool[cn.b+i], ds.argOffs[i], ds.argTypes[i])
+		}
+		em("    movb $1, ")
+		emI(ds.activeOff)
+		em("(%rbp)\n")
+		return
+	}
+	if s.kind == NKReturn {
+		if f.isHandleDisp {
+			f.emitHandleDispReturn(sn)
+			return
+		}
+		if s.b == 1 && f.nResults > 1 {
+			var dsts [16]i64
+			for i := u32(0); i < f.nResults; i++ {
+				dsts[i] = 16 + i64(f.abi.retOffs[i])
+			}
+			f.emitMultiCallTo(listPool[s.a], dsts[:usize(f.nResults)], f.results[:usize(f.nResults)])
+		} else {
+			driver for i := u32(0); i < s.b && i < f.nResults; i++ {
+				f.emitExprTo(listPool[s.a+i], 16+i64(f.abi.retOffs[i]), f.results[i])
+			}
+		}
+		em("    jmp ")
+		emLbl("epi", f.epilogueLbl)
+		em("\n")
+		return
+	}
+	if s.kind == NKMatchStmt {
+		f.emitMatch(sn, false, 0, 0)
+		return
+	}
+	if s.kind == NKHandleStmt {
+		f.emitHandle(sn, false, 0, 0)
+		return
+	}
+}
+
+driver func (f *FnGen) emitShortDecl(sn u32) {
+	s := nodes[sn]
+	if s.d == 1 && s.b > 1 {
+		var dsts [16]i64
+		var dts [16]u32
+		driver for i := u32(0); i < s.b && i < 16; i++ {
+			ln := listPool[s.a+i]
+			if nodes[ln].a == kwBlank || nodeSym[ln] == 0 {
+				dsts[i] = 0
+				dts[i] = 0
+			} else {
+				dsts[i] = f.ensureLocal(nodeSym[ln])
+				dts[i] = f.symType(nodeSym[ln])
+			}
+		}
+		f.emitMultiCallTo(listPool[s.c], dsts[:usize(s.b)], dts[:usize(s.b)])
+		return
+	}
+	var tmps [16]i64
+	var tts [16]u32
+	driver for i := u32(0); i < s.d && i < 16; i++ {
+		ln := listPool[s.a+i]
+		rn := listPool[s.c+i]
+		var ty u32 = 0
+		if nodes[ln].a != kwBlank && nodeSym[ln] != 0 {
+			ty = f.symType(nodeSym[ln])
+		} else {
+			ty = f.typeOf(rn)
+			if (nodeFlags[rn] & NFImplicitBytes) != 0 {
+				ty = makeSliceType(TYU8)
+			}
+		}
+		sz, al := layoutOf(ty)
+		tmps[i] = f.allocLocal(sz, al)
+		tts[i] = ty
+		f.emitExprTo(rn, tmps[i], ty)
+	}
+	driver for i := u32(0); i < s.b && i < 16; i++ {
+		ln := listPool[s.a+i]
+		if nodes[ln].a == kwBlank || nodeSym[ln] == 0 {
+			continue
+		}
+		off := f.ensureLocal(nodeSym[ln])
+		sz, _ := layoutOf(tts[i])
+		f.emitCopyFrame(off, tmps[i], sz)
+	}
+}
+
+driver func (f *FnGen) emitAssign(sn u32) {
+	s := nodes[sn]
+	if s.op != TKAssign {
+		f.emitCompoundAssign(sn)
+		return
+	}
+	if s.d == 1 && s.b > 1 {
+		callNode := listPool[s.c]
+		tu := f.typeOf(callNode)
+		var tmps [16]i64
+		var dts [16]u32
+		driver for i := u32(0); i < s.b && i < 16; i++ {
+			ty := f.subst(typeList[types[tu].a+i])
+			sz, al := layoutOf(ty)
+			tmps[i] = f.allocLocal(sz, al)
+			dts[i] = ty
+		}
+		f.emitMultiCallTo(callNode, tmps[:usize(s.b)], dts[:usize(s.b)])
+		driver for i := u32(0); i < s.b && i < 16; i++ {
+			ln := listPool[s.a+i]
+			if nodes[ln].kind == NKIdent && nodes[ln].a == kwBlank {
+				continue
+			}
+			f.emitAddr(ln)
+			em("    movq %rax, %rdi\n")
+			sz, _ := layoutOf(dts[i])
+			f.emitCopyFrameToReg(tmps[i], sz)
+		}
+		return
+	}
+	var addrs [16]i64
+	var tmps [16]i64
+	var tts [16]u32
+	driver for i := u32(0); i < s.b && i < 16; i++ {
+		ln := listPool[s.a+i]
+		if nodes[ln].kind == NKIdent && nodes[ln].a == kwBlank {
+			continue
+		}
+		addrs[i] = f.allocLocal(8, 8)
+		f.emitAddr(ln)
+		em("    movq %rax, ")
+		emI(addrs[i])
+		em("(%rbp)\n")
+	}
+	driver for i := u32(0); i < s.d && i < 16; i++ {
+		ln := listPool[s.a+i]
+		rn := listPool[s.c+i]
+		var ty u32 = 0
+		if nodes[ln].kind == NKIdent && nodes[ln].a == kwBlank {
+			ty = f.typeOf(rn)
+			if (nodeFlags[rn] & NFImplicitBytes) != 0 {
+				ty = makeSliceType(TYU8)
+			}
+		} else {
+			ty = f.typeOf(ln)
+		}
+		sz, al := layoutOf(ty)
+		tmps[i] = f.allocLocal(sz, al)
+		tts[i] = ty
+		f.emitExprTo(rn, tmps[i], ty)
+	}
+	driver for i := u32(0); i < s.b && i < 16; i++ {
+		ln := listPool[s.a+i]
+		if nodes[ln].kind == NKIdent && nodes[ln].a == kwBlank {
+			continue
+		}
+		em("    movq ")
+		emI(addrs[i])
+		em("(%rbp), %rdi\n")
+		sz, _ := layoutOf(tts[i])
+		f.emitCopyFrameToReg(tmps[i], sz)
+	}
+}
+
+driver func (f *FnGen) emitCompoundAssign(sn u32) {
+	s := nodes[sn]
+	ln := listPool[s.a]
+	rn := listPool[s.c]
+	lt := f.typeOf(ln)
+	addrSlot := f.allocLocal(8, 8)
+	f.emitAddr(ln)
+	em("    movq %rax, ")
+	emI(addrSlot)
+	em("(%rbp)\n")
+	rhsSlot := f.allocLocal(8, 8)
+	if s.op == TKShlAssign || s.op == TKShrAssign {
+		f.emitScalar(rn, f.typeOf(rn))
+	} else {
+		f.emitScalar(rn, lt)
+	}
+	em("    movq %rax, ")
+	emI(rhsSlot)
+	em("(%rbp)\n")
+	em("    movq ")
+	emI(addrSlot)
+	em("(%rbp), %rdx\n")
+	f.emitLoadScalarReg("rdx", lt)
+	em("    movq ")
+	emI(rhsSlot)
+	em("(%rbp), %rcx\n")
+	var binOp u8 = TKAdd
+	if s.op == TKSubAssign {
+		binOp = TKSub
+	} else if s.op == TKMulAssign {
+		binOp = TKMul
+	} else if s.op == TKQuoAssign {
+		binOp = TKQuo
+	} else if s.op == TKRemAssign {
+		binOp = TKRem
+	} else if s.op == TKAndAssign {
+		binOp = TKAnd
+	} else if s.op == TKOrAssign {
+		binOp = TKOr
+	} else if s.op == TKXorAssign {
+		binOp = TKXor
+	} else if s.op == TKShlAssign {
+		binOp = TKShl
+	} else if s.op == TKShrAssign {
+		binOp = TKShr
+	}
+	if isFloatType(lt) {
+		f.emitFloatBinOpRegs(binOp, lt)
+	} else {
+		f.emitIntBinOpRegs(binOp, lt)
+	}
+	em("    movq ")
+	emI(addrSlot)
+	em("(%rbp), %rdx\n")
+	f.emitStoreScalarReg("rdx", lt)
+}
+
+// ---------------------------------------------------------------------------
+// Flat Match Statement / Expression codegen
+
+driver func (f *FnGen) emitMatch(mn u32, isExpr bool, dstOff i64, wantTy u32) {
+	n := nodes[mn]
+	st := f.typeOf(n.a)
+	su := under(st)
+	sz, al := layoutOf(st)
+	scrutOff := f.allocLocal(sz, al)
+	f.emitExprTo(n.a, scrutOff, st)
+
+	endLbl := freshLabel()
+	for i := u32(0); i < n.c; i++ {
+		arm := nodes[listPool[n.b+i]]
+		bodyLbl := freshLabel()
+		nextLbl := freshLabel()
+		f.emitMatchPatCheck(arm.a, scrutOff, st, su, bodyLbl, nextLbl)
+		emLbl("mbody", bodyLbl)
+		em(":\n")
+		f.emitMatchPatBinds(arm.a, scrutOff, su)
+		if isExpr {
+			f.emitExprTo(arm.b, dstOff, wantTy)
+		} else {
+			if nodes[arm.b].kind == NKBlock {
+				f.emitBlock(arm.b)
+			} else {
+				f.emitStmt(arm.b)
+			}
+		}
+		em("    jmp ")
+		emLbl("mend", endLbl)
+		em("\n")
+		emLbl("mnext", nextLbl)
+		em(":\n")
+	}
+	emLbl("mend", endLbl)
+	em(":\n")
+}
+
+driver func (f *FnGen) emitMatchPatCheck(patNode u32, scrutOff i64, scrutTy u32, scrutUnder u32, hitLbl u32, missLbl u32) {
+	pn := nodes[patNode]
+	if pn.kind == NKPatWild {
+		em("    jmp ")
+		emLbl("mbody", hitLbl)
+		em("\n")
+		return
+	}
+	if pn.kind == NKPatOr {
+		for i := u32(0); i < pn.b; i++ {
+			altNext := freshLabel()
+			f.emitMatchPatCheck(listPool[pn.a+i], scrutOff, scrutTy, scrutUnder, hitLbl, altNext)
+			emLbl("mnext", altNext)
+			em(":\n")
+		}
+		em("    jmp ")
+		emLbl("mnext", missLbl)
+		em("\n")
+		return
+	}
+	if pn.kind == NKPatCtor && (nodeFlags[patNode]&NFVariantSel) != 0 {
+		// Compare enum tag against nodeSelIdx[patNode]
+		tagSize, _, _ := enumLayout(scrutUnder)
+		vidx := nodeSelIdx[patNode]
+		if tagSize == 1 {
+			em("    movzbl ")
+			emI(scrutOff)
+			em("(%rbp), %eax\n")
+		} else if tagSize == 2 {
+			em("    movzwl ")
+			emI(scrutOff)
+			em("(%rbp), %eax\n")
+		} else {
+			em("    movl ")
+			emI(scrutOff)
+			em("(%rbp), %eax\n")
+		}
+		em("    cmpl $")
+		emU(u64(vidx))
+		em(", %eax\n    je ")
+		emLbl("mbody", hitLbl)
+		em("\n    jmp ")
+		emLbl("mnext", missLbl)
+		em("\n")
+		return
+	}
+	// Literal or constant pattern
+	var valExpr u32 = pn.a
+	if isStringType(scrutTy) {
+		sz, al := layoutOf(TYString)
+		pSlot := f.allocLocal(sz, al)
+		f.emitExprTo(valExpr, pSlot, TYString)
+		em("    movq ")
+		emI(scrutOff)
+		em("(%rbp), %rdi\n    movq ")
+		emI(scrutOff + 8)
+		em("(%rbp), %rsi\n    movq ")
+		emI(pSlot)
+		em("(%rbp), %rdx\n    movq ")
+		emI(pSlot + 8)
+		em("(%rbp), %rcx\n    call _fc_rt_bytes_eq\n    testb %al, %al\n    jnz ")
+		emLbl("mbody", hitLbl)
+		em("\n    jmp ")
+		emLbl("mnext", missLbl)
+		em("\n")
+		return
+	}
+	// Scalar comparison (int / bool / error)
+	f.emitScalar(valExpr, scrutTy)
+	em("    movq %rax, %rcx\n")
+	f.emitLoadScalarFromFrame(scrutOff, scrutTy)
+	em("    cmpq %rcx, %rax\n    je ")
+	emLbl("mbody", hitLbl)
+	em("\n    jmp ")
+	emLbl("mnext", missLbl)
+	em("\n")
+}
+
+driver func (f *FnGen) emitMatchPatBinds(patNode u32, scrutOff i64, scrutUnder u32) {
+	pn := nodes[patNode]
+	if pn.kind != NKPatCtor || (nodeFlags[patNode]&NFVariantSel) == 0 || pn.c == 0 {
+		return
+	}
+	vidx := nodeSelIdx[patNode]
+	vr := variants[types[scrutUnder].a+vidx]
+	driver for i := u32(0); i < pn.c && i < vr.payCount; i++ {
+		bn := listPool[pn.b+i]
+		if nodes[bn].kind == NKIdent && nodes[bn].a != kwBlank && nodeSym[bn] != 0 {
+			sym := nodeSym[bn]
+			dstOff := f.ensureLocal(sym)
+			pty := f.subst(typeList[vr.payStart+i])
+			poff := enumPayloadOffset(scrutUnder, vidx, i)
+			sz, _ := layoutOf(pty)
+			f.emitCopyFrame(dstOff, scrutOff+i64(poff), sz)
+		}
+	}
+}

@@ -234,22 +234,35 @@ func (l *Lexer) operator(start diag.Pos) Token {
 		}
 	case '%':
 		k = REM
+		if n1 == '=' {
+			k, size = REM_ASSIGN, 2
+		}
 	case '&':
 		k = AND
 		if n1 == '&' {
 			k, size = LAND, 2
+		} else if n1 == '=' {
+			k, size = AND_ASSIGN, 2
 		}
 	case '|':
 		k = OR
 		if n1 == '|' {
 			k, size = LOR, 2
+		} else if n1 == '=' {
+			k, size = OR_ASSIGN, 2
 		}
 	case '^':
 		k = XOR
+		if n1 == '=' {
+			k, size = XOR_ASSIGN, 2
+		}
 	case '<':
 		k = LSS
 		if n1 == '<' {
 			k, size = SHL, 2
+			if n2 == '=' {
+				k, size = SHL_ASSIGN, 3
+			}
 		} else if n1 == '=' {
 			k, size = LEQ, 2
 		}
@@ -257,6 +270,9 @@ func (l *Lexer) operator(start diag.Pos) Token {
 		k = GTR
 		if n1 == '>' {
 			k, size = SHR, 2
+			if n2 == '=' {
+				k, size = SHR_ASSIGN, 3
+			}
 		} else if n1 == '=' {
 			k, size = GEQ, 2
 		}
@@ -289,16 +305,12 @@ func (l *Lexer) operator(start diag.Pos) Token {
 		k = RBRACE
 	case ',':
 		k = COMMA
-	case '@':
-		k = AT
 	case ';':
 		k = SEMICOLON
 	case '.':
 		k = PERIOD
 		if n1 == '.' && n2 == '.' {
 			k, size = ELLIPSIS, 3
-		} else if n1 == '.' {
-			k, size = DOTDOT, 2
 		}
 	}
 	if k == ILLEGAL {

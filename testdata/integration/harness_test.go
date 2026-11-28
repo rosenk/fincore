@@ -10,7 +10,6 @@
 // Environment:
 //
 //	FINC0=/path/to/finc0   use a prebuilt finc0 instead of `go build ./bootstrap/cmd/finc0`
-//	FINC_RACE=0|1          0: only static builds, 1: only --race builds, unset: both
 //
 // Every test skips (not fails) while the compiler is not ready: when finc0
 // cannot be built, or when `finc0 build`/`finc0 check` reports "not implemented".
@@ -145,7 +144,7 @@ func runFinc0(t testing.TB, args ...string) ([]byte, int) {
 }
 
 // ---------------------------------------------------------------------------
-// Build modes (static / --race).
+// Build modes (native static ELF64).
 
 type buildMode struct {
 	name string
@@ -153,13 +152,7 @@ type buildMode struct {
 }
 
 func buildModes() []buildMode {
-	switch strings.ToLower(os.Getenv("FINC_RACE")) {
-	case "0", "false", "no", "off":
-		return []buildMode{{"static", false}}
-	case "1", "true", "yes", "on", "only":
-		return []buildMode{{"race", true}}
-	}
-	return []buildMode{{"static", false}, {"race", true}}
+	return []buildMode{{"native", false}}
 }
 
 // forEachMode runs fn as a subtest per build mode, sequentially (the
