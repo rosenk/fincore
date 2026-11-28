@@ -1,0 +1,422 @@
+// Package json provides a zero-allocation, zero-GC JSON builder and zero-copy
+// JSON object field extractor for FinCore (ideal for HTTP/1.1 REST APIs).
+// Every function is Layer-2 provably total and never allocates on a heap.
+package json
+
+import "std/strings"
+
+// Builder[N] encodes JSON directly into a fixed-capacity stack/value buffer of N bytes.
+type Builder[N usize] struct {
+	buf       [N]byte
+	n         usize
+	depth     u8
+	needComma [16]bool
+	overflow  bool
+}
+
+func (b *Builder[N]) Reset() {
+	b.n = 0
+	b.depth = 0
+	b.overflow = false
+}
+
+func (b *Builder[N]) Bytes() const []byte {
+	return b.buf[:b.n]
+}
+
+func (b *Builder[N]) Len() usize {
+	return b.n
+}
+
+func (b *Builder[N]) Overflowed() bool {
+	return b.overflow
+}
+
+func (b *Builder[N]) putByte(c byte) {
+	if b.n >= N {
+		b.overflow = true
+		return
+	}
+	b.buf[b.n] = c
+	b.n++
+}
+
+func (b *Builder[N]) putBytes(s const []byte) {
+	for i := usize(0); i < len(s); i++ {
+		b.putByte(s[i])
+	}
+}
+
+func (b *Builder[N]) putEscapedStr(s const []byte) {
+	b.putByte('"')
+	for i := usize(0); i < len(s); i++ {
+		c := s[i]
+		if c == '"' {
+			b.putByte('\\')
+			b.putByte('"')
+		} else if c == '\\' {
+			b.putByte('\\')
+			b.putByte('\\')
+		} else if c == '\n' {
+			b.putByte('\\')
+			b.putByte('n')
+		} else if c == '\r' {
+			b.putByte('\\')
+			b.putByte('r')
+		} else if c == '\t' {
+			b.putByte('\\')
+			b.putByte('t')
+		} else {
+			b.putByte(c)
+		}
+	}
+	b.putByte('"')
+}
+
+func (b *Builder[N]) emitCommaIfNeeded() {
+	if b.depth > 0 && b.depth <= 16 {
+		idx := usize(b.depth - 1)
+		if b.needComma[idx] {
+			b.putByte(',')
+		}
+		b.needComma[idx] = true
+	}
+}
+
+func (b *Builder[N]) emitKey(key string) {
+	b.emitCommaIfNeeded()
+	b.putEscapedStr(strView(key))
+	b.putByte(':')
+}
+
+func (b *Builder[N]) BeginObject() {
+	b.emitCommaIfNeeded()
+	b.putByte('{')
+	if b.depth < 16 {
+		b.needComma[usize(b.depth)] = false
+		b.depth++
+	}
+}
+
+func (b *Builder[N]) EndObject() {
+	if b.depth > 0 {
+		b.depth--
+	}
+	b.putByte('}')
+}
+
+func (b *Builder[N]) BeginArray() {
+	b.emitCommaIfNeeded()
+	b.putByte('[')
+	if b.depth < 16 {
+		b.needComma[usize(b.depth)] = false
+		b.depth++
+	}
+}
+
+func (b *Builder[N]) EndArray() {
+	if b.depth > 0 {
+		b.depth--
+	}
+	b.putByte(']')
+}
+
+func (b *Builder[N]) BeginObjectField(key string) {
+	b.emitKey(key)
+	b.putByte('{')
+	if b.depth < 16 {
+		b.needComma[usize(b.depth)] = false
+		b.depth++
+	}
+}
+
+func (b *Builder[N]) BeginArrayField(key string) {
+	b.emitKey(key)
+	b.putByte('[')
+	if b.depth < 16 {
+		b.needComma[usize(b.depth)] = false
+		b.depth++
+	}
+}
+
+func (b *Builder[N]) FieldStr(key string, val string) {
+	b.emitKey(key)
+	b.putEscapedStr(strView(val))
+}
+
+func (b *Builder[N]) FieldBytes(key string, val const []byte) {
+	b.emitKey(key)
+	b.putEscapedStr(val)
+}
+
+func (b *Builder[N]) FieldUint(key string, val u64) {
+	b.emitKey(key)
+	var tmp [32]byte
+	m := formatTo(tmp[:], "%d", val)
+	b.putBytes(tmp[:m])
+}
+
+func (b *Builder[N]) FieldInt(key string, val i64) {
+	b.emitKey(key)
+	var tmp [32]byte
+	m := formatTo(tmp[:], "%d", val)
+	b.putBytes(tmp[:m])
+}
+
+func (b *Builder[N]) FieldFloat(key string, val f64) {
+	b.emitKey(key)
+	var tmp [48]byte
+	m := formatTo(tmp[:], "%f", val)
+	b.putBytes(tmp[:m])
+}
+
+func (b *Builder[N]) FieldBool(key string, val bool) {
+	b.emitKey(key)
+	if val {
+		b.putBytes(strView("true"))
+	} else {
+		b.putBytes(strView("false"))
+	}
+}
+
+func (b *Builder[N]) FieldNull(key string) {
+	b.emitKey(key)
+	b.putBytes(strView("null"))
+}
+
+func (b *Builder[N]) ElemStr(val string) {
+	b.emitCommaIfNeeded()
+	b.putEscapedStr(strView(val))
+}
+
+func (b *Builder[N]) ElemInt(val i64) {
+	b.emitCommaIfNeeded()
+	var tmp [32]byte
+	m := formatTo(tmp[:], "%d", val)
+	b.putBytes(tmp[:m])
+}
+
+func (b *Builder[N]) ElemUint(val u64) {
+	b.emitCommaIfNeeded()
+	var tmp [32]byte
+	m := formatTo(tmp[:], "%d", val)
+	b.putBytes(tmp[:m])
+}
+
+func (b *Builder[N]) ElemBool(val bool) {
+	b.emitCommaIfNeeded()
+	if val {
+		b.putBytes(strView("true"))
+	} else {
+		b.putBytes(strView("false"))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy JSON top-level object field scanner
+
+func skipWS(s const []byte, i usize) usize {
+	n := len(s)
+	for step := usize(0); step < n; step++ {
+		if i >= n {
+			break
+		}
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			i++
+		} else {
+			break
+		}
+	}
+	return i
+}
+
+// scanString scans a JSON quoted string starting at s[i] == '"'.
+// Returns (contentStart, contentEnd, nextPos, ok).
+func scanString(s const []byte, i usize) (usize, usize, usize, bool) {
+	n := len(s)
+	if i >= n || s[i] != '"' {
+		return 0, 0, i, false
+	}
+	start := i + 1
+	p := start
+	escaped := false
+	for step := usize(0); step < n; step++ {
+		if p >= n {
+			return 0, 0, n, false
+		}
+		c := s[p]
+		if escaped {
+			escaped = false
+			p++
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			p++
+			continue
+		}
+		if c == '"' {
+			return start, p, p + 1, true
+		}
+		p++
+	}
+	return 0, 0, n, false
+}
+
+// scanValue scans one JSON value starting at s[i] and returns (valStart, valEnd, nextPos, ok).
+func scanValue(s const []byte, i usize) (usize, usize, usize, bool) {
+	n := len(s)
+	i = skipWS(s, i)
+	if i >= n {
+		return 0, 0, i, false
+	}
+	c := s[i]
+	if c == '"' {
+		_, _, nxt, ok := scanString(s, i)
+		return i, nxt, nxt, ok
+	}
+	if c == '{' || c == '[' {
+		p := i
+		depth := u32(0)
+		inStr := false
+		esc := false
+		for step := usize(0); step < n; step++ {
+			if p >= n {
+				return 0, 0, n, false
+			}
+			ch := s[p]
+			if inStr {
+				if esc {
+					esc = false
+				} else if ch == '\\' {
+					esc = true
+				} else if ch == '"' {
+					inStr = false
+				}
+				p++
+				continue
+			}
+			if ch == '"' {
+				inStr = true
+			} else if ch == '{' || ch == '[' {
+				depth++
+			} else if ch == '}' || ch == ']' {
+				if depth > 0 {
+					depth--
+				}
+				if depth == 0 {
+					return i, p + 1, p + 1, true
+				}
+			}
+			p++
+		}
+		return 0, 0, n, false
+	}
+	// Primitive token (number, true, false, null)
+	p := i
+	for step := usize(0); step < n; step++ {
+		if p >= n {
+			break
+		}
+		ch := s[p]
+		if ch == ',' || ch == '}' || ch == ']' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+			break
+		}
+		p++
+	}
+	if p == i {
+		return 0, 0, i, false
+	}
+	return i, p, p, true
+}
+
+func findRawSpan(doc const []byte, key string) (usize, usize, bool) {
+	n := len(doc)
+	i := skipWS(doc, 0)
+	if i >= n || doc[i] != '{' {
+		return 0, 0, false
+	}
+	i++
+	target := strView(key)
+	for step := usize(0); step < n; step++ {
+		i = skipWS(doc, i)
+		if i >= n || doc[i] == '}' {
+			break
+		}
+		ks, ke, nxt, ok := scanString(doc, i)
+		if !ok {
+			return 0, 0, false
+		}
+		i = skipWS(doc, nxt)
+		if i >= n || doc[i] != ':' {
+			return 0, 0, false
+		}
+		i++
+		vs, ve, vnxt, vok := scanValue(doc, i)
+		if !vok {
+			return 0, 0, false
+		}
+		if strings.Equal(doc[ks:ke], target) {
+			return vs, ve, true
+		}
+		i = skipWS(doc, vnxt)
+		if i < n && doc[i] == ',' {
+			i++
+		} else {
+			break
+		}
+	}
+	return 0, 0, false
+}
+
+// GetRaw finds top-level field `key` in a JSON object and returns its raw value slice (zero-copy).
+func GetRaw(doc const []byte, key string) (const []byte, bool) {
+	vs, ve, ok := findRawSpan(doc, key)
+	if !ok {
+		return doc[:0], false
+	}
+	return doc[vs:ve], true
+}
+
+// GetString extracts a top-level string field value (unquoted view, zero-copy).
+func GetString(doc const []byte, key string) (const []byte, bool) {
+	vs, ve, ok := findRawSpan(doc, key)
+	if !ok || ve-vs < 2 || doc[vs] != '"' || doc[ve-1] != '"' {
+		return doc[:0], false
+	}
+	return doc[vs+1 : ve-1], true
+}
+
+// GetUint extracts a top-level unsigned integer field value.
+func GetUint(doc const []byte, key string) (u64, bool) {
+	raw, ok := GetRaw(doc, key)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseUint(raw)
+}
+
+// GetInt extracts a top-level signed integer field value.
+func GetInt(doc const []byte, key string) (i64, bool) {
+	raw, ok := GetRaw(doc, key)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseInt(raw)
+}
+
+// GetBool extracts a top-level boolean field value.
+func GetBool(doc const []byte, key string) (bool, bool) {
+	raw, ok := GetRaw(doc, key)
+	if !ok {
+		return false, false
+	}
+	if strings.EqualStr(raw, "true") {
+		return true, true
+	}
+	if strings.EqualStr(raw, "false") {
+		return false, true
+	}
+	return false, false
+}

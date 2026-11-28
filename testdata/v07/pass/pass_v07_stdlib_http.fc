@@ -1,0 +1,144 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/http"
+	"std/json"
+	"std/strings"
+)
+
+func apiHandler(req const *http.Request, w *http.ResponseWriter) {
+	if req.MethodIs("GET") && req.PathIs("/api/ping") {
+		var jb json.Builder[256]
+		jb.BeginObject()
+		jb.FieldStr("status", "ok")
+		jb.FieldBool("zero_gc", true)
+		jb.FieldUint("ver", 7)
+		jb.EndObject()
+		w.SetHeader("X-Engine", "FinCore")
+		w.WriteJSON(http.StatusOK, jb.Bytes())
+		return
+	}
+	if req.MethodIs("POST") && req.PathIs("/api/echo") {
+		name, okN := json.GetString(req.Body(), "name")
+		count, okC := json.GetUint(req.Body(), "count")
+		if !okN || !okC {
+			w.WriteText(http.StatusBadRequest, "bad json")
+			return
+		}
+		var jb json.Builder[256]
+		jb.BeginObject()
+		jb.FieldBytes("hello", name)
+		jb.FieldUint("double", count*2)
+		jb.EndObject()
+		w.WriteJSON(http.StatusCreated, jb.Bytes())
+		return
+	}
+	w.WriteText(http.StatusNotFound, "not found")
+}
+
+driver func main(io Stdio, net Net) error {
+	// 1. Test std/strings (Cut, TrimSpace, EqualFold, SplitByte via Tier-1 effect, ParseInt)
+	trimmed := strings.TrimSpace(strView("  Content-Type: application/json \r\n"))
+	hk, hv, cutOk := strings.CutByte(trimmed, ':')
+	foldOk := strings.EqualFoldStr(hk, "content-type")
+	valOk := strings.EqualStr(strings.TrimSpace(hv), "application/json")
+	var parts u32 = 0
+	handle strings.SplitByte(strView("a,b,c,d"), ',') with strings.YieldPart {
+		yieldPart(part) -> {
+			if len(part) == 1 {
+				parts++
+			}
+			resume()
+		}
+	}
+	pi, piOk := strings.ParseInt(strView("-42"))
+
+	// 2. Test std/json Builder + Zero-copy Scanner
+	var jb json.Builder[256]
+	jb.BeginObject()
+	jb.FieldStr("lang", "FinCore")
+	jb.FieldInt("score", -7)
+	jb.FieldBool("fast", true)
+	jb.BeginArrayField("tags")
+	jb.ElemStr("native")
+	jb.ElemUint(64)
+	jb.EndArray()
+	jb.EndObject()
+	jdoc := jb.Bytes()
+	jLang, _ := json.GetString(jdoc, "lang")
+	jScore, _ := json.GetInt(jdoc, "score")
+	jFast, _ := json.GetBool(jdoc, "fast")
+
+	// 3. End-to-end HTTP/1.1 Keep-Alive + POST JSON + 404 over std/http FiberScope!
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr()
+
+	srvCtx, stopSrv := NewContext()
+	defer stopSrv()
+
+	var srv http.Server
+	srv.Workers = 4
+	srv.MaxConns = 64
+	srvPtr := &srv
+
+	var getOk Atomic[u64]
+	var postOk Atomic[u64]
+	var notFoundOk Atomic[u64]
+
+	scope bg := NewFiberScope(4, 32) {
+		_ = bg.Spawn(srvCtx, driver func() {
+			_ = srvPtr.Serve(srvCtx, ln, apiHandler)
+		})
+
+		// Client opens ONE TCP connection and sends 3 Keep-Alive HTTP/1.1 requests!
+		cCtx, cancelC := NewContext()
+		defer cancelC()
+		conn, derr := net.DialTCP(cCtx, addr)
+		if derr == nil {
+			defer conn.Close()
+			var rbuf [1024]byte
+
+			// Request 1: GET /api/ping (Keep-Alive)
+			r1 := strBytes("GET /api/ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
+			_, _ = conn.Write(cCtx, r1)
+			n1, e1 := conn.Read(cCtx, rbuf[:])
+			if e1 == nil && strings.ContainsStr(rbuf[:n1], "200 OK") &&
+				strings.ContainsStr(rbuf[:n1], "X-Engine: FinCore") &&
+				strings.ContainsStr(rbuf[:n1], "{\"status\":\"ok\",\"zero_gc\":true,\"ver\":7}") {
+				_ = getOk.Add(1)
+			}
+
+			// Request 2: POST /api/echo with JSON body on SAME Keep-Alive connection!
+			r2 := strBytes("POST /api/echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 28\r\n\r\n{\"name\":\"world\",\"count\":21} ")
+			_, _ = conn.Write(cCtx, r2)
+			n2, e2 := conn.Read(cCtx, rbuf[:])
+			if e2 == nil && strings.ContainsStr(rbuf[:n2], "201 Created") &&
+				strings.ContainsStr(rbuf[:n2], "{\"hello\":\"world\",\"double\":42}") {
+				_ = postOk.Add(1)
+			}
+
+			// Request 3: GET /missing (Connection: close)
+			r3 := strBytes("GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+			_, _ = conn.Write(cCtx, r3)
+			n3, e3 := conn.Read(cCtx, rbuf[:])
+			if e3 == nil && strings.ContainsStr(rbuf[:n3], "404 Not Found") &&
+				strings.ContainsStr(rbuf[:n3], "not found") {
+				_ = notFoundOk.Add(1)
+			}
+		}
+
+		stopSrv()
+		bg.Wait()
+	}
+
+	var out [256]byte
+	n := formatTo(out[:], "str=%v,%v,%v,%d,%d,%v json=%s,%d,%v http=%d,%d,%d reqs=%d\n",
+		cutOk, foldOk, valOk, parts, pi, piOk,
+		bytesToStr(strBytes("FinCore")), jScore, jFast && strings.EqualStr(jLang, "FinCore"),
+		getOk.Load(), postOk.Load(), notFoundOk.Load(), srv.TotalRequests.Load())
+	return io.WriteStdout(out[:n])
+}

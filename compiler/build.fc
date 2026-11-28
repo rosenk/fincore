@@ -533,7 +533,7 @@ driver func cmdTest(io Stdio, env Env, fs FS, ex Exec) error {
 			var needMaj u32 = 0
 			var needMin u32 = 0
 			scanSinceRecursive(fs, rootDir, fullPath[:fpLen], &needMaj, &needMin, 0)
-			if needMaj > 0 || (needMaj == 0 && needMin > 6) {
+			if needMaj > 0 || (needMaj == 0 && needMin > 7) {
 				skipped++
 				if needMaj > skipMaxMaj || (needMaj == skipMaxMaj && needMin > skipMaxMin) {
 					skipMaxMaj = needMaj

@@ -455,7 +455,10 @@ driver func (p *Parser) parseReceiver() u32 {
 	rn := newNode(NKRecv, p.fileID, lt.off)
 	nameTok := p.expect(TKIdent, "expected receiver name")
 	nodes[rn].a = nameTok.strID
-	if p.eat(TKMul) {
+	if p.eat(TKConst) {
+		p.expect(TKMul, "expected '*' after 'const' in receiver")
+		nodes[rn].flags = 3 // bit0=ptr, bit1=constRecv
+	} else if p.eat(TKMul) {
 		nodes[rn].flags = 1 // pointer receiver
 	}
 	tname := p.expect(TKIdent, "expected receiver type name")

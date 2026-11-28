@@ -57,9 +57,9 @@ lint: fmt-check vet ## fmt-check + vet
 test-corpus: finc0 ## run finc0 test on testdata/ (native static ELF64 binaries)
 	$(FINC0) test -v testdata/
 
-test-examples: finc ## compile all examples/*.fc and versioned examples/v0{3,4,5,6}/*.fc with self-hosted bin/finc
+test-examples: finc ## compile all examples/*.fc and versioned examples/v0{3,4,5,6,7}/*.fc with self-hosted bin/finc
 	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; \
-	for f in examples/*.fc examples/v03/*.fc examples/v04/*.fc examples/v05/*.fc examples/v06/*.fc; do \
+	for f in examples/*.fc examples/v03/*.fc examples/v04/*.fc examples/v05/*.fc examples/v06/*.fc examples/v07/*.fc; do \
 	  o=$${f%.fc}.out; \
 	  $(FINC) build --comptime-fuel=$(FUEL) -o "$$d/example" "$$f"; \
 	  if [ -f "$$o" ]; then \

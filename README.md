@@ -23,14 +23,14 @@ In practice:
 
 `bootstrap/` (`finc0`, written in Go) exists **strictly to bootstrap FinCore v0.1 Native** and is **permanently frozen**.
 
-`compiler/` (`finc`, FinCore v0.6) is a **100% FinCore self-hosted native compiler** (~19k LOC across 18 files) that compiles directly to standalone static Linux x86_64 ELF64 binaries — **zero `libc`, zero GC, zero Go runtime**, including **algebraic effects (`effect`/`with`/`handle`) & linear one-shot continuations (`resume`)**, **indexed dependent types (`[m + n]T`) with `where` refinement proofs & zero-overhead bounds-check elimination**, **immutable views (`const []T`, `const *T`, zero-copy `strView`)**, **bounded scoped `Arena` allocation**, **M:N `epoll` Fiber Scheduler (`NewFiberScope` + `Spawn`/`Ready` — FinCore's zero-GC Eio equivalent)**, **SSE2 `f32`/`f64`**, **lock-free `Atomic[T]`**, **shallow static generic constraints (`Equal`/`Ordered`/`Numeric`)**, **x86_64 peephole optimizer** (self-compiles in **~0.35s**), and **finitist stratified Datalog (`std/datalog`)**:
+`compiler/` (`finc`, FinCore v0.7) is a **100% FinCore self-hosted native compiler** (~19.5k LOC across 19 files) that compiles directly to standalone static Linux x86_64 ELF64 binaries — **zero `libc`, zero GC, zero Go runtime**, including **algebraic effects (`effect`/`with`/`handle`) & linear one-shot continuations (`resume`)**, **indexed dependent types (`[m + n]T`) with `where` refinement proofs & zero-overhead bounds-check elimination**, **immutable views (`const []T`, `const *T`, zero-copy `strView`)**, **bounded scoped `Arena` allocation**, **M:N `epoll` Fiber Scheduler (`NewFiberScope` + `Spawn`/`Ready`)**, **SSE2 `f32`/`f64`**, **lock-free `Atomic[T]`**, **shallow static generic constraints (`Equal`/`Ordered`/`Numeric`)**, **x86_64 peephole optimizer** (self-compiles in **~0.35s**), **`finc fmt` + `--pretty` caret diagnostics**, and a **Go-style zero-GC standard library (`std/http`, `std/json`, `std/strings`, `std/datalog`, `std/vec`, `std/maps`, `std/bytes`, `std/strconv`, `std/sort`, `std/path`)**:
 
 ```text
 bootstrap/ (Go, FROZEN at v0.1 Native) ──► finc0 ──► static Linux x86_64 ELF64 (no libc, no GC)
-compiler/  (100% FinCore, v0.6 Native) ──► finc1 ──► finc2 == finc3 (bit-for-bit fixed point in ~0.35s!)
+compiler/  (100% FinCore, v0.7 Native) ──► finc1 ──► finc2 == finc3 (bit-for-bit fixed point in ~0.35s!)
 ```
 
-**No more Go is written beyond Stage 0.** Every version of the language and compiler (v0.2 self-hosting; v0.3 algebraic effects & one-shot continuations; v0.4 dependent types, `where` bounds-check elimination, `const []T`, `Arena`; v0.5 M:N `epoll` fibers, `Spawn`/`Ready`, SSE2 `f32`/`f64`, lock-free `Atomic[T]`; v0.6 `Equal`/`Ordered`/`Numeric` constraints, x86_64 peephole optimizer, `std/datalog`) is implemented strictly in FinCore itself. See [`bootstrap/README.md`](bootstrap/README.md).
+**No more Go is written beyond Stage 0.** See [`bootstrap/README.md`](bootstrap/README.md) and [`docs/guide.md`](docs/guide.md).
 
 ## Example
 

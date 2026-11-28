@@ -1,0 +1,517 @@
+// Package http provides a zero-GC, zero-libc, zero-allocation HTTP/1.1 server
+// built on FinCore's M:N epoll FiberScope ("FinCore Eio") with Keep-Alive,
+// zero-copy request parsing, graceful drain, and lock-free Atomic[u64] metrics.
+package http
+
+import "std/strings"
+
+const (
+	StatusOK                  u16 = 200
+	StatusCreated             u16 = 201
+	StatusNoContent           u16 = 204
+	StatusBadRequest          u16 = 400
+	StatusUnauthorized        u16 = 401
+	StatusForbidden           u16 = 403
+	StatusNotFound            u16 = 404
+	StatusMethodNotAllowed    u16 = 405
+	StatusPayloadTooLarge     u16 = 413
+	StatusInternalServerError u16 = 500
+
+	MaxReqBuf  usize = 4096
+	MaxRespBuf usize = 8192
+	MaxHeadBuf usize = 1024
+	MaxHeaders usize = 24
+)
+
+func StatusText(code u16) string {
+	if code == StatusOK {
+		return "OK"
+	}
+	if code == StatusCreated {
+		return "Created"
+	}
+	if code == StatusNoContent {
+		return "No Content"
+	}
+	if code == StatusBadRequest {
+		return "Bad Request"
+	}
+	if code == StatusUnauthorized {
+		return "Unauthorized"
+	}
+	if code == StatusForbidden {
+		return "Forbidden"
+	}
+	if code == StatusNotFound {
+		return "Not Found"
+	}
+	if code == StatusMethodNotAllowed {
+		return "Method Not Allowed"
+	}
+	if code == StatusPayloadTooLarge {
+		return "Payload Too Large"
+	}
+	return "Internal Server Error"
+}
+
+type HeaderSpan struct {
+	nameOff u16
+	nameLen u16
+	valOff  u16
+	valLen  u16
+}
+
+// Request holds a parsed HTTP/1.1 request in a bounded stack buffer with zero-copy views.
+type Request struct {
+	buf       [MaxReqBuf]byte
+	bufLen    usize
+	methodOff u16
+	methodLen u16
+	pathOff   u16
+	pathLen   u16
+	queryOff  u16
+	queryLen  u16
+	bodyOff   u16
+	bodyLen   u16
+	headers   [MaxHeaders]HeaderSpan
+	nHeaders  u32
+	keepAlive bool
+}
+
+func (r const *Request) Method() const []byte {
+	s := usize(r.methodOff)
+	return r.buf[s : s+usize(r.methodLen)]
+}
+
+func (r const *Request) MethodIs(m string) bool {
+	return strings.EqualStr(r.Method(), m)
+}
+
+func (r const *Request) Path() const []byte {
+	s := usize(r.pathOff)
+	return r.buf[s : s+usize(r.pathLen)]
+}
+
+func (r const *Request) PathIs(p string) bool {
+	return strings.EqualStr(r.Path(), p)
+}
+
+func (r const *Request) PathHasPrefix(p string) bool {
+	return strings.HasPrefixStr(r.Path(), p)
+}
+
+func (r const *Request) Query() const []byte {
+	s := usize(r.queryOff)
+	return r.buf[s : s+usize(r.queryLen)]
+}
+
+func (r const *Request) Body() const []byte {
+	s := usize(r.bodyOff)
+	return r.buf[s : s+usize(r.bodyLen)]
+}
+
+func (r const *Request) KeepAlive() bool {
+	return r.keepAlive
+}
+
+// Header returns the first header matching name (ASCII case-insensitive, zero-copy).
+func (r const *Request) Header(name string) (const []byte, bool) {
+	target := strView(name)
+	for i := u32(0); i < r.nHeaders; i++ {
+		h := r.headers[i]
+		ns := usize(h.nameOff)
+		if strings.EqualFold(r.buf[ns:ns+usize(h.nameLen)], target) {
+			vs := usize(h.valOff)
+			return r.buf[vs : vs+usize(h.valLen)], true
+		}
+	}
+	return r.buf[:0], false
+}
+
+// ResponseWriter builds an HTTP/1.1 response in a bounded stack buffer (0 allocations).
+type ResponseWriter struct {
+	headBuf [MaxHeadBuf]byte
+	headLen usize
+	bodyBuf [MaxRespBuf]byte
+	bodyLen usize
+	ctBuf   [64]byte
+	ctLen   usize
+	status  u16
+	written bool
+}
+
+func (w *ResponseWriter) reset() {
+	w.headLen = 0
+	w.bodyLen = 0
+	w.ctLen = 0
+	w.status = StatusOK
+	w.written = false
+}
+
+// SetHeader appends a custom response header (`Name: Value\r\n`).
+func (w *ResponseWriter) SetHeader(name string, val string) {
+	rem := MaxHeadBuf - w.headLen
+	if rem < 8 {
+		return
+	}
+	n := formatTo(w.headBuf[w.headLen:], "%s: %s\r\n", name, val)
+	w.headLen += n
+}
+
+// WriteBytes sets status, Content-Type, and response body from a byte view.
+func (w *ResponseWriter) WriteBytes(status u16, contentType string, body const []byte) {
+	w.status = status
+	w.written = true
+	ctv := strView(contentType)
+	cn := len(ctv)
+	if cn > 64 {
+		cn = 64
+	}
+	for i := usize(0); i < cn; i++ {
+		w.ctBuf[i] = ctv[i]
+	}
+	w.ctLen = cn
+	bn := len(body)
+	if bn > MaxRespBuf {
+		bn = MaxRespBuf
+	}
+	for i := usize(0); i < bn; i++ {
+		w.bodyBuf[i] = body[i]
+	}
+	w.bodyLen = bn
+}
+
+// WriteText writes a `text/plain; charset=utf-8` response.
+func (w *ResponseWriter) WriteText(status u16, body string) {
+	w.WriteBytes(status, "text/plain; charset=utf-8", strView(body))
+}
+
+// WriteJSON writes an `application/json` response.
+func (w *ResponseWriter) WriteJSON(status u16, body const []byte) {
+	w.WriteBytes(status, "application/json", body)
+}
+
+// WriteStatus writes an empty response with the given status code.
+func (w *ResponseWriter) WriteStatus(status u16) {
+	w.WriteBytes(status, "text/plain; charset=utf-8", strView(""))
+}
+
+// ParseRequest parses an HTTP/1.1 request from r.buf[:r.bufLen].
+// Returns (consumedBytes, complete, ok).
+// If complete == false && ok == true, caller should read more bytes from socket.
+func ParseRequest(r *Request) (usize, bool, bool) {
+	data := r.buf[:r.bufLen]
+	hdrEnd, found := strings.Index(data, strView("\r\n\r\n"))
+	if !found {
+		if r.bufLen >= MaxReqBuf {
+			return 0, false, false // header too large
+		}
+		return 0, false, true // need more bytes
+	}
+	bodyStart := hdrEnd + 4
+
+	// Request line: METHOD SP REQUEST-TARGET SP HTTP/1.x
+	lineEnd, okLine := strings.Index(data[:hdrEnd], strView("\r\n"))
+	if !okLine {
+		lineEnd = hdrEnd
+	}
+	reqLine := data[:lineEnd]
+	sp1, ok1 := strings.IndexByte(reqLine, ' ')
+	if !ok1 || sp1 == 0 {
+		return 0, false, false
+	}
+	r.methodOff = 0
+	r.methodLen = u16(sp1)
+
+	rest1 := reqLine[sp1+1:]
+	sp2, ok2 := strings.IndexByte(rest1, ' ')
+	if !ok2 || sp2 == 0 {
+		return 0, false, false
+	}
+	targetOff := sp1 + 1
+	target := reqLine[targetOff : targetOff+sp2]
+	if qIdx, hasQ := strings.IndexByte(target, '?'); hasQ {
+		r.pathOff = u16(targetOff)
+		r.pathLen = u16(qIdx)
+		r.queryOff = u16(targetOff + qIdx + 1)
+		r.queryLen = u16(sp2 - qIdx - 1)
+	} else {
+		r.pathOff = u16(targetOff)
+		r.pathLen = u16(sp2)
+		r.queryOff = 0
+		r.queryLen = 0
+	}
+
+	version := rest1[sp2+1:]
+	r.keepAlive = strings.EqualStr(version, "HTTP/1.1")
+	r.nHeaders = 0
+
+	// Parse headers
+	var contentLen usize = 0
+	pos := lineEnd + 2
+	for step := usize(0); step < MaxHeaders+4; step++ {
+		if pos >= hdrEnd {
+			break
+		}
+		rem := data[pos:hdrEnd]
+		relEnd, hasCRLF := strings.Index(rem, strView("\r\n"))
+		var hl usize = len(rem)
+		if hasCRLF {
+			hl = relEnd
+		}
+		hline := rem[:hl]
+		if colon, hasC := strings.IndexByte(hline, ':'); hasC && colon > 0 {
+			nameOff := pos
+			nameLen := colon
+			// Trim spaces around header value
+			vLo := pos + colon + 1
+			vHi := pos + hl
+			for ws := usize(0); ws < hl; ws++ {
+				if vLo < vHi && (data[vLo] == ' ' || data[vLo] == '\t') {
+					vLo++
+				} else {
+					break
+				}
+			}
+			for ws := usize(0); ws < hl; ws++ {
+				if vHi > vLo && (data[vHi-1] == ' ' || data[vHi-1] == '\t') {
+					vHi--
+				} else {
+					break
+				}
+			}
+			if usize(r.nHeaders) < MaxHeaders {
+				r.headers[r.nHeaders] = HeaderSpan{
+					nameOff: u16(nameOff),
+					nameLen: u16(nameLen),
+					valOff:  u16(vLo),
+					valLen:  u16(vHi - vLo),
+				}
+				r.nHeaders++
+			}
+			hName := data[nameOff : nameOff+nameLen]
+			hVal := data[vLo:vHi]
+			if strings.EqualFoldStr(hName, "Content-Length") {
+				if cl, okCL := strings.ParseUint(hVal); okCL {
+					contentLen = usize(cl)
+				} else {
+					return 0, false, false
+				}
+			} else if strings.EqualFoldStr(hName, "Connection") {
+				if strings.EqualFoldStr(hVal, "close") {
+					r.keepAlive = false
+				} else if strings.EqualFoldStr(hVal, "keep-alive") {
+					r.keepAlive = true
+				}
+			}
+		}
+		pos += hl + 2
+	}
+
+	totalNeed := bodyStart + contentLen
+	if totalNeed > MaxReqBuf {
+		return 0, false, false
+	}
+	if r.bufLen < totalNeed {
+		return 0, false, true // need more body bytes
+	}
+	r.bodyOff = u16(bodyStart)
+	r.bodyLen = u16(contentLen)
+	return totalNeed, true, true
+}
+
+func writeAll(ctx Context, conn Conn, data []byte) error {
+	for rem := data; len(rem) > 0; {
+		n, err := conn.Write(ctx, rem)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+	return nil
+}
+
+func sendResponse(ctx Context, conn Conn, w *ResponseWriter, keepAlive bool) error {
+	if !w.written {
+		w.WriteText(StatusOK, "")
+	}
+	var hdr [1536]byte
+	connHdr := "close"
+	if keepAlive {
+		connHdr = "keep-alive"
+	}
+	var ct []byte
+	if w.ctLen > 0 {
+		ct = w.ctBuf[:w.ctLen]
+	} else {
+		ct = strBytes("text/plain; charset=utf-8")
+	}
+	n := formatTo(hdr[:], "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: %s\r\n",
+		u32(w.status), StatusText(w.status), ct, w.bodyLen, connHdr)
+	if w.headLen > 0 && n+w.headLen+2 <= len(hdr) {
+		for i := usize(0); i < w.headLen; i++ {
+			hdr[n+i] = w.headBuf[i]
+		}
+		n += w.headLen
+	}
+	if n+2 <= len(hdr) {
+		hdr[n] = '\r'
+		hdr[n+1] = '\n'
+		n += 2
+	}
+	// Fast path: combine header + small body into one write syscall (avoids Nagle/TCP split!)
+	if w.bodyLen > 0 && n+w.bodyLen <= len(hdr) {
+		for i := usize(0); i < w.bodyLen; i++ {
+			hdr[n+i] = w.bodyBuf[i]
+		}
+		return writeAll(ctx, conn, hdr[:n+w.bodyLen])
+	}
+	if err := writeAll(ctx, conn, hdr[:n]); err != nil {
+		return err
+	}
+	if w.bodyLen > 0 {
+		return writeAll(ctx, conn, w.bodyBuf[:w.bodyLen])
+	}
+	return nil
+}
+
+driver func serveConn(
+	drainCtx Context,
+	hardCtx Context,
+	conn Conn,
+	idleTimeout u64,
+	handler func(const *Request, *ResponseWriter),
+	totalReqs *Atomic[u64],
+) {
+	defer conn.Close()
+	var req Request
+	var rw ResponseWriter
+	req.bufLen = 0
+
+	driver for !drainCtx.Done() {
+		// Try parsing buffered pipelined/partial bytes first
+		consumed, complete, ok := ParseRequest(&req)
+		if !ok {
+			rw.reset()
+			rw.WriteText(StatusBadRequest, "bad request\n")
+			_ = sendResponse(hardCtx, conn, &rw, false)
+			return
+		}
+		if !complete {
+			readCtx := hardCtx.WithTimeout(idleTimeout)
+			n, err := conn.Read(readCtx, req.buf[req.bufLen:])
+			if err != nil || n == 0 {
+				return
+			}
+			req.bufLen += n
+			continue
+		}
+
+		// Dispatch request to user handler!
+		rw.reset()
+		handler(&req, &rw)
+		_ = totalReqs.Add(1)
+
+		keep := req.keepAlive && !drainCtx.Done()
+		if err := sendResponse(hardCtx, conn, &rw, keep); err != nil {
+			return
+		}
+		if !keep {
+			return
+		}
+		// Shift any pipelined trailing bytes down to buf[0]
+		rem := req.bufLen - consumed
+		if rem > 0 {
+			for i := usize(0); i < rem; i++ {
+				req.buf[i] = req.buf[consumed+i]
+			}
+		}
+		req.bufLen = rem
+	}
+}
+
+// Server configures and runs a bounded, zero-GC M:N FiberScope HTTP/1.1 server.
+type Server struct {
+	Addr          string
+	Workers       usize
+	MaxConns      usize
+	IdleTimeout   u64
+	DrainHorizon  u64
+	TotalRequests Atomic[u64]
+}
+
+// Serve accepts connections on an already-bound Listener until drainCtx is cancelled.
+// Ideal for both production servers and embedded tests (with "127.0.0.1:0").
+driver func (s *Server) Serve(
+	drainCtx Context,
+	ln Listener,
+	handler func(const *Request, *ResponseWriter),
+) error {
+	defer ln.Close()
+	workers := s.Workers
+	if workers == 0 {
+		workers = 4
+	}
+	maxConns := s.MaxConns
+	if maxConns == 0 {
+		maxConns = 1024
+	}
+	idleTimeout := s.IdleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = 30 * Second
+	}
+	drainHorizon := s.DrainHorizon
+	if drainHorizon == 0 {
+		drainHorizon = 5 * Second
+	}
+
+	hardCtx, cancelHard := NewContext()
+	defer cancelHard()
+
+	reqCounter := &s.TotalRequests
+
+	scope conns := NewFiberScope(workers, maxConns) {
+		driver for {
+			if err := conns.Ready(drainCtx); err != nil {
+				break
+			}
+			conn, err := ln.Accept(drainCtx)
+			if err != nil {
+				if drainCtx.Done() {
+					break
+				}
+				continue
+			}
+			if err := conns.Spawn(drainCtx, driver func() {
+				serveConn(drainCtx, hardCtx, conn, idleTimeout, handler, reqCounter)
+			}); err != nil {
+				break
+			}
+		}
+		if !conns.WaitTimeout(drainHorizon) {
+			cancelHard()
+			conns.Wait()
+		}
+	}
+	return nil
+}
+
+// ListenAndServe binds s.Addr, wires SIGINT/SIGTERM graceful shutdown, and serves HTTP/1.1.
+driver func (s *Server) ListenAndServe(
+	net Net,
+	sig Signals,
+	handler func(const *Request, *ResponseWriter),
+) error {
+	ln, err := net.ListenTCP(s.Addr)
+	if err != nil {
+		return err
+	}
+
+	drainCtx, stopSignals := sig.NotifyContext(SIGINT, SIGTERM)
+	defer stopSignals()
+
+	return s.Serve(drainCtx, ln, handler)
+}

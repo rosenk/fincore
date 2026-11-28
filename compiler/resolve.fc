@@ -488,8 +488,11 @@ func registerPkgDecls(pkgID u32) {
 					// Method (not in package namespace; registered in methods table later)
 					rn := nodes[d.b]
 					var fl u8 = 0
-					if rn.flags != 0 {
+					if (rn.flags & 1) != 0 {
 						fl = 8 // ptrRecv
+					}
+					if (rn.flags & 2) != 0 {
+						fl |= 16 // constPtrRecv
 					}
 					s := addSym(Sym{
 						kind:     SymMethod,
@@ -852,7 +855,9 @@ driver func resolveFuncDeclSig(pkgID u32, dn u32) {
 				}
 				rty = instantiateNamed(rty, rargs[:nTP])
 			}
-			if rn.flags != 0 {
+			if (rn.flags & 2) != 0 {
+				rty = makeConstPtrType(rty)
+			} else if (rn.flags & 1) != 0 {
 				rty = makePtrType(rty)
 			}
 			nodeType[d.b] = rty

@@ -1,0 +1,54 @@
+// FinCore v0.7 Production-Style HTTP/1.1 JSON API Server:
+//   - Go-ergonomic std/http + std/json + std/strings
+//   - M:N epoll FiberScope (4 OS threads, 4096 concurrent Keep-Alive connections)
+//   - Zero GC, zero malloc, zero libc (~45 KB standalone static Linux ELF64!)
+package main
+
+import (
+	"std/http"
+	"std/json"
+)
+
+var apiHits Atomic[u64]
+
+func handleRequest(req const *http.Request, w *http.ResponseWriter) {
+	if req.MethodIs("GET") && req.PathIs("/") {
+		w.WriteText(http.StatusOK, "Hello from FinCore v0.7 (zero libc, zero GC)!\n")
+		return
+	}
+	if req.MethodIs("GET") && req.PathIs("/api/status") {
+		hits := apiHits.Add(1)
+		var jb json.Builder[512]
+		jb.BeginObject()
+		jb.FieldStr("engine", "FinCore v0.7")
+		jb.FieldBool("zero_gc", true)
+		jb.FieldBool("zero_libc", true)
+		jb.FieldUint("hits", hits)
+		jb.EndObject()
+		w.SetHeader("X-Powered-By", "FinCore")
+		w.WriteJSON(http.StatusOK, jb.Bytes())
+		return
+	}
+	if req.MethodIs("POST") && req.PathIs("/api/echo") {
+		msg, ok := json.GetString(req.Body(), "message")
+		if !ok {
+			w.WriteText(http.StatusBadRequest, "{\"error\":\"missing message\"}\n")
+			return
+		}
+		var jb json.Builder[512]
+		jb.BeginObject()
+		jb.FieldBytes("echo", msg)
+		jb.EndObject()
+		w.WriteJSON(http.StatusOK, jb.Bytes())
+		return
+	}
+	w.WriteText(http.StatusNotFound, "404 page not found\n")
+}
+
+driver func main(net Net, sig Signals) error {
+	var srv http.Server
+	srv.Addr = "0.0.0.0:8080"
+	srv.Workers = 4
+	srv.MaxConns = 4096
+	return srv.ListenAndServe(net, sig, handleRequest)
+}

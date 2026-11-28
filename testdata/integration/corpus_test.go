@@ -127,6 +127,11 @@ func TestCorpusFail(t *testing.T) {
 		sort.Strings(v06Files)
 		files = append(files, v06Files...)
 	}
+	if cMaj > 0 || cMin >= 7 {
+		v07Files, _ := filepath.Glob(filepath.Join(root, "testdata", "v07", "fail", "*.fc"))
+		sort.Strings(v07Files)
+		files = append(files, v07Files...)
+	}
 	for _, file := range files {
 		rel, _ := filepath.Rel(root, file)
 		t.Run(strings.TrimSuffix(filepath.Base(file), ".fc"), func(t *testing.T) {
@@ -193,6 +198,12 @@ func TestCorpusPass(t *testing.T) {
 		v06Pass := filepath.Join(root, "testdata", "v06", "pass")
 		if _, err := os.Stat(v06Pass); err == nil {
 			passDirs = append(passDirs, v06Pass)
+		}
+	}
+	if cMaj > 0 || cMin >= 7 {
+		v07Pass := filepath.Join(root, "testdata", "v07", "pass")
+		if _, err := os.Stat(v07Pass); err == nil {
+			passDirs = append(passDirs, v07Pass)
 		}
 	}
 	for _, curPassDir := range passDirs {

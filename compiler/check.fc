@@ -2107,6 +2107,9 @@ driver func (c *Checker) checkCallArgs(en u32, sig Type) {
 		if !c.checkAssignable(arg, got, want) {
 			addDiagStr(E2002, nodes[arg].fileID, nodes[arg].off, "argument type mismatch")
 		}
+		if sig.op == EffDriver && classOf(want) == ClsLinear {
+			c.consumeLinear(arg)
+		}
 	}
 }
 
@@ -2203,6 +2206,7 @@ driver func (c *Checker) checkUserMethodCall(en u32, recvExpr u32, recvTy u32, b
 	n := nodes[en]
 	dn := syms[mSym].declNode
 	needPtr := (syms[mSym].flags & 8) != 0
+	isConstRecv := (syms[mSym].flags & 16) != 0
 	var autoAddr u8 = 0
 	finalRecvTy := recvTy
 	if needPtr && !isPtr {
@@ -2210,10 +2214,14 @@ driver func (c *Checker) checkUserMethodCall(en u32, recvExpr u32, recvTy u32, b
 			addDiagStr(E2002, n.fileID, n.off, "cannot call pointer-receiver method on non-addressable value")
 		}
 		autoAddr = 1
-		finalRecvTy = makePtrType(baseTy)
+		if isConstRecv {
+			finalRecvTy = makeConstPtrType(baseTy)
+		} else {
+			finalRecvTy = makePtrType(baseTy)
+		}
 	} else if !needPtr && isPtr {
 		finalRecvTy = baseTy
-	} else if needPtr && isPtr && isConstView(recvTy) {
+	} else if needPtr && isPtr && isConstView(recvTy) && !isConstRecv {
 		addDiagStr(E2014, n.fileID, n.off, "cannot call mutable pointer-receiver method on const pointer")
 	}
 

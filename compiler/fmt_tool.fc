@@ -1,0 +1,191 @@
+package main
+
+// Canonical FinCore source formatter (`finc fmt [-w | --check] <file.fc>`).
+// Written 100% in FinCore: normalizes tab indentation from block/group nesting,
+// strips trailing whitespace, collapses multiple blank lines, and ensures a
+// single trailing newline while preserving comments and string/char literals.
+
+var fmtInBuf [262144]byte
+var fmtOutBuf [262144]byte
+
+// formatFinCoreSource formats src into dst, returning the formatted byte length.
+func formatFinCoreSource(src []byte, dst []byte) usize {
+	n := len(src)
+	outPos := usize(0)
+	indent := i32(0)
+	blankRun := u32(0)
+	i := usize(0)
+
+	for step := usize(0); step < n+1; step++ {
+		if i >= n {
+			break
+		}
+		ls := i
+		for scan := usize(0); scan < n; scan++ {
+			if i >= n || src[i] == '\n' {
+				break
+			}
+			i++
+		}
+		le := i
+		if i < n && src[i] == '\n' {
+			i++
+		}
+		// Trim leading spaces/tabs and trailing spaces/tabs/CR
+		tLo := ls
+		for s := usize(0); s < le-ls; s++ {
+			if tLo < le && (src[tLo] == ' ' || src[tLo] == '\t') {
+				tLo++
+			} else {
+				break
+			}
+		}
+		tHi := le
+		for s := usize(0); s < le-tLo; s++ {
+			if tHi > tLo && (src[tHi-1] == ' ' || src[tHi-1] == '\t' || src[tHi-1] == '\r') {
+				tHi--
+			} else {
+				break
+			}
+		}
+		line := src[tLo:tHi]
+		if len(line) == 0 {
+			blankRun++
+			if blankRun == 1 && outPos > 0 {
+				outPos = bufAppendByte(dst, outPos, '\n')
+			}
+			continue
+		}
+		blankRun = 0
+
+		// Leading closing delimiters (`}`, `)`) dedent this line before emitting
+		leadClose := i32(0)
+		for k := usize(0); k < len(line); k++ {
+			c := line[k]
+			if c == '}' || c == ')' {
+				leadClose++
+			} else {
+				break
+			}
+		}
+		lineIndent := indent - leadClose
+		if lineIndent < 0 {
+			lineIndent = 0
+		}
+		for t := i32(0); t < lineIndent; t++ {
+			outPos = bufAppendByte(dst, outPos, '\t')
+		}
+		outPos = bufAppend(dst, outPos, line)
+		outPos = bufAppendByte(dst, outPos, '\n')
+
+		// Scan net brace/paren delta on this line (ignoring strings, chars, and // comments)
+		inStr := false
+		inChar := false
+		esc := false
+		var delta i32 = 0
+		for k := usize(0); k < len(line); k++ {
+			c := line[k]
+			if inStr {
+				if esc {
+					esc = false
+				} else if c == '\\' {
+					esc = true
+				} else if c == '"' {
+					inStr = false
+				}
+				continue
+			}
+			if inChar {
+				if esc {
+					esc = false
+				} else if c == '\\' {
+					esc = true
+				} else if c == '\'' {
+					inChar = false
+				}
+				continue
+			}
+			if c == '/' && k+1 < len(line) && line[k+1] == '/' {
+				break
+			}
+			if c == '"' {
+				inStr = true
+			} else if c == '\'' {
+				inChar = true
+			} else if c == '{' || c == '(' {
+				delta++
+			} else if c == '}' || c == ')' {
+				delta--
+			}
+		}
+		indent += delta
+		if indent < 0 {
+			indent = 0
+		}
+	}
+	// Strip trailing extra blank line if present
+	if outPos >= 2 && dst[outPos-1] == '\n' && dst[outPos-2] == '\n' {
+		outPos--
+	}
+	return outPos
+}
+
+driver func cmdFmt(io Stdio, env Env, fs FS) error {
+	argc := env.ArgsCount()
+	if argc < 3 {
+		_ = io.WriteStderr(strBytes("usage: finc fmt [-w | --check] <file.fc...>\n"))
+		return ErrIO
+	}
+	writeMode := false
+	checkMode := false
+	firstFile := usize(2)
+	for i := usize(2); i < argc; i++ {
+		arg := strBytes(env.Arg(i))
+		if sliceEq(arg, strBytes("-w")) {
+			writeMode = true
+			firstFile = i + 1
+		} else if sliceEq(arg, strBytes("--check")) {
+			checkMode = true
+			firstFile = i + 1
+		} else {
+			firstFile = i
+			break
+		}
+	}
+	if firstFile >= argc {
+		_ = io.WriteStderr(strBytes("usage: finc fmt [-w | --check] <file.fc...>\n"))
+		return ErrIO
+	}
+	needsFmt := false
+	for i := firstFile; i < argc; i++ {
+		path := env.Arg(i)
+		n, err := fs.ReadFileInto(path, fmtInBuf[:])
+		if err != nil {
+			_ = io.WriteStderr(strBytes("finc fmt: cannot read file\n"))
+			return err
+		}
+		outLen := formatFinCoreSource(fmtInBuf[:n], fmtOutBuf[:])
+		changed := !sliceEq(fmtInBuf[:n], fmtOutBuf[:outLen])
+		if checkMode {
+			if changed {
+				needsFmt = true
+				_ = io.WriteStdout(strBytes(path))
+				_ = io.WriteStdout(strBytes("\n"))
+			}
+		} else if writeMode {
+			if changed {
+				if werr := fs.WriteFile(path, fmtOutBuf[:outLen]); werr != nil {
+					return werr
+				}
+			}
+		} else {
+			if werr := io.WriteStdout(fmtOutBuf[:outLen]); werr != nil {
+				return werr
+			}
+		}
+	}
+	if checkMode && needsFmt {
+		return ErrIO
+	}
+	return nil
+}

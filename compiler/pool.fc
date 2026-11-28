@@ -81,6 +81,7 @@ var diags [MaxDiags]Diag
 var diagCount u32
 var diagMsgBuf [MaxDiagBytes]byte
 var diagMsgUsed u32
+var prettyDiags bool
 
 // poolInit resets and initializes interned string 0 as "".
 func poolInit() {
@@ -341,6 +342,43 @@ driver func printDiags(io Stdio) error {
 		}
 		if err := io.WriteStderr(lineBuf[:pos]); err != nil {
 			return err
+		}
+		if prettyDiags && d.fileID < fileCount {
+			f := files[d.fileID]
+			if ln >= 1 && ln <= f.lineCount {
+				ls := usize(f.srcOff + lineOffs[f.lineStart+ln-1])
+				fEnd := usize(f.srcOff + f.srcLen)
+				le := ls
+				for scan := usize(0); scan < 256; scan++ {
+					if le >= fEnd || srcBuf[le] == '\n' || srcBuf[le] == '\r' {
+						break
+					}
+					le++
+				}
+				var ctxBuf [512]byte
+				cp := formatTo(ctxBuf[:], "  %4d | ", ln)
+				cp += copy(ctxBuf[cp:], srcBuf[ls:le])
+				cp = bufAppendByte(ctxBuf[:], cp, '\n')
+				cp = bufAppendStr(ctxBuf[:], cp, "       | ")
+				var caretCol u32 = 1
+				if col > 1 {
+					caretCol = col
+				}
+				for c := u32(1); c < caretCol; c++ {
+					if cp+4 >= len(ctxBuf) {
+						break
+					}
+					if ls+usize(c-1) < le && srcBuf[ls+usize(c-1)] == '\t' {
+						cp = bufAppendByte(ctxBuf[:], cp, '\t')
+					} else {
+						cp = bufAppendByte(ctxBuf[:], cp, ' ')
+					}
+				}
+				cp = bufAppendStr(ctxBuf[:], cp, "^\n")
+				if err := io.WriteStderr(ctxBuf[:cp]); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
