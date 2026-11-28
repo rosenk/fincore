@@ -5,6 +5,7 @@ package main
 
 const (
 	MaxModDeps     = 64
+	MaxModLinks    = 32
 	MaxModFileSize = 32 * 1024
 )
 
@@ -20,6 +21,10 @@ var modRootBuf [512]byte
 var modRootLen usize
 var modDeps [MaxModDeps]ModDep
 var modDepCount u32
+var modLinks [MaxModLinks]u32
+var modLinkCount u32
+var cliLinks [MaxModLinks]u32
+var cliLinkCount u32
 var modFileBuf [MaxModFileSize]byte
 
 func modInit() {
@@ -27,6 +32,22 @@ func modInit() {
 	modNameStr = 0
 	modRootLen = 0
 	modDepCount = 0
+	modLinkCount = 0
+}
+
+func addModLink(lib []byte) {
+	if modLinkCount >= MaxModLinks || len(lib) == 0 {
+		return
+	}
+	sid := internBytes(lib)
+	lc := modLinkCount
+	for i := u32(0); i < lc; i++ {
+		if modLinks[i] == sid {
+			return
+		}
+	}
+	modLinks[modLinkCount] = sid
+	modLinkCount++
 }
 
 func isModSpace(c byte) bool {
@@ -151,6 +172,10 @@ func parseModFile(data []byte) {
 		if sliceEq(tok0, strBytes("module")) {
 			if len(tok1) > 0 {
 				modNameStr = internBytes(tok1)
+			}
+		} else if sliceEq(tok0, strBytes("link")) {
+			if len(tok1) > 0 {
+				addModLink(tok1)
 			}
 		} else if sliceEq(tok0, strBytes("require")) {
 			if len(tok1) == 1 && tok1[0] == '(' {

@@ -19,6 +19,7 @@
 .equ SYS_munmap,       11
 .equ SYS_rt_sigaction, 13
 .equ SYS_rt_sigreturn, 15
+.equ SYS_ioctl,        16
 .equ SYS_pipe,         22
 .equ SYS_dup2,         33
 .equ SYS_getpid,       39
@@ -67,13 +68,17 @@
 .equ ENOTDIR,       20
 .equ CLOCK_REALTIME,  0
 .equ CLOCK_MONOTONIC, 1
+.equ TCGETS,          0x5401
+.equ TCSETS,          0x5402
+.equ TIOCGWINSZ,      0x5413
+.equ POLLIN_STDIN,    1
 
 # ---------------------------------------------------------------------------
 # Entry point: kernel enters _start with:
 #   (%rsp)    = argc
 #   8(%rsp)   = argv[0] ... NULL
 #   ...       = envp[0] ... NULL
-.global _start
+.weak _start
 _start:
     xorq    %rbp, %rbp
     movq    (%rsp), %rax
@@ -108,6 +113,7 @@ _start:
     syscall
 
 # _fc_rt_print_err(%rdi = err_id)
+.global _fc_rt_print_err
 _fc_rt_print_err:
     pushq   %rbp
     movq    %rsp, %rbp
@@ -504,6 +510,156 @@ _fc_rt_read_stdin:
     popq    %rbx
     ret
 
+# _fc_rt_term_raw() -> %rax = err
+.global _fc_rt_term_raw
+_fc_rt_term_raw:
+    subq    $72, %rsp
+    movq    $SYS_ioctl, %rax
+    xorq    %rdi, %rdi
+    movq    $TCGETS, %rsi
+    leaq    _fc_term_orig(%rip), %rdx
+    syscall
+    testq   %rax, %rax
+    jl      .L_tr_err
+    movq    $1, _fc_term_saved(%rip)
+    # Copy 64 bytes from _fc_term_orig to stack raw copy
+    leaq    _fc_term_orig(%rip), %rsi
+    movq    %rsp, %rdi
+    movq    $8, %rcx
+    cld
+    rep     movsq
+    # c_iflag &= ~(BRKINT|INPCK|ISTRIP|ICRNL|IXON) = ~0x532
+    andl    $~0x532, 0(%rsp)
+    # c_lflag &= ~(ISIG|ICANON|ECHO|IEXTEN) = ~0x800b
+    andl    $~0x800b, 12(%rsp)
+    # c_cc[VTIME]=0 (off 22), c_cc[VMIN]=1 (off 23)
+    movb    $0, 22(%rsp)
+    movb    $1, 23(%rsp)
+    movq    $SYS_ioctl, %rax
+    xorq    %rdi, %rdi
+    movq    $TCSETS, %rsi
+    movq    %rsp, %rdx
+    syscall
+    testq   %rax, %rax
+    jl      .L_tr_err
+    xorq    %rax, %rax
+    addq    $72, %rsp
+    ret
+.L_tr_err:
+    movq    $ERR_IO, %rax
+    addq    $72, %rsp
+    ret
+
+# _fc_rt_term_restore() -> %rax = err
+.global _fc_rt_term_restore
+_fc_rt_term_restore:
+    cmpq    $0, _fc_term_saved(%rip)
+    je      .L_trest_ok
+    movq    $SYS_ioctl, %rax
+    xorq    %rdi, %rdi
+    movq    $TCSETS, %rsi
+    leaq    _fc_term_orig(%rip), %rdx
+    syscall
+    movq    $0, _fc_term_saved(%rip)
+.L_trest_ok:
+    xorq    %rax, %rax
+    ret
+
+# _fc_rt_term_size() -> (%rax = cols, %rdx = rows, %rcx = ok)
+.global _fc_rt_term_size
+_fc_rt_term_size:
+    subq    $16, %rsp
+    movq    $0, 0(%rsp)
+    movq    $SYS_ioctl, %rax
+    movq    $1, %rdi
+    movq    $TIOCGWINSZ, %rsi
+    movq    %rsp, %rdx
+    syscall
+    testq   %rax, %rax
+    jl      .L_ts_fail
+    movzwq  2(%rsp), %rax     # ws_col
+    movzwq  0(%rsp), %rdx     # ws_row
+    testq   %rax, %rax
+    jz      .L_ts_fail
+    testq   %rdx, %rdx
+    jz      .L_ts_fail
+    movq    $1, %rcx
+    addq    $16, %rsp
+    ret
+.L_ts_fail:
+    xorq    %rax, %rax
+    xorq    %rdx, %rdx
+    xorq    %rcx, %rcx
+    addq    $16, %rsp
+    ret
+
+# _fc_rt_read_stdin_timeout(%rdi = dst_ptr, %rsi = dst_len, %rdx = timeout_ms) -> (%rax = n, %rdx = err)
+.global _fc_rt_read_stdin_timeout
+_fc_rt_read_stdin_timeout:
+    pushq   %rbx
+    pushq   %r12
+    pushq   %r13
+    subq    $16, %rsp
+    movq    %rdi, %rbx
+    movq    %rsi, %r12
+    movq    %rdx, %r13
+.L_rst_poll:
+    # struct pollfd { int fd=0; short events=POLLIN; short revents=0; }
+    movl    $0, 0(%rsp)
+    movw    $POLLIN_STDIN, 4(%rsp)
+    movw    $0, 6(%rsp)
+    movq    $SYS_poll, %rax
+    movq    %rsp, %rdi
+    movq    $1, %rsi
+    movq    %r13, %rdx
+    syscall
+    cmpq    $-EINTR, %rax
+    je      .L_rst_poll
+    testq   %rax, %rax
+    jl      .L_rst_io
+    jz      .L_rst_timeout
+.L_rst_read:
+    movq    $SYS_read, %rax
+    xorq    %rdi, %rdi
+    movq    %rbx, %rsi
+    movq    %r12, %rdx
+    syscall
+    cmpq    $-EINTR, %rax
+    je      .L_rst_read
+    testq   %rax, %rax
+    jl      .L_rst_io
+    jz      .L_rst_eof
+    xorq    %rdx, %rdx
+    addq    $16, %rsp
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    ret
+.L_rst_timeout:
+    xorq    %rax, %rax
+    movq    $ERR_TIMEOUT, %rdx
+    addq    $16, %rsp
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    ret
+.L_rst_eof:
+    xorq    %rax, %rax
+    movq    $ERR_EOF, %rdx
+    addq    $16, %rsp
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    ret
+.L_rst_io:
+    xorq    %rax, %rax
+    movq    $ERR_IO, %rdx
+    addq    $16, %rsp
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    ret
+
 # ---------------------------------------------------------------------------
 # Env
 
@@ -625,6 +781,8 @@ _fc_rt_clock_unix_ns:
 .weak _fc_rt_fiber_sleep
 .global _fc_rt_clock_sleep
 _fc_rt_clock_sleep:
+    cmpq    $0, _fc_fiber_runtime_active(%rip)
+    je      .L_cs_os_thread
     movq    %fs:0, %rax
     testq   %rax, %rax
     jz      .L_cs_os_thread
@@ -1427,7 +1585,12 @@ _fc_rt_argv:       .skip 8
 .global _fc_rt_envp
 _fc_rt_envp:       .skip 8
 _fc_tmp_seq:       .skip 8
+.global _fc_rt_stderr_written
 _fc_rt_stderr_written: .skip 8
+.global _fc_fiber_runtime_active
+_fc_fiber_runtime_active: .skip 8
+_fc_term_saved:    .skip 8
+_fc_term_orig:     .skip 64
 _fc_str_arena_pos: .skip 8
 .balign 16
 .global _fc_main_tls

@@ -198,6 +198,7 @@ func internRodataStrID(sid u32) u32 {
 		return id
 	}
 	emitRawBytesSec(SecStrAsm, sb)
+	secWriteStr(SecStrAsm, "    .byte 0\n")
 	return id
 }
 
@@ -708,7 +709,7 @@ driver func generateProgramAsm() bool {
 			fn := nodes[files[fid].astNode]
 			for di := u32(0); di < fn.e; di++ {
 				dn := listPool[fn.d+di]
-				if nodes[dn].kind == NKFuncDecl && nodes[dn].op != EffComptime {
+				if nodes[dn].kind == NKFuncDecl && nodes[dn].op != EffComptime && (nodes[dn].flags&1) == 0 {
 					if nodeInstCount[dn] == 0 {
 						var empty [0]u32
 						_ = requestFunc(nodeSym[dn], empty[:])

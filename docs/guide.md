@@ -102,6 +102,14 @@ scope conns := NewFiberScope(4, 4096) {
 }
 ```
 
+### C FFI & Dynamic Linking (Opt-In — Static Zero-Libc Remains Default!)
+Programs without `extern` or `link` compile to 100% static zero-libc ELF64 binaries. To call C/GPU libraries (e.g. Vulkan, SDL3, SQLite), declare `link <lib>` in `finc.mod` (or `-l<lib>` on `finc build`) and use `extern driver func` (Layer 3):
+```go
+extern driver func vkCreateInstance(info const *VkInstanceCreateInfo, alloc u64, out *u64) i32
+extern "SDL_CreateWindow" driver func CreateWindow(title u64, w i32, h i32, flags u64) u64
+```
+Builtins `cstr(s string) u64`, `ptrAddr(p *T) u64`, and `slicePtr(s []T) u64` pass zero-copy pointers directly using the System V AMD64 C ABI.
+
 ## 3. Standard Library (`std/`)
 
 | Package | Purpose |
@@ -118,6 +126,7 @@ scope conns := NewFiberScope(4, 4096) {
 | `std/net/dns` | Pure-FinCore RFC 1035 DNS A-record resolver (`/etc/hosts`, `/etc/resolv.conf`, `QueryUDP`, `QueryTCP`, `ResolveIPv4`) |
 | `std/time` | Zero-GC UTC calendar (`Clock.UnixNs()`, `DateTime`, RFC 3339 format/parse, RFC 7231 HTTP-date) |
 | `std/flag` | Go-style zero-GC CLI flag parser over `Env` (`Bool`, `Uint`, `Int`, `String`, `--`, positional args, `WriteUsage`) |
+| `std/rand` | Layer-2 total PRNG (`Xorshift64*`, `Intn`, Fisher-Yates `Shuffle`) |
 | `std/sql` | Driver-agnostic zero-GC SQL core (`Param` enum, zero-copy `Row`, `RowBuf`, `Result`, `DBError` SQLSTATE) |
 | `std/pg` | Pure-FinCore PostgreSQL v3.0 wire-protocol driver (`SCRAM-SHA-256`/MD5/cleartext/trust, pipelined Extended Query, scoped `Open` & `WithTx`) |
 | `std/encoding/hex` | Zero-alloc hexadecimal `Encode` / `Decode` (`EncodedLen`, `DecodedLen`) |

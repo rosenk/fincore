@@ -1,0 +1,40 @@
+// SINCE: v0.7
+package main
+
+import "std/rand"
+
+extern driver func strlen(s u64) usize
+extern "memcmp" driver func cMemcmp(a u64, b u64, n usize) i32
+extern driver func abs(x i32) i32
+
+driver func main(io Stdio) error {
+	// 1. C FFI via System V AMD64 ABI (extern driver func + cstr + slicePtr + ptrAddr)
+	sLen := strlen(cstr("FinCore FFI"))
+	a := [4]byte{10, 20, 30, 40}
+	b := [4]byte{10, 20, 30, 40}
+	cmpEq := cMemcmp(slicePtr(a[:]), slicePtr(b[:]), 4)
+	var x u64 = 123
+	pa := ptrAddr(&x)
+	absVal := abs(-42)
+	ffiOk := sLen == 11 && cmpEq == 0 && pa != 0 && absVal == 42
+
+	// 2. std/rand (7-bag Fisher-Yates shuffle + deterministic PRNG)
+	rng := rand.New(0x123456789abcdef)
+	bag := [7]u8{0, 1, 2, 3, 4, 5, 6}
+	rand.Shuffle[u8](&rng, bag[:])
+	var mask u8 = 0
+	for i := usize(0); i < 7; i++ {
+		if bag[i] < 7 {
+			mask |= u8(1) << bag[i]
+		}
+	}
+	randOk := mask == 0x7f && rng.Intn(100) < 100
+
+	// 3. Stdio terminal helpers are safe even in non-TTY CI environments
+	_ = io.RestoreMode()
+	_, _, _ = io.TermSize()
+
+	var out [128]byte
+	n := formatTo(out[:], "ffi=%v rand=%v\n", ffiOk, randOk)
+	return io.WriteStdout(out[:n])
+}

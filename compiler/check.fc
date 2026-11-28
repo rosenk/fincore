@@ -216,7 +216,7 @@ driver func checkProgram() {
 			fn := nodes[files[fid].astNode]
 			for di := u32(0); di < fn.e; di++ {
 				dn := listPool[fn.d+di]
-				if nodes[dn].kind == NKFuncDecl {
+				if nodes[dn].kind == NKFuncDecl && (nodes[dn].flags&1) == 0 {
 					checkFuncDecl(pid, dn)
 				}
 			}
@@ -2430,6 +2430,33 @@ driver func (c *Checker) checkBuiltinCall(en u32, bid u16) u32 {
 		} else {
 			retTy = makeConstSliceType(TYU8)
 		}
+	} else if bid == BFCstr {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "cstr requires 1 argument (string)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], TYString)
+		}
+		retTy = TYU64
+	} else if bid == BFPtrAddr {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "ptrAddr requires 1 argument (pointer)")
+		} else {
+			at := c.checkExpr(listPool[n.b], 0)
+			if types[under(at)].kind != TKindPtr {
+				addDiagStr(E2002, n.fileID, nodes[listPool[n.b]].off, "ptrAddr requires a pointer argument")
+			}
+		}
+		retTy = TYU64
+	} else if bid == BFSlicePtr {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "slicePtr requires 1 argument (slice)")
+		} else {
+			at := c.checkExpr(listPool[n.b], 0)
+			if types[under(at)].kind != TKindSlice {
+				addDiagStr(E2002, n.fileID, nodes[listPool[n.b]].off, "slicePtr requires a slice argument")
+			}
+		}
+		retTy = TYU64
 	} else if bid == BFPanic {
 		if c.fnEff != EffDriver {
 			addDiagStr(E5001, n.fileID, n.off, "panic is only allowed in driver functions")
@@ -2892,6 +2919,25 @@ driver func (c *Checker) checkBuiltinMethodCall(en u32, recvExpr u32, recvTy u32
 	} else if bm == BMStdioReadStdin {
 		if n.c == 1 {
 			_ = c.checkExpr(listPool[n.b], makeSliceType(TYU8))
+		}
+		var rs [2]u32
+		rs[0] = TYUsize
+		rs[1] = TYError
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMStdioEnableRawMode || bm == BMStdioRestoreMode {
+		retTy = TYError
+	} else if bm == BMStdioTermSize {
+		var rs [3]u32
+		rs[0] = TYU32
+		rs[1] = TYU32
+		rs[2] = TYBool
+		retTy = makeTupleType(rs[:])
+	} else if bm == BMStdioReadStdinTimeout {
+		if n.c != 2 {
+			addDiagStr(E2003, n.fileID, n.off, "ReadStdinTimeout requires ([]byte, u32)")
+		} else {
+			_ = c.checkExpr(listPool[n.b], makeSliceType(TYU8))
+			_ = c.checkExpr(listPool[n.b+1], TYU32)
 		}
 		var rs [2]u32
 		rs[0] = TYUsize

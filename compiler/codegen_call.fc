@@ -132,7 +132,142 @@ driver func (f *FnGen) emitVariantCtor(en u32, ci CallInfo, dstOff i64) {
 	}
 }
 
+driver func (f *FnGen) emitExternCall(en u32, ci CallInfo, dsts []i64) {
+	sigTy := f.subst(ci.sigType)
+	sig := types[sigTy]
+	dn := syms[ci.calleeSym].declNode
+	cSymStr := nodes[dn].e
+	if cSymStr == 0 {
+		cSymStr = syms[ci.calleeSym].nameStr
+	}
+
+	var ptypes [16]u32
+	var argSlots [16]i64
+	var argIsFloat [16]bool
+	nArgs := sig.b
+	if nArgs > 16 {
+		nArgs = 16
+	}
+	n := nodes[en]
+	for i := u32(0); i < nArgs; i++ {
+		ptypes[i] = f.subst(typeList[sig.a+i])
+		sz, al := layoutOf(ptypes[i])
+		argSlots[i] = f.allocLocal(sz, al)
+		argIsFloat[i] = isFloatType(ptypes[i])
+		if i < n.c {
+			f.emitExprTo(listPool[n.b+i], argSlots[i], ptypes[i])
+		}
+	}
+
+	// Count stack-spilled args (int args >= 6, float args >= 8)
+	var intCnt u32 = 0
+	var fltCnt u32 = 0
+	var stackIdx [16]u32
+	var nStack u32 = 0
+	for i := u32(0); i < nArgs; i++ {
+		if argIsFloat[i] {
+			if fltCnt >= 8 {
+				stackIdx[nStack] = i
+				nStack++
+			}
+			fltCnt++
+		} else {
+			if intCnt >= 6 {
+				stackIdx[nStack] = i
+				nStack++
+			}
+			intCnt++
+		}
+	}
+
+	var stackBytes u64 = 0
+	if nStack > 0 {
+		stackBytes = alignUp64Safe(u64(nStack)*8, 16)
+		em("    subq $")
+		emU(stackBytes)
+		em(", %rsp\n")
+		for si := u32(0); si < nStack; si++ {
+			ai := stackIdx[si]
+			f.emitLoadScalarFromFrame(argSlots[ai], ptypes[ai])
+			em("    movq %rax, ")
+			emU(u64(si) * 8)
+			em("(%rsp)\n")
+		}
+	}
+
+	// Load float args into %xmm0..%xmm7
+	var fi u32 = 0
+	for i := u32(0); i < nArgs; i++ {
+		if argIsFloat[i] {
+			if fi < 8 {
+				if under(ptypes[i]) == TYF32 {
+					em("    movss ")
+				} else {
+					em("    movsd ")
+				}
+				emI(argSlots[i])
+				em("(%rbp), %xmm")
+				emU(u64(fi))
+				em("\n")
+			}
+			fi++
+		}
+	}
+
+	// Load integer/pointer args into System V AMD64 registers %rdi, %rsi, %rdx, %rcx, %r8, %r9
+	intRegNames := [6]string{"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"}
+	var ii u32 = 0
+	for i := u32(0); i < nArgs; i++ {
+		if !argIsFloat[i] {
+			if ii < 6 {
+				f.emitLoadScalarFromFrame(argSlots[i], ptypes[i])
+				em("    movq %rax, ")
+				em(intRegNames[ii])
+				em("\n")
+			}
+			ii++
+		}
+	}
+
+	if fi > 0 {
+		em("    movl $")
+		emU(u64(fi))
+		em(", %eax\n")
+	} else {
+		em("    xorl %eax, %eax\n")
+	}
+	em("    call ")
+	emBytes(strSlice(cSymStr))
+	em("\n")
+
+	if stackBytes > 0 {
+		em("    addq $")
+		emU(stackBytes)
+		em(", %rsp\n")
+	}
+
+	if sig.d > 0 && len(dsts) > 0 && dsts[0] != 0 {
+		rt := f.subst(typeList[sig.c])
+		ru := under(rt)
+		if ru == TYF32 {
+			em("    movss %xmm0, ")
+			emI(dsts[0])
+			em("(%rbp)\n")
+		} else if ru == TYF64 {
+			em("    movsd %xmm0, ")
+			emI(dsts[0])
+			em("(%rbp)\n")
+		} else {
+			f.emitStoreScalarToFrame(dsts[0], rt)
+		}
+	}
+}
+
 driver func (f *FnGen) emitUserCall(en u32, ci CallInfo, dsts []i64, dts []u32) {
+	if ci.kind == CKFunc && ci.calleeSym != 0 && (nodes[syms[ci.calleeSym].declNode].flags&1) != 0 {
+		f.emitExternCall(en, ci, dsts)
+		return
+	}
 	_ = dts
 	sigTy := f.subst(ci.sigType)
 	sig := types[sigTy]
@@ -698,6 +833,43 @@ driver func (f *FnGen) emitBuiltinCall(en u32, ci CallInfo, dsts []i64, dts []u3
 			emI(dst0 + 8)
 			em("(%rbp)\n    movq %rax, ")
 			emI(dst0 + 16)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFCstr {
+		sSlot := f.allocLocal(16, 8)
+		f.emitExprTo(listPool[n.b], sSlot, TYString)
+		if dst0 != 0 {
+			em("    movq ")
+			emI(sSlot)
+			em("(%rbp), %rax\n    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFPtrAddr {
+		f.emitScalar(listPool[n.b], f.typeOf(listPool[n.b]))
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+
+	if bid == BFSlicePtr {
+		slArg := listPool[n.b]
+		slSlot := f.allocLocal(24, 8)
+		f.emitExprTo(slArg, slSlot, f.typeOf(slArg))
+		if dst0 != 0 {
+			em("    movq ")
+			emI(slSlot)
+			em("(%rbp), %rax\n    movq %rax, ")
+			emI(dst0)
 			em("(%rbp)\n")
 		}
 		return
@@ -1629,6 +1801,58 @@ driver func (f *FnGen) emitBuiltinMethodFromSlots(bm u16, recvOff i64, argOffs [
 		em("(%rbp), %rdi\n    movq ")
 		emI(argOffs[0] + 8)
 		em("(%rbp), %rsi\n    call _fc_rt_read_stdin\n")
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movq %rdx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMStdioEnableRawMode || bm == BMStdioRestoreMode {
+		if bm == BMStdioEnableRawMode {
+			em("    call _fc_rt_term_raw\n")
+		} else {
+			em("    call _fc_rt_term_restore\n")
+		}
+		if dst0 != 0 {
+			em("    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMStdioTermSize {
+		em("    call _fc_rt_term_size\n")
+		if dst0 != 0 {
+			em("    movl %eax, ")
+			emI(dst0)
+			em("(%rbp)\n")
+		}
+		if dst1 != 0 {
+			em("    movl %edx, ")
+			emI(dst1)
+			em("(%rbp)\n")
+		}
+		if len(dsts) > 2 && dsts[2] != 0 {
+			em("    movb %cl, ")
+			emI(dsts[2])
+			em("(%rbp)\n")
+		}
+		return
+	}
+	if bm == BMStdioReadStdinTimeout {
+		em("    movq ")
+		emI(argOffs[0])
+		em("(%rbp), %rdi\n    movq ")
+		emI(argOffs[0] + 8)
+		em("(%rbp), %rsi\n    movl ")
+		emI(argOffs[1])
+		em("(%rbp), %edx\n    call _fc_rt_read_stdin_timeout\n")
 		if dst0 != 0 {
 			em("    movq %rax, ")
 			emI(dst0)

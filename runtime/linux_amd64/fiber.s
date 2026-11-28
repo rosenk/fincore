@@ -404,6 +404,7 @@ _fc_rt_fscope_new:
     movq    $ARCH_SET_FS, %rdi
     movq    %r12, %rsi
     syscall
+    movq    $1, _fc_fiber_runtime_active(%rip)
     movq    8(%r12), %rbx       # rbx = fscope (callee-saved in worker loop)
     subq    $800, %rsp          # epoll_events[64] (64 * 12 = 768 bytes) + scratch
 
@@ -903,6 +904,8 @@ _fc_rt_fiber_sleep:
 # _fc_rt_fiber_yield() — cooperative yield if running inside a fiber
 .global _fc_rt_fiber_yield
 _fc_rt_fiber_yield:
+    cmpq    $0, _fc_fiber_runtime_active(%rip)
+    je      .L_fy_noop
     movq    %fs:0, %rax
     testq   %rax, %rax
     jz      .L_fy_noop

@@ -168,23 +168,117 @@ driver func buildNativeBinary(io Stdio, env Env, fs FS, ex Exec, target []byte, 
 		}
 	}
 
-	// Link statically with /usr/bin/ld (zero libc, zero dynamic linker!)
-	var ldArgs [13]string
-	ldArgs[0] = "-static"
-	ldArgs[1] = "-z"
-	ldArgs[2] = "noexecstack"
-	ldArgs[3] = "--build-id=none"
-	ldArgs[4] = "-o"
-	ldArgs[5] = bytesToStr(outPath)
-	ldArgs[6] = rtObjStrs[0]
-	ldArgs[7] = rtObjStrs[1]
-	ldArgs[8] = rtObjStrs[2]
-	ldArgs[9] = rtObjStrs[3]
-	ldArgs[10] = rtObjStrs[4]
-	ldArgs[11] = rtObjStrs[5]
-	ldArgs[12] = bytesToStr(progO[:progOLen])
+	// Check if program uses dynamic C FFI linking (via finc.mod `link`, CLI `-l`, or `extern` funcs)
+	hasExtern := false
+	poc := pkgOrderCount
+	for pi := u32(0); pi < poc; pi++ {
+		p := pkgs[pkgOrder[pi]]
+		for fi := u32(0); fi < p.fileCount; fi++ {
+			fid := pkgFiles[p.fileStart+fi]
+			fnode := nodes[files[fid].astNode]
+			for di := u32(0); di < fnode.e; di++ {
+				dn := listPool[fnode.d+di]
+				if nodes[dn].kind == NKFuncDecl && (nodes[dn].flags&1) != 0 {
+					hasExtern = true
+				}
+			}
+		}
+	}
+	useDynLink := hasExtern || modLinkCount > 0 || cliLinkCount > 0
 
-	lc, len2, lerr := ex.Run(ctx, "/usr/bin/ld", ldArgs[:], emptyEnv[:], "", errBuf[:])
+	var lc ExitStatus
+	var len2 usize = 0
+	var lerr error = nil
+
+	if !useDynLink {
+		// Link statically with /usr/bin/ld (zero libc, zero dynamic linker!)
+		var ldArgs [13]string
+		ldArgs[0] = "-static"
+		ldArgs[1] = "-z"
+		ldArgs[2] = "noexecstack"
+		ldArgs[3] = "--build-id=none"
+		ldArgs[4] = "-o"
+		ldArgs[5] = bytesToStr(outPath)
+		ldArgs[6] = rtObjStrs[0]
+		ldArgs[7] = rtObjStrs[1]
+		ldArgs[8] = rtObjStrs[2]
+		ldArgs[9] = rtObjStrs[3]
+		ldArgs[10] = rtObjStrs[4]
+		ldArgs[11] = rtObjStrs[5]
+		ldArgs[12] = bytesToStr(progO[:progOLen])
+		lc, len2, lerr = ex.Run(ctx, "/usr/bin/ld", ldArgs[:], emptyEnv[:], "", errBuf[:])
+	} else {
+		// Assemble entry_dyn.s and dynamically link with /usr/bin/gcc -no-pie + requested -l libs
+		var dynSrc [512]byte
+		dynSrcLen := pathJoin2(dynSrc[:], rtDir[:rtDirLen], "entry_dyn.s")
+		var dynObj [512]byte
+		dynObjLen := pathJoin2(dynObj[:], tmpB, "rt_entry_dyn.o")
+		asArgs[2] = bytesToStr(dynObj[:dynObjLen])
+		asArgs[3] = bytesToStr(dynSrc[:dynSrcLen])
+		c3, en3, e3 := ex.Run(ctx, "/usr/bin/as", asArgs[:], emptyEnv[:], "", errBuf[:])
+		if e3 != nil || c3.Code != 0 {
+			if en3 > 0 {
+				_ = io.WriteStderr(errBuf[:en3])
+			}
+			cleanupTempBuild(fs, tmpB)
+			return ErrExec
+		}
+
+		var gccArgs [64]string
+		ga := usize(0)
+		gccArgs[ga] = "-no-pie"
+		ga++
+		gccArgs[ga] = "-Wl,-z,noexecstack"
+		ga++
+		gccArgs[ga] = "-o"
+		ga++
+		gccArgs[ga] = bytesToStr(outPath)
+		ga++
+		gccArgs[ga] = bytesToStr(dynObj[:dynObjLen])
+		ga++
+		for ri := usize(0); ri < 6; ri++ {
+			gccArgs[ga] = rtObjStrs[ri]
+			ga++
+		}
+		gccArgs[ga] = bytesToStr(progO[:progOLen])
+		ga++
+		var lflagBuf [1024]byte
+		lpos := usize(0)
+		mlc := modLinkCount
+		for li := u32(0); li < mlc; li++ {
+			if ga >= 60 {
+				break
+			}
+			lb := strSlice(modLinks[li])
+			if lpos+2+len(lb) <= len(lflagBuf) {
+				start := lpos
+				lflagBuf[lpos] = '-'
+				lflagBuf[lpos+1] = 'l'
+				lpos += 2
+				lpos += copy(lflagBuf[lpos:], lb)
+				gccArgs[ga] = bytesToStr(lflagBuf[start:lpos])
+				ga++
+			}
+		}
+		clc := cliLinkCount
+		for li := u32(0); li < clc; li++ {
+			if ga >= 62 {
+				break
+			}
+			lb := strSlice(cliLinks[li])
+			if lpos+2+len(lb) <= len(lflagBuf) {
+				start := lpos
+				lflagBuf[lpos] = '-'
+				lflagBuf[lpos+1] = 'l'
+				lpos += 2
+				lpos += copy(lflagBuf[lpos:], lb)
+				gccArgs[ga] = bytesToStr(lflagBuf[start:lpos])
+				ga++
+			}
+		}
+		lc, len2, lerr = ex.Run(ctx, "/usr/bin/gcc", gccArgs[:ga], emptyEnv[:], "", errBuf[:])
+	}
+
 	cleanupTempBuild(fs, tmpB)
 	if lerr != nil || lc.Code != 0 {
 		if len2 > 0 {
@@ -196,9 +290,9 @@ driver func buildNativeBinary(io Stdio, env Env, fs FS, ex Exec, target []byte, 
 }
 
 driver func cleanupTempBuild(fs FS, tmpB []byte) {
-	names := [8]string{"prog.s", "prog.o", "rt_sys.o", "rt_fmt.o", "rt_net.o", "rt_scope.o", "rt_effect.o", "rt_fiber.o"}
+	names := [9]string{"prog.s", "prog.o", "rt_sys.o", "rt_fmt.o", "rt_net.o", "rt_scope.o", "rt_effect.o", "rt_fiber.o", "rt_entry_dyn.o"}
 	var p [512]byte
-	for i := usize(0); i < 8; i++ {
+	for i := usize(0); i < 9; i++ {
 		n := pathJoin2(p[:], tmpB, names[i])
 		_ = fs.RemoveAll(bytesToStr(p[:n]))
 	}
@@ -214,6 +308,7 @@ driver func cmdBuild(io Stdio, env Env, fs FS, ex Exec) error {
 	var targetBuf [512]byte
 	var targetLen usize = 0
 	comptimeFuelBudget = 1_000_000
+	cliLinkCount = 0
 
 	i := usize(2)
 	driver for i < argc {
@@ -221,6 +316,11 @@ driver func cmdBuild(io Stdio, env Env, fs FS, ex Exec) error {
 		if sliceEq(arg, strBytes("-o")) && i+1 < argc {
 			i++
 			outLen = copy(outBuf[:], strBytes(env.Arg(i)))
+		} else if len(arg) > 2 && arg[0] == '-' && arg[1] == 'l' {
+			if cliLinkCount < MaxModLinks {
+				cliLinks[cliLinkCount] = internBytes(arg[2:])
+				cliLinkCount++
+			}
 		} else if len(arg) > 11 && sliceEq(arg[:11], strBytes("--emit-asm=")) {
 			emitLen = copy(emitBuf[:], arg[11:])
 		} else if len(arg) > 16 && sliceEq(arg[:16], strBytes("--comptime-fuel=")) {

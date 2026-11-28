@@ -245,6 +245,8 @@ _fc_rt_sig_notify:
 # _fc_rt_poll_wait(%rdi = fd, %rsi = events(POLLIN/POLLOUT), %rdx = ctx_state, %rcx = ctx_deadline) -> %rax = err
 .weak _fc_rt_fiber_poll_wait
 .L_poll_wait:
+    cmpq    $0, _fc_fiber_runtime_active(%rip)
+    je      .L_pw_os_thread
     movq    %fs:0, %rax
     testq   %rax, %rax
     jz      .L_pw_os_thread

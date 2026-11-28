@@ -155,6 +155,12 @@ driver func parseFile(fileID u32) u32 {
 				decls[nDecl] = d
 				nDecl++
 			}
+		} else if k == TKIdent && sliceEq(strSlice(p.cur().strID), strBytes("extern")) {
+			d := p.parseExternFuncDecl()
+			if nDecl < len(decls) {
+				decls[nDecl] = d
+				nDecl++
+			}
 		} else if k == TKEffect {
 			d := p.parseEffectDecl()
 			if nDecl < len(decls) {
@@ -414,6 +420,32 @@ driver func (p *Parser) parseTypeParamList() (u32, u32) {
 	}
 	p.expect(TKRBrack, "expected ']'")
 	return pushList(tps[:n])
+}
+
+driver func (p *Parser) parseExternFuncDecl() u32 {
+	startOff := p.cur().off
+	p.next() // consume "extern"
+	var cSymStr u32 = 0
+	if p.at(TKString) {
+		cSymStr = p.cur().strID
+		p.next()
+	}
+	// Accept `extern driver func` or `extern func` (always Layer-3 EffDriver!)
+	_ = p.eat(TKDriver)
+	p.expect(TKFunc, "expected 'func' in extern declaration")
+	fn := newNode(NKFuncDecl, p.fileID, startOff)
+	nodes[fn].op = EffDriver
+	nodes[fn].flags = 1 // extern C FFI declaration
+	nt := p.expect(TKIdent, "expected function name")
+	nodes[fn].a = nt.strID
+	if cSymStr == 0 {
+		cSymStr = nt.strID
+	}
+	nodes[fn].e = cSymStr
+	nodes[fn].c = p.parseFuncSig(false, false)
+	nodes[fn].d = 0 // no body
+	p.expectSemi()
+	return fn
 }
 
 driver func (p *Parser) parseFuncDecl() u32 {
