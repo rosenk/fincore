@@ -89,6 +89,8 @@ type FnGen struct {
 	dispEarlyRetOff i64
 
 	epilogueLbl u32
+	lastDbgFile u32
+	lastDbgLine u32
 }
 
 driver func (f *FnGen) subst(ty u32) u32 {
@@ -302,11 +304,30 @@ driver func emitMonoFunc(monoIdx u32) {
 	}
 
 	// Pre-scan body (not entering nested FuncLits) for GoLits, local vars, scopes, and defers
-	f.prescanStmt(bodyNode)
+	isExprBody := it.litNode != 0 && (nodes[it.litNode].flags&2) != 0
+	if isExprBody {
+		f.prescanExpr(bodyNode)
+	} else {
+		f.prescanStmt(bodyNode)
+	}
 
 	// Emit body into fnBodyBuf
 	fnBodyLen = 0
-	f.emitBlock(bodyNode)
+	if isExprBody {
+		if f.nResults == 1 {
+			f.emitExprTo(bodyNode, 16+i64(f.abi.retOffs[0]), f.results[0])
+		} else if f.nResults > 1 {
+			var dsts [16]i64
+			for ri := u32(0); ri < f.nResults; ri++ {
+				dsts[ri] = 16 + i64(f.abi.retOffs[ri])
+			}
+			f.emitMultiCallTo(bodyNode, dsts[:usize(f.nResults)], f.results[:usize(f.nResults)])
+		} else {
+			f.emitExprDiscard(bodyNode)
+		}
+	} else {
+		f.emitBlock(bodyNode)
+	}
 
 	// Flush prologue + fnBodyBuf + epilogue into textBuf!
 	f.emitFinishedFunc()
@@ -439,6 +460,10 @@ driver func (f *FnGen) prescanExpr(en u32) {
 	n := nodes[en]
 	if n.kind == NKFuncLit {
 		return // don't descend into nested literals
+	}
+	if n.kind == NKTry {
+		f.prescanExpr(n.a)
+		return
 	}
 	if n.kind == NKCall {
 		if nodeCall[en] != 0 {
@@ -697,6 +722,20 @@ driver func (f *FnGen) emitStmt(sn u32) {
 		return
 	}
 	s := nodes[sn]
+	if emitDebugInfo && s.kind != NKBlock && s.fileID < fileCount {
+		ln, col := offsetToLineCol(s.fileID, s.off)
+		if f.lastDbgFile != s.fileID+1 || f.lastDbgLine != ln {
+			f.lastDbgFile = s.fileID + 1
+			f.lastDbgLine = ln
+			em("    .loc ")
+			emU(u64(s.fileID + 1))
+			em(" ")
+			emU(u64(ln))
+			em(" ")
+			emU(u64(col))
+			em("\n")
+		}
+	}
 	if s.kind == NKBlock {
 		f.emitBlock(sn)
 		return

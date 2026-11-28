@@ -386,6 +386,13 @@ func TestRemoteModGetAndTransitiveLink(t *testing.T) {
 	if !strings.Contains(string(modBytes), "require example.test/org/cmath v0.1.0") {
 		t.Fatalf("finc.mod not updated:\n%s", modBytes)
 	}
+	lockBytes, err := os.ReadFile(filepath.Join(appDir, "finc.lock"))
+	if err != nil {
+		t.Fatalf("finc.lock not created: %v", err)
+	}
+	if !strings.Contains(string(lockBytes), "example.test/org/cmath v0.1.0 sha256:") {
+		t.Fatalf("unexpected finc.lock:\n%s", lockBytes)
+	}
 
 	// 2. `finc build` offline (from cache only, testing transitive `link m`)
 	binPath := filepath.Join(appDir, "appbin")
@@ -405,7 +412,27 @@ func TestRemoteModGetAndTransitiveLink(t *testing.T) {
 		t.Fatalf("appbin run: err=%v out=%q", err, outRun)
 	}
 
-	// 3. Wipe cache, run bare `finc get` (sync from finc.mod), and verify cache restored
+	// 2b. Verify tamper detection via finc.lock
+	cachedFile := filepath.Join(cacheDir, "example.test", "org", "cmath@v0.1.0", "cmath.fc")
+	origSrc, err := os.ReadFile(cachedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cachedFile, append(origSrc, []byte("\n// tampered\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmdTamper := exec.Command(fincBin, "check", ".")
+	cmdTamper.Dir = appDir
+	cmdTamper.Env = append(os.Environ(),
+		"FINCORE_ROOT="+moduleRoot(t),
+		"FINC_MOD_CACHE="+cacheDir,
+	)
+	outTamper, err := cmdTamper.CombinedOutput()
+	if err == nil || !strings.Contains(string(outTamper), "finc.lock checksum mismatch") {
+		t.Fatalf("expected checksum mismatch on tampered cache, got err=%v out=%s", err, outTamper)
+	}
+
+	// 3. Wipe cache, run bare `finc get` (sync from finc.mod), and verify cache restored + verified against finc.lock
 	if err := os.RemoveAll(cacheDir); err != nil {
 		t.Fatal(err)
 	}
@@ -415,5 +442,74 @@ func TestRemoteModGetAndTransitiveLink(t *testing.T) {
 	outSync, err := cmdSync.CombinedOutput()
 	if err != nil || !strings.Contains(string(outSync), "downloaded example.test/org/cmath@v0.1.0") {
 		t.Fatalf("finc get sync failed: %v\n%s", err, outSync)
+	}
+}
+
+// TestDwarfAndLSP verifies DWARF -g debug line tables and `finc lsp` JSON-RPC
+// (initialize, live didOpen/didChange diagnostics, hover types, go-to-definition).
+func TestDwarfAndLSP(t *testing.T) {
+	fincBin := requireFinc0(t)
+	cMaj, cMin := compilerVersion(t)
+	if cMaj == 0 && cMin < 7 {
+		t.Skip("needs v0.7")
+	}
+
+	tmp := t.TempDir()
+	srcPath := filepath.Join(tmp, "sample.fc")
+	goodSrc := "package main\n\nfunc addTwo(a i64, b i64) i64 {\n\treturn a + b\n}\n\ndriver func main(io Stdio) error {\n\t_ = io\n\tres := addTwo(20, 22)\n\t_ = res\n\treturn nil\n}\n"
+	if err := os.WriteFile(srcPath, []byte(goodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. DWARF -g build verification
+	dbgBin := filepath.Join(tmp, "sample_dbg")
+	cmdDbg := exec.Command(fincBin, "build", "-g", "-o", dbgBin, srcPath)
+	cmdDbg.Env = append(os.Environ(), "FINCORE_ROOT="+moduleRoot(t))
+	if out, err := cmdDbg.CombinedOutput(); err != nil {
+		t.Fatalf("finc build -g failed: %v\n%s", err, out)
+	}
+	reOut, err := exec.Command("readelf", "-S", dbgBin).CombinedOutput()
+	if err != nil || !strings.Contains(string(reOut), ".debug_line") {
+		t.Fatalf("missing .debug_line in -g binary: err=%v\n%s", err, reOut)
+	}
+
+	// 2. End-to-end `finc lsp` JSON-RPC session
+	frame := func(body string) string {
+		return "Content-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body
+	}
+	uri := "file://" + srcPath
+	badSrcEsc := "package main\\n\\nfunc addTwo(a i64, b i64) i64 {\\n\\treturn \\\"oops\\\"\\n}\\n"
+	goodSrcEsc := strings.ReplaceAll(goodSrc, "\n", "\\n")
+	goodSrcEsc = strings.ReplaceAll(goodSrcEsc, "\t", "\\t")
+
+	var in bytes.Buffer
+	in.WriteString(frame(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}`))
+	in.WriteString(frame(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"` + uri + `","languageId":"finc","version":1,"text":"` + badSrcEsc + `"}}}`))
+	in.WriteString(frame(`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"` + uri + `","version":2},"contentChanges":[{"text":"` + goodSrcEsc + `"}]}}`))
+	in.WriteString(frame(`{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"` + uri + `"},"position":{"line":8,"character":2}}}`))
+	in.WriteString(frame(`{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"` + uri + `"},"position":{"line":8,"character":10}}}`))
+	in.WriteString(frame(`{"jsonrpc":"2.0","id":4,"method":"shutdown","params":null}`))
+	in.WriteString(frame(`{"jsonrpc":"2.0","method":"exit","params":null}`))
+
+	cmdLsp := exec.Command(fincBin, "lsp")
+	cmdLsp.Env = append(os.Environ(), "FINCORE_ROOT="+moduleRoot(t))
+	cmdLsp.Stdin = &in
+	var lspOut, lspErr bytes.Buffer
+	cmdLsp.Stdout = &lspOut
+	cmdLsp.Stderr = &lspErr
+	if err := cmdLsp.Run(); err != nil {
+		t.Fatalf("finc lsp failed: %v\nstderr:\n%s\nstdout:\n%s", err, lspErr.String(), lspOut.String())
+	}
+	got := lspOut.String()
+	for _, want := range []string{
+		`"name":"finc-lsp"`,
+		`"code":"E2002"`,
+		`"diagnostics":[]`,
+		`var res i64`,
+		`"line":2`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("finc lsp output missing %q\nfull output:\n%s", want, got)
+		}
 	}
 }

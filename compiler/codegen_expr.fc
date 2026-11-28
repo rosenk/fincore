@@ -489,6 +489,10 @@ driver func (f *FnGen) emitExprDiscard(en u32) {
 	if en == 0 {
 		return
 	}
+	if nodes[en].kind == NKTry {
+		f.emitTryTo(en, 0, 0, true)
+		return
+	}
 	if nodes[en].kind == NKCall {
 		var emptyDst [0]i64
 		var emptyDt [0]u32
@@ -748,10 +752,91 @@ driver func (f *FnGen) emitExprTo(en u32, dstOff i64, wantTy u32) {
 		f.emitFuncLit(en, dstOff)
 		return
 	}
+	if n.kind == NKTry {
+		f.emitTryTo(en, dstOff, wantTy, false)
+		return
+	}
 	if n.kind == NKCall {
 		f.emitSingleCallTo(en, dstOff, wantTy)
 		return
 	}
+}
+
+driver func (f *FnGen) emitTryEarlyReturn(errSlot i64) {
+	okLbl := freshLabel()
+	em("    movq ")
+	emI(errSlot)
+	em("(%rbp), %rax\n    testq %rax, %rax\n    jz ")
+	emLbl("tryok", okLbl)
+	em("\n")
+	// Zero all non-error return slots of enclosing function
+	if f.nResults > 1 {
+		for ri := u32(0); ri+1 < f.nResults; ri++ {
+			rsz, _ := layoutOf(f.results[ri])
+			f.emitZero(16+i64(f.abi.retOffs[ri]), rsz)
+		}
+	}
+	if f.nResults > 0 {
+		em("    movq ")
+		emI(errSlot)
+		em("(%rbp), %rax\n    movq %rax, ")
+		emI(16 + i64(f.abi.retOffs[f.nResults-1]))
+		em("(%rbp)\n")
+	}
+	em("    jmp ")
+	emLbl("epi", f.epilogueLbl)
+	em("\n")
+	emLbl("tryok", okLbl)
+	em(":\n")
+}
+
+driver func (f *FnGen) emitTryTo(en u32, dstOff i64, wantTy u32, discard bool) {
+	inner := nodes[en].a
+	innerTy := f.typeOf(inner)
+	errSlot := f.allocLocal(8, 8)
+	if innerTy == TYError {
+		f.emitExprTo(inner, errSlot, TYError)
+		f.emitTryEarlyReturn(errSlot)
+		return
+	}
+	if innerTy != 0 && types[innerTy].kind == TKindTuple && types[innerTy].b >= 2 {
+		tc := types[innerTy].b
+		var dsts [16]i64
+		var dts [16]u32
+		if discard {
+			for i := u32(0); i+1 < tc && i < 15; i++ {
+				dsts[i] = 0
+				dts[i] = 0
+			}
+		} else {
+			dsts[0] = dstOff
+			dts[0] = wantTy
+			for i := u32(1); i+1 < tc && i < 15; i++ {
+				dsts[i] = 0
+				dts[i] = 0
+			}
+		}
+		dsts[tc-1] = errSlot
+		dts[tc-1] = TYError
+		f.emitMultiCallTo(inner, dsts[:usize(tc)], dts[:usize(tc)])
+		f.emitTryEarlyReturn(errSlot)
+	}
+}
+
+driver func (f *FnGen) emitTryMulti(en u32, dsts []i64, dts []u32) {
+	inner := nodes[en].a
+	errSlot := f.allocLocal(8, 8)
+	k := len(dsts)
+	var extDsts [16]i64
+	var extDts [16]u32
+	for i := usize(0); i < k && i < 15; i++ {
+		extDsts[i] = dsts[i]
+		extDts[i] = dts[i]
+	}
+	extDsts[k] = errSlot
+	extDts[k] = TYError
+	f.emitMultiCallTo(inner, extDsts[:k+1], extDts[:k+1])
+	f.emitTryEarlyReturn(errSlot)
 }
 
 func (f *FnGen) emitStrBytesConst(strID u32, dstOff i64) {

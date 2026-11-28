@@ -1,0 +1,36 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/iter"
+	"std/sort"
+)
+
+driver func main(io Stdio) error {
+	nums := [6]i64{5, 2, 9, 1, 7, 3}
+	// Type-inferred short lambda for generic sort (descending!)
+	sort.Sort[i64](nums[:], |a, b| a > b)
+
+	// Capturing short lambda with FilterInto + Fold + ForEach mutation
+	var threshold i64 = 3
+	var filtered [6]i64
+	nf := iter.FilterInto[i64](filtered[:], nums[:], |x| x > threshold)
+	sum := iter.Fold[i64, i64](filtered[:nf], 0, |acc, x| acc + x)
+
+	var evens usize = 0
+	iter.ForEach[i64](nums[:], |x| {
+		if (x & 1) == 0 {
+			evens++
+		}
+	})
+
+	// Explicit-param standalone lambda + 0-arg `||` lambda
+	add10 := |v i64| v + 10
+	getBase := || sum + add10(5)
+
+	var out [128]byte
+	n := formatTo(out[:], "top=%d nf=%d sum=%d evens=%d base=%d\n",
+		nums[0], nf, sum, evens, getBase())
+	io.WriteStdout(out[:n])?
+	return nil
+}

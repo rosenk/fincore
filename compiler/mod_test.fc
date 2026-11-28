@@ -1,0 +1,48 @@
+package main
+
+import "std/testing"
+
+func TestModPathHelpers(t *testing.T) {
+	t.Assert(isLocalModTarget(strBytes("./vendor")), "./vendor should be local")
+	t.Assert(isLocalModTarget(strBytes("../shared")), "../shared should be local")
+	t.Assert(isLocalModTarget(strBytes("/abs/path")), "/abs/path should be local")
+	t.Assert(!isLocalModTarget(strBytes("v0.1.0")), "v0.1.0 should be remote")
+	t.Assert(!isLocalModTarget(strBytes("main")), "main should be remote")
+
+	t.Assert(isSafeModPath(strBytes("github.com/rosenk/finc-vulkan")), "valid github path")
+	t.Assert(!isSafeModPath(strBytes("../escape")), "reject path traversal")
+	t.Assert(!isSafeModPath(strBytes("/abs")), "reject absolute remote")
+	t.Assert(isTestSourceName("foo_test.fc"), "detect _test.fc")
+	t.Assert(!isTestSourceName("foo.fc"), "regular .fc is not test")
+}
+
+func TestLockfileLookup(t *testing.T) {
+	sample := strBytes("# lockfile\ngithub.com/rosenk/finc-vulkan v0.1.0 sha256:abcdef0123456789\n")
+	var dst [128]byte
+	n, ok := lookupLockHash(sample, strBytes("github.com/rosenk/finc-vulkan"), strBytes("v0.1.0"), dst[:])
+	t.Assert(ok, "should find lock entry")
+	t.AssertEqStr(dst[:n], "sha256:abcdef0123456789", "lock hash matches")
+
+	_, ok2 := lookupLockHash(sample, strBytes("github.com/rosenk/finc-vulkan"), strBytes("v0.2.0"), dst[:])
+	t.Assert(!ok2, "different version should not match")
+}
+
+func TestParseIntLit(t *testing.T) {
+	v, ok := parseIntLit(strBytes("0x1_00"))
+	t.Assert(ok, "hex literal parses")
+	t.AssertEqUint(v, 256, "0x1_00 == 256")
+
+	v2, ok2 := parseIntLit(strBytes("0b1010_0101"))
+	t.Assert(ok2, "binary literal parses")
+	t.AssertEqUint(v2, 165, "0b1010_0101 == 165")
+}
+
+func TestForEachModLineClosure(t *testing.T) {
+	var count u64 = 0
+	forEachModLine(strBytes("a\nb\nc"), |line, _| {
+		if len(line) == 1 {
+			count++
+		}
+	})
+	t.AssertEqUint(count, 3, "forEachModLine visited all 3 lines")
+}

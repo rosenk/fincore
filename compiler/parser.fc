@@ -1622,6 +1622,13 @@ driver func (p *Parser) parsePostfixExpr() u32 {
 			x = p.parseStructLit(x)
 			continue
 		}
+		if t.kind == TKQuestion {
+			_ = p.next()
+			tn := newNode(NKTry, p.fileID, t.off)
+			nodes[tn].a = x
+			x = tn
+			continue
+		}
 		break
 	}
 	return x
@@ -1756,6 +1763,56 @@ driver func (p *Parser) parsePrimaryExpr() u32 {
 		body := p.parseBlock()
 		n := newNode(NKFuncLit, p.fileID, t.off)
 		nodes[n].op = eff
+		nodes[n].a = sig
+		nodes[n].b = body
+		return n
+	}
+	// Shorthand scoped closure: `|x, y| expr`, `|x i64| { ... }`, `|| expr`, `driver |x| ...`
+	if t.kind == TKOr || t.kind == TKLOr || (t.kind == TKDriver && (p.peek(1).kind == TKOr || p.peek(1).kind == TKLOr)) {
+		var eff u8 = EffTotal
+		var fl u16 = 1 // bit0=short lambda (can inherit effect & return types from hint)
+		if p.eat(TKDriver) {
+			eff = EffDriver
+		}
+		var params [32]u32
+		np := usize(0)
+		if p.eat(TKLOr) {
+			// `||` -> zero-argument lambda
+		} else {
+			p.expect(TKOr, "expected '|'")
+			driver for !p.at(TKOr) && !p.at(TKEof) {
+				pt := p.expect(TKIdent, "expected parameter name in closure")
+				var pty u32 = 0
+				if !p.at(TKComma) && !p.at(TKOr) {
+					pty = p.parseType()
+				}
+				pn := newNode(NKParam, p.fileID, pt.off)
+				nodes[pn].a = pt.strID
+				nodes[pn].b = pty
+				if np < len(params) {
+					params[np] = pn
+					np++
+				}
+				if !p.eat(TKComma) {
+					break
+				}
+			}
+			p.expect(TKOr, "expected '|' after closure parameters")
+		}
+		ps, pc := pushList(params[:np])
+		sig := newNode(NKFuncSig, p.fileID, t.off)
+		nodes[sig].c = ps
+		nodes[sig].d = pc
+		var body u32 = 0
+		if p.at(TKLBrace) {
+			body = p.parseBlock()
+		} else {
+			fl |= 2 // bit1=expression body
+			body = p.parseExpr(1)
+		}
+		n := newNode(NKFuncLit, p.fileID, t.off)
+		nodes[n].op = eff
+		nodes[n].flags = fl
 		nodes[n].a = sig
 		nodes[n].b = body
 		return n

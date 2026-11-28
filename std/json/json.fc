@@ -420,3 +420,42 @@ func GetBool(doc const []byte, key string) (bool, bool) {
 	}
 	return false, false
 }
+
+// UnescapeInto decodes JSON string escape sequences (\n, \r, \t, \", \\, \/)
+// from raw (without surrounding quotes) into dst, returning bytes written.
+func UnescapeInto(dst []byte, raw const []byte) usize {
+	out := usize(0)
+	i := usize(0)
+	n := len(raw)
+	for step := usize(0); step < n; step++ {
+		if i >= n || out >= len(dst) {
+			break
+		}
+		c := raw[i]
+		if c == '\\' && i+1 < n {
+			nx := raw[i+1]
+			i += 2
+			if nx == 'n' {
+				dst[out] = '\n'
+			} else if nx == 'r' {
+				dst[out] = '\r'
+			} else if nx == 't' {
+				dst[out] = '\t'
+			} else if nx == '"' {
+				dst[out] = '"'
+			} else if nx == '\\' {
+				dst[out] = '\\'
+			} else if nx == '/' {
+				dst[out] = '/'
+			} else {
+				dst[out] = nx
+			}
+			out++
+		} else {
+			dst[out] = c
+			out++
+			i++
+		}
+	}
+	return out
+}

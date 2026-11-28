@@ -1,0 +1,701 @@
+package main
+
+import (
+	"std/json"
+	"std/strings"
+)
+
+// FinCore Language Server Protocol (LSP) server (`finc lsp`).
+// Communicates over stdio using JSON-RPC 2.0 Content-Length framing and
+// FinCore's own std/json package (zero libc, zero GC).
+// Supports: initialize, didOpen, didChange, didSave, publishDiagnostics,
+// hover (resolved FinCore types), definition (go-to-definition), shutdown, exit.
+
+const (
+	MaxLspDocs    = 16
+	MaxLspDocSize = 131072
+	MaxLspBuf     = 262144
+)
+
+var lspDocPaths [MaxLspDocs][512]byte
+var lspDocPathLens [MaxLspDocs]usize
+var lspDocData [MaxLspDocs][MaxLspDocSize]byte
+var lspDocLens [MaxLspDocs]usize
+var lspDocCount usize
+
+var lspInBuf [MaxLspBuf]byte
+var lspInLen usize
+var lspMsgBuf [MaxLspBuf]byte
+var lspOutRaw [MaxLspBuf]byte
+
+func lspLookupOverlay(path []byte) (const []byte, bool) {
+	n := lspDocCount
+	for i := usize(0); i < n; i++ {
+		if sliceEq(lspDocPaths[i][:lspDocPathLens[i]], path) {
+			return lspDocData[i][:lspDocLens[i]], true
+		}
+	}
+	return lspDocData[0][:0], false
+}
+
+func lspStoreOverlay(path const []byte, text const []byte) {
+	idx := lspDocCount
+	for i := usize(0); i < lspDocCount; i++ {
+		if len(path) == lspDocPathLens[i] && strings.Equal(lspDocPaths[i][:lspDocPathLens[i]], path) {
+			idx = i
+			break
+		}
+	}
+	if idx >= MaxLspDocs {
+		idx = MaxLspDocs - 1
+	} else if idx == lspDocCount {
+		lspDocCount++
+	}
+	pl := len(path)
+	if pl > 512 {
+		pl = 512
+	}
+	for i := usize(0); i < pl; i++ {
+		lspDocPaths[idx][i] = path[i]
+	}
+	lspDocPathLens[idx] = pl
+	dl := len(text)
+	if dl > MaxLspDocSize {
+		dl = MaxLspDocSize
+	}
+	for i := usize(0); i < dl; i++ {
+		lspDocData[idx][i] = text[i]
+	}
+	lspDocLens[idx] = dl
+}
+
+func lspUriToPath(uri const []byte, dst []byte) usize {
+	s := uri
+	pref := strView("file://")
+	if len(s) >= len(pref) && strings.Equal(s[:len(pref)], pref) {
+		s = s[len(pref):]
+	}
+	n := len(s)
+	if n > len(dst) {
+		n = len(dst)
+	}
+	for i := usize(0); i < n; i++ {
+		dst[i] = s[i]
+	}
+	return n
+}
+
+func lspFindHeaderEnd(buf const []byte) (usize, bool) {
+	if len(buf) < 4 {
+		return 0, false
+	}
+	lim := len(buf) - 3
+	for i := usize(0); i < lim; i++ {
+		if buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func lspParseContentLength(hdr const []byte) (usize, bool) {
+	key := strView("Content-Length:")
+	n := len(hdr)
+	if n < len(key) {
+		return 0, false
+	}
+	lim := n - len(key) + 1
+	for i := usize(0); i < lim; i++ {
+		if strings.Equal(hdr[i:i+len(key)], key) {
+			p := i + len(key)
+			for step := usize(0); step < n; step++ {
+				if p < n && (hdr[p] == ' ' || hdr[p] == '\t') {
+					p++
+				} else {
+					break
+				}
+			}
+			vs := p
+			for step := usize(0); step < n; step++ {
+				if p < n && hdr[p] >= '0' && hdr[p] <= '9' {
+					p++
+				} else {
+					break
+				}
+			}
+			if p > vs {
+				if v, ok := strings.ParseUint(hdr[vs:p]); ok {
+					return usize(v), true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+driver func lspReadMessage(io Stdio) (usize, error) {
+	driver for {
+		if hdrEnd, ok := lspFindHeaderEnd(lspInBuf[:lspInLen]); ok {
+			clen, cok := lspParseContentLength(lspInBuf[:hdrEnd])
+			if !cok {
+				return 0, ErrParse
+			}
+			bodyStart := hdrEnd + 4
+			total := bodyStart + clen
+			if lspInLen >= total {
+				if clen > MaxLspBuf {
+					return 0, ErrArenaFull
+				}
+				copy(lspMsgBuf[:clen], lspInBuf[bodyStart:total])
+				rem := lspInLen - total
+				if rem > 0 {
+					copy(lspInBuf[:rem], lspInBuf[total:lspInLen])
+				}
+				lspInLen = rem
+				return clen, nil
+			}
+		}
+		if lspInLen >= MaxLspBuf {
+			return 0, ErrArenaFull
+		}
+		nr := io.ReadStdin(lspInBuf[lspInLen:])?
+		if nr == 0 {
+			return 0, ErrEOF
+		}
+		lspInLen += nr
+	}
+}
+
+driver func lspWriteMessage(io Stdio, body const []byte) error {
+	var hdr [64]byte
+	hn := formatTo(hdr[:], "Content-Length: %d\r\n\r\n", len(body))
+	io.WriteStdout(hdr[:hn])?
+	n := len(body)
+	if n > MaxLspBuf {
+		n = MaxLspBuf
+	}
+	for i := usize(0); i < n; i++ {
+		lspOutRaw[i] = body[i]
+	}
+	return io.WriteStdout(lspOutRaw[:n])
+}
+
+driver func lspAnalyzePath(fs FS, env Env, path []byte) {
+	poolInit()
+	lexerInit()
+	astInit()
+	typesInit()
+	valsInit()
+	resolveInit(env)
+	comptimeFuelBudget = 1_000_000
+	if err := loadProgram(fs, path); err != nil {
+		return
+	}
+	if diagCount == 0 {
+		checkProgram()
+	}
+}
+
+func lspFindFileID(path []byte) (u32, bool) {
+	fc := fileCount
+	for i := u32(0); i < fc; i++ {
+		if sliceEq(strSlice(files[i].pathID), path) {
+			return i, true
+		}
+	}
+	if fc > 0 {
+		return 0, true
+	}
+	return 0, false
+}
+
+func lspLineColToOff(fid u32, line0 u32, col0 u32) u32 {
+	if fid >= fileCount {
+		return 0
+	}
+	f := files[fid]
+	if f.lineCount == 0 {
+		return 0
+	}
+	if line0 >= f.lineCount {
+		line0 = f.lineCount - 1
+	}
+	return lineOffs[usize(f.lineStart+line0)] + col0
+}
+
+func lspFindNodeAt(fid u32, off u32) (u32, u32) {
+	if fid >= fileCount {
+		return 0, 0
+	}
+	f := files[fid]
+	tokOff := off
+	foundTok := false
+	for i := u32(0); i < f.tokCount; i++ {
+		tk := toks[f.tokStart+i]
+		if tk.off <= off && off <= tk.end {
+			tokOff = tk.off
+			foundTok = true
+			break
+		}
+	}
+	if !foundTok {
+		return 0, 0
+	}
+	var bestNode u32 = 0
+	var bestSym u32 = 0
+	nc := nodeCount
+	for id := u32(1); id < nc; id++ {
+		n := nodes[id]
+		if n.fileID != fid {
+			continue
+		}
+		if n.kind == NKCall && nodeCall[id] != 0 {
+			ci := calls[nodeCall[id]]
+			if ci.calleeSym != 0 {
+				fnNode := nodes[n.a]
+				if fnNode.off == tokOff || n.off == tokOff {
+					return id, ci.calleeSym
+				}
+			}
+		}
+		if n.off != tokOff {
+			continue
+		}
+		if nodeSym[id] != 0 {
+			bestNode = id
+			bestSym = nodeSym[id]
+			if n.kind == NKIdent || n.kind == NKSelector {
+				return bestNode, bestSym
+			}
+		} else if bestNode == 0 && nodeType[id] != 0 {
+			bestNode = id
+		}
+	}
+	return bestNode, bestSym
+}
+
+driver func lspFormatType(dst []byte, pos usize, ty u32, depth u32) usize {
+	if depth > 6 || ty == 0 || ty >= typeCount {
+		return bufAppendStr(dst, pos, "any")
+	}
+	if ty == TYBool {
+		return bufAppendStr(dst, pos, "bool")
+	} else if ty == TYU8 {
+		return bufAppendStr(dst, pos, "u8")
+	} else if ty == TYU16 {
+		return bufAppendStr(dst, pos, "u16")
+	} else if ty == TYU32 {
+		return bufAppendStr(dst, pos, "u32")
+	} else if ty == TYU64 {
+		return bufAppendStr(dst, pos, "u64")
+	} else if ty == TYUsize {
+		return bufAppendStr(dst, pos, "usize")
+	} else if ty == TYI8 {
+		return bufAppendStr(dst, pos, "i8")
+	} else if ty == TYI16 {
+		return bufAppendStr(dst, pos, "i16")
+	} else if ty == TYI32 {
+		return bufAppendStr(dst, pos, "i32")
+	} else if ty == TYI64 {
+		return bufAppendStr(dst, pos, "i64")
+	} else if ty == TYInt {
+		return bufAppendStr(dst, pos, "int")
+	} else if ty == TYF32 {
+		return bufAppendStr(dst, pos, "f32")
+	} else if ty == TYF64 {
+		return bufAppendStr(dst, pos, "f64")
+	} else if ty == TYString {
+		return bufAppendStr(dst, pos, "string")
+	} else if ty == TYError {
+		return bufAppendStr(dst, pos, "error")
+	} else if ty == TYStdio {
+		return bufAppendStr(dst, pos, "Stdio")
+	} else if ty == TYFS {
+		return bufAppendStr(dst, pos, "FS")
+	} else if ty == TYEnv {
+		return bufAppendStr(dst, pos, "Env")
+	} else if ty == TYClock {
+		return bufAppendStr(dst, pos, "Clock")
+	} else if ty == TYNet {
+		return bufAppendStr(dst, pos, "Net")
+	} else if ty == TYExec {
+		return bufAppendStr(dst, pos, "Exec")
+	} else if ty == TYContext {
+		return bufAppendStr(dst, pos, "Context")
+	} else if ty == TYScope {
+		return bufAppendStr(dst, pos, "Scope")
+	}
+
+	t := types[ty]
+	if t.kind == TKindNamed && t.a != 0 {
+		return bufAppend(dst, pos, strSlice(syms[t.a].nameStr))
+	}
+	if t.kind == TKindSlice {
+		if (t.flags & 1) != 0 {
+			pos = bufAppendStr(dst, pos, "const ")
+		}
+		pos = bufAppendStr(dst, pos, "[]")
+		return lspFormatType(dst, pos, t.a, depth+1)
+	}
+	if t.kind == TKindPtr {
+		if (t.flags & 1) != 0 {
+			pos = bufAppendStr(dst, pos, "const ")
+		}
+		pos = bufAppendByte(dst, pos, '*')
+		return lspFormatType(dst, pos, t.a, depth+1)
+	}
+	if t.kind == TKindArray {
+		var nb [32]byte
+		nn := formatTo(nb[:], "[%d]", t.lenVal)
+		pos = bufAppend(dst, pos, nb[:nn])
+		return lspFormatType(dst, pos, t.a, depth+1)
+	}
+	if t.kind == TKindSig {
+		if t.op == EffDriver {
+			pos = bufAppendStr(dst, pos, "driver ")
+		}
+		pos = bufAppendStr(dst, pos, "func(")
+		for i := u32(0); i < t.b; i++ {
+			if i > 0 {
+				pos = bufAppendStr(dst, pos, ", ")
+			}
+			pos = lspFormatType(dst, pos, typeList[t.a+i], depth+1)
+		}
+		pos = bufAppendByte(dst, pos, ')')
+		if t.d == 1 {
+			pos = bufAppendByte(dst, pos, ' ')
+			pos = lspFormatType(dst, pos, typeList[t.c], depth+1)
+		} else if t.d > 1 {
+			pos = bufAppendStr(dst, pos, " (")
+			for i := u32(0); i < t.d; i++ {
+				if i > 0 {
+					pos = bufAppendStr(dst, pos, ", ")
+				}
+				pos = lspFormatType(dst, pos, typeList[t.c+i], depth+1)
+			}
+			pos = bufAppendByte(dst, pos, ')')
+		}
+		return pos
+	}
+	if t.kind == TKindStruct {
+		return bufAppendStr(dst, pos, "struct")
+	}
+	if t.kind == TKindEnum {
+		return bufAppendStr(dst, pos, "enum")
+	}
+	return bufAppendStr(dst, pos, "any")
+}
+
+driver func lspPublishDiagnostics(io Stdio, uri const []byte, fid u32) error {
+	var jb json.Builder[65536]
+	jb.BeginObject()
+	jb.FieldStr("jsonrpc", "2.0")
+	jb.FieldStr("method", "textDocument/publishDiagnostics")
+	jb.BeginObjectField("params")
+	jb.FieldBytes("uri", uri)
+	jb.BeginArrayField("diagnostics")
+	dc := diagCount
+	for i := u32(0); i < dc; i++ {
+		d := diags[i]
+		if d.fileID != fid {
+			continue
+		}
+		ln, col := offsetToLineCol(d.fileID, d.off)
+		l0 := u64(0)
+		c0 := u64(0)
+		if ln > 0 {
+			l0 = u64(ln - 1)
+		}
+		if col > 0 {
+			c0 = u64(col - 1)
+		}
+		var codeBuf [16]byte
+		cn := formatTo(codeBuf[:], "E%d", d.code)
+		jb.BeginObject()
+		jb.BeginObjectField("range")
+		jb.BeginObjectField("start")
+		jb.FieldUint("line", l0)
+		jb.FieldUint("character", c0)
+		jb.EndObject()
+		jb.BeginObjectField("end")
+		jb.FieldUint("line", l0)
+		jb.FieldUint("character", c0+1)
+		jb.EndObject()
+		jb.EndObject()
+		jb.FieldInt("severity", 1)
+		jb.FieldBytes("code", codeBuf[:cn])
+		jb.FieldStr("source", "finc")
+		jb.FieldBytes("message", diagMsgBuf[usize(d.msgOff):usize(d.msgOff+d.msgLen)])
+		jb.EndObject()
+	}
+	jb.EndArray()
+	jb.EndObject()
+	jb.EndObject()
+	return lspWriteMessage(io, jb.Bytes())
+}
+
+func lspWriteId(jb *json.Builder[65536], msg const []byte) {
+	if idInt, ok := json.GetInt(msg, "id"); ok {
+		jb.FieldInt("id", idInt)
+	} else if idStr, ok2 := json.GetString(msg, "id"); ok2 {
+		jb.FieldBytes("id", idStr)
+	} else {
+		jb.FieldNull("id")
+	}
+}
+
+driver func cmdLsp(io Stdio, env Env, fs FS) error {
+	lspDocCount = 0
+	lspInLen = 0
+	shutdownReq := false
+	var pathBuf [512]byte
+	var uriBuf [512]byte
+	var textBuf [MaxLspDocSize]byte
+
+	driver for {
+		mlen, rerr := lspReadMessage(io)
+		if rerr != nil {
+			if rerr == ErrEOF {
+				return nil
+			}
+			return rerr
+		}
+		msg := lspMsgBuf[:mlen]
+		meth, hasMeth := json.GetString(msg, "method")
+		if !hasMeth {
+			continue
+		}
+
+		if strings.EqualStr(meth, "initialize") {
+			var jb json.Builder[65536]
+			jb.BeginObject()
+			jb.FieldStr("jsonrpc", "2.0")
+			lspWriteId(&jb, msg)
+			jb.BeginObjectField("result")
+			jb.BeginObjectField("capabilities")
+			jb.FieldInt("textDocumentSync", 1)
+			jb.FieldBool("hoverProvider", true)
+			jb.FieldBool("definitionProvider", true)
+			jb.EndObject()
+			jb.BeginObjectField("serverInfo")
+			jb.FieldStr("name", "finc-lsp")
+			jb.FieldStr("version", "0.7")
+			jb.EndObject()
+			jb.EndObject()
+			jb.EndObject()
+			lspWriteMessage(io, jb.Bytes())?
+			continue
+		}
+
+		if strings.EqualStr(meth, "shutdown") {
+			shutdownReq = true
+			var jb json.Builder[65536]
+			jb.BeginObject()
+			jb.FieldStr("jsonrpc", "2.0")
+			lspWriteId(&jb, msg)
+			jb.FieldNull("result")
+			jb.EndObject()
+			lspWriteMessage(io, jb.Bytes())?
+			continue
+		}
+
+		if strings.EqualStr(meth, "exit") {
+			if shutdownReq {
+				return nil
+			}
+			return nil
+		}
+
+		params, hasParams := json.GetRaw(msg, "params")
+		if !hasParams {
+			continue
+		}
+
+		if strings.EqualStr(meth, "textDocument/didOpen") {
+			if td, ok := json.GetRaw(params, "textDocument"); ok {
+				if rawUri, uok := json.GetString(td, "uri"); uok {
+					ul := json.UnescapeInto(uriBuf[:], rawUri)
+					pl := lspUriToPath(uriBuf[:ul], pathBuf[:])
+					if rawText, tok := json.GetString(td, "text"); tok {
+						tl := json.UnescapeInto(textBuf[:], rawText)
+						lspStoreOverlay(pathBuf[:pl], textBuf[:tl])
+					}
+					lspAnalyzePath(fs, env, pathBuf[:pl])
+					if fid, fok := lspFindFileID(pathBuf[:pl]); fok {
+						lspPublishDiagnostics(io, uriBuf[:ul], fid)?
+					}
+				}
+			}
+			continue
+		}
+
+		if strings.EqualStr(meth, "textDocument/didChange") {
+			if td, ok := json.GetRaw(params, "textDocument"); ok {
+				if rawUri, uok := json.GetString(td, "uri"); uok {
+					ul := json.UnescapeInto(uriBuf[:], rawUri)
+					pl := lspUriToPath(uriBuf[:ul], pathBuf[:])
+					if cc, cok := json.GetRaw(params, "contentChanges"); cok {
+						// Find first '{' object inside contentChanges array
+						objStart := usize(0)
+						foundObj := false
+						for i := usize(0); i < len(cc); i++ {
+							if cc[i] == '{' {
+								objStart = i
+								foundObj = true
+								break
+							}
+						}
+						if foundObj {
+							if rawText, tok := json.GetString(cc[objStart:], "text"); tok {
+								tl := json.UnescapeInto(textBuf[:], rawText)
+								lspStoreOverlay(pathBuf[:pl], textBuf[:tl])
+							}
+						}
+					}
+					lspAnalyzePath(fs, env, pathBuf[:pl])
+					if fid, fok := lspFindFileID(pathBuf[:pl]); fok {
+						lspPublishDiagnostics(io, uriBuf[:ul], fid)?
+					}
+				}
+			}
+			continue
+		}
+
+		if strings.EqualStr(meth, "textDocument/didSave") {
+			if td, ok := json.GetRaw(params, "textDocument"); ok {
+				if rawUri, uok := json.GetString(td, "uri"); uok {
+					ul := json.UnescapeInto(uriBuf[:], rawUri)
+					pl := lspUriToPath(uriBuf[:ul], pathBuf[:])
+					lspAnalyzePath(fs, env, pathBuf[:pl])
+					if fid, fok := lspFindFileID(pathBuf[:pl]); fok {
+						lspPublishDiagnostics(io, uriBuf[:ul], fid)?
+					}
+				}
+			}
+			continue
+		}
+
+		if strings.EqualStr(meth, "textDocument/hover") {
+			var jb json.Builder[65536]
+			jb.BeginObject()
+			jb.FieldStr("jsonrpc", "2.0")
+			lspWriteId(&jb, msg)
+			answered := false
+			if td, ok := json.GetRaw(params, "textDocument"); ok {
+				if rawUri, uok := json.GetString(td, "uri"); uok {
+					if posObj, pok := json.GetRaw(params, "position"); pok {
+						l0, lok := json.GetUint(posObj, "line")
+						c0, cok := json.GetUint(posObj, "character")
+						if lok && cok {
+							ul := json.UnescapeInto(uriBuf[:], rawUri)
+							pl := lspUriToPath(uriBuf[:ul], pathBuf[:])
+							lspAnalyzePath(fs, env, pathBuf[:pl])
+							if fid, fok := lspFindFileID(pathBuf[:pl]); fok {
+								off := lspLineColToOff(fid, u32(l0), u32(c0))
+								hitNode, hitSym := lspFindNodeAt(fid, off)
+								var hbuf [512]byte
+								hp := usize(0)
+								if hitSym != 0 {
+									s := syms[hitSym]
+									hp = bufAppendStr(hbuf[:], hp, "```finc\n")
+									if s.kind == SymFunc || s.kind == SymMethod {
+										hp = bufAppendStr(hbuf[:], hp, "func ")
+									} else if s.kind == SymVar || s.kind == SymLocal || s.kind == SymParam {
+										hp = bufAppendStr(hbuf[:], hp, "var ")
+									} else if s.kind == SymConst {
+										hp = bufAppendStr(hbuf[:], hp, "const ")
+									} else if s.kind == SymType {
+										hp = bufAppendStr(hbuf[:], hp, "type ")
+									}
+									hp = bufAppend(hbuf[:], hp, strSlice(s.nameStr))
+									hp = bufAppendByte(hbuf[:], hp, ' ')
+									hp = lspFormatType(hbuf[:], hp, s.typeID, 0)
+									hp = bufAppendStr(hbuf[:], hp, "\n```")
+								} else if hitNode != 0 && nodeType[hitNode] != 0 {
+									hp = bufAppendStr(hbuf[:], hp, "```finc\n")
+									hp = lspFormatType(hbuf[:], hp, nodeType[hitNode], 0)
+									hp = bufAppendStr(hbuf[:], hp, "\n```")
+								}
+								if hp > 0 {
+									jb.BeginObjectField("result")
+									jb.BeginObjectField("contents")
+									jb.FieldStr("kind", "markdown")
+									jb.FieldBytes("value", hbuf[:hp])
+									jb.EndObject()
+									jb.EndObject()
+									answered = true
+								}
+							}
+						}
+					}
+				}
+			}
+			if !answered {
+				jb.FieldNull("result")
+			}
+			jb.EndObject()
+			lspWriteMessage(io, jb.Bytes())?
+			continue
+		}
+
+		if strings.EqualStr(meth, "textDocument/definition") {
+			var jb json.Builder[65536]
+			jb.BeginObject()
+			jb.FieldStr("jsonrpc", "2.0")
+			lspWriteId(&jb, msg)
+			answered := false
+			if td, ok := json.GetRaw(params, "textDocument"); ok {
+				if rawUri, uok := json.GetString(td, "uri"); uok {
+					if posObj, pok := json.GetRaw(params, "position"); pok {
+						l0, lok := json.GetUint(posObj, "line")
+						c0, cok := json.GetUint(posObj, "character")
+						if lok && cok {
+							ul := json.UnescapeInto(uriBuf[:], rawUri)
+							pl := lspUriToPath(uriBuf[:ul], pathBuf[:])
+							lspAnalyzePath(fs, env, pathBuf[:pl])
+							if fid, fok := lspFindFileID(pathBuf[:pl]); fok {
+								off := lspLineColToOff(fid, u32(l0), u32(c0))
+								_, hitSym := lspFindNodeAt(fid, off)
+								if hitSym != 0 && syms[hitSym].fileID < fileCount {
+									s := syms[hitSym]
+									dln, dcol := offsetToLineCol(s.fileID, s.off)
+									dl0 := u64(0)
+									dc0 := u64(0)
+									if dln > 0 {
+										dl0 = u64(dln - 1)
+									}
+									if dcol > 0 {
+										dc0 = u64(dcol - 1)
+									}
+									var defUri [600]byte
+									du := bufAppendStr(defUri[:], 0, "file://")
+									du = bufAppend(defUri[:], du, strSlice(files[s.fileID].pathID))
+									jb.BeginObjectField("result")
+									jb.FieldBytes("uri", defUri[:du])
+									jb.BeginObjectField("range")
+									jb.BeginObjectField("start")
+									jb.FieldUint("line", dl0)
+									jb.FieldUint("character", dc0)
+									jb.EndObject()
+									jb.BeginObjectField("end")
+									jb.FieldUint("line", dl0)
+									jb.FieldUint("character", dc0+1)
+									jb.EndObject()
+									jb.EndObject()
+									jb.EndObject()
+									answered = true
+								}
+							}
+						}
+					}
+				}
+			}
+			if !answered {
+				jb.FieldNull("result")
+			}
+			jb.EndObject()
+			lspWriteMessage(io, jb.Bytes())?
+			continue
+		}
+	}
+}

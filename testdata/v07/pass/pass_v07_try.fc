@@ -1,0 +1,51 @@
+// SINCE: v0.7
+package main
+
+// Tests postfix `?` error propagation operator:
+// - void error statement (`checkPositive(x)?`)
+// - single-value unwrap (`v := parseDouble(s)?`)
+// - multi-value unwrap (`a, b := splitAdd(x, y)?`)
+// - defer execution on early return via `?`
+
+var deferRan bool
+
+func checkPositive(x i64) error {
+	if x <= 0 {
+		return ErrParse
+	}
+	return nil
+}
+
+func doubleIfPos(x i64) (i64, error) {
+	checkPositive(x)?
+	return x * 2, nil
+}
+
+func pairOps(a i64, b i64) (i64, i64, error) {
+	da := doubleIfPos(a)?
+	db := doubleIfPos(b)?
+	return da + db, da * db, nil
+}
+
+func markDefer() {
+	deferRan = true
+}
+
+func testDeferOnTry(x i64) (i64, error) {
+	defer markDefer()
+	v := doubleIfPos(x)?
+	return v + 10, nil
+}
+
+driver func main(io Stdio) error {
+	s, p := pairOps(3, 4)?
+	_, _, err2 := pairOps(3, -1)
+	deferRan = false
+	_, err3 := testDeferOnTry(-5)
+
+	var out [128]byte
+	n := formatTo(out[:], "sum=%d prod=%d err2=%v err3=%v defer=%v\n",
+		s, p, err2 == ErrParse, err3 == ErrParse, deferRan)
+	io.WriteStdout(out[:n])?
+	return nil
+}

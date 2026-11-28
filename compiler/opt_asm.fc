@@ -118,6 +118,88 @@ func isFrameSlot(s []byte) bool {
 	return n >= 7 && s[n-1] == ')' && s[n-2] == 'p' && s[n-3] == 'b' && s[n-4] == 'r' && s[n-5] == '%' && s[n-6] == '('
 }
 
+func invertSetCC(cc []byte, wantInvert bool) (string, bool) {
+	if bytesEqStr(cc, "e") {
+		if wantInvert {
+			return "jne", true
+		}
+		return "je", true
+	}
+	if bytesEqStr(cc, "ne") {
+		if wantInvert {
+			return "je", true
+		}
+		return "jne", true
+	}
+	if bytesEqStr(cc, "l") {
+		if wantInvert {
+			return "jge", true
+		}
+		return "jl", true
+	}
+	if bytesEqStr(cc, "le") {
+		if wantInvert {
+			return "jg", true
+		}
+		return "jle", true
+	}
+	if bytesEqStr(cc, "g") {
+		if wantInvert {
+			return "jle", true
+		}
+		return "jg", true
+	}
+	if bytesEqStr(cc, "ge") {
+		if wantInvert {
+			return "jl", true
+		}
+		return "jge", true
+	}
+	if bytesEqStr(cc, "b") {
+		if wantInvert {
+			return "jae", true
+		}
+		return "jb", true
+	}
+	if bytesEqStr(cc, "be") {
+		if wantInvert {
+			return "ja", true
+		}
+		return "jbe", true
+	}
+	if bytesEqStr(cc, "a") {
+		if wantInvert {
+			return "jbe", true
+		}
+		return "ja", true
+	}
+	if bytesEqStr(cc, "ae") {
+		if wantInvert {
+			return "jb", true
+		}
+		return "jae", true
+	}
+	return "", false
+}
+
+func lineOverwritesRax(line []byte) bool {
+	if len(line) < 12 || line[0] != ' ' {
+		return false
+	}
+	if bytesEqStr(line, "    xorl %eax, %eax") {
+		return true
+	}
+	if bytesStartsWith(line, "    leaq ") && bytesEndsWith(line, ", %rax") {
+		// Ensure source doesn't reference %rax
+		return !bytesStartsWith(line, "    leaq (%rax") && !bytesStartsWith(line, "    leaq 0(%rax")
+	}
+	if bytesStartsWith(line, "    movq ") && bytesEndsWith(line, ", %rax") {
+		src := line[9 : len(line)-6]
+		return isFrameSlot(src)
+	}
+	return false
+}
+
 driver func emitOptimizedFnBody() {
 	if fnBodyLen == 0 {
 		return
@@ -152,11 +234,11 @@ driver func emitOptimizedFnBody() {
 	var lastStoreKind u8 = 0
 	var lastSlotStart u32 = 0
 	var lastSlotLen u32 = 0
-	skipNext := false
+	skipCount := u32(0)
 
 	for i := u32(0); i < nLines; i++ {
-		if skipNext {
-			skipNext = false
+		if skipCount > 0 {
+			skipCount--
 			continue
 		}
 		ls := usize(optLineStart[i])
@@ -172,6 +254,77 @@ driver func emitOptimizedFnBody() {
 		}
 
 		c4 := line[4]
+
+		// Rule 5 (Branch Fusion):
+		//   `setCC -slot(%rbp)` + `movzbq -slot(%rbp), %rax` + `testb %al, %al` + `jz/jnz .L`
+		//   -> direct `j!CC .L` / `jCC .L` (eliminates 3 instructions + stack round-trip on every if/for!)
+		if c4 == 's' && i+3 < nLines && ll > 15 && line[5] == 'e' && line[6] == 't' {
+			sp := usize(7)
+			for step := usize(0); step < 4; step++ {
+				if sp < ll && line[sp] != ' ' {
+					sp++
+				} else {
+					break
+				}
+			}
+			if sp > 7 && sp+8 < ll && line[sp] == ' ' && line[sp+1] == '-' {
+				cc := line[7:sp]
+				slot := line[sp+1:]
+				if isFrameSlot(slot) {
+					l1 := fnBodyBuf[usize(optLineStart[i+1]) : usize(optLineStart[i+1])+usize(optLineLen[i+1])]
+					l2 := fnBodyBuf[usize(optLineStart[i+2]) : usize(optLineStart[i+2])+usize(optLineLen[i+2])]
+					l3 := fnBodyBuf[usize(optLineStart[i+3]) : usize(optLineStart[i+3])+usize(optLineLen[i+3])]
+					if bytesStartsWith(l1, "    movzbq ") && bytesEndsWith(l1, ", %rax") &&
+						sliceEq(l1[11:len(l1)-6], slot) &&
+						bytesEqStr(l2, "    testb %al, %al") &&
+						(bytesStartsWith(l3, "    jz ") || bytesStartsWith(l3, "    jnz ")) {
+						isJZ := l3[5] == 'z'
+						if jcc, ok := invertSetCC(cc, isJZ); ok {
+							var tgtOff usize = 7
+							if !isJZ {
+								tgtOff = 8
+							}
+							secWriteStr(SecText, "    ")
+							secWriteStr(SecText, jcc)
+							secWriteByte(SecText, ' ')
+							secWrite(SecText, l3[tgtOff:])
+							secWriteByte(SecText, '\n')
+							lastStoreKind = 0
+							skipCount = 3
+							continue
+						}
+					}
+				}
+			}
+		}
+
+		// Rule 6 (Direct Frame Scalar Load Folding):
+		//   `leaq OFF(%rbp), %rax` + `movq 0(%rax), %rcx` + `movq %rcx, S(%rbp)` + `movq %rcx, %rax`
+		//   -> `movq OFF(%rbp), %rax` + `movq %rax, S(%rbp)` (eliminates 2 instructions on every local load!)
+		if c4 == 'l' && i+3 < nLines && ll > 16 && bytesStartsWith(line, "    leaq ") && bytesEndsWith(line, ", %rax") {
+			baseSlot := line[9 : ll-6]
+			if isFrameSlot(baseSlot) {
+				l1 := fnBodyBuf[usize(optLineStart[i+1]) : usize(optLineStart[i+1])+usize(optLineLen[i+1])]
+				l2 := fnBodyBuf[usize(optLineStart[i+2]) : usize(optLineStart[i+2])+usize(optLineLen[i+2])]
+				l3 := fnBodyBuf[usize(optLineStart[i+3]) : usize(optLineStart[i+3])+usize(optLineLen[i+3])]
+				if bytesEqStr(l1, "    movq 0(%rax), %rcx") &&
+					bytesStartsWith(l2, "    movq %rcx, ") &&
+					isFrameSlot(l2[15:]) &&
+					bytesEqStr(l3, "    movq %rcx, %rax") {
+					dstSlot := l2[15:]
+					secWriteStr(SecText, "    movq ")
+					secWrite(SecText, baseSlot)
+					secWriteStr(SecText, ", %rax\n    movq %rax, ")
+					secWrite(SecText, dstSlot)
+					secWriteByte(SecText, '\n')
+					lastStoreKind = 1
+					lastSlotStart = optLineStart[i+2] + 15
+					lastSlotLen = u32(len(dstSlot))
+					skipCount = 3
+					continue
+				}
+			}
+		}
 
 		// Fast path: Jump peepholes (`jmp` / `je`)
 		if c4 == 'j' {
@@ -196,7 +349,7 @@ driver func emitOptimizedFnBody() {
 						secWrite(SecText, nextLine[8:])
 						secWriteByte(SecText, '\n')
 						lastStoreKind = 0
-						skipNext = true // skip the `jmp .L_B`
+						skipCount = 1 // skip the `jmp .L_B`
 						continue
 					}
 				}

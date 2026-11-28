@@ -1,0 +1,78 @@
+// Package iter provides zero-GC, Layer-2 total functional combinators over slices
+// designed to pair cleanly with FinCore's stack-allocated scoped closures (`|x| ...`).
+package iter
+
+func ForEach[T any](xs const []T, fn func(T)) {
+	for i := usize(0); i < len(xs); i++ {
+		fn(xs[i])
+	}
+}
+
+func Fold[T any, A any](xs const []T, init A, fn func(A, T) A) A {
+	acc := init
+	for i := usize(0); i < len(xs); i++ {
+		acc = fn(acc, xs[i])
+	}
+	return acc
+}
+
+func MapInto[T any, U any](dst []U, src const []T, fn func(T) U) usize {
+	n := len(src)
+	if len(dst) < n {
+		n = len(dst)
+	}
+	for i := usize(0); i < n; i++ {
+		dst[i] = fn(src[i])
+	}
+	return n
+}
+
+func FilterInto[T any](dst []T, src const []T, pred func(T) bool) usize {
+	out := usize(0)
+	for i := usize(0); i < len(src); i++ {
+		if pred(src[i]) {
+			if out < len(dst) {
+				dst[out] = src[i]
+				out++
+			}
+		}
+	}
+	return out
+}
+
+func Any[T any](xs const []T, pred func(T) bool) bool {
+	for i := usize(0); i < len(xs); i++ {
+		if pred(xs[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func All[T any](xs const []T, pred func(T) bool) bool {
+	for i := usize(0); i < len(xs); i++ {
+		if !pred(xs[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func Count[T any](xs const []T, pred func(T) bool) usize {
+	var c usize = 0
+	for i := usize(0); i < len(xs); i++ {
+		if pred(xs[i]) {
+			c++
+		}
+	}
+	return c
+}
+
+func Find[T any](xs const []T, pred func(T) bool) (usize, bool) {
+	for i := usize(0); i < len(xs); i++ {
+		if pred(xs[i]) {
+			return i, true
+		}
+	}
+	return 0, false
+}

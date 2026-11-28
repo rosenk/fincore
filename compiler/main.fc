@@ -10,7 +10,7 @@ driver func main(io Stdio, env Env, fs FS, ex Exec) error {
 	_ = ex
 	argc := env.ArgsCount()
 	if argc < 2 {
-		_ = io.WriteStderr(strBytes("usage: finc <init|get|parse|check|build|run|test|fmt|version> [args...]\n"))
+		_ = io.WriteStderr(strBytes("usage: finc <init|get|parse|check|build|run|test|fmt|lsp|version> [args...]\n"))
 		return ErrIO
 	}
 	cmd := strBytes(env.Arg(1))
@@ -22,6 +22,9 @@ driver func main(io Stdio, env Env, fs FS, ex Exec) error {
 	}
 	if sliceEq(cmd, strBytes("get")) {
 		return cmdGet(io, env, fs, ex)
+	}
+	if sliceEq(cmd, strBytes("lsp")) {
+		return cmdLsp(io, env, fs)
 	}
 	if sliceEq(cmd, strBytes("parse")) {
 		return cmdParse(io, env, fs)
@@ -41,7 +44,7 @@ driver func main(io Stdio, env Env, fs FS, ex Exec) error {
 	if sliceEq(cmd, strBytes("fmt")) {
 		return cmdFmt(io, env, fs)
 	}
-	_ = io.WriteStderr(strBytes("usage: finc <init|get|parse|check|build|run|test|fmt|version> [args...]\n"))
+	_ = io.WriteStderr(strBytes("usage: finc <init|get|parse|check|build|run|test|fmt|lsp|version> [args...]\n"))
 	return ErrIO
 }
 
@@ -81,9 +84,7 @@ driver func cmdCheck(io Stdio, env Env, fs FS) error {
 		return ErrIO
 	}
 	target := strBytes(env.Arg(targetIdx))
-	if err := loadProgram(fs, target); err != nil {
-		return err
-	}
+	loadProgram(fs, target)?
 	if diagCount == 0 {
 		checkProgram()
 	}
@@ -97,10 +98,7 @@ driver func cmdCheck(io Stdio, env Env, fs FS) error {
 driver func loadTargetFiles(fs FS, target []byte) error {
 	if fs.IsDir(bytesToStr(target)) {
 		var names [64]string
-		n, err := fs.ListSourceFiles(bytesToStr(target), names[:])
-		if err != nil {
-			return err
-		}
+		n := fs.ListSourceFiles(bytesToStr(target), names[:])?
 		var pathBuf [512]byte
 		for i := usize(0); i < n; i++ {
 			pos := usize(0)
@@ -109,9 +107,7 @@ driver func loadTargetFiles(fs FS, target []byte) error {
 				pos = bufAppendByte(pathBuf[:], pos, '/')
 			}
 			pos = bufAppendStr(pathBuf[:], pos, names[i])
-			if err := loadOneFile(fs, pathBuf[:pos]); err != nil {
-				return err
-			}
+			loadOneFile(fs, pathBuf[:pos])?
 		}
 		return nil
 	}
@@ -123,10 +119,7 @@ driver func loadOneFile(fs FS, path []byte) error {
 	if usize(off) >= MaxSrcBytes {
 		return ErrArenaFull
 	}
-	n, err := fs.ReadFileInto(bytesToStr(path), srcBuf[usize(off):])
-	if err != nil {
-		return err
-	}
+	n := fs.ReadFileInto(bytesToStr(path), srcBuf[usize(off):])?
 	srcUsed += u32(n)
 	fid := addSourceFile(path, off, u32(n))
 	lexFile(fid)

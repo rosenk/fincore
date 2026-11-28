@@ -88,6 +88,7 @@ const (
 	NKTypeExpr   u8 = 87 // a=typeNode (when type syntax appears in expr pos, e.g. T(x) or []byte(x))
 	NKHandleExpr u8 = 88 // flags: bit0=isBlockBody; a=bodyNode, b=armStart, c=armCount, d=effTypeNode(0=infer)
 	NKFloatLit   u8 = 89 // a=strID, b=u64PoolIdx (IEEE-754 f64 bit pattern)
+	NKTry        u8 = 90 // a=innerExpr (postfix '?' error propagation)
 )
 
 // Effect modes (stored in Node.op for NKFuncDecl/NKFuncLit/NKTypeFunc).
@@ -137,6 +138,21 @@ func newNode(kind u8, fileID u32, off u32) u32 {
 	sigEffStart[id] = 0
 	sigEffCount[id] = 0
 	paramWhere[id] = 0
+	nodeSym[id] = 0
+	nodeType[id] = 0
+	nodeVal[id] = 0
+	nodeCall[id] = 0
+	nodeFlags[id] = 0
+	nodeSelIdx[id] = 0
+	nodeInstStart[id] = 0
+	nodeInstCount[id] = 0
+	litCapStart[id] = 0
+	litCapCount[id] = 0
+	fnEvStart[id] = 0
+	fnEvCount[id] = 0
+	nodeHandle[id] = 0
+	handleArmOpIdx[id] = 0
+	handleArmResumeSym[id] = 0
 	nodeEmbedID[id] = 0
 	nodeEmbedErr[id] = 0
 	return id

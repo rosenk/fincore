@@ -12,6 +12,10 @@ driver func (f *FnGen) emitSingleCallTo(en u32, dstOff i64, wantTy u32) {
 }
 
 driver func (f *FnGen) emitMultiCallTo(en u32, dsts []i64, dts []u32) {
+	if nodes[en].kind == NKTry {
+		f.emitTryMulti(en, dsts, dts)
+		return
+	}
 	if nodeCall[en] == 0 {
 		return
 	}

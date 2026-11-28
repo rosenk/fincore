@@ -93,6 +93,7 @@ const (
 	TKSemi      u8 = 82 // ;
 	TKArrow     u8 = 83 // ->
 	TKEllipsis  u8 = 84 // ...
+	TKQuestion  u8 = 85 // ?
 )
 
 const (
@@ -277,7 +278,7 @@ func triggersSemi(k u8) bool {
 	return k == TKIdent || k == TKInt || k == TKFloat || k == TKString || k == TKChar ||
 		k == TKTrue || k == TKFalse || k == TKNil || k == TKAny ||
 		k == TKReturn || k == TKBreak || k == TKContinue ||
-		k == TKInc || k == TKDec ||
+		k == TKInc || k == TKDec || k == TKQuestion ||
 		k == TKRParen || k == TKRBrack || k == TKRBrace
 }
 
@@ -750,6 +751,8 @@ func lexFile(fileID u32) {
 			}
 		} else if c == ';' {
 			kind = TKSemi
+		} else if c == '?' {
+			kind = TKQuestion
 		} else {
 			addDiagStr(E1001, fileID, u32(start), "unexpected character")
 		}

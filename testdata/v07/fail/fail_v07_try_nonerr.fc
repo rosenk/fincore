@@ -1,0 +1,17 @@
+// SINCE: v0.7
+package main
+
+func mayFail() (i64, error) {
+	return 1, nil
+}
+
+func badFn() i64 {
+	v := mayFail()? // ERROR E2002
+	return v
+}
+
+driver func main(io Stdio) error {
+	_ = io
+	_ = badFn()
+	return nil
+}

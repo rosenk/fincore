@@ -919,6 +919,9 @@ driver func (c *Checker) exprDepth(en u32) u32 {
 	if n.kind == NKIndex {
 		return c.exprDepth(n.a)
 	}
+	if n.kind == NKTry {
+		return c.exprDepth(n.a)
+	}
 	if n.kind == NKCall && nodeCall[en] != 0 {
 		ci := calls[nodeCall[en]]
 		var mx u32 = 0
@@ -1062,7 +1065,9 @@ driver func (c *Checker) checkExpr(en u32, hint u32) u32 {
 	} else if n.kind == NKHandleExpr {
 		res = c.checkHandle(en, true, hint)
 	} else if n.kind == NKFuncLit {
-		res = c.checkFuncLit(en)
+		res = c.checkFuncLit(en, hint)
+	} else if n.kind == NKTry {
+		res = c.checkTry(en)
 	} else if n.kind == NKCall {
 		res = c.checkCall(en, hint)
 	} else if n.kind == NKTypeExpr {
@@ -1071,6 +1076,33 @@ driver func (c *Checker) checkExpr(en u32, hint u32) u32 {
 
 	nodeType[en] = res
 	return res
+}
+
+driver func (c *Checker) checkTry(en u32) u32 {
+	n := nodes[en]
+	if c.retCount == 0 || typeList[c.retStart+c.retCount-1] != TYError {
+		addDiagStr(E2002, n.fileID, n.off, "operator '?' requires enclosing function to return error")
+		_ = c.checkExpr(n.a, 0)
+		return TYInvalid
+	}
+	it := c.checkExpr(n.a, 0)
+	if it == TYInvalid {
+		return TYInvalid
+	}
+	if it == TYError {
+		return 0
+	}
+	if it != 0 && types[it].kind == TKindTuple && types[it].b >= 2 {
+		tc := types[it].b
+		if typeList[types[it].a+tc-1] == TYError {
+			if tc == 2 {
+				return typeList[types[it].a]
+			}
+			return newType(Type{kind: TKindTuple, a: types[it].a, b: tc - 1})
+		}
+	}
+	addDiagStr(E2002, n.fileID, n.off, "operator '?' requires operand returning error")
+	return TYInvalid
 }
 
 driver func (c *Checker) checkIdent(en u32) u32 {
@@ -1567,13 +1599,30 @@ driver func (c *Checker) checkArrayLit(en u32) u32 {
 	return arrTy
 }
 
-driver func (c *Checker) checkFuncLit(en u32) u32 {
+driver func (c *Checker) checkFuncLit(en u32, hint u32) u32 {
 	n := nodes[en]
 	sn := nodes[n.a]
+	var hu u32 = 0
+	if hint != 0 && types[under(hint)].kind == TKindSig {
+		hu = under(hint)
+	}
+	eff := n.op
+	if (n.flags&1) != 0 && eff == EffTotal && hu != 0 {
+		eff = types[hu].op
+		nodes[en].op = eff
+	}
+
 	var ptypes [32]u32
 	for i := u32(0); i < sn.d; i++ {
 		pn := listPool[sn.c+i]
-		pt := resolveTypeNode(c.pkgID, nodes[pn].b)
+		var pt u32 = TYInvalid
+		if nodes[pn].b != 0 {
+			pt = resolveTypeNode(c.pkgID, nodes[pn].b)
+		} else if hu != 0 && i < types[hu].b {
+			pt = typeList[types[hu].a+i]
+		} else {
+			addDiagStr(E2002, nodes[pn].fileID, nodes[pn].off, "cannot infer closure parameter type without context")
+		}
 		nodeType[pn] = pt
 		ptypes[i] = pt
 	}
@@ -1585,10 +1634,14 @@ driver func (c *Checker) checkFuncLit(en u32) u32 {
 		for i := u32(0); i < nr; i++ {
 			rtypes[i] = resolveTypeNode(c.pkgID, listPool[rl.a+i])
 		}
+	} else if (n.flags&1) != 0 && hu != 0 {
+		nr = types[hu].d
+		for i := u32(0); i < nr && i < 16; i++ {
+			rtypes[i] = typeList[types[hu].c+i]
+		}
 	}
 	ps, pc := pushTypeList(ptypes[:usize(sn.d)])
 	rs, rc := pushTypeList(rtypes[:usize(nr)])
-	sigTy := newType(Type{kind: TKindSig, op: n.op, a: ps, b: pc, c: rs, d: rc})
 
 	// Check body in nested closure context
 	savedInLit := c.inLit
@@ -1607,7 +1660,7 @@ driver func (c *Checker) checkFuncLit(en u32) u32 {
 	c.inLit = true
 	c.litNode = en
 	c.outerBase = savedLocals
-	c.fnEff = n.op
+	c.fnEff = eff
 	c.retStart = rs
 	c.retCount = rc
 	c.nLitCaps = 0
@@ -1622,7 +1675,31 @@ driver func (c *Checker) checkFuncLit(en u32) u32 {
 			c.pushLocal(p.a, psym, ptypes[i], c.blockDepth)
 		}
 	}
-	c.checkBlock(n.b)
+	if (n.flags & 2) != 0 {
+		var retHint u32 = 0
+		if rc == 1 {
+			retHint = rtypes[0]
+		}
+		bt := c.checkExpr(n.b, retHint)
+		if sn.e == 0 && hu == 0 && bt != 0 && bt != TYInvalid {
+			// Infer return type from expression body when no hint was given
+			if types[bt].kind == TKindTuple {
+				nr = types[bt].b
+				for i := u32(0); i < nr && i < 16; i++ {
+					rtypes[i] = defaultType(typeList[types[bt].a+i])
+				}
+			} else {
+				nr = 1
+				rtypes[0] = defaultType(bt)
+			}
+			rs, rc = pushTypeList(rtypes[:usize(nr)])
+		} else if rc == 1 && bt != TYInvalid && !c.checkAssignable(n.b, bt, rtypes[0]) {
+			addDiagStr(E2002, nodes[n.b].fileID, nodes[n.b].off, "closure body type does not match expected return type")
+		}
+	} else {
+		c.checkBlock(n.b)
+	}
+	sigTy := newType(Type{kind: TKindSig, op: eff, a: ps, b: pc, c: rs, d: rc})
 
 	// Persist captured symbols for codegen, and mark captured linear outer locals as moved!
 	capStart := capPoolUsed

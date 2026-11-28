@@ -2,15 +2,17 @@ SHELL := /bin/bash
 GO      ?= go
 BIN     := bin
 FINC0   := $(BIN)/finc0
+FINCSEED := $(BIN)/finc_seed
 FINC1   := $(BIN)/finc1
 FINC2   := $(BIN)/finc2
 FINC3   := $(BIN)/finc3
 FINC    := $(BIN)/finc
+SEED_GZ := bootstrap/seed/finc_seed.s.gz
 FUEL    ?= 1000000
 
 export CGO_ENABLED ?= 0
 
-.PHONY: all build finc0 finc1 finc bootstrap test vet fmt fmt-check lint test-corpus test-examples integration ci clean help
+.PHONY: all build finc0 finc-seed update-seed finc1 finc bootstrap test vet fmt fmt-check lint test-corpus test-examples integration ci clean help
 
 all: vet test build finc ## vet, test, build finc0 and self-hosted finc
 
@@ -23,22 +25,40 @@ finc0: ## build bin/finc0 (static Go binary, frozen at v0.1 Native)
 	@mkdir -p $(BIN)
 	$(GO) build -trimpath -o $(FINC0) ./bootstrap/cmd/finc0
 
-finc1: finc0 ## build Stage 1 native compiler (bin/finc1) using finc0
-	$(FINC0) build -o $(FINC1) ./compiler
+finc-seed: ## assemble rolling self-hosting seed compiler from bootstrap/seed/finc_seed.s.gz
+	@mkdir -p $(BIN)
+	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; \
+	gzip -dc $(SEED_GZ) > "$$d/seed.s"; \
+	as --64 -o "$$d/seed.o" "$$d/seed.s"; \
+	for f in sys fmt net scope effect fiber; do \
+	  as --64 -o "$$d/rt_$$f.o" "runtime/linux_amd64/$$f.s"; \
+	done; \
+	ld -static -z noexecstack --build-id=none -o $(FINCSEED) \
+	  "$$d/rt_sys.o" "$$d/rt_fmt.o" "$$d/rt_net.o" "$$d/rt_scope.o" "$$d/rt_effect.o" "$$d/rt_fiber.o" "$$d/seed.o"
+
+finc1: finc-seed ## build Stage 1 native compiler (bin/finc1) using rolling seed
+	FINCROOT=$$(pwd) FINCORE_ROOT=$$(pwd) $(FINCSEED) build -o $(FINC1) ./compiler
 
 finc: finc1 ## build self-hosted native compiler (bin/finc = finc2)
-	$(FINC1) build -o $(FINC) ./compiler
+	FINCROOT=$$(pwd) FINCORE_ROOT=$$(pwd) $(FINC1) build -o $(FINC) ./compiler
 
 bootstrap: finc1 ## full 3-stage native fixed-point check (finc1 -> finc2 == finc3) + integration
 	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; \
-	$(FINC1) build --emit-asm="$$d/stage2.s" -o $(FINC2) ./compiler; \
-	$(FINC2) build --emit-asm="$$d/stage3.s" -o $(FINC3) ./compiler; \
+	FINCROOT=$$(pwd) FINCORE_ROOT=$$(pwd) $(FINC1) build --emit-asm="$$d/stage2.s" -o $(FINC2) ./compiler; \
+	FINCROOT=$$(pwd) FINCORE_ROOT=$$(pwd) $(FINC2) build --emit-asm="$$d/stage3.s" -o $(FINC3) ./compiler; \
 	cmp -s "$$d/stage2.s" "$$d/stage3.s" || { echo "bootstrap: stage2.s != stage3.s"; exit 1; }; \
 	cmp -s $(FINC2) $(FINC3) || { echo "bootstrap: finc2 != finc3"; exit 1; }; \
 	cp $(FINC2) $(FINC); \
 	sha256sum "$$d/stage2.s" "$$d/stage3.s" $(FINC2) $(FINC3); \
 	echo "bootstrap: native self-hosting fixed point verified (finc2 == finc3)"; \
 	FINC0=$$(pwd)/$(FINC2) $(GO) test -count=1 ./testdata/integration/
+
+update-seed: bootstrap ## promote verified fixed-point finc2 assembly to bootstrap/seed/finc_seed.s.gz
+	@mkdir -p bootstrap/seed
+	@set -eo pipefail; d=$$(mktemp -d); trap 'rm -rf "$$d"' EXIT; \
+	FINCROOT=$$(pwd) FINCORE_ROOT=$$(pwd) $(FINC2) build --emit-asm="$$d/seed.s" -o "$$d/seed_bin" ./compiler; \
+	gzip -n -9 -c "$$d/seed.s" > $(SEED_GZ); \
+	echo "update-seed: updated $(SEED_GZ) ($$(stat -c%s $(SEED_GZ)) bytes)"
 
 test: ## run bootstrap Go unit tests
 	$(GO) test -count=1 ./bootstrap/...

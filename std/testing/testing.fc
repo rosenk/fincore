@@ -1,0 +1,82 @@
+// Package testing provides a zero-GC, Layer-2 unit test harness for `finc test`.
+package testing
+
+type T struct {
+	Failed  bool
+	Checks  u32
+	FailMsg [256]byte
+	FailLen usize
+}
+
+func (t *T) Fail() {
+	t.Failed = true
+}
+
+func (t *T) Error(msg string) {
+	t.Failed = true
+	if t.FailLen == 0 {
+		v := strView(msg)
+		n := len(v)
+		if n > len(t.FailMsg) {
+			n = len(t.FailMsg)
+		}
+		for i := usize(0); i < n; i++ {
+			t.FailMsg[i] = v[i]
+		}
+		t.FailLen = n
+	}
+}
+
+func (t *T) Assert(cond bool, msg string) {
+	t.Checks++
+	if !cond {
+		t.Error(msg)
+	}
+}
+
+func (t *T) AssertEqInt(got i64, want i64, msg string) {
+	t.Checks++
+	if got != want {
+		t.Failed = true
+		if t.FailLen == 0 {
+			t.FailLen = formatTo(t.FailMsg[:], "%s (got=%d want=%d)", msg, got, want)
+		}
+	}
+}
+
+func (t *T) AssertEqUint(got u64, want u64, msg string) {
+	t.Checks++
+	if got != want {
+		t.Failed = true
+		if t.FailLen == 0 {
+			t.FailLen = formatTo(t.FailMsg[:], "%s (got=%d want=%d)", msg, got, want)
+		}
+	}
+}
+
+func (t *T) AssertEqStr(got const []byte, want string, msg string) {
+	t.Checks++
+	w := strView(want)
+	eq := len(got) == len(w)
+	if eq {
+		for i := usize(0); i < len(w); i++ {
+			if got[i] != w[i] {
+				eq = false
+				break
+			}
+		}
+	}
+	if !eq {
+		t.Failed = true
+		if t.FailLen == 0 {
+			t.FailLen = formatTo(t.FailMsg[:], "%s (got=%s want=%s)", msg, got, want)
+		}
+	}
+}
+
+func (t *T) AssertNil(err error, msg string) {
+	t.Checks++
+	if err != nil {
+		t.Error(msg)
+	}
+}

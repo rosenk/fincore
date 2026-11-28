@@ -21,6 +21,18 @@ var fileImportCount u32
 
 var fincRootBuf [512]byte
 var fincRootLen usize
+var testMode bool
+var testHarnessBuf [65536]byte
+var testHarnessLen usize
+
+func isTestSourceName(name string) bool {
+	v := strView(name)
+	n := len(v)
+	if n < 8 {
+		return false
+	}
+	return v[n-8] == '_' && v[n-7] == 't' && v[n-6] == 'e' && v[n-5] == 's' && v[n-4] == 't' && v[n-3] == '.' && v[n-2] == 'f' && v[n-1] == 'c'
+}
 
 func resolveInit(env Env) {
 	uniSymCount = 0
@@ -224,10 +236,11 @@ func lookupFileImport(fileID u32, aliasStr u32) (u32, bool) {
 
 driver func loadProgram(fs FS, target []byte) error {
 	loadModuleForTarget(fs, target)
-	pid, err := loadPkg(fs, target, true, 0, 0)
-	if err != nil {
-		return err
+	if modLockErr {
+		addDiagStr(E2001, 0, 0, bytesToStr(modLockErrMsg[:modLockErrLen]))
+		return nil
 	}
+	pid := loadPkg(fs, target, true, 0, 0)?
 	rootPkgID = pid
 	assignPkgPrefixes()
 	// Register declarations of all packages in topological order
@@ -298,31 +311,30 @@ driver func loadPkg(fs FS, path []byte, isRoot bool, impFileID u32, impOff u32) 
 	nf := usize(0)
 	if fs.IsDir(bytesToStr(dirBuf[:dirLen])) {
 		var names [64]string
-		n, err := fs.ListSourceFiles(bytesToStr(dirBuf[:dirLen]), names[:])
-		if err != nil {
-			return pid, err
-		}
+		n := fs.ListSourceFiles(bytesToStr(dirBuf[:dirLen]), names[:])?
 		var fpBuf [512]byte
 		for i := usize(0); i < n; i++ {
+			if isTestSourceName(names[i]) && !(testMode && isRoot) {
+				continue
+			}
 			p := bufAppend(fpBuf[:], 0, dirBuf[:dirLen])
 			if p > 0 && fpBuf[p-1] != '/' {
 				p = bufAppendByte(fpBuf[:], p, '/')
 			}
 			p = bufAppendStr(fpBuf[:], p, names[i])
-			fid, lerr := loadAndParseFile(fs, fpBuf[:p])
-			if lerr != nil {
-				return pid, lerr
-			}
+			fid := loadAndParseFile(fs, fpBuf[:p])?
 			if nf < len(localFids) {
 				localFids[nf] = fid
 				nf++
 			}
 		}
-	} else {
-		fid, lerr := loadAndParseFile(fs, dirBuf[:dirLen])
-		if lerr != nil {
-			return pid, lerr
+		if testMode && isRoot && testHarnessLen > 0 && nf < len(localFids) {
+			hfid := loadAndParseMem(strView("_finc_testmain.fc"), testHarnessBuf[:testHarnessLen])?
+			localFids[nf] = hfid
+			nf++
 		}
+	} else {
+		fid := loadAndParseFile(fs, dirBuf[:dirLen])?
 		localFids[0] = fid
 		nf = 1
 	}
@@ -379,16 +391,39 @@ func isStdImport(path []byte) bool {
 }
 
 driver func loadAndParseFile(fs FS, path []byte) (u32, error) {
+	if ov, ok := lspLookupOverlay(path); ok {
+		return loadAndParseMem(path, ov)
+	}
 	off := srcUsed
 	if usize(off) >= MaxSrcBytes {
 		return 0, ErrArenaFull
 	}
-	n, err := fs.ReadFileInto(bytesToStr(path), srcBuf[usize(off):])
-	if err != nil {
-		return 0, err
-	}
+	n := fs.ReadFileInto(bytesToStr(path), srcBuf[usize(off):])?
 	srcUsed += u32(n)
 	fid := addSourceFile(path, off, u32(n))
+	lexFile(fid)
+	_ = parseFile(fid)
+	return fid, nil
+}
+
+driver func loadAndParseMem(path const []byte, data const []byte) (u32, error) {
+	off := srcUsed
+	if usize(off)+len(data) >= MaxSrcBytes {
+		return 0, ErrArenaFull
+	}
+	for i := usize(0); i < len(data); i++ {
+		srcBuf[usize(off)+i] = data[i]
+	}
+	srcUsed += u32(len(data))
+	var pbuf [128]byte
+	pl := len(path)
+	if pl > len(pbuf) {
+		pl = len(pbuf)
+	}
+	for i := usize(0); i < pl; i++ {
+		pbuf[i] = path[i]
+	}
+	fid := addSourceFile(pbuf[:pl], off, u32(len(data)))
 	lexFile(fid)
 	_ = parseFile(fid)
 	return fid, nil
@@ -497,8 +532,14 @@ func registerPkgDecls(pkgID u32) {
 						pkgSyms[pkgSymCount] = s
 						pkgSymCount++
 					}
-					if pkgID == rootPkgID && d.a == kwMain {
-						mainFuncSym = s
+					if pkgID == rootPkgID {
+						if testMode {
+							if sliceEq(strSlice(d.a), strBytes("__finc_test_main")) {
+								mainFuncSym = s
+							}
+						} else if d.a == kwMain {
+							mainFuncSym = s
+						}
 					}
 				} else {
 					// Method (not in package namespace; registered in methods table later)
