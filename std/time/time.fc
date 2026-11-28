@@ -1,0 +1,257 @@
+// Package time provides zero-GC UTC calendar date/time arithmetic, RFC 3339
+// formatting & parsing, and RFC 7231 HTTP-date formatting over Clock.UnixNs().
+// Uses Howard Hinnant's O(1) civil-from-days / days-from-civil algorithms (Layer-2 total).
+package time
+
+import "std/strings"
+
+const (
+	SecondsPerMinute u64 = 60
+	SecondsPerHour   u64 = 3600
+	SecondsPerDay    u64 = 86400
+	NsPerSecond      u64 = 1_000_000_000
+)
+
+// DateTime represents a UTC wall-clock timestamp.
+type DateTime struct {
+	Year       i32
+	Month      u8  // 1..12
+	Day        u8  // 1..31
+	Hour       u8  // 0..23
+	Minute     u8  // 0..59
+	Second     u8  // 0..59
+	Nanosecond u32 // 0..999_999_999
+}
+
+// FromUnixSec converts UTC Unix epoch seconds (since 1970-01-01T00:00:00Z) to DateTime.
+func FromUnixSec(sec u64) DateTime {
+	days := i64(sec / SecondsPerDay)
+	rem := sec % SecondsPerDay
+	hour := u8(rem / SecondsPerHour)
+	rem = rem % SecondsPerHour
+	min := u8(rem / SecondsPerMinute)
+	s := u8(rem % SecondsPerMinute)
+
+	// Howard Hinnant civil_from_days (exact for all proleptic Gregorian dates)
+	z := days + 719468
+	var era i64 = 0
+	if z >= 0 {
+		era = z / 146097
+	} else {
+		era = (z - 146096) / 146097
+	}
+	doe := u64(z - era*146097)                                // [0, 146096]
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365    // [0, 399]
+	y := i64(yoe) + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100)                  // [0, 365]
+	mp := (5*doy + 2) / 153                                   // [0, 11]
+	d := u8(doy - (153*mp+2)/5 + 1)                           // [1, 31]
+	var m u8 = 0
+	if mp < 10 {
+		m = u8(mp + 3)
+	} else {
+		m = u8(mp - 9)
+	}
+	if m <= 2 {
+		y++
+	}
+	return DateTime{
+		Year:       i32(y),
+		Month:      m,
+		Day:        d,
+		Hour:       hour,
+		Minute:     min,
+		Second:     s,
+		Nanosecond: 0,
+	}
+}
+
+// FromUnixNs converts UTC Unix nanoseconds to DateTime.
+func FromUnixNs(ns u64) DateTime {
+	dt := FromUnixSec(ns / NsPerSecond)
+	dt.Nanosecond = u32(ns % NsPerSecond)
+	return dt
+}
+
+// Now reads the current UTC wall-clock DateTime from Clock (CLOCK_REALTIME).
+func Now(clock Clock) DateTime {
+	return FromUnixNs(clock.UnixNs())
+}
+
+// ToUnixSec converts dt to UTC Unix epoch seconds.
+func (dt const *DateTime) ToUnixSec() u64 {
+	y := i64(dt.Year)
+	m := i64(dt.Month)
+	d := i64(dt.Day)
+	if m <= 2 {
+		y--
+	}
+	var era i64 = 0
+	if y >= 0 {
+		era = y / 400
+	} else {
+		era = (y - 399) / 400
+	}
+	yoe := u64(y - era*400)
+	var mp u64 = 0
+	if m > 2 {
+		mp = u64(m - 3)
+	} else {
+		mp = u64(m + 9)
+	}
+	doy := (153*mp+2)/5 + u64(d) - 1
+	doe := yoe*365 + yoe/4 - yoe/100 + doy
+	days := era*146097 + i64(doe) - 719468
+	if days < 0 {
+		return 0
+	}
+	return u64(days)*SecondsPerDay + u64(dt.Hour)*SecondsPerHour + u64(dt.Minute)*SecondsPerMinute + u64(dt.Second)
+}
+
+// ToUnixNs converts dt to UTC Unix nanoseconds.
+func (dt const *DateTime) ToUnixNs() u64 {
+	return dt.ToUnixSec()*NsPerSecond + u64(dt.Nanosecond)
+}
+
+// Weekday returns 0=Sunday .. 6=Saturday for dt (1970-01-01 was Thursday = 4).
+func (dt const *DateTime) Weekday() u8 {
+	days := dt.ToUnixSec() / SecondsPerDay
+	return u8((days + 4) % 7)
+}
+
+func weekdayName(w u8) string {
+	if w == 0 {
+		return "Sun"
+	}
+	if w == 1 {
+		return "Mon"
+	}
+	if w == 2 {
+		return "Tue"
+	}
+	if w == 3 {
+		return "Wed"
+	}
+	if w == 4 {
+		return "Thu"
+	}
+	if w == 5 {
+		return "Fri"
+	}
+	return "Sat"
+}
+
+func monthName(m u8) string {
+	if m == 1 {
+		return "Jan"
+	}
+	if m == 2 {
+		return "Feb"
+	}
+	if m == 3 {
+		return "Mar"
+	}
+	if m == 4 {
+		return "Apr"
+	}
+	if m == 5 {
+		return "May"
+	}
+	if m == 6 {
+		return "Jun"
+	}
+	if m == 7 {
+		return "Jul"
+	}
+	if m == 8 {
+		return "Aug"
+	}
+	if m == 9 {
+		return "Sep"
+	}
+	if m == 10 {
+		return "Oct"
+	}
+	if m == 11 {
+		return "Nov"
+	}
+	return "Dec"
+}
+
+// FormatRFC3339 formats dt as "YYYY-MM-DDTHH:MM:SSZ" (20 bytes).
+func (dt const *DateTime) FormatRFC3339(dst []byte) usize {
+	return formatTo(dst, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+		u32(dt.Year), u32(dt.Month), u32(dt.Day),
+		u32(dt.Hour), u32(dt.Minute), u32(dt.Second))
+}
+
+// FormatRFC3339Nano formats dt as "YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ" (30 bytes).
+func (dt const *DateTime) FormatRFC3339Nano(dst []byte) usize {
+	return formatTo(dst, "%04d-%02d-%02dT%02d:%02d:%02d.%09dZ",
+		u32(dt.Year), u32(dt.Month), u32(dt.Day),
+		u32(dt.Hour), u32(dt.Minute), u32(dt.Second), dt.Nanosecond)
+}
+
+// FormatHTTPDate formats dt as RFC 7231 IMF-fixdate: "Sat, 28 Nov 2026 19:10:52 GMT" (29 bytes).
+func (dt const *DateTime) FormatHTTPDate(dst []byte) usize {
+	return formatTo(dst, "%s, %02d %s %04d %02d:%02d:%02d GMT",
+		weekdayName(dt.Weekday()), u32(dt.Day), monthName(dt.Month),
+		u32(dt.Year), u32(dt.Hour), u32(dt.Minute), u32(dt.Second))
+}
+
+// ParseRFC3339 parses a UTC RFC 3339 timestamp ("YYYY-MM-DDTHH:MM:SSZ" or with ".fracZ").
+func ParseRFC3339(b const []byte) (DateTime, bool) {
+	var z DateTime
+	if len(b) < 20 {
+		return z, false
+	}
+	if b[4] != '-' || b[7] != '-' || (b[10] != 'T' && b[10] != 't' && b[10] != ' ') ||
+		b[13] != ':' || b[16] != ':' {
+		return z, false
+	}
+	yr, okY := strings.ParseUint(b[0:4])
+	mo, okMo := strings.ParseUint(b[5:7])
+	dy, okD := strings.ParseUint(b[8:10])
+	hr, okH := strings.ParseUint(b[11:13])
+	mi, okMi := strings.ParseUint(b[14:16])
+	sc, okS := strings.ParseUint(b[17:19])
+	if !okY || !okMo || !okD || !okH || !okMi || !okS {
+		return z, false
+	}
+	if mo < 1 || mo > 12 || dy < 1 || dy > 31 || hr > 23 || mi > 59 || sc > 60 {
+		return z, false
+	}
+	var nanos u32 = 0
+	pos := usize(19)
+	if pos < len(b) && b[pos] == '.' {
+		pos++
+		var mult u32 = 100_000_000
+		digits := usize(0)
+		for step := usize(0); step < 12; step++ {
+			if pos >= len(b) || b[pos] < '0' || b[pos] > '9' {
+				break
+			}
+			if mult > 0 {
+				nanos += u32(b[pos]-'0') * mult
+				mult /= 10
+			}
+			digits++
+			pos++
+		}
+		if digits == 0 {
+			return z, false
+		}
+	}
+	if pos != len(b)-1 || (b[pos] != 'Z' && b[pos] != 'z') {
+		return z, false
+	}
+	return DateTime{
+		Year:       i32(yr),
+		Month:      u8(mo),
+		Day:        u8(dy),
+		Hour:       u8(hr),
+		Minute:     u8(mi),
+		Second:     u8(sc),
+		Nanosecond: nanos,
+	}, true
+}

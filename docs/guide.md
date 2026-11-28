@@ -97,7 +97,10 @@ scope conns := NewFiberScope(4, 4096) {
 | `std/sort` | Total in-place sorting |
 | `std/path` | Zero-allocation path manipulation |
 | `std/json` | Bounded `json.Builder[N]` encoder + zero-copy `GetString`/`GetInt`/`GetUint`/`GetBool` |
-| `std/http` | Zero-GC M:N `epoll` HTTP/1.1 Keep-Alive server (`http.Server`), live SSE streaming (`ServeStream`, `SSEStream`), and client (`http.Get`, `http.Post`, `http.Do`, `http.SubscribeSSE`) |
+| `std/http` | Zero-GC M:N `epoll` HTTP/1.1 Keep-Alive server (`http.Server`), `Router` (`:params`, `*wildcard`, `QueryValue`, `CookieValue`), live SSE (`ServeStream`, `SSEStream`), and client (`Get`, `Post`, `Do`, `SubscribeSSE`) |
+| `std/net/dns` | Pure-FinCore RFC 1035 DNS A-record resolver (`/etc/hosts`, `/etc/resolv.conf`, `QueryUDP`, `QueryTCP`, `ResolveIPv4`) |
+| `std/time` | Zero-GC UTC calendar (`Clock.UnixNs()`, `DateTime`, RFC 3339 format/parse, RFC 7231 HTTP-date) |
+| `std/flag` | Go-style zero-GC CLI flag parser over `Env` (`Bool`, `Uint`, `Int`, `String`, `--`, positional args, `WriteUsage`) |
 | `std/sql` | Driver-agnostic zero-GC SQL core (`Param` enum, zero-copy `Row`, `RowBuf`, `Result`, `DBError` SQLSTATE) |
 | `std/pg` | Pure-FinCore PostgreSQL v3.0 wire-protocol driver (`SCRAM-SHA-256`/MD5/cleartext/trust, pipelined Extended Query, scoped `Open` & `WithTx`) |
 | `std/encoding/hex` | Zero-alloc hexadecimal `Encode` / `Decode` (`EncodedLen`, `DecodedLen`) |

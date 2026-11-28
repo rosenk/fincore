@@ -2695,7 +2695,7 @@ driver func (c *Checker) checkBuiltinMethodCall(en u32, recvExpr u32, recvTy u32
 		rs[0] = TYListener
 		rs[1] = TYError
 		retTy = makeTupleType(rs[:])
-	} else if bm == BMNetDialTCP {
+	} else if bm == BMNetDialTCP || bm == BMNetDialUDP {
 		if n.c == 2 {
 			_ = c.checkExpr(listPool[n.b], TYContext)
 			_ = c.checkExpr(listPool[n.b+1], TYString)
@@ -2736,7 +2736,7 @@ driver func (c *Checker) checkBuiltinMethodCall(en u32, recvExpr u32, recvTy u32
 		rs[0] = TYContext
 		rs[1] = TYCancelFunc
 		retTy = makeTupleType(rs[:])
-	} else if bm == BMClockNow {
+	} else if bm == BMClockNow || bm == BMClockUnixNs {
 		retTy = TYU64
 	} else if bm == BMClockSleep {
 		if n.c != 2 {

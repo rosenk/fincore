@@ -23,6 +23,7 @@
 
 .equ AF_INET,         2
 .equ SOCK_STREAM,     1
+.equ SOCK_DGRAM,      2
 .equ SOCK_NONBLOCK,   0x800
 .equ SOCK_CLOEXEC,    0x80000
 .equ SOL_SOCKET,      1
@@ -708,6 +709,63 @@ _fc_rt_net_dial_tcp:
     addq    $32, %rsp
     popq    %r13
     popq    %r12
+    popq    %rbx
+    ret
+
+# _fc_rt_net_dial_udp(%rdi = ctx_state, %rsi = ctx_deadline, %rdx = addr_ptr, %rcx = addr_len)
+# -> (%rax = conn_fd, %rdx = err)  (connected non-blocking IPv4 UDP socket)
+.global _fc_rt_net_dial_udp
+_fc_rt_net_dial_udp:
+    pushq   %rbx
+    subq    $32, %rsp
+    # Check ctx cancellation before dialing
+    pushq   %rdx
+    pushq   %rcx
+    call    _fc_rt_ctx_err
+    popq    %rcx
+    popq    %rdx
+    testq   %rax, %rax
+    jnz     .L_du_ctx_err
+    movq    %rdx, %rdi
+    movq    %rcx, %rsi
+    call    .L_parse_ipv4_port
+    testq   %rcx, %rcx
+    jz      .L_du_err_io
+    movw    $AF_INET, 0(%rsp)
+    movw    %dx, 2(%rsp)
+    movl    %eax, 4(%rsp)
+    movq    $0, 8(%rsp)
+    movq    $SYS_socket, %rax
+    movq    $AF_INET, %rdi
+    movq    $(SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC), %rsi
+    xorq    %rdx, %rdx
+    syscall
+    testq   %rax, %rax
+    jl      .L_du_err_io
+    movq    %rax, %rbx
+    movq    $SYS_connect, %rax
+    movq    %rbx, %rdi
+    movq    %rsp, %rsi
+    movq    $16, %rdx
+    syscall
+    testq   %rax, %rax
+    jl      .L_du_close_io
+    movq    %rbx, %rax
+    xorq    %rdx, %rdx
+    jmp     .L_du_ret
+.L_du_close_io:
+    movq    $SYS_close, %rax
+    movq    %rbx, %rdi
+    syscall
+.L_du_err_io:
+    movq    $-1, %rax
+    movq    $ERR_IO, %rdx
+    jmp     .L_du_ret
+.L_du_ctx_err:
+    movq    %rax, %rdx
+    movq    $-1, %rax
+.L_du_ret:
+    addq    $32, %rsp
     popq    %rbx
     ret
 

@@ -65,6 +65,7 @@
 .equ EINTR,         4
 .equ ENOENT,        2
 .equ ENOTDIR,       20
+.equ CLOCK_REALTIME,  0
 .equ CLOCK_MONOTONIC, 1
 
 # ---------------------------------------------------------------------------
@@ -598,6 +599,20 @@ _fc_rt_clock_now:
     subq    $24, %rsp
     movq    $SYS_clock_gettime, %rax
     movq    $CLOCK_MONOTONIC, %rdi
+    movq    %rsp, %rsi
+    syscall
+    movq    (%rsp), %rax      # tv_sec
+    imulq   $1000000000, %rax, %rax
+    addq    8(%rsp), %rax     # tv_nsec
+    addq    $24, %rsp
+    ret
+
+# _fc_rt_clock_unix_ns() -> %rax (wall-clock CLOCK_REALTIME ns since 1970-01-01T00:00:00Z)
+.global _fc_rt_clock_unix_ns
+_fc_rt_clock_unix_ns:
+    subq    $24, %rsp
+    movq    $SYS_clock_gettime, %rax
+    movq    $CLOCK_REALTIME, %rdi
     movq    %rsp, %rsi
     syscall
     movq    (%rsp), %rax      # tv_sec

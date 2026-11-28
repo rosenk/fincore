@@ -1,0 +1,393 @@
+// Zero-GC HTTP/1.1 Router (path params `:id`, `*wildcard`), URL percent-decoding,
+// query string lookup, and Cookie parsing — 100% Layer-2 total, zero heap.
+package http
+
+import "std/strings"
+
+const (
+	MaxRouteParams usize = 8
+	MaxRoutes      usize = 64
+)
+
+type paramSpan struct {
+	keyOff u16
+	keyLen u16
+	valOff u16
+	valLen u16
+}
+
+// Params holds extracted path parameters for a matched route (e.g. `/users/:id`).
+type Params struct {
+	keyBuf [256]byte
+	keyLen usize
+	valBuf [512]byte
+	valLen usize
+	items  [MaxRouteParams]paramSpan
+	count  usize
+}
+
+func (p *Params) Reset() {
+	p.keyLen = 0
+	p.valLen = 0
+	p.count = 0
+}
+
+func (p *Params) add(k const []byte, v const []byte) {
+	if p.count >= MaxRouteParams {
+		return
+	}
+	ko := p.keyLen
+	kn := len(k)
+	if ko+kn > len(p.keyBuf) {
+		kn = len(p.keyBuf) - ko
+	}
+	for i := usize(0); i < kn; i++ {
+		p.keyBuf[ko+i] = k[i]
+	}
+	p.keyLen = ko + kn
+
+	vo := p.valLen
+	vn := len(v)
+	if vo+vn > len(p.valBuf) {
+		vn = len(p.valBuf) - vo
+	}
+	for i := usize(0); i < vn; i++ {
+		p.valBuf[vo+i] = v[i]
+	}
+	p.valLen = vo + vn
+
+	p.items[p.count] = paramSpan{
+		keyOff: u16(ko),
+		keyLen: u16(kn),
+		valOff: u16(vo),
+		valLen: u16(vn),
+	}
+	p.count++
+}
+
+func (p const *Params) Len() usize {
+	return p.count
+}
+
+func (p const *Params) Get(name string) (const []byte, bool) {
+	target := strView(name)
+	for i := usize(0); i < p.count; i++ {
+		it := p.items[i]
+		ks := usize(it.keyOff)
+		if strings.Equal(p.keyBuf[ks:ks+usize(it.keyLen)], target) {
+			vs := usize(it.valOff)
+			return p.valBuf[vs : vs+usize(it.valLen)], true
+		}
+	}
+	return p.valBuf[:0], false
+}
+
+func (p const *Params) Uint(name string) (u64, bool) {
+	v, ok := p.Get(name)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseUint(v)
+}
+
+func (p const *Params) Int(name string) (i64, bool) {
+	v, ok := p.Get(name)
+	if !ok {
+		return 0, false
+	}
+	return strings.ParseInt(v)
+}
+
+// MatchRoute matches path against pattern supporting `:param` segments and trailing `*wildcard`.
+func MatchRoute(pattern string, path const []byte, params *Params) bool {
+	params.Reset()
+	pat := strView(pattern)
+	pn := len(pat)
+	sn := len(path)
+
+	pi := usize(0)
+	si := usize(0)
+	if pi < pn && pat[pi] == '/' {
+		pi++
+	}
+	if si < sn && path[si] == '/' {
+		si++
+	}
+
+	for step := usize(0); step < 64; step++ {
+		if pi >= pn && si >= sn {
+			return true
+		}
+		if pi >= pn || si >= sn {
+			return false
+		}
+
+		// Extract next pattern segment
+		pEnd := pn
+		for j := pi; j < pn; j++ {
+			if pat[j] == '/' {
+				pEnd = j
+				break
+			}
+		}
+		pSeg := pat[pi:pEnd]
+
+		// Trailing wildcard `*name` captures the entire remaining path!
+		if len(pSeg) >= 1 && pSeg[0] == '*' {
+			if len(pSeg) > 1 {
+				params.add(pSeg[1:], path[si:])
+			}
+			return true
+		}
+
+		// Extract next path segment
+		sEnd := sn
+		for j := si; j < sn; j++ {
+			if path[j] == '/' {
+				sEnd = j
+				break
+			}
+		}
+		sSeg := path[si:sEnd]
+
+		if len(pSeg) >= 2 && pSeg[0] == ':' {
+			if len(sSeg) == 0 {
+				return false
+			}
+			params.add(pSeg[1:], sSeg)
+		} else {
+			if !strings.Equal(pSeg, sSeg) {
+				return false
+			}
+		}
+
+		pi = pEnd
+		if pi < pn && pat[pi] == '/' {
+			pi++
+		}
+		si = sEnd
+		if si < sn && path[si] == '/' {
+			si++
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// URL Percent-Decoding, Query String & Cookie Parsers
+
+func hexNibble(c byte) (u8, bool) {
+	if c >= '0' && c <= '9' {
+		return c - '0', true
+	}
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 10, true
+	}
+	if c >= 'A' && c <= 'F' {
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// URLDecode decodes application/x-www-form-urlencoded bytes (`+` -> ' ', `%XX` -> byte).
+func URLDecode(dst []byte, src const []byte) usize {
+	n := len(src)
+	di := usize(0)
+	si := usize(0)
+	for step := usize(0); step < n; step++ {
+		if si >= n || di >= len(dst) {
+			break
+		}
+		c := src[si]
+		if c == '+' {
+			dst[di] = ' '
+			di++
+			si++
+		} else if c == '%' && si+2 < n {
+			hi, ok1 := hexNibble(src[si+1])
+			lo, ok2 := hexNibble(src[si+2])
+			if ok1 && ok2 {
+				dst[di] = (hi << 4) | lo
+				di++
+				si += 3
+			} else {
+				dst[di] = c
+				di++
+				si++
+			}
+		} else {
+			dst[di] = c
+			di++
+			si++
+		}
+	}
+	return di
+}
+
+// QueryValue finds key in a URL query string ("a=1&q=hello%20world") and URL-decodes its value into dst.
+func QueryValue(query const []byte, key string, dst []byte) (usize, bool) {
+	target := strView(key)
+	pos := usize(0)
+	n := len(query)
+	for step := usize(0); step < 64; step++ {
+		if pos >= n {
+			break
+		}
+		amp := n
+		for j := pos; j < n; j++ {
+			if query[j] == '&' {
+				amp = j
+				break
+			}
+		}
+		pair := query[pos:amp]
+		if eq, hasEq := strings.IndexByte(pair, '='); hasEq {
+			if strings.Equal(pair[:eq], target) {
+				return URLDecode(dst, pair[eq+1:]), true
+			}
+		} else if strings.Equal(pair, target) {
+			return 0, true
+		}
+		pos = amp + 1
+	}
+	return 0, false
+}
+
+// CookieValue returns the zero-copy value of cookie `name` from the `Cookie:` request header.
+func CookieValue(req const *Request, name string) (const []byte, bool) {
+	cookieTarget := strView("Cookie")
+	var hdrStart usize = 0
+	var hdrEnd usize = 0
+	foundHdr := false
+	for i := u32(0); i < req.nHeaders; i++ {
+		h := req.headers[i]
+		ns := usize(h.nameOff)
+		if strings.EqualFold(req.buf[ns:ns+usize(h.nameLen)], cookieTarget) {
+			hdrStart = usize(h.valOff)
+			hdrEnd = hdrStart + usize(h.valLen)
+			foundHdr = true
+			break
+		}
+	}
+	if !foundHdr {
+		return req.buf[:0], false
+	}
+	target := strView(name)
+	pos := hdrStart
+	for step := usize(0); step < 64; step++ {
+		if pos >= hdrEnd {
+			break
+		}
+		semi := hdrEnd
+		for j := pos; j < hdrEnd; j++ {
+			if req.buf[j] == ';' {
+				semi = j
+				break
+			}
+		}
+		// Trim leading/trailing spaces of `k=v`
+		lo := pos
+		hi := semi
+		for ws := usize(0); ws < semi-pos; ws++ {
+			if lo < hi && (req.buf[lo] == ' ' || req.buf[lo] == '\t') {
+				lo++
+			} else {
+				break
+			}
+		}
+		for ws := usize(0); ws < semi-pos; ws++ {
+			if hi > lo && (req.buf[hi-1] == ' ' || req.buf[hi-1] == '\t') {
+				hi--
+			} else {
+				break
+			}
+		}
+		if eq, hasEq := strings.IndexByte(req.buf[lo:hi], '='); hasEq {
+			kEnd := lo + eq
+			for ws := usize(0); ws < eq; ws++ {
+				if kEnd > lo && (req.buf[kEnd-1] == ' ' || req.buf[kEnd-1] == '\t') {
+					kEnd--
+				} else {
+					break
+				}
+			}
+			if strings.Equal(req.buf[lo:kEnd], target) {
+				vLo := lo + eq + 1
+				for ws := usize(0); ws < hi-vLo; ws++ {
+					if vLo < hi && (req.buf[vLo] == ' ' || req.buf[vLo] == '\t') {
+						vLo++
+					} else {
+						break
+					}
+				}
+				return req.buf[vLo:hi], true
+			}
+		}
+		pos = semi + 1
+	}
+	return req.buf[:0], false
+}
+
+// ---------------------------------------------------------------------------
+// Bounded Zero-GC Router (supports automatic 404 & 405 Method Not Allowed)
+
+type routeEntry struct {
+	method  string
+	pattern string
+	handler func(const *Request, const *Params, *ResponseWriter)
+}
+
+type Router struct {
+	routes [MaxRoutes]routeEntry
+	count  usize
+}
+
+func (rt *Router) Handle(method string, pattern string, handler func(const *Request, const *Params, *ResponseWriter)) {
+	if rt.count >= MaxRoutes {
+		return
+	}
+	rt.routes[rt.count] = routeEntry{
+		method:  method,
+		pattern: pattern,
+		handler: handler,
+	}
+	rt.count++
+}
+
+func (rt *Router) Get(pattern string, handler func(const *Request, const *Params, *ResponseWriter)) {
+	rt.Handle("GET", pattern, handler)
+}
+
+func (rt *Router) Post(pattern string, handler func(const *Request, const *Params, *ResponseWriter)) {
+	rt.Handle("POST", pattern, handler)
+}
+
+func (rt *Router) Put(pattern string, handler func(const *Request, const *Params, *ResponseWriter)) {
+	rt.Handle("PUT", pattern, handler)
+}
+
+func (rt *Router) Delete(pattern string, handler func(const *Request, const *Params, *ResponseWriter)) {
+	rt.Handle("DELETE", pattern, handler)
+}
+
+// Dispatch matches req against registered routes, invoking the handler with extracted Params,
+// or writing 405 Method Not Allowed / 404 Not Found automatically.
+func (rt const *Router) Dispatch(req const *Request, w *ResponseWriter) {
+	var params Params
+	pathMatched := false
+	reqPath := req.Path()
+	for i := usize(0); i < rt.count; i++ {
+		if MatchRoute(rt.routes[i].pattern, reqPath, &params) {
+			pathMatched = true
+			if req.MethodIs(rt.routes[i].method) {
+				rt.routes[i].handler(req, &params, w)
+				return
+			}
+		}
+	}
+	if pathMatched {
+		w.WriteText(StatusMethodNotAllowed, "method not allowed")
+	} else {
+		w.WriteText(StatusNotFound, "not found")
+	}
+}

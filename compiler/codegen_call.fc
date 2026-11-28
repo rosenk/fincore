@@ -1246,7 +1246,7 @@ driver func (f *FnGen) emitBuiltinMethodFromSlots(bm u16, recvOff i64, argOffs [
 		}
 		return
 	}
-	if bm == BMNetDialTCP {
+	if bm == BMNetDialTCP || bm == BMNetDialUDP {
 		em("    movq ")
 		emI(argOffs[0])
 		em("(%rbp), %rdi\n    movq ")
@@ -1255,7 +1255,11 @@ driver func (f *FnGen) emitBuiltinMethodFromSlots(bm u16, recvOff i64, argOffs [
 		emI(argOffs[1])
 		em("(%rbp), %rdx\n    movq ")
 		emI(argOffs[1] + 8)
-		em("(%rbp), %rcx\n    call _fc_rt_net_dial_tcp\n")
+		if bm == BMNetDialUDP {
+			em("(%rbp), %rcx\n    call _fc_rt_net_dial_udp\n")
+		} else {
+			em("(%rbp), %rcx\n    call _fc_rt_net_dial_tcp\n")
+		}
 		if dst0 != 0 {
 			em("    movq %rax, ")
 			emI(dst0)
@@ -1352,8 +1356,12 @@ driver func (f *FnGen) emitBuiltinMethodFromSlots(bm u16, recvOff i64, argOffs [
 		}
 		return
 	}
-	if bm == BMClockNow {
-		em("    call _fc_rt_clock_now\n")
+	if bm == BMClockNow || bm == BMClockUnixNs {
+		if bm == BMClockUnixNs {
+			em("    call _fc_rt_clock_unix_ns\n")
+		} else {
+			em("    call _fc_rt_clock_now\n")
+		}
 		if dst0 != 0 {
 			em("    movq %rax, ")
 			emI(dst0)

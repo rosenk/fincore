@@ -194,6 +194,8 @@ const (
 	BMAtomicAdd         u16 = 42
 	BMAtomicSwap        u16 = 43
 	BMAtomicCAS         u16 = 44
+	BMClockUnixNs       u16 = 45
+	BMNetDialUDP        u16 = 46
 )
 
 // Call kinds.
@@ -1758,6 +1760,9 @@ func lookupBuiltinMethod(recvTy u32, nameStr u32) u16 {
 		if sliceEq(s, strBytes("DialTCP")) {
 			return BMNetDialTCP
 		}
+		if sliceEq(s, strBytes("DialUDP")) {
+			return BMNetDialUDP
+		}
 	} else if recvTy == TYListener {
 		if sliceEq(s, strBytes("Addr")) {
 			return BMListenerAddr
@@ -1788,6 +1793,9 @@ func lookupBuiltinMethod(recvTy u32, nameStr u32) u16 {
 	} else if recvTy == TYClock {
 		if sliceEq(s, strBytes("Now")) {
 			return BMClockNow
+		}
+		if sliceEq(s, strBytes("UnixNs")) {
+			return BMClockUnixNs
 		}
 		if sliceEq(s, strBytes("Sleep")) {
 			return BMClockSleep

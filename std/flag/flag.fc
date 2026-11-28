@@ -1,0 +1,364 @@
+// Package flag implements a Go-style zero-GC command-line flag parser over Env
+// (supports --name=val, --name val, -n val, --bool, -b, --, and positional args).
+package flag
+
+import "std/strings"
+
+const (
+	MaxFlags      usize = 32
+	MaxPositional usize = 32
+	MaxStrValLen  usize = 256
+)
+
+const (
+	KindBool   u8 = 0
+	KindUint   u8 = 1
+	KindInt    u8 = 2
+	KindString u8 = 3
+)
+
+type flagDef struct {
+	name    string
+	short   byte
+	usage   string
+	kind    u8
+	boolVal bool
+	uintVal u64
+	intVal  i64
+	strBuf  [MaxStrValLen]byte
+	strLen  usize
+	wasSet  bool
+}
+
+type posArg struct {
+	buf [MaxStrValLen]byte
+	len usize
+}
+
+// FlagSet holds registered CLI flags and parsed results in bounded stack storage.
+type FlagSet struct {
+	programName string
+	defs        [MaxFlags]flagDef
+	nDefs       usize
+	pos         [MaxPositional]posArg
+	nPos        usize
+	helpWanted  bool
+}
+
+func New(programName string) FlagSet {
+	return FlagSet{programName: programName}
+}
+
+func copyToBuf(dst []byte, src const []byte) usize {
+	n := len(src)
+	if n > len(dst) {
+		n = len(dst)
+	}
+	for i := usize(0); i < n; i++ {
+		dst[i] = src[i]
+	}
+	return n
+}
+
+// Bool registers a boolean flag (`--name` or `-short`). Returns its index handle.
+func (fs *FlagSet) Bool(name string, short byte, defVal bool, usage string) usize {
+	if fs.nDefs >= MaxFlags {
+		return 0
+	}
+	idx := fs.nDefs
+	fs.defs[idx] = flagDef{
+		name:    name,
+		short:   short,
+		usage:   usage,
+		kind:    KindBool,
+		boolVal: defVal,
+	}
+	fs.nDefs++
+	return idx
+}
+
+// Uint registers an unsigned 64-bit integer flag.
+func (fs *FlagSet) Uint(name string, short byte, defVal u64, usage string) usize {
+	if fs.nDefs >= MaxFlags {
+		return 0
+	}
+	idx := fs.nDefs
+	fs.defs[idx] = flagDef{
+		name:    name,
+		short:   short,
+		usage:   usage,
+		kind:    KindUint,
+		uintVal: defVal,
+	}
+	fs.nDefs++
+	return idx
+}
+
+// Int registers a signed 64-bit integer flag.
+func (fs *FlagSet) Int(name string, short byte, defVal i64, usage string) usize {
+	if fs.nDefs >= MaxFlags {
+		return 0
+	}
+	idx := fs.nDefs
+	fs.defs[idx] = flagDef{
+		name:   name,
+		short:  short,
+		usage:  usage,
+		kind:   KindInt,
+		intVal: defVal,
+	}
+	fs.nDefs++
+	return idx
+}
+
+// String registers a string flag.
+func (fs *FlagSet) String(name string, short byte, defVal string, usage string) usize {
+	if fs.nDefs >= MaxFlags {
+		return 0
+	}
+	idx := fs.nDefs
+	fs.defs[idx] = flagDef{
+		name:  name,
+		short: short,
+		usage: usage,
+		kind:  KindString,
+	}
+	fs.defs[idx].strLen = copyToBuf(fs.defs[idx].strBuf[:], strView(defVal))
+	fs.nDefs++
+	return idx
+}
+
+func (fs const *FlagSet) GetBool(id usize) bool {
+	if id >= fs.nDefs {
+		return false
+	}
+	return fs.defs[id].boolVal
+}
+
+func (fs const *FlagSet) GetUint(id usize) u64 {
+	if id >= fs.nDefs {
+		return 0
+	}
+	return fs.defs[id].uintVal
+}
+
+func (fs const *FlagSet) GetInt(id usize) i64 {
+	if id >= fs.nDefs {
+		return 0
+	}
+	return fs.defs[id].intVal
+}
+
+func (fs const *FlagSet) GetString(id usize) const []byte {
+	if id >= fs.nDefs {
+		return fs.defs[0].strBuf[:0]
+	}
+	return fs.defs[id].strBuf[:fs.defs[id].strLen]
+}
+
+func (fs const *FlagSet) WasSet(id usize) bool {
+	if id >= fs.nDefs {
+		return false
+	}
+	return fs.defs[id].wasSet
+}
+
+func (fs const *FlagSet) HelpRequested() bool {
+	return fs.helpWanted
+}
+
+func (fs const *FlagSet) NumPositional() usize {
+	return fs.nPos
+}
+
+func (fs const *FlagSet) Positional(i usize) const []byte {
+	if i >= fs.nPos {
+		return fs.pos[0].buf[:0]
+	}
+	return fs.pos[i].buf[:fs.pos[i].len]
+}
+
+func (fs const *FlagSet) findLong(name const []byte) (usize, bool) {
+	for i := usize(0); i < fs.nDefs; i++ {
+		if strings.EqualStr(name, fs.defs[i].name) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (fs const *FlagSet) findShort(ch byte) (usize, bool) {
+	if ch == 0 {
+		return 0, false
+	}
+	for i := usize(0); i < fs.nDefs; i++ {
+		if fs.defs[i].short == ch {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func (fs *FlagSet) assignValue(idx usize, val const []byte) error {
+	k := fs.defs[idx].kind
+	if k == KindBool {
+		if strings.EqualFoldStr(val, "true") || strings.EqualStr(val, "1") {
+			fs.defs[idx].boolVal = true
+			fs.defs[idx].wasSet = true
+			return nil
+		}
+		if strings.EqualFoldStr(val, "false") || strings.EqualStr(val, "0") {
+			fs.defs[idx].boolVal = false
+			fs.defs[idx].wasSet = true
+			return nil
+		}
+		return ErrParse
+	}
+	if k == KindUint {
+		v, ok := strings.ParseUint(val)
+		if !ok {
+			return ErrParse
+		}
+		fs.defs[idx].uintVal = v
+		fs.defs[idx].wasSet = true
+		return nil
+	}
+	if k == KindInt {
+		v, ok := strings.ParseInt(val)
+		if !ok {
+			return ErrParse
+		}
+		fs.defs[idx].intVal = v
+		fs.defs[idx].wasSet = true
+		return nil
+	}
+	fs.defs[idx].strLen = copyToBuf(fs.defs[idx].strBuf[:], val)
+	fs.defs[idx].wasSet = true
+	return nil
+}
+
+func (fs *FlagSet) addPositional(arg const []byte) {
+	if fs.nPos >= MaxPositional {
+		return
+	}
+	fs.pos[fs.nPos].len = copyToBuf(fs.pos[fs.nPos].buf[:], arg)
+	fs.nPos++
+}
+
+// ParseSlice parses an explicit argument slice (excluding argv[0]), ideal for tests and subcommands.
+func (fs *FlagSet) ParseSlice(args const []string) error {
+	fs.nPos = 0
+	fs.helpWanted = false
+	afterDashDash := false
+	skipNext := false
+	n := len(args)
+
+	for i := usize(0); i < n; i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		a := strView(args[i])
+		if afterDashDash || len(a) < 2 || a[0] != '-' {
+			fs.addPositional(a)
+			continue
+		}
+		if len(a) == 2 && a[0] == '-' && a[1] == '-' {
+			afterDashDash = true
+			continue
+		}
+		if strings.EqualStr(a, "-h") || strings.EqualStr(a, "--help") {
+			fs.helpWanted = true
+			continue
+		}
+
+		// Long flag `--name` or `--name=val`, or short flag `-n` / `-n=val`
+		var idx usize = 0
+		var found bool = false
+		var hasInlineVal bool = false
+		var inlineVal const []byte = a[:0]
+
+		if a[1] == '-' {
+			rest := a[2:]
+			if eqPos, hasEq := strings.IndexByte(rest, '='); hasEq {
+				idx, found = fs.findLong(rest[:eqPos])
+				hasInlineVal = true
+				inlineVal = rest[eqPos+1:]
+			} else {
+				idx, found = fs.findLong(rest)
+			}
+		} else {
+			rest := a[1:]
+			if len(rest) == 1 {
+				idx, found = fs.findShort(rest[0])
+			} else if len(rest) >= 2 && rest[1] == '=' {
+				idx, found = fs.findShort(rest[0])
+				hasInlineVal = true
+				inlineVal = rest[2:]
+			} else {
+				idx, found = fs.findLong(rest)
+			}
+		}
+
+		if !found {
+			return ErrParse
+		}
+
+		if fs.defs[idx].kind == KindBool && !hasInlineVal {
+			fs.defs[idx].boolVal = true
+			fs.defs[idx].wasSet = true
+			continue
+		}
+		if hasInlineVal {
+			if err := fs.assignValue(idx, inlineVal); err != nil {
+				return err
+			}
+			continue
+		}
+		if i+1 >= n {
+			return ErrParse
+		}
+		if err := fs.assignValue(idx, strView(args[i+1])); err != nil {
+			return err
+		}
+		skipNext = true
+	}
+	return nil
+}
+
+// Parse parses process arguments from Env (starting at argv[1]).
+func (fs *FlagSet) Parse(env Env) error {
+	argc := env.ArgsCount()
+	if argc <= 1 {
+		return nil
+	}
+	var args [64]string
+	cnt := argc - 1
+	if cnt > 64 {
+		cnt = 64
+	}
+	for i := usize(0); i < cnt; i++ {
+		args[i] = env.Arg(i + 1)
+	}
+	return fs.ParseSlice(args[:cnt])
+}
+
+// WriteUsage writes a clean Go-style usage summary to stderr.
+func (fs const *FlagSet) WriteUsage(io Stdio) {
+	var line [512]byte
+	hn := formatTo(line[:], "Usage: %s [flags]\n", fs.programName)
+	_ = io.WriteStderr(line[:hn])
+	for i := usize(0); i < fs.nDefs; i++ {
+		d := fs.defs[i]
+		var ln usize = 0
+		if d.short != 0 {
+			var sh [2]byte
+			sh[0] = '-'
+			sh[1] = d.short
+			ln = formatTo(line[:], "  %s, --%s\t%s\n", bytesToStr(sh[:]), d.name, d.usage)
+		} else {
+			ln = formatTo(line[:], "      --%s\t%s\n", d.name, d.usage)
+		}
+		_ = io.WriteStderr(line[:ln])
+	}
+}

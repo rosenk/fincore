@@ -1,0 +1,414 @@
+// Package dns provides a pure-FinCore, zero-GC RFC 1035 DNS A-record resolver
+// with /etc/hosts and /etc/resolv.conf parsing, RFC 1035 label compression,
+// and UDP/TCP DNS transport over Net.DialUDP / Net.DialTCP.
+package dns
+
+import "std/strings"
+
+const (
+	TypeA   u16 = 1
+	ClassIN u16 = 1
+)
+
+// IPv4 holds a resolved 4-byte IPv4 address.
+type IPv4 struct {
+	Octets [4]byte
+}
+
+// Format formats ip as dotted-quad ASCII (e.g. "93.184.216.34") into dst.
+func (ip const *IPv4) Format(dst []byte) usize {
+	return formatTo(dst, "%d.%d.%d.%d",
+		u32(ip.Octets[0]), u32(ip.Octets[1]), u32(ip.Octets[2]), u32(ip.Octets[3]))
+}
+
+// FormatHostPort formats ip + port as "A.B.C.D:PORT" (ready for net.DialTCP).
+func (ip const *IPv4) FormatHostPort(dst []byte, port u16) usize {
+	return formatTo(dst, "%d.%d.%d.%d:%d",
+		u32(ip.Octets[0]), u32(ip.Octets[1]), u32(ip.Octets[2]), u32(ip.Octets[3]), u32(port))
+}
+
+// ParseIPv4 parses a dotted-quad IPv4 literal ("127.0.0.1").
+func ParseIPv4(s const []byte) (IPv4, bool) {
+	var ip IPv4
+	pos := usize(0)
+	n := len(s)
+	for oct := usize(0); oct < 4; oct++ {
+		if pos >= n {
+			return ip, false
+		}
+		end := n
+		if oct < 3 {
+			foundDot := false
+			for j := pos; j < n; j++ {
+				if s[j] == '.' {
+					end = j
+					foundDot = true
+					break
+				}
+			}
+			if !foundDot {
+				return ip, false
+			}
+		}
+		v, ok := strings.ParseUint(s[pos:end])
+		if !ok || v > 255 {
+			return ip, false
+		}
+		ip.Octets[oct] = byte(v)
+		pos = end + 1
+	}
+	if pos != n+1 {
+		return ip, false
+	}
+	return ip, true
+}
+
+func putBE16(dst []byte, off usize, v u16) {
+	dst[off] = byte((v >> 8) & 0xff)
+	dst[off+1] = byte(v & 0xff)
+}
+
+func getBE16(b const []byte, off usize) u16 {
+	return (u16(b[off]) << 8) | u16(b[off+1])
+}
+
+// ---------------------------------------------------------------------------
+// RFC 1035 Wire Packet Builder & Parser (Layer-2 Total, Zero-Alloc)
+
+// BuildQueryA builds a standard RFC 1035 recursive A-record query packet into dst.
+func BuildQueryA(dst []byte, txID u16, host const []byte) (usize, error) {
+	if len(dst) < 64 || len(host) == 0 || len(host) > 253 {
+		return 0, ErrParse
+	}
+	// 12-byte DNS Header: ID, Flags=0x0100 (RD=1), QDCOUNT=1, AN/NS/AR=0
+	putBE16(dst, 0, txID)
+	putBE16(dst, 2, 0x0100)
+	putBE16(dst, 4, 1)
+	putBE16(dst, 6, 0)
+	putBE16(dst, 8, 0)
+	putBE16(dst, 10, 0)
+
+	pos := usize(12)
+	n := len(host)
+	// Strip optional trailing dot
+	if n > 0 && host[n-1] == '.' {
+		n--
+	}
+	segStart := usize(0)
+	for i := usize(0); i < n+1; i++ {
+		if i == n || host[i] == '.' {
+			segLen := i - segStart
+			if segLen == 0 || segLen > 63 || pos+1+segLen+5 > len(dst) {
+				return 0, ErrParse
+			}
+			dst[pos] = byte(segLen)
+			pos++
+			for j := usize(0); j < segLen; j++ {
+				dst[pos+j] = host[segStart+j]
+			}
+			pos += segLen
+			segStart = i + 1
+		}
+	}
+	dst[pos] = 0 // root label
+	pos++
+	putBE16(dst, pos, TypeA)
+	pos += 2
+	putBE16(dst, pos, ClassIN)
+	pos += 2
+	return pos, nil
+}
+
+// skipDNSName skips an RFC 1035 domain name (including 0xC0 compression pointers).
+func skipDNSName(pkt const []byte, start usize) (usize, bool) {
+	pos := start
+	n := len(pkt)
+	for step := usize(0); step < 128; step++ {
+		if pos >= n {
+			return 0, false
+		}
+		b := pkt[pos]
+		if b == 0 {
+			return pos + 1, true
+		}
+		if (b & 0xc0) == 0xc0 {
+			if pos+2 > n {
+				return 0, false
+			}
+			return pos + 2, true
+		}
+		if (b & 0xc0) != 0 {
+			return 0, false
+		}
+		pos += 1 + usize(b)
+	}
+	return 0, false
+}
+
+// ParseResponseA extracts the first IPv4 A record from an RFC 1035 DNS response packet.
+func ParseResponseA(pkt const []byte, expectTxID u16) (IPv4, error) {
+	var ip IPv4
+	if len(pkt) < 12 {
+		return ip, ErrParse
+	}
+	txID := getBE16(pkt, 0)
+	if txID != expectTxID {
+		return ip, ErrParse
+	}
+	flags := getBE16(pkt, 2)
+	// Must be QR=1 (response) and RCODE=0 (no error)
+	if (flags&0x8000) == 0 || (flags&0x000f) != 0 {
+		return ip, ErrNotFound
+	}
+	qdCount := getBE16(pkt, 4)
+	anCount := getBE16(pkt, 6)
+	if anCount == 0 {
+		return ip, ErrNotFound
+	}
+
+	pos := usize(12)
+	// Skip Question section
+	for q := u16(0); q < qdCount; q++ {
+		nextPos, ok := skipDNSName(pkt, pos)
+		if !ok || nextPos+4 > len(pkt) {
+			return ip, ErrParse
+		}
+		pos = nextPos + 4 // QTYPE(2) + QCLASS(2)
+	}
+
+	// Scan Answer section for first IN A record (rdlen == 4)
+	for a := u16(0); a < anCount; a++ {
+		nextPos, ok := skipDNSName(pkt, pos)
+		if !ok || nextPos+10 > len(pkt) {
+			return ip, ErrParse
+		}
+		rtype := getBE16(pkt, nextPos)
+		rclass := getBE16(pkt, nextPos+2)
+		rdlen := usize(getBE16(pkt, nextPos+8))
+		rdataOff := nextPos + 10
+		if rdataOff+rdlen > len(pkt) {
+			return ip, ErrParse
+		}
+		if rtype == TypeA && rclass == ClassIN && rdlen == 4 {
+			ip.Octets[0] = pkt[rdataOff]
+			ip.Octets[1] = pkt[rdataOff+1]
+			ip.Octets[2] = pkt[rdataOff+2]
+			ip.Octets[3] = pkt[rdataOff+3]
+			return ip, nil
+		}
+		pos = rdataOff + rdlen
+	}
+	return ip, ErrNotFound
+}
+
+// ---------------------------------------------------------------------------
+// /etc/hosts & /etc/resolv.conf Parsers (Layer-2 Total)
+
+func isSpaceOrTab(c byte) bool {
+	return c == ' ' || c == '\t'
+}
+
+// LookupHostsData searches /etc/hosts file contents for host and returns its IPv4 address.
+func LookupHostsData(hostsData const []byte, host const []byte) (IPv4, bool) {
+	var z IPv4
+	pos := usize(0)
+	n := len(hostsData)
+	for step := usize(0); step < n+1; step++ {
+		if pos >= n {
+			break
+		}
+		lineEnd := n
+		for j := pos; j < n; j++ {
+			if hostsData[j] == '\n' {
+				lineEnd = j
+				break
+			}
+		}
+		line := hostsData[pos:lineEnd]
+		// Strip comments starting at '#'
+		if hashPos, hasHash := strings.IndexByte(line, '#'); hasHash {
+			line = line[:hashPos]
+		}
+		line = strings.TrimSpace(line)
+		if len(line) > 0 {
+			// First token is IP, remaining tokens are hostnames
+			sp := len(line)
+			for k := usize(0); k < len(line); k++ {
+				if isSpaceOrTab(line[k]) {
+					sp = k
+					break
+				}
+			}
+			if ip, okIP := ParseIPv4(line[:sp]); okIP && sp < len(line) {
+				tokPos := sp
+				for tokStep := usize(0); tokStep < 32; tokStep++ {
+					for ws := usize(0); ws < len(line); ws++ {
+						if tokPos < len(line) && isSpaceOrTab(line[tokPos]) {
+							tokPos++
+						} else {
+							break
+						}
+					}
+					if tokPos >= len(line) {
+						break
+					}
+					tokEnd := len(line)
+					for k := tokPos; k < len(line); k++ {
+						if isSpaceOrTab(line[k]) {
+							tokEnd = k
+							break
+						}
+					}
+					if strings.EqualFold(line[tokPos:tokEnd], host) {
+						return ip, true
+					}
+					tokPos = tokEnd
+				}
+			}
+		}
+		pos = lineEnd + 1
+	}
+	return z, false
+}
+
+// ParseResolvConf extracts the first IPv4 `nameserver` from /etc/resolv.conf contents.
+func ParseResolvConf(data const []byte) (IPv4, bool) {
+	var z IPv4
+	pos := usize(0)
+	n := len(data)
+	for step := usize(0); step < n+1; step++ {
+		if pos >= n {
+			break
+		}
+		lineEnd := n
+		for j := pos; j < n; j++ {
+			if data[j] == '\n' {
+				lineEnd = j
+				break
+			}
+		}
+		line := strings.TrimSpace(data[pos:lineEnd])
+		if strings.HasPrefix(line, strView("nameserver")) && len(line) > 10 && isSpaceOrTab(line[10]) {
+			rest := strings.TrimSpace(line[10:])
+			// Trim trailing comment or whitespace
+			end := len(rest)
+			for k := usize(0); k < len(rest); k++ {
+				if isSpaceOrTab(rest[k]) || rest[k] == '#' {
+					end = k
+					break
+				}
+			}
+			if ip, ok := ParseIPv4(rest[:end]); ok {
+				return ip, true
+			}
+		}
+		pos = lineEnd + 1
+	}
+	return z, false
+}
+
+// ---------------------------------------------------------------------------
+// Network DNS Resolvers (UDP & TCP)
+
+// QueryUDP resolves host by sending an RFC 1035 UDP DNS query to serverAddr ("IP:53").
+driver func QueryUDP(ctx Context, net Net, serverAddr string, host string) (IPv4, error) {
+	var z IPv4
+	var qbuf [512]byte
+	txID := u16(0x4643) ^ u16(len(host)*131)
+	qn, qerr := BuildQueryA(qbuf[:], txID, strView(host))
+	if qerr != nil {
+		return z, qerr
+	}
+	conn, err := net.DialUDP(ctx, serverAddr)
+	if err != nil {
+		return z, err
+	}
+	defer conn.Close()
+
+	if _, werr := conn.Write(ctx, qbuf[:qn]); werr != nil {
+		return z, werr
+	}
+	var rbuf [512]byte
+	rn, rerr := conn.Read(ctx, rbuf[:])
+	if rerr != nil {
+		return z, rerr
+	}
+	return ParseResponseA(rbuf[:rn], txID)
+}
+
+// QueryTCP resolves host using RFC 1035 DNS-over-TCP (2-byte BE length prefix).
+driver func QueryTCP(ctx Context, net Net, serverAddr string, host string) (IPv4, error) {
+	var z IPv4
+	var qbuf [514]byte
+	txID := u16(0x4643) ^ u16(len(host)*131)
+	qn, qerr := BuildQueryA(qbuf[2:], txID, strView(host))
+	if qerr != nil {
+		return z, qerr
+	}
+	putBE16(qbuf[:], 0, u16(qn))
+
+	conn, err := net.DialTCP(ctx, serverAddr)
+	if err != nil {
+		return z, err
+	}
+	defer conn.Close()
+
+	for rem := qbuf[:qn+2]; len(rem) > 0; {
+		n, werr := conn.Write(ctx, rem)
+		if werr != nil {
+			return z, werr
+		}
+		if n == 0 {
+			return z, ErrZeroWrite
+		}
+		rem = rem[n:]
+	}
+
+	var rbuf [514]byte
+	got := usize(0)
+	driver for {
+		if got >= 2 {
+			want := usize(getBE16(rbuf[:], 0))
+			if want > 512 {
+				return z, ErrParse
+			}
+			if got >= 2+want {
+				return ParseResponseA(rbuf[2:2+want], txID)
+			}
+		}
+		n, rerr := conn.Read(ctx, rbuf[got:])
+		if rerr != nil {
+			return z, rerr
+		}
+		if n == 0 {
+			return z, ErrEOF
+		}
+		got += n
+	}
+}
+
+// ResolveIPv4 resolves host via: (1) direct IPv4 literal, (2) /etc/hosts, (3) /etc/resolv.conf UDP query.
+driver func ResolveIPv4(ctx Context, net Net, fs FS, host string) (IPv4, error) {
+	hv := strView(host)
+	if ip, ok := ParseIPv4(hv); ok {
+		return ip, nil
+	}
+	var fbuf [8192]byte
+	if hn, herr := fs.ReadFileInto("/etc/hosts", fbuf[:]); herr == nil {
+		if ip, ok := LookupHostsData(fbuf[:hn], hv); ok {
+			return ip, nil
+		}
+	}
+	var nsAddr [32]byte
+	nsLen := usize(0)
+	if rn, rerr := fs.ReadFileInto("/etc/resolv.conf", fbuf[:]); rerr == nil {
+		if ns, ok := ParseResolvConf(fbuf[:rn]); ok {
+			nsLen = ns.FormatHostPort(nsAddr[:], 53)
+		}
+	}
+	if nsLen == 0 {
+		ns := IPv4{Octets: [4]byte{1, 1, 1, 1}}
+		nsLen = ns.FormatHostPort(nsAddr[:], 53)
+	}
+	return QueryUDP(ctx, net, bytesToStr(nsAddr[:nsLen]), host)
+}

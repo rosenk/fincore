@@ -1,0 +1,266 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/flag"
+	"std/http"
+	"std/net/dns"
+	"std/strings"
+	"std/time"
+)
+
+func userPostHandler(req const *http.Request, params const *http.Params, w *http.ResponseWriter) {
+	uid, okU := params.Uint("id")
+	pid, okP := params.Uint("pid")
+	if !okU || !okP {
+		w.WriteText(http.StatusBadRequest, "bad params")
+		return
+	}
+	var qbuf [128]byte
+	qn, _ := http.QueryValue(req.Query(), "q", qbuf[:])
+	var out [256]byte
+	n := formatTo(out[:], "u=%d p=%d q=%s", uid, pid, bytesToStr(qbuf[:qn]))
+	w.WriteBytes(http.StatusOK, "text/plain", out[:n])
+}
+
+func staticWildcardHandler(req const *http.Request, params const *http.Params, w *http.ResponseWriter) {
+	_ = req
+	fp, ok := params.Get("filepath")
+	if !ok {
+		w.WriteText(http.StatusNotFound, "missing")
+		return
+	}
+	var out [128]byte
+	n := formatTo(out[:], "file=%s", bytesToStr(fp))
+	w.WriteBytes(http.StatusOK, "text/plain", out[:n])
+}
+
+// Local RFC 1035 DNS-over-TCP test server answering with a compressed A record (93.184.216.34).
+driver func serveMockDNSTCP(ctx Context, ln Listener) {
+	defer ln.Close()
+	conn, err := ln.Accept(ctx)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	var qbuf [514]byte
+	got := usize(0)
+	var qlen usize = 0
+	driver for {
+		if got >= 2 {
+			qlen = (usize(qbuf[0]) << 8) | usize(qbuf[1])
+			if got >= 2+qlen {
+				break
+			}
+		}
+		n, rerr := conn.Read(ctx, qbuf[got:])
+		if rerr != nil || n == 0 {
+			return
+		}
+		got += n
+	}
+
+	// Build response: copy header + question, set QR=1/RA=1, ANCOUNT=1, append compressed A record
+	var resp [514]byte
+	for i := usize(0); i < qlen; i++ {
+		resp[2+i] = qbuf[2+i]
+	}
+	resp[2+2] = 0x81 // QR=1, RD=1
+	resp[2+3] = 0x80 // RA=1, RCODE=0
+	resp[2+6] = 0x00
+	resp[2+7] = 0x01 // ANCOUNT = 1
+
+	pos := 2 + qlen
+	// Compressed pointer to QNAME at offset 12 (0xC0 0x0C)
+	resp[pos] = 0xc0
+	resp[pos+1] = 0x0c
+	// TYPE = A (1), CLASS = IN (1), TTL = 60, RDLENGTH = 4
+	resp[pos+2] = 0
+	resp[pos+3] = 1
+	resp[pos+4] = 0
+	resp[pos+5] = 1
+	resp[pos+6] = 0
+	resp[pos+7] = 0
+	resp[pos+8] = 0
+	resp[pos+9] = 60
+	resp[pos+10] = 0
+	resp[pos+11] = 4
+	// RDATA = 93.184.216.34
+	resp[pos+12] = 93
+	resp[pos+13] = 184
+	resp[pos+14] = 216
+	resp[pos+15] = 34
+	pos += 16
+
+	ansLen := pos - 2
+	resp[0] = byte((ansLen >> 8) & 0xff)
+	resp[1] = byte(ansLen & 0xff)
+	_, _ = conn.Write(ctx, resp[:pos])
+}
+
+driver func main(io Stdio, net Net, clock Clock) error {
+	// 1. std/time + Clock.UnixNs() (CLOCK_REALTIME)
+	now := time.Now(clock)
+	epoch := time.FromUnixSec(0)
+	var tb1 [64]byte
+	n1 := epoch.FormatRFC3339(tb1[:])
+	var tb2 [64]byte
+	n2 := epoch.FormatHTTPDate(tb2[:])
+	leap, okLeap := time.ParseRFC3339(strView("2024-02-29T23:59:59.123456789Z"))
+	leapRT := time.FromUnixNs(leap.ToUnixNs())
+	var tb3 [64]byte
+	n3 := leapRT.FormatRFC3339Nano(tb3[:])
+	timeOk := now.Year >= 2024 &&
+		epoch.Weekday() == 4 &&
+		strings.EqualStr(tb1[:n1], "1970-01-01T00:00:00Z") &&
+		strings.EqualStr(tb2[:n2], "Thu, 01 Jan 1970 00:00:00 GMT") &&
+		okLeap && leap.Year == 2024 && leap.Month == 2 && leap.Day == 29 &&
+		strings.EqualStr(tb3[:n3], "2024-02-29T23:59:59.123456789Z")
+
+	// 2. std/flag
+	fs := flag.New("finc-app")
+	fPort := fs.Uint("port", 'p', 8080, "HTTP listen port")
+	fHost := fs.String("host", 'h', "127.0.0.1", "bind host")
+	fOff := fs.Int("offset", 0, 0, "signed offset")
+	fVerb := fs.Bool("verbose", 'v', false, "enable verbose logs")
+
+	argv := [8]string{"--port=9090", "-v", "--host", "0.0.0.0", "--offset=-5", "--", "--literal", "main.fc"}
+	ferr := fs.ParseSlice(argv[:])
+	badArgv := [1]string{"--unknown-flag"}
+	fs2 := flag.New("bad")
+	badErr := fs2.ParseSlice(badArgv[:])
+	flagOk := ferr == nil && badErr == ErrParse &&
+		fs.GetUint(fPort) == 9090 &&
+		strings.EqualStr(fs.GetString(fHost), "0.0.0.0") &&
+		fs.GetInt(fOff) == -5 &&
+		fs.GetBool(fVerb) &&
+		fs.NumPositional() == 2 &&
+		strings.EqualStr(fs.Positional(0), "--literal") &&
+		strings.EqualStr(fs.Positional(1), "main.fc")
+
+	// 3. std/net/dns (/etc/hosts, /etc/resolv.conf, RFC 1035 TCP query, Net.DialUDP)
+	mockHosts := strView("# comment\n127.0.0.1\tlocalhost local.dev # inline\n10.0.0.5 api.internal\n")
+	hip1, hok1 := dns.LookupHostsData(mockHosts, strView("LOCAL.DEV"))
+	hip2, hok2 := dns.LookupHostsData(mockHosts, strView("api.internal"))
+	var hstr [32]byte
+	hn2 := hip2.Format(hstr[:])
+
+	mockResolv := strView("# systemd-resolved\nsearch lan\nnameserver 1.1.1.1\n")
+	nsip, nsok := dns.ParseResolvConf(mockResolv)
+	var nsstr [32]byte
+	nsn := nsip.Format(nsstr[:])
+
+	dnsLn, derr := net.ListenTCP("127.0.0.1:0")
+	if derr != nil {
+		return derr
+	}
+	dnsAddr := dnsLn.Addr()
+	dnsCtx, stopDns := NewContext()
+	defer stopDns()
+
+	var dnsQueryOk bool = false
+	var udpOk bool = false
+
+	scope dnsScope := NewFiberScope(2, 8) {
+		_ = dnsScope.Spawn(dnsCtx, driver func() {
+			serveMockDNSTCP(dnsCtx, dnsLn)
+		})
+		qCtx, cancelQ := NewContext()
+		defer cancelQ()
+		gotIP, qerr := dns.QueryTCP(qCtx, net, dnsAddr, "example.com")
+		if qerr == nil {
+			var ipStr [32]byte
+			in := gotIP.Format(ipStr[:])
+			dnsQueryOk = strings.EqualStr(ipStr[:in], "93.184.216.34")
+		}
+		// Verify Net.DialUDP creates a connected non-blocking UDP Conn cleanly!
+		if uconn, uerr := net.DialUDP(qCtx, "127.0.0.1:53535"); uerr == nil {
+			var ping [4]byte
+			ping[0] = 'p'
+			ping[1] = 'i'
+			ping[2] = 'n'
+			ping[3] = 'g'
+			_, _ = uconn.Write(qCtx, ping[:])
+			_ = uconn.Close()
+			udpOk = true
+		}
+		dnsScope.Wait()
+	}
+	dnsOk := hok1 && hip1.Octets[0] == 127 && hip1.Octets[3] == 1 &&
+		hok2 && strings.EqualStr(hstr[:hn2], "10.0.0.5") &&
+		nsok && strings.EqualStr(nsstr[:nsn], "1.1.1.1") &&
+		dnsQueryOk && udpOk
+
+	// 4. std/http Router (:params, *wildcard, QueryValue/URLDecode, 404/405, CookieValue)
+	var router http.Router
+	router.Get("/users/:id/posts/:pid", userPostHandler)
+	router.Get("/static/*filepath", staticWildcardHandler)
+	routerPtr := &router
+
+	httpLn, herr := net.ListenTCP("127.0.0.1:0")
+	if herr != nil {
+		return herr
+	}
+	httpAddr := httpLn.Addr()
+	srvCtx, stopSrv := NewContext()
+	defer stopSrv()
+
+	var srv http.Server
+	srv.Workers = 2
+	srv.MaxConns = 16
+	srvPtr := &srv
+
+	var routeOk bool = false
+	var wildOk bool = false
+	var err405Ok bool = false
+	var err404Ok bool = false
+
+	scope httpScope := NewFiberScope(2, 16) {
+		_ = httpScope.Spawn(srvCtx, driver func() {
+			_ = srvPtr.Serve(srvCtx, httpLn, func(req const *http.Request, w *http.ResponseWriter) {
+				routerPtr.Dispatch(req, w)
+			})
+		})
+
+		cCtx, cancelC := NewContext()
+		defer cancelC()
+
+		var r1 http.ClientResponse
+		if e1 := http.Get(cCtx, net, httpAddr, "/users/42/posts/7?q=hello%20world+ok", &r1); e1 == nil {
+			routeOk = r1.StatusCode == http.StatusOK && strings.EqualStr(r1.Body(), "u=42 p=7 q=hello world ok")
+		}
+		var r2 http.ClientResponse
+		if e2 := http.Get(cCtx, net, httpAddr, "/static/css/app.css", &r2); e2 == nil {
+			wildOk = r2.StatusCode == http.StatusOK && strings.EqualStr(r2.Body(), "file=css/app.css")
+		}
+		var r3 http.ClientResponse
+		if e3 := http.Post(cCtx, net, httpAddr, "/users/42/posts/7", "text/plain", strView("x"), &r3); e3 == nil {
+			err405Ok = r3.StatusCode == http.StatusMethodNotAllowed
+		}
+		var r4 http.ClientResponse
+		if e4 := http.Get(cCtx, net, httpAddr, "/does-not-exist", &r4); e4 == nil {
+			err404Ok = r4.StatusCode == http.StatusNotFound
+		}
+
+		stopSrv()
+		httpScope.Wait()
+	}
+
+	// Test CookieValue parsing on a parsed HTTP Request
+	var creq http.Request
+	rawReq := strView("GET / HTTP/1.1\r\nHost: localhost\r\nCookie: a=1; sid=xyz99; theme=dark\r\n\r\n")
+	for i := usize(0); i < len(rawReq); i++ {
+		creq.buf[i] = rawReq[i]
+	}
+	creq.bufLen = len(rawReq)
+	_, _, parsedC := http.ParseRequest(&creq)
+	sid, okSid := http.CookieValue(&creq, "sid")
+	theme, okTheme := http.CookieValue(&creq, "theme")
+	cookieOk := parsedC && okSid && strings.EqualStr(sid, "xyz99") && okTheme && strings.EqualStr(theme, "dark")
+
+	var out [256]byte
+	n := formatTo(out[:], "time=%v flag=%v dns=%v http=%v,%v,%v,%v,%v\n",
+		timeOk, flagOk, dnsOk, routeOk, wildOk, err405Ok, err404Ok, cookieOk)
+	return io.WriteStdout(out[:n])
+}
