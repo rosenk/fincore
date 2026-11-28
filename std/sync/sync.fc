@@ -1,0 +1,235 @@
+// Package sync provides ZIO-inspired zero-GC concurrency and resilience primitives:
+//   - Semaphore (scoped WithPermit guaranteeing zero permit leaks)
+//   - CircuitBreaker (Closed / Open / HalfOpen fail-fast protection)
+//   - TokenBucket (allocation-free rate limiter over Clock)
+package sync
+
+// ---------------------------------------------------------------------------
+// Scoped Cooperative Semaphore (ZIO Semaphore.withPermit)
+
+type Semaphore struct {
+	permits    Atomic[u64]
+	maxPermits u64
+}
+
+func NewSemaphore(permits u64) Semaphore {
+	var s Semaphore
+	s.permits.Store(permits)
+	s.maxPermits = permits
+	return s
+}
+
+func (s const *Semaphore) Available() u64 {
+	return s.permits.Load()
+}
+
+// TryAcquire attempts to claim one permit without blocking.
+driver func (s *Semaphore) TryAcquire() bool {
+	driver for {
+		cur := s.permits.Load()
+		if cur == 0 {
+			return false
+		}
+		if s.permits.CompareAndSwap(cur, cur-1) {
+			return true
+		}
+	}
+}
+
+// Acquire cooperatively waits (via FiberYield) until one permit is acquired or ctx is cancelled.
+driver func (s *Semaphore) Acquire(ctx Context) error {
+	driver for {
+		if s.TryAcquire() {
+			return nil
+		}
+		if ctx.Done() {
+			return ctx.Err()
+		}
+		FiberYield()
+	}
+}
+
+// Release returns one permit back to the semaphore.
+func (s *Semaphore) Release() {
+	_ = s.permits.Add(1)
+}
+
+// WithPermit acquires a permit, runs fn, and ALWAYS releases the permit on exit
+// (even on error — zero permit leaks by construction).
+driver func (s *Semaphore) WithPermit(ctx Context, fn driver func() error) error {
+	if err := s.Acquire(ctx); err != nil {
+		return err
+	}
+	err := fn()
+	s.Release()
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// CircuitBreaker (Closed -> Open -> HalfOpen -> Closed)
+
+const (
+	CBClosed   u8 = 0
+	CBOpen     u8 = 1
+	CBHalfOpen u8 = 2
+)
+
+type CircuitBreaker struct {
+	lock             Atomic[u64]
+	state            u8
+	failures         u32
+	failureThreshold u32
+	openTimeoutNs    u64
+	openedAtNs       u64
+	probeInFlight    bool
+}
+
+func NewCircuitBreaker(failureThreshold u32, openTimeoutNs u64) CircuitBreaker {
+	thresh := failureThreshold
+	if thresh == 0 {
+		thresh = 1
+	}
+	return CircuitBreaker{
+		state:            CBClosed,
+		failureThreshold: thresh,
+		openTimeoutNs:    openTimeoutNs,
+	}
+}
+
+driver func (cb *CircuitBreaker) acquireLock() {
+	driver for {
+		if cb.lock.CompareAndSwap(0, 1) {
+			return
+		}
+		FiberYield()
+	}
+}
+
+func (cb *CircuitBreaker) releaseLock() {
+	cb.lock.Store(0)
+}
+
+driver func (cb *CircuitBreaker) State() u8 {
+	cb.acquireLock()
+	st := cb.state
+	cb.releaseLock()
+	return st
+}
+
+driver func (cb *CircuitBreaker) Failures() u32 {
+	cb.acquireLock()
+	f := cb.failures
+	cb.releaseLock()
+	return f
+}
+
+driver func (cb *CircuitBreaker) Reset() {
+	cb.acquireLock()
+	cb.state = CBClosed
+	cb.failures = 0
+	cb.openedAtNs = 0
+	cb.probeInFlight = false
+	cb.releaseLock()
+}
+
+// Call executes fn if the breaker allows it; fails fast with ErrClosed while Open.
+driver func (cb *CircuitBreaker) Call(clock Clock, fn driver func() error) error {
+	now := clock.Now()
+	cb.acquireLock()
+	if cb.state == CBOpen {
+		if now >= cb.openedAtNs && now-cb.openedAtNs >= cb.openTimeoutNs {
+			cb.state = CBHalfOpen
+			cb.probeInFlight = true
+		} else {
+			cb.releaseLock()
+			return ErrClosed
+		}
+	} else if cb.state == CBHalfOpen {
+		if cb.probeInFlight {
+			cb.releaseLock()
+			return ErrClosed
+		}
+		cb.probeInFlight = true
+	}
+	cb.releaseLock()
+
+	err := fn()
+
+	cb.acquireLock()
+	if err == nil {
+		cb.state = CBClosed
+		cb.failures = 0
+		cb.probeInFlight = false
+	} else {
+		cb.failures++
+		if cb.state == CBHalfOpen || cb.failures >= cb.failureThreshold {
+			cb.state = CBOpen
+			cb.openedAtNs = clock.Now()
+			cb.probeInFlight = false
+		}
+	}
+	cb.releaseLock()
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// TokenBucket Rate Limiter (Zero-GC, Thread-Safe)
+
+type TokenBucket struct {
+	lock         Atomic[u64]
+	capacity     u64
+	tokens       u64
+	refillPerSec u64
+	lastRefillNs u64
+}
+
+func NewTokenBucket(capacity u64, refillPerSec u64, nowNs u64) TokenBucket {
+	return TokenBucket{
+		capacity:     capacity,
+		tokens:       capacity,
+		refillPerSec: refillPerSec,
+		lastRefillNs: nowNs,
+	}
+}
+
+driver func (tb *TokenBucket) acquireLock() {
+	driver for {
+		if tb.lock.CompareAndSwap(0, 1) {
+			return
+		}
+		FiberYield()
+	}
+}
+
+func (tb *TokenBucket) releaseLock() {
+	tb.lock.Store(0)
+}
+
+// AllowAt refills tokens up to nowNs and consumes 1 token if available.
+driver func (tb *TokenBucket) AllowAt(nowNs u64) bool {
+	tb.acquireLock()
+	if nowNs > tb.lastRefillNs && tb.refillPerSec > 0 {
+		elapsedNs := nowNs - tb.lastRefillNs
+		added := (elapsedNs / 1_000_000) * tb.refillPerSec / 1000
+		if added > 0 {
+			if tb.tokens+added > tb.capacity {
+				tb.tokens = tb.capacity
+			} else {
+				tb.tokens += added
+			}
+			tb.lastRefillNs = nowNs
+		}
+	}
+	if tb.tokens == 0 {
+		tb.releaseLock()
+		return false
+	}
+	tb.tokens--
+	tb.releaseLock()
+	return true
+}
+
+// Allow refills using clock.Now() and consumes 1 token if available.
+driver func (tb *TokenBucket) Allow(clock Clock) bool {
+	return tb.AllowAt(clock.Now())
+}

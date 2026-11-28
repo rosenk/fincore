@@ -105,4 +105,6 @@ scope conns := NewFiberScope(4, 4096) {
 | `std/crypto/sha256` | Layer-2 total FIPS 180-4 SHA-256 (`Sum256` one-shot + streaming `Hasher`) |
 | `std/log` | Zero-alloc structured logger over `Stdio` + `Clock` (`Debug`/`Info`/`Warn`/`Error`/`InfoKV`/`ErrorKV`) |
 | `std/chan` | Bounded zero-GC MPMC CSP channels (`Chan[N, T]`: `Send`, `Recv`, `TrySend`, `TryRecv`, `Close` over `NewFiberScope`) |
+| `std/sync` | ZIO-inspired concurrency & resilience (`Semaphore.WithPermit`, `CircuitBreaker`, `TokenBucket` rate limiter) |
+| `std/retry` | ZIO-inspired composable retry `Schedule` (`Fixed`, `Exponential`, `Fibonacci`, `WithJitter`, `Do`, `DoIf`) |
 | `std/datalog` | Finitist stratified & Flix-style Lattice Datalog (`Unary`, `Binary`, `Join`, `TransitiveClosure`, `AntiJoin`, `LatticeMap`, `ShortestPaths`, `PropagateBits`) |

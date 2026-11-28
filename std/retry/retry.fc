@@ -1,0 +1,189 @@
+// Package retry provides ZIO-inspired composable, allocation-free retry
+// schedules (Fixed, Exponential, Fibonacci, deterministic jitter) and
+// Context-aware retry runners over Clock.
+package retry
+
+const (
+	KindFixed       u8 = 0
+	KindExponential u8 = 1
+	KindFibonacci   u8 = 2
+)
+
+// Schedule is a pure Layer-2 value describing retry backoff timing.
+type Schedule struct {
+	kind       u8
+	maxRetries u32
+	baseNs     u64
+	maxNs      u64
+	jitterSeed u64
+	useJitter  bool
+}
+
+// Fixed retries up to maxRetries times with a constant delay between attempts.
+func Fixed(maxRetries u32, delayNs u64) Schedule {
+	return Schedule{
+		kind:       KindFixed,
+		maxRetries: maxRetries,
+		baseNs:     delayNs,
+		maxNs:      delayNs,
+	}
+}
+
+// Exponential retries with doubling backoff (baseNs, 2*baseNs, 4*baseNs, ...) capped at maxDelayNs.
+func Exponential(maxRetries u32, baseDelayNs u64, maxDelayNs u64) Schedule {
+	capNs := maxDelayNs
+	if capNs < baseDelayNs {
+		capNs = baseDelayNs
+	}
+	return Schedule{
+		kind:       KindExponential,
+		maxRetries: maxRetries,
+		baseNs:     baseDelayNs,
+		maxNs:      capNs,
+	}
+}
+
+// Fibonacci retries with Fibonacci backoff (1x, 1x, 2x, 3x, 5x, 8x, ...) capped at maxDelayNs.
+func Fibonacci(maxRetries u32, baseDelayNs u64, maxDelayNs u64) Schedule {
+	capNs := maxDelayNs
+	if capNs < baseDelayNs {
+		capNs = baseDelayNs
+	}
+	return Schedule{
+		kind:       KindFibonacci,
+		maxRetries: maxRetries,
+		baseNs:     baseDelayNs,
+		maxNs:      capNs,
+	}
+}
+
+// WithJitter returns a copy of s applying deterministic [50%, 100%] jitter to avoid thundering herds.
+func (s Schedule) WithJitter(seed u64) Schedule {
+	out := s
+	out.jitterSeed = seed
+	out.useJitter = true
+	return out
+}
+
+func capDelay(val u64, maxNs u64) u64 {
+	if maxNs > 0 && val > maxNs {
+		return maxNs
+	}
+	return val
+}
+
+func applyJitter(delay u64, seed u64, retryIdx u32) u64 {
+	if delay <= 1 {
+		return delay
+	}
+	x := seed ^ (u64(retryIdx+1) * 0x9e3779b97f4a7c15)
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	half := delay / 2
+	span := delay - half
+	if span == 0 {
+		return delay
+	}
+	return half + (x % (span + 1))
+}
+
+// DelayFor computes the nanosecond delay before retry retryIdx (0-based).
+// Returns (delayNs, true) if another retry should occur, or (0, false) if exhausted.
+func (s const *Schedule) DelayFor(retryIdx u32) (u64, bool) {
+	if retryIdx >= s.maxRetries {
+		return 0, false
+	}
+	var d u64 = s.baseNs
+	if s.kind == KindExponential {
+		steps := retryIdx
+		if steps > 60 {
+			steps = 60
+		}
+		for i := u32(0); i < steps; i++ {
+			if s.maxNs > 0 && d >= s.maxNs {
+				d = s.maxNs
+				break
+			}
+			if d > (u64(1) << 62) {
+				d = s.maxNs
+				break
+			}
+			d = d * 2
+		}
+		d = capDelay(d, s.maxNs)
+	} else if s.kind == KindFibonacci {
+		steps := retryIdx
+		if steps > 60 {
+			steps = 60
+		}
+		var a u64 = 1
+		var b u64 = 1
+		for i := u32(0); i < steps; i++ {
+			next := a + b
+			if next < b {
+				b = a
+				break
+			}
+			a = b
+			b = next
+		}
+		if s.baseNs > 0 && s.maxNs > 0 && a > s.maxNs/s.baseNs {
+			d = s.maxNs
+		} else {
+			d = capDelay(s.baseNs*a, s.maxNs)
+		}
+	}
+	if s.useJitter {
+		d = applyJitter(d, s.jitterSeed, retryIdx)
+	}
+	return d, true
+}
+
+// DoIf executes fn(attempt) and retries according to sched while shouldRetry(err) is true.
+// Immediately aborts and returns ctx.Err() if ctx is cancelled during sleep.
+driver func DoIf(
+	ctx Context,
+	clock Clock,
+	sched Schedule,
+	shouldRetry func(error) bool,
+	fn driver func(u32) error,
+) error {
+	var attempt u32 = 0
+	driver for {
+		err := fn(attempt)
+		if err == nil {
+			return nil
+		}
+		if !shouldRetry(err) {
+			return err
+		}
+		delay, more := sched.DelayFor(attempt)
+		if !more {
+			return err
+		}
+		if ctx.Done() {
+			return ctx.Err()
+		}
+		if delay > 0 {
+			if serr := clock.Sleep(ctx, delay); serr != nil {
+				return serr
+			}
+		}
+		attempt++
+	}
+}
+
+func alwaysRetry(err error) bool {
+	return err != nil
+}
+
+// Do executes fn(attempt) and retries any non-nil error according to sched.
+driver func Do(
+	ctx Context,
+	clock Clock,
+	sched Schedule,
+	fn driver func(u32) error,
+) error {
+	return DoIf(ctx, clock, sched, alwaysRetry, fn)
+}
