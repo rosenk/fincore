@@ -1,0 +1,5 @@
+package mathx
+
+func AddMul(a u64, b u64, k u64) u64 {
+	return (a + b) * k
+}

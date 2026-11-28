@@ -219,6 +219,7 @@ func lookupFileImport(fileID u32, aliasStr u32) (u32, bool) {
 // Multi-package loader (loads root + transitive imports in topological order)
 
 driver func loadProgram(fs FS, target []byte) error {
+	loadModuleForTarget(fs, target)
 	pid, err := loadPkg(fs, target, true, 0, 0)
 	if err != nil {
 		return err
@@ -271,6 +272,8 @@ driver func loadPkg(fs FS, path []byte, isRoot bool, impFileID u32, impOff u32) 
 			dirLen = bufAppend(dirBuf[:], 0, fincRootBuf[:fincRootLen])
 			dirLen = bufAppendByte(dirBuf[:], dirLen, '/')
 			dirLen = bufAppend(dirBuf[:], dirLen, path)
+		} else if ml, okMod := resolveModuleImport(dirBuf[:], path); okMod {
+			dirLen = ml
 		} else {
 			dirLen = copy(dirBuf[:], path)
 		}

@@ -1,0 +1,377 @@
+package main
+
+// FinCore module manifest (`finc.mod`) discovery, parser, import resolver, and `finc init`.
+// Written in Stage-0 compatible FinCore (zero libc, zero GC, fixed-capacity buffers).
+
+const (
+	MaxModDeps     = 64
+	MaxModFileSize = 32 * 1024
+)
+
+type ModDep struct {
+	prefixStr u32 // import prefix, e.g. "shared" or "acme/auth"
+	dirStr    u32 // directory path (relative to finc.mod dir, or absolute)
+	isReplace bool
+}
+
+var modLoaded bool
+var modNameStr u32
+var modRootBuf [512]byte
+var modRootLen usize
+var modDeps [MaxModDeps]ModDep
+var modDepCount u32
+var modFileBuf [MaxModFileSize]byte
+
+func modInit() {
+	modLoaded = false
+	modNameStr = 0
+	modRootLen = 0
+	modDepCount = 0
+}
+
+func isModSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r'
+}
+
+func trimModLine(b []byte) []byte {
+	// Strip // or # comments
+	end := len(b)
+	for i := usize(0); i < len(b); i++ {
+		if b[i] == '#' {
+			end = i
+			break
+		}
+		if b[i] == '/' && i+1 < len(b) && b[i+1] == '/' {
+			end = i
+			break
+		}
+	}
+	lo := usize(0)
+	hi := end
+	for step := usize(0); step < end; step++ {
+		if lo < hi && isModSpace(b[lo]) {
+			lo++
+		} else {
+			break
+		}
+	}
+	for step := usize(0); step < end; step++ {
+		if hi > lo && isModSpace(b[hi-1]) {
+			hi--
+		} else {
+			break
+		}
+	}
+	return b[lo:hi]
+}
+
+// nextModToken splits the first whitespace-delimited token from s.
+// Returns (tokStart, tokEnd, nextPos).
+func nextModToken(s []byte, start usize) (usize, usize, usize) {
+	n := len(s)
+	p := start
+	for step := usize(0); step < n; step++ {
+		if p < n && isModSpace(s[p]) {
+			p++
+		} else {
+			break
+		}
+	}
+	ts := p
+	for step := usize(0); step < n; step++ {
+		if p < n && !isModSpace(s[p]) {
+			p++
+		} else {
+			break
+		}
+	}
+	return ts, p, p
+}
+
+func addModDep(prefix []byte, dir []byte, isReplace bool) {
+	if modDepCount >= MaxModDeps || len(prefix) == 0 || len(dir) == 0 {
+		return
+	}
+	modDeps[modDepCount] = ModDep{
+		prefixStr: internBytes(prefix),
+		dirStr:    internBytes(dir),
+		isReplace: isReplace,
+	}
+	modDepCount++
+}
+
+func parseModFile(data []byte) {
+	inRequire := false
+	inReplace := false
+	pos := usize(0)
+	n := len(data)
+	for step := usize(0); step < n+1; step++ {
+		if pos >= n {
+			break
+		}
+		lineEnd := n
+		for j := pos; j < n; j++ {
+			if data[j] == '\n' {
+				lineEnd = j
+				break
+			}
+		}
+		line := trimModLine(data[pos:lineEnd])
+		pos = lineEnd + 1
+		if len(line) == 0 {
+			continue
+		}
+		if len(line) == 1 && line[0] == ')' {
+			inRequire = false
+			inReplace = false
+			continue
+		}
+		t0s, t0e, p1 := nextModToken(line, 0)
+		tok0 := line[t0s:t0e]
+		t1s, t1e, p2 := nextModToken(line, p1)
+		tok1 := line[t1s:t1e]
+		t2s, t2e, _ := nextModToken(line, p2)
+		tok2 := line[t2s:t2e]
+
+		if inRequire {
+			if len(tok0) > 0 && len(tok1) > 0 {
+				addModDep(tok0, tok1, false)
+			}
+			continue
+		}
+		if inReplace {
+			if len(tok0) > 0 && sliceEq(tok1, strBytes("=>")) && len(tok2) > 0 {
+				addModDep(tok0, tok2, true)
+			} else if len(tok0) > 0 && len(tok1) > 0 {
+				addModDep(tok0, tok1, true)
+			}
+			continue
+		}
+
+		if sliceEq(tok0, strBytes("module")) {
+			if len(tok1) > 0 {
+				modNameStr = internBytes(tok1)
+			}
+		} else if sliceEq(tok0, strBytes("require")) {
+			if len(tok1) == 1 && tok1[0] == '(' {
+				inRequire = true
+			} else if len(tok1) > 0 && len(tok2) > 0 {
+				addModDep(tok1, tok2, false)
+			}
+		} else if sliceEq(tok0, strBytes("replace")) {
+			if len(tok1) == 1 && tok1[0] == '(' {
+				inReplace = true
+			} else if len(tok1) > 0 {
+				t3s, t3e, _ := nextModToken(line, t2e)
+				tok3 := line[t3s:t3e]
+				if sliceEq(tok2, strBytes("=>")) && len(tok3) > 0 {
+					addModDep(tok1, tok3, true)
+				} else if len(tok2) > 0 {
+					addModDep(tok1, tok2, true)
+				}
+			}
+		}
+	}
+}
+
+func parentDirLen(p []byte, curLen usize) usize {
+	if curLen == 0 {
+		return 0
+	}
+	end := curLen
+	// Strip trailing '/'
+	for step := usize(0); step < curLen; step++ {
+		if end > 1 && p[end-1] == '/' {
+			end--
+		} else {
+			break
+		}
+	}
+	lastSlash := usize(0)
+	found := false
+	for i := usize(0); i < end; i++ {
+		if p[i] == '/' {
+			lastSlash = i
+			found = true
+		}
+	}
+	if !found {
+		return 0
+	}
+	if lastSlash == 0 {
+		return 1 // root "/"
+	}
+	return lastSlash
+}
+
+// loadModuleForTarget walks upward from target's directory looking for `finc.mod`.
+driver func loadModuleForTarget(fs FS, target []byte) {
+	modInit()
+	var dir [512]byte
+	dirLen := copy(dir[:], target)
+	if !fs.IsDir(bytesToStr(dir[:dirLen])) {
+		dirLen = parentDirLen(dir[:], dirLen)
+	} else {
+		// Strip trailing '/'
+		lim := dirLen
+		for step := usize(0); step < lim; step++ {
+			if dirLen > 1 && dir[dirLen-1] == '/' {
+				dirLen--
+			} else {
+				break
+			}
+		}
+	}
+
+	var cand [512]byte
+	for depth := usize(0); depth < 16; depth++ {
+		cl := usize(0)
+		if dirLen > 0 {
+			cl = bufAppend(cand[:], 0, dir[:dirLen])
+			if cand[cl-1] != '/' {
+				cl = bufAppendByte(cand[:], cl, '/')
+			}
+		}
+		cl = bufAppendStr(cand[:], cl, "finc.mod")
+		if !fs.IsDir(bytesToStr(cand[:cl])) {
+			n, err := fs.ReadFileInto(bytesToStr(cand[:cl]), modFileBuf[:])
+			if err == nil {
+				modLoaded = true
+				modRootLen = copy(modRootBuf[:], dir[:dirLen])
+				parseModFile(modFileBuf[:n])
+				return
+			}
+		}
+		if dirLen == 0 || (dirLen == 1 && dir[0] == '/') {
+			return
+		}
+		nextLen := parentDirLen(dir[:], dirLen)
+		if nextLen == dirLen {
+			return
+		}
+		dirLen = nextLen
+	}
+}
+
+func matchImportPrefix(imp []byte, prefix []byte) (usize, bool) {
+	if len(prefix) == 0 || len(imp) < len(prefix) {
+		return 0, false
+	}
+	for i := usize(0); i < len(prefix); i++ {
+		if imp[i] != prefix[i] {
+			return 0, false
+		}
+	}
+	if len(imp) == len(prefix) {
+		return len(prefix), true
+	}
+	if imp[len(prefix)] == '/' {
+		return len(prefix) + 1, true
+	}
+	return 0, false
+}
+
+func joinModPath(dst []byte, base []byte, sub []byte, suffix []byte) usize {
+	pos := usize(0)
+	if len(sub) > 0 && sub[0] == '/' {
+		pos = bufAppend(dst, pos, sub)
+	} else {
+		if len(base) > 0 {
+			pos = bufAppend(dst, pos, base)
+			if pos > 0 && dst[pos-1] != '/' {
+				pos = bufAppendByte(dst, pos, '/')
+			}
+		}
+		if len(sub) > 0 {
+			// Skip leading "./"
+			s := sub
+			if len(s) >= 2 && s[0] == '.' && s[1] == '/' {
+				s = s[2:]
+			}
+			pos = bufAppend(dst, pos, s)
+		}
+	}
+	if len(suffix) > 0 {
+		if pos > 0 && dst[pos-1] != '/' {
+			pos = bufAppendByte(dst, pos, '/')
+		}
+		pos = bufAppend(dst, pos, suffix)
+	}
+	return pos
+}
+
+// resolveModuleImport resolves an import path using the active `finc.mod`.
+// Returns (outLen, matched).
+func resolveModuleImport(dst []byte, impPath []byte) (usize, bool) {
+	if !modLoaded {
+		return 0, false
+	}
+	// 1. Check replace rules first, then require rules (longest prefix wins).
+	var bestIdx u32 = 0
+	var bestLen usize = 0
+	var bestSuffOff usize = 0
+	foundDep := false
+	dc := modDepCount
+	for pass := u32(0); pass < 2; pass++ {
+		wantReplace := pass == 0
+		for i := u32(0); i < dc; i++ {
+			if modDeps[i].isReplace != wantReplace {
+				continue
+			}
+			pref := strSlice(modDeps[i].prefixStr)
+			if suffOff, ok := matchImportPrefix(impPath, pref); ok {
+				if !foundDep || len(pref) > bestLen {
+					foundDep = true
+					bestIdx = i
+					bestLen = len(pref)
+					bestSuffOff = suffOff
+				}
+			}
+		}
+		if foundDep {
+			break
+		}
+	}
+	if foundDep {
+		dir := strSlice(modDeps[bestIdx].dirStr)
+		suff := impPath[bestSuffOff:]
+		return joinModPath(dst, modRootBuf[:modRootLen], dir, suff), true
+	}
+
+	// 2. Check current module's own `module <name>` prefix.
+	if modNameStr != 0 {
+		mn := strSlice(modNameStr)
+		if suffOff, ok := matchImportPrefix(impPath, mn); ok {
+			var empty [0]byte
+			return joinModPath(dst, modRootBuf[:modRootLen], empty[:], impPath[suffOff:]), true
+		}
+	}
+	return 0, false
+}
+
+// cmdInit implements `finc init <module>` (creates `finc.mod` in current directory).
+driver func cmdInit(io Stdio, env Env, fs FS) error {
+	if env.ArgsCount() < 3 {
+		_ = io.WriteStderr(strBytes("usage: finc init <module-name>\n"))
+		return ErrIO
+	}
+	modName := env.Arg(2)
+	if len(modName) == 0 {
+		_ = io.WriteStderr(strBytes("finc init: module name cannot be empty\n"))
+		return ErrIO
+	}
+	var probe [16]byte
+	if _, err := fs.ReadFileInto("finc.mod", probe[:]); err == nil {
+		_ = io.WriteStderr(strBytes("finc init: finc.mod already exists\n"))
+		return ErrIO
+	}
+	var content [256]byte
+	n := formatTo(content[:], "module %s\n\nfinc 0.7\n", modName)
+	if err := fs.WriteFile("finc.mod", content[:n]); err != nil {
+		_ = io.WriteStderr(strBytes("finc init: failed to write finc.mod\n"))
+		return err
+	}
+	var msg [256]byte
+	mn := formatTo(msg[:], "finc: created finc.mod (module %s)\n", modName)
+	return io.WriteStdout(msg[:mn])
+}

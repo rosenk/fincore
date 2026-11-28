@@ -6,6 +6,7 @@ FinCore compiles directly to **standalone static Linux x86_64 ELF64 machine code
 
 ```sh
 finc version                            # Print compiler version
+finc init <module>                      # Create a finc.mod manifest in current directory
 finc build -o app main.fc               # Compile to standalone static ELF64
 finc build --emit-asm=app.s -o app ...  # Also save generated x86_64 GAS assembly
 finc run main.fc                        # Build & run immediately
@@ -13,6 +14,22 @@ finc check [--pretty] main.fc           # Type, scope, totality, and where-claus
 finc fmt [-w | --check] file.fc         # Canonical tab-indented source formatter
 finc test [-v] testdata/                # Run conformance suite
 ```
+
+### Module Manifest (`finc.mod`)
+FinCore discovers `finc.mod` upward from the target package directory (like `go.mod`):
+```text
+module myapp
+
+finc 0.7
+
+require (
+	shared ../shared
+	extlib ./vendor/extlib
+)
+
+replace oldmod => ./vendor/newmod
+```
+Imports under `myapp/...` resolve relative to the `finc.mod` root, and `require`/`replace` map prefixes to local or vendored directories with zero network access during builds.
 
 ## 2. Core Language Features
 

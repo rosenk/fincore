@@ -10,12 +10,15 @@ driver func main(io Stdio, env Env, fs FS, ex Exec) error {
 	_ = ex
 	argc := env.ArgsCount()
 	if argc < 2 {
-		_ = io.WriteStderr(strBytes("usage: finc <parse|check|build|run|test|fmt|version> [args...]\n"))
+		_ = io.WriteStderr(strBytes("usage: finc <init|parse|check|build|run|test|fmt|version> [args...]\n"))
 		return ErrIO
 	}
 	cmd := strBytes(env.Arg(1))
 	if sliceEq(cmd, strBytes("version")) || sliceEq(cmd, strBytes("--version")) {
 		return io.WriteStdout(strBytes(CompilerVersion))
+	}
+	if sliceEq(cmd, strBytes("init")) {
+		return cmdInit(io, env, fs)
 	}
 	if sliceEq(cmd, strBytes("parse")) {
 		return cmdParse(io, env, fs)
@@ -35,7 +38,7 @@ driver func main(io Stdio, env Env, fs FS, ex Exec) error {
 	if sliceEq(cmd, strBytes("fmt")) {
 		return cmdFmt(io, env, fs)
 	}
-	_ = io.WriteStderr(strBytes("usage: finc <parse|check|build|run|test|fmt|version> [args...]\n"))
+	_ = io.WriteStderr(strBytes("usage: finc <init|parse|check|build|run|test|fmt|version> [args...]\n"))
 	return ErrIO
 }
 

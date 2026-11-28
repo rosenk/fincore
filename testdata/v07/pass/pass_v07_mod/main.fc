@@ -1,0 +1,19 @@
+// SINCE: v0.7
+package main
+
+import (
+	"demoapp/mathx"
+	"extlib/greet"
+	og "oldgreet"
+	"std/strings"
+)
+
+driver func main(io Stdio) error {
+	v := mathx.AddMul(3, 4, 6)
+	t1 := greet.Tag()
+	t2 := og.Tag()
+	same := strings.Equal(strView(t1), strView(t2))
+	var out [128]byte
+	n := formatTo(out[:], "val=%d tag=%s replace=%v\n", v, t1, same)
+	return io.WriteStdout(out[:n])
+}
