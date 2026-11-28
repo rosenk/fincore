@@ -296,3 +296,124 @@ func TestSinceSkip(t *testing.T) {
 		}
 	}
 }
+
+// TestRemoteModGetAndTransitiveLink tests `finc get`, module cache resolution,
+// and transitive `link` inheritance from a remote git repository (hermetically via FINC_GIT_BASE).
+func TestRemoteModGetAndTransitiveLink(t *testing.T) {
+	fincBin := requireFinc0(t)
+	cMaj, cMin := compilerVersion(t)
+	if cMaj == 0 && cMin < 7 {
+		t.Skip("needs v0.7")
+	}
+
+	tmp := t.TempDir()
+	remotesDir := filepath.Join(tmp, "remotes")
+	workLib := filepath.Join(tmp, "worklib")
+	bareLib := filepath.Join(remotesDir, "example.test", "org", "cmath.git")
+	cacheDir := filepath.Join(tmp, "cache")
+	appDir := filepath.Join(tmp, "app")
+
+	mustRun := func(dir string, name string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command(name, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@example.test",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@example.test",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s %v failed: %v\n%s", name, args, err, out)
+		}
+		return string(out)
+	}
+
+	if err := os.MkdirAll(workLib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(bareLib), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create remote library repo with `link m` in its own finc.mod and tag v0.1.0
+	if err := os.WriteFile(filepath.Join(workLib, "finc.mod"), []byte("module example.test/org/cmath\n\nfinc 0.7\n\nlink m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workLib, "cmath.fc"), []byte("package cmath\n\nextern \"floor\" driver func Floor(x f64) f64\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(workLib, "git", "init", "-b", "main")
+	mustRun(workLib, "git", "add", ".")
+	mustRun(workLib, "git", "commit", "-m", "initial")
+	mustRun(workLib, "git", "tag", "v0.1.0")
+	mustRun(tmp, "git", "clone", "--bare", workLib, bareLib)
+
+	// Create consumer app WITHOUT any local path or `link m` in its finc.mod
+	if err := os.WriteFile(filepath.Join(appDir, "finc.mod"), []byte("module example.test/app\n\nfinc 0.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	appSrc := "package main\n\nimport \"example.test/org/cmath\"\n\ndriver func main(io Stdio) error {\n\tv := cmath.Floor(3.9)\n\tvar buf [32]byte\n\tn := formatTo(buf[:], \"floor=%d\\n\", i64(v))\n\treturn io.WriteStdout(buf[:n])\n}\n"
+	if err := os.WriteFile(filepath.Join(appDir, "main.fc"), []byte(appSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseEnv := append(os.Environ(),
+		"FINCORE_ROOT="+moduleRoot(t),
+		"FINC_MOD_CACHE="+cacheDir,
+		"FINC_GIT_BASE=file://"+remotesDir,
+	)
+
+	// 1. `finc get example.test/org/cmath@v0.1.0`
+	cmdGet := exec.Command(fincBin, "get", "example.test/org/cmath@v0.1.0")
+	cmdGet.Dir = appDir
+	cmdGet.Env = baseEnv
+	outGet, err := cmdGet.CombinedOutput()
+	if err != nil {
+		t.Fatalf("finc get failed: %v\n%s", err, outGet)
+	}
+	if !strings.Contains(string(outGet), "downloaded example.test/org/cmath@v0.1.0") {
+		t.Fatalf("unexpected finc get output:\n%s", outGet)
+	}
+	modBytes, err := os.ReadFile(filepath.Join(appDir, "finc.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(modBytes), "require example.test/org/cmath v0.1.0") {
+		t.Fatalf("finc.mod not updated:\n%s", modBytes)
+	}
+
+	// 2. `finc build` offline (from cache only, testing transitive `link m`)
+	binPath := filepath.Join(appDir, "appbin")
+	cmdBuild := exec.Command(fincBin, "build", "-o", binPath, ".")
+	cmdBuild.Dir = appDir
+	cmdBuild.Env = append(os.Environ(),
+		"FINCORE_ROOT="+moduleRoot(t),
+		"FINC_MOD_CACHE="+cacheDir,
+	)
+	outBuild, err := cmdBuild.CombinedOutput()
+	if err != nil {
+		t.Fatalf("finc build failed: %v\n%s", err, outBuild)
+	}
+
+	outRun, err := exec.Command(binPath).CombinedOutput()
+	if err != nil || string(outRun) != "floor=3\n" {
+		t.Fatalf("appbin run: err=%v out=%q", err, outRun)
+	}
+
+	// 3. Wipe cache, run bare `finc get` (sync from finc.mod), and verify cache restored
+	if err := os.RemoveAll(cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	cmdSync := exec.Command(fincBin, "get")
+	cmdSync.Dir = appDir
+	cmdSync.Env = baseEnv
+	outSync, err := cmdSync.CombinedOutput()
+	if err != nil || !strings.Contains(string(outSync), "downloaded example.test/org/cmath@v0.1.0") {
+		t.Fatalf("finc get sync failed: %v\n%s", err, outSync)
+	}
+}

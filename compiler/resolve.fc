@@ -36,6 +36,7 @@ func resolveInit(env Env) {
 		}
 		fincRootLen = len(fr)
 	}
+	modInitCache(env)
 	initUniverse()
 }
 
@@ -271,6 +272,7 @@ driver func loadPkg(fs FS, path []byte, isRoot bool, impFileID u32, impOff u32) 
 	if isRoot {
 		dirLen = copy(dirBuf[:], path)
 	} else {
+		modLastResolveRemote = false
 		if fincRootLen > 0 && isStdImport(path) {
 			dirLen = bufAppend(dirBuf[:], 0, fincRootBuf[:fincRootLen])
 			dirLen = bufAppendByte(dirBuf[:], dirLen, '/')
@@ -281,7 +283,11 @@ driver func loadPkg(fs FS, path []byte, isRoot bool, impFileID u32, impOff u32) 
 			dirLen = copy(dirBuf[:], path)
 		}
 		if !fs.IsDir(bytesToStr(dirBuf[:dirLen])) {
-			addDiagStr(E2001, impFileID, impOff, "imported package directory not found")
+			if modLastResolveRemote {
+				addDiagStr(E2001, impFileID, impOff, "imported remote module not in cache (run 'finc get')")
+			} else {
+				addDiagStr(E2001, impFileID, impOff, "imported package directory not found")
+			}
 			pkgs[pid].state = 2
 			return pid, nil
 		}

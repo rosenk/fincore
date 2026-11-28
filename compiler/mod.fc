@@ -10,15 +10,19 @@ const (
 )
 
 type ModDep struct {
-	prefixStr u32 // import prefix, e.g. "shared" or "acme/auth"
-	dirStr    u32 // directory path (relative to finc.mod dir, or absolute)
+	prefixStr u32 // import prefix, e.g. "shared" or "github.com/rosenk/finc-vulkan"
+	dirStr    u32 // local directory path OR remote version/ref (e.g. "v0.1.0", "main")
 	isReplace bool
+	isRemote  bool
 }
 
 var modLoaded bool
 var modNameStr u32
 var modRootBuf [512]byte
 var modRootLen usize
+var modCacheBuf [512]byte
+var modCacheLen usize
+var modLastResolveRemote bool
 var modDeps [MaxModDeps]ModDep
 var modDepCount u32
 var modLinks [MaxModLinks]u32
@@ -26,13 +30,50 @@ var modLinkCount u32
 var cliLinks [MaxModLinks]u32
 var cliLinkCount u32
 var modFileBuf [MaxModFileSize]byte
+var depModFileBuf [MaxModFileSize]byte
+var modOutBuf [MaxModFileSize]byte
 
 func modInit() {
 	modLoaded = false
 	modNameStr = 0
 	modRootLen = 0
+	modLastResolveRemote = false
 	modDepCount = 0
 	modLinkCount = 0
+}
+
+func modInitCache(env Env) {
+	modCacheLen = 0
+	if mc, ok := env.GetEnv("FINC_MOD_CACHE"); ok && len(mc) > 0 && len(mc) < len(modCacheBuf) {
+		modCacheLen = copy(modCacheBuf[:], strBytes(mc))
+		return
+	}
+	if home, ok := env.GetEnv("HOME"); ok && len(home) > 0 && len(home)+16 < len(modCacheBuf) {
+		p := bufAppendStr(modCacheBuf[:], 0, home)
+		if p > 0 && modCacheBuf[p-1] != '/' {
+			p = bufAppendByte(modCacheBuf[:], p, '/')
+		}
+		modCacheLen = bufAppendStr(modCacheBuf[:], p, ".finc/pkg/mod")
+		return
+	}
+	modCacheLen = bufAppendStr(modCacheBuf[:], 0, "/tmp/.finc/pkg/mod")
+}
+
+func isLocalModTarget(target []byte) bool {
+	if len(target) == 0 {
+		return false
+	}
+	return target[0] == '.' || target[0] == '/'
+}
+
+func hasModDepPrefix(prefix u32, isReplace bool) bool {
+	dc := modDepCount
+	for i := u32(0); i < dc; i++ {
+		if modDeps[i].prefixStr == prefix && modDeps[i].isReplace == isReplace {
+			return true
+		}
+	}
+	return false
 }
 
 func addModLink(lib []byte) {
@@ -113,15 +154,24 @@ func addModDep(prefix []byte, dir []byte, isReplace bool) {
 	if modDepCount >= MaxModDeps || len(prefix) == 0 || len(dir) == 0 {
 		return
 	}
+	pid := internBytes(prefix)
+	if hasModDepPrefix(pid, isReplace) {
+		return
+	}
+	remote := false
+	if !isReplace && !isLocalModTarget(dir) {
+		remote = true
+	}
 	modDeps[modDepCount] = ModDep{
-		prefixStr: internBytes(prefix),
+		prefixStr: pid,
 		dirStr:    internBytes(dir),
 		isReplace: isReplace,
+		isRemote:  remote,
 	}
 	modDepCount++
 }
 
-func parseModFile(data []byte) {
+func parseModFileInner(data []byte, isRoot bool) {
 	inRequire := false
 	inReplace := false
 	pos := usize(0)
@@ -156,21 +206,25 @@ func parseModFile(data []byte) {
 
 		if inRequire {
 			if len(tok0) > 0 && len(tok1) > 0 {
-				addModDep(tok0, tok1, false)
+				if isRoot || !isLocalModTarget(tok1) {
+					addModDep(tok0, tok1, false)
+				}
 			}
 			continue
 		}
 		if inReplace {
-			if len(tok0) > 0 && sliceEq(tok1, strBytes("=>")) && len(tok2) > 0 {
-				addModDep(tok0, tok2, true)
-			} else if len(tok0) > 0 && len(tok1) > 0 {
-				addModDep(tok0, tok1, true)
+			if isRoot {
+				if len(tok0) > 0 && sliceEq(tok1, strBytes("=>")) && len(tok2) > 0 {
+					addModDep(tok0, tok2, true)
+				} else if len(tok0) > 0 && len(tok1) > 0 {
+					addModDep(tok0, tok1, true)
+				}
 			}
 			continue
 		}
 
 		if sliceEq(tok0, strBytes("module")) {
-			if len(tok1) > 0 {
+			if isRoot && len(tok1) > 0 {
 				modNameStr = internBytes(tok1)
 			}
 		} else if sliceEq(tok0, strBytes("link")) {
@@ -181,12 +235,14 @@ func parseModFile(data []byte) {
 			if len(tok1) == 1 && tok1[0] == '(' {
 				inRequire = true
 			} else if len(tok1) > 0 && len(tok2) > 0 {
-				addModDep(tok1, tok2, false)
+				if isRoot || !isLocalModTarget(tok2) {
+					addModDep(tok1, tok2, false)
+				}
 			}
 		} else if sliceEq(tok0, strBytes("replace")) {
 			if len(tok1) == 1 && tok1[0] == '(' {
 				inReplace = true
-			} else if len(tok1) > 0 {
+			} else if isRoot && len(tok1) > 0 {
 				t3s, t3e, _ := nextModToken(line, t2e)
 				tok3 := line[t3s:t3e]
 				if sliceEq(tok2, strBytes("=>")) && len(tok3) > 0 {
@@ -194,6 +250,68 @@ func parseModFile(data []byte) {
 				} else if len(tok2) > 0 {
 					addModDep(tok1, tok2, true)
 				}
+			}
+		}
+	}
+}
+
+func parseModFile(data []byte) {
+	parseModFileInner(data, true)
+}
+
+func parseDepModFile(data []byte) {
+	parseModFileInner(data, false)
+}
+
+func buildRemoteModDir(dst []byte, modPath []byte, ver []byte, suffix []byte) usize {
+	pos := bufAppend(dst, 0, modCacheBuf[:modCacheLen])
+	if pos > 0 && dst[pos-1] != '/' {
+		pos = bufAppendByte(dst, pos, '/')
+	}
+	pos = bufAppend(dst, pos, modPath)
+	pos = bufAppendByte(dst, pos, '@')
+	pos = bufAppend(dst, pos, ver)
+	if len(suffix) > 0 {
+		pos = bufAppendByte(dst, pos, '/')
+		pos = bufAppend(dst, pos, suffix)
+	}
+	return pos
+}
+
+func resolveDepRootDir(dst []byte, dep ModDep) usize {
+	var empty [0]byte
+	if dep.isRemote {
+		return buildRemoteModDir(dst, strSlice(dep.prefixStr), strSlice(dep.dirStr), empty[:])
+	}
+	return joinModPath(dst, modRootBuf[:modRootLen], strSlice(dep.dirStr), empty[:])
+}
+
+// loadDepModFiles loads `<depDir>/finc.mod` for every active dependency so
+// transitive `link` flags and remote `require`s are picked up automatically.
+driver func loadDepModFiles(fs FS) {
+	var depDir [512]byte
+	var cand [512]byte
+	for i := u32(0); i < MaxModDeps; i++ {
+		if i >= modDepCount {
+			break
+		}
+		dep := modDeps[i]
+		if !dep.isReplace && hasModDepPrefix(dep.prefixStr, true) {
+			continue
+		}
+		dl := resolveDepRootDir(depDir[:], dep)
+		if dl == 0 {
+			continue
+		}
+		cl := bufAppend(cand[:], 0, depDir[:dl])
+		if cl > 0 && cand[cl-1] != '/' {
+			cl = bufAppendByte(cand[:], cl, '/')
+		}
+		cl = bufAppendStr(cand[:], cl, "finc.mod")
+		if !fs.IsDir(bytesToStr(cand[:cl])) {
+			n, err := fs.ReadFileInto(bytesToStr(cand[:cl]), depModFileBuf[:])
+			if err == nil {
+				parseDepModFile(depModFileBuf[:n])
 			}
 		}
 	}
@@ -264,6 +382,7 @@ driver func loadModuleForTarget(fs FS, target []byte) {
 				modLoaded = true
 				modRootLen = copy(modRootBuf[:], dir[:dirLen])
 				parseModFile(modFileBuf[:n])
+				loadDepModFiles(fs)
 				return
 			}
 		}
@@ -360,6 +479,11 @@ func resolveModuleImport(dst []byte, impPath []byte) (usize, bool) {
 	if foundDep {
 		dir := strSlice(modDeps[bestIdx].dirStr)
 		suff := impPath[bestSuffOff:]
+		if modDeps[bestIdx].isRemote {
+			modLastResolveRemote = true
+			return buildRemoteModDir(dst, strSlice(modDeps[bestIdx].prefixStr), dir, suff), true
+		}
+		modLastResolveRemote = false
 		return joinModPath(dst, modRootBuf[:modRootLen], dir, suff), true
 	}
 
@@ -399,4 +523,378 @@ driver func cmdInit(io Stdio, env Env, fs FS) error {
 	var msg [256]byte
 	mn := formatTo(msg[:], "finc: created finc.mod (module %s)\n", modName)
 	return io.WriteStdout(msg[:mn])
+}
+
+// ---------------------------------------------------------------------------
+// Remote module fetching (`finc get`)
+
+func isSafeModPath(s []byte) bool {
+	if len(s) == 0 || s[0] == '/' || s[0] == '.' {
+		return false
+	}
+	for i := usize(0); i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			return false
+		}
+		if c == '.' && i+1 < len(s) && s[i+1] == '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func buildGitHTTPSUrl(dst []byte, env Env, modPath []byte) usize {
+	if base, ok := env.GetEnv("FINC_GIT_BASE"); ok && len(base) > 0 {
+		p := bufAppendStr(dst, 0, base)
+		if p > 0 && dst[p-1] != '/' {
+			p = bufAppendByte(dst, p, '/')
+		}
+		p = bufAppend(dst, p, modPath)
+		p = bufAppendStr(dst, p, ".git")
+		return p
+	}
+	p := bufAppendStr(dst, 0, "https://")
+	p = bufAppend(dst, p, modPath)
+	p = bufAppendStr(dst, p, ".git")
+	return p
+}
+
+func buildGitSSHUrl(dst []byte, modPath []byte) (usize, bool) {
+	// Split "host/org/repo" -> "git@host:org/repo.git"
+	slash := usize(0)
+	found := false
+	for i := usize(0); i < len(modPath); i++ {
+		if modPath[i] == '/' {
+			slash = i
+			found = true
+			break
+		}
+	}
+	if !found || slash == 0 || slash+1 >= len(modPath) {
+		return 0, false
+	}
+	p := bufAppendStr(dst, 0, "git@")
+	p = bufAppend(dst, p, modPath[:slash])
+	p = bufAppendByte(dst, p, ':')
+	p = bufAppend(dst, p, modPath[slash+1:])
+	p = bufAppendStr(dst, p, ".git")
+	return p, true
+}
+
+driver func gitCloneRef(ex Exec, url []byte, ver []byte, tmpDest []byte, errBuf []byte) (usize, bool) {
+	ctx, cancel := NewContext()
+	defer cancel()
+	var emptyEnv [0]string
+	var rmArgs [2]string
+	rmArgs[0] = "-rf"
+	rmArgs[1] = bytesToStr(tmpDest)
+
+	// 1. Fast shallow clone of branch/tag
+	_, _, _ = ex.Run(ctx, "/usr/bin/rm", rmArgs[:], emptyEnv[:], "", errBuf)
+	var cloneArgs [6]string
+	cloneArgs[0] = "clone"
+	cloneArgs[1] = "--depth"
+	cloneArgs[2] = "1"
+	cloneArgs[3] = "--branch"
+	cloneArgs[4] = bytesToStr(ver)
+	cloneArgs[5] = bytesToStr(url)
+	// Need 7 args including dest
+	var cloneArgs7 [7]string
+	cloneArgs7[0] = cloneArgs[0]
+	cloneArgs7[1] = cloneArgs[1]
+	cloneArgs7[2] = cloneArgs[2]
+	cloneArgs7[3] = cloneArgs[3]
+	cloneArgs7[4] = cloneArgs[4]
+	cloneArgs7[5] = cloneArgs[5]
+	cloneArgs7[6] = bytesToStr(tmpDest)
+	st, en, err := ex.Run(ctx, "/usr/bin/git", cloneArgs7[:], emptyEnv[:], "", errBuf)
+	if err == nil && st.Code == 0 {
+		return en, true
+	}
+
+	// 2. Fallback: full clone + checkout (supports commit SHAs)
+	_, _, _ = ex.Run(ctx, "/usr/bin/rm", rmArgs[:], emptyEnv[:], "", errBuf)
+	var fullArgs [3]string
+	fullArgs[0] = "clone"
+	fullArgs[1] = bytesToStr(url)
+	fullArgs[2] = bytesToStr(tmpDest)
+	st2, en2, err2 := ex.Run(ctx, "/usr/bin/git", fullArgs[:], emptyEnv[:], "", errBuf)
+	if err2 != nil || st2.Code != 0 {
+		_, _, _ = ex.Run(ctx, "/usr/bin/rm", rmArgs[:], emptyEnv[:], "", errBuf)
+		return en2, false
+	}
+	var coArgs [4]string
+	coArgs[0] = "-C"
+	coArgs[1] = bytesToStr(tmpDest)
+	coArgs[2] = "checkout"
+	coArgs[3] = bytesToStr(ver)
+	st3, en3, err3 := ex.Run(ctx, "/usr/bin/git", coArgs[:], emptyEnv[:], "", errBuf)
+	if err3 != nil || st3.Code != 0 {
+		_, _, _ = ex.Run(ctx, "/usr/bin/rm", rmArgs[:], emptyEnv[:], "", errBuf)
+		return en3, false
+	}
+	return en3, true
+}
+
+driver func fetchRemoteModule(io Stdio, env Env, fs FS, ex Exec, modPath []byte, ver []byte) error {
+	if !isSafeModPath(modPath) || !isSafeModPath(ver) {
+		_ = io.WriteStderr(strBytes("finc get: invalid module path or version\n"))
+		return ErrIO
+	}
+	var empty [0]byte
+	var dest [512]byte
+	destLen := buildRemoteModDir(dest[:], modPath, ver, empty[:])
+	if fs.IsDir(bytesToStr(dest[:destLen])) {
+		var msg [512]byte
+		mn := formatTo(msg[:], "finc get: cached %s@%s\n", modPath, ver)
+		_ = io.WriteStdout(msg[:mn])
+		return nil
+	}
+
+	// Ensure parent directory exists
+	parLen := parentDirLen(dest[:], destLen)
+	ctx, cancel := NewContext()
+	defer cancel()
+	var emptyEnv [0]string
+	var errBuf [4096]byte
+	if parLen > 0 {
+		var mkArgs [2]string
+		mkArgs[0] = "-p"
+		mkArgs[1] = bytesToStr(dest[:parLen])
+		st, en, merr := ex.Run(ctx, "/usr/bin/mkdir", mkArgs[:], emptyEnv[:], "", errBuf[:])
+		if merr != nil || st.Code != 0 {
+			if en > 0 {
+				_ = io.WriteStderr(errBuf[:en])
+			}
+			return ErrExec
+		}
+	}
+
+	var tmpDest [540]byte
+	tmpLen := bufAppend(tmpDest[:], 0, dest[:destLen])
+	tmpLen = bufAppendStr(tmpDest[:], tmpLen, ".tmp")
+
+	var url [540]byte
+	urlLen := buildGitHTTPSUrl(url[:], env, modPath)
+	en, ok := gitCloneRef(ex, url[:urlLen], ver, tmpDest[:tmpLen], errBuf[:])
+	if !ok {
+		// If FINC_GIT_BASE is not set, try SSH fallback (useful for private repos)
+		if _, hasBase := env.GetEnv("FINC_GIT_BASE"); !hasBase {
+			if sshLen, hasSSH := buildGitSSHUrl(url[:], modPath); hasSSH {
+				en2, ok2 := gitCloneRef(ex, url[:sshLen], ver, tmpDest[:tmpLen], errBuf[:])
+				if ok2 {
+					ok = true
+					en = en2
+				}
+			}
+		}
+	}
+	if !ok {
+		if en > 0 {
+			_ = io.WriteStderr(errBuf[:en])
+		}
+		var emsg [512]byte
+		emn := formatTo(emsg[:], "finc get: failed to fetch %s@%s\n", modPath, ver)
+		_ = io.WriteStderr(emsg[:emn])
+		return ErrExec
+	}
+
+	var mvArgs [2]string
+	mvArgs[0] = bytesToStr(tmpDest[:tmpLen])
+	mvArgs[1] = bytesToStr(dest[:destLen])
+	mst, men, merr := ex.Run(ctx, "/usr/bin/mv", mvArgs[:], emptyEnv[:], "", errBuf[:])
+	if merr != nil || mst.Code != 0 {
+		if men > 0 {
+			_ = io.WriteStderr(errBuf[:men])
+		}
+		return ErrExec
+	}
+
+	var msg [512]byte
+	mn := formatTo(msg[:], "finc get: downloaded %s@%s\n", modPath, ver)
+	_ = io.WriteStdout(msg[:mn])
+	return nil
+}
+
+// upsertModRequire updates or appends `require <modPath> <ver>` in `./finc.mod` if it exists.
+driver func upsertModRequire(fs FS, modPath []byte, ver []byte) error {
+	n, err := fs.ReadFileInto("finc.mod", modFileBuf[:])
+	if err != nil {
+		return nil
+	}
+	data := modFileBuf[:n]
+	outPos := usize(0)
+	pos := usize(0)
+	inRequire := false
+	updated := false
+
+	driver for pos < n {
+		lineEnd := n
+		for j := pos; j < n; j++ {
+			if data[j] == '\n' {
+				lineEnd = j
+				break
+			}
+		}
+		rawLine := data[pos:lineEnd]
+		hasNL := lineEnd < n
+		pos = lineEnd + 1
+
+		trimmed := trimModLine(rawLine)
+		if len(trimmed) == 1 && trimmed[0] == ')' {
+			inRequire = false
+			outPos = bufAppend(modOutBuf[:], outPos, rawLine)
+			if hasNL {
+				outPos = bufAppendByte(modOutBuf[:], outPos, '\n')
+			}
+			continue
+		}
+
+		t0s, t0e, p1 := nextModToken(trimmed, 0)
+		tok0 := trimmed[t0s:t0e]
+		t1s, t1e, _ := nextModToken(trimmed, p1)
+		tok1 := trimmed[t1s:t1e]
+
+		if inRequire && sliceEq(tok0, modPath) {
+			outPos = bufAppendByte(modOutBuf[:], outPos, '\t')
+			outPos = bufAppend(modOutBuf[:], outPos, modPath)
+			outPos = bufAppendByte(modOutBuf[:], outPos, ' ')
+			outPos = bufAppend(modOutBuf[:], outPos, ver)
+			outPos = bufAppendByte(modOutBuf[:], outPos, '\n')
+			updated = true
+			continue
+		}
+		if sliceEq(tok0, strBytes("require")) {
+			if len(tok1) == 1 && tok1[0] == '(' {
+				inRequire = true
+			} else if sliceEq(tok1, modPath) {
+				outPos = bufAppendStr(modOutBuf[:], outPos, "require ")
+				outPos = bufAppend(modOutBuf[:], outPos, modPath)
+				outPos = bufAppendByte(modOutBuf[:], outPos, ' ')
+				outPos = bufAppend(modOutBuf[:], outPos, ver)
+				outPos = bufAppendByte(modOutBuf[:], outPos, '\n')
+				updated = true
+				continue
+			}
+		}
+
+		outPos = bufAppend(modOutBuf[:], outPos, rawLine)
+		if hasNL {
+			outPos = bufAppendByte(modOutBuf[:], outPos, '\n')
+		}
+	}
+
+	if !updated {
+		if outPos > 0 && modOutBuf[outPos-1] != '\n' {
+			outPos = bufAppendByte(modOutBuf[:], outPos, '\n')
+		}
+		outPos = bufAppendStr(modOutBuf[:], outPos, "require ")
+		outPos = bufAppend(modOutBuf[:], outPos, modPath)
+		outPos = bufAppendByte(modOutBuf[:], outPos, ' ')
+		outPos = bufAppend(modOutBuf[:], outPos, ver)
+		outPos = bufAppendByte(modOutBuf[:], outPos, '\n')
+	}
+
+	return fs.WriteFile("finc.mod", modOutBuf[:outPos])
+}
+
+// cmdGet implements `finc get [<module>[@<version>] ...]`
+driver func cmdGet(io Stdio, env Env, fs FS, ex Exec) error {
+	poolInit()
+	modInit()
+	modInitCache(env)
+
+	argc := env.ArgsCount()
+	if argc == 2 {
+		// Sync all remote `require`s from `./finc.mod` (including transitive deps)
+		n, err := fs.ReadFileInto("finc.mod", modFileBuf[:])
+		if err != nil {
+			_ = io.WriteStderr(strBytes("finc get: finc.mod not found in current directory\n"))
+			return ErrIO
+		}
+		parseModFile(modFileBuf[:n])
+	} else {
+		// Parse any existing finc.mod replaces, then add explicit targets
+		if n, err := fs.ReadFileInto("finc.mod", modFileBuf[:]); err == nil {
+			parseModFile(modFileBuf[:n])
+		}
+		for i := usize(2); i < argc; i++ {
+			spec := strBytes(env.Arg(i))
+			atIdx := usize(0)
+			hasAt := false
+			for j := usize(0); j < len(spec); j++ {
+				if spec[j] == '@' {
+					atIdx = j
+					hasAt = true
+					break
+				}
+			}
+			var mp []byte
+			var ver []byte
+			if hasAt {
+				mp = spec[:atIdx]
+				ver = spec[atIdx+1:]
+			} else {
+				mp = spec
+				ver = strBytes("main")
+			}
+			if err := fetchRemoteModule(io, env, fs, ex, mp, ver); err != nil {
+				return err
+			}
+			if err := upsertModRequire(fs, mp, ver); err != nil {
+				return err
+			}
+			// Update or add entry in modDeps so transitive deps get scanned too
+			mpID := internBytes(mp)
+			verID := internBytes(ver)
+			found := false
+			dc := modDepCount
+			for k := u32(0); k < dc; k++ {
+				if modDeps[k].prefixStr == mpID && !modDeps[k].isReplace {
+					modDeps[k].dirStr = verID
+					modDeps[k].isRemote = true
+					found = true
+					break
+				}
+			}
+			if !found {
+				addModDep(mp, ver, false)
+			}
+		}
+	}
+
+	// Download any uncached remote deps (including transitive deps discovered in dep finc.mod)
+	var depDir [512]byte
+	var cand [512]byte
+	for i := u32(0); i < MaxModDeps; i++ {
+		if i >= modDepCount {
+			break
+		}
+		dep := modDeps[i]
+		if !dep.isRemote || hasModDepPrefix(dep.prefixStr, true) {
+			continue
+		}
+		mp := strSlice(dep.prefixStr)
+		ver := strSlice(dep.dirStr)
+		dl := resolveDepRootDir(depDir[:], dep)
+		if argc == 2 || !fs.IsDir(bytesToStr(depDir[:dl])) {
+			if err := fetchRemoteModule(io, env, fs, ex, mp, ver); err != nil {
+				return err
+			}
+		}
+		if dl > 0 {
+			cl := bufAppend(cand[:], 0, depDir[:dl])
+			if cl > 0 && cand[cl-1] != '/' {
+				cl = bufAppendByte(cand[:], cl, '/')
+			}
+			cl = bufAppendStr(cand[:], cl, "finc.mod")
+			if !fs.IsDir(bytesToStr(cand[:cl])) {
+				if dn, derr := fs.ReadFileInto(bytesToStr(cand[:cl]), depModFileBuf[:]); derr == nil {
+					parseDepModFile(depModFileBuf[:dn])
+				}
+			}
+		}
+	}
+	return nil
 }
