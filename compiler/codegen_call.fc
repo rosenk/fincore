@@ -494,6 +494,58 @@ func (f *FnGen) emitCopyRSPToFrame(dstOff i64, rspOff u64, size u64) {
 driver func (f *FnGen) emitDeferredCall(deferIdx u32) {
 	ds := f.defers[deferIdx]
 	ci := calls[nodeCall[ds.callNode]]
+	if ci.kind == CKFunc && ci.calleeSym != 0 && (nodes[syms[ci.calleeSym].declNode].flags&1) != 0 {
+		sigTy := f.subst(ci.sigType)
+		sig := types[sigTy]
+		dn := syms[ci.calleeSym].declNode
+		cSymStr := nodes[dn].e
+		if cSymStr == 0 {
+			cSymStr = syms[ci.calleeSym].nameStr
+		}
+		intRegNames := [6]string{"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"}
+		var ii u32 = 0
+		var fi u32 = 0
+		nArgs := sig.b
+		if nArgs > ds.nArgs {
+			nArgs = ds.nArgs
+		}
+		for i := u32(0); i < nArgs; i++ {
+			pt := ds.argTypes[i]
+			if isFloatType(pt) {
+				if fi < 8 {
+					if under(pt) == TYF32 {
+						em("    movss ")
+					} else {
+						em("    movsd ")
+					}
+					emI(ds.argOffs[i])
+					em("(%rbp), %xmm")
+					emU(u64(fi))
+					em("\n")
+				}
+				fi++
+			} else {
+				if ii < 6 {
+					f.emitLoadScalarFromFrame(ds.argOffs[i], pt)
+					em("    movq %rax, ")
+					em(intRegNames[ii])
+					em("\n")
+				}
+				ii++
+			}
+		}
+		if fi > 0 {
+			em("    movl $")
+			emU(u64(fi))
+			em(", %eax\n")
+		} else {
+			em("    xorl %eax, %eax\n")
+		}
+		em("    call ")
+		emBytes(strSlice(cSymStr))
+		em("\n")
+		return
+	}
 	if ci.kind == CKFunc || ci.kind == CKMethod || ci.kind == CKValue {
 		sigTy := f.subst(ci.sigType)
 		sig := types[sigTy]
