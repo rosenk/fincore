@@ -1,0 +1,225 @@
+package main
+
+// Compile-time file embedding (`embed("path")` -> string, `embedBytes("path")` -> const []byte).
+// Files are read once during compilation relative to the referencing source file,
+// deduplicated, and emitted directly into `.rodata` (zero heap, zero runtime syscalls).
+
+const (
+	MaxEmbedFiles = 128
+	MaxEmbedBytes = 2 * 1024 * 1024 // 2 MB in .bss (demand-paged by Linux)
+)
+
+type EmbedEntry struct {
+	pathStr u32
+	off     u32
+	length  u32
+	emitted bool
+}
+
+var embedData [MaxEmbedBytes]byte
+var embedUsed u32
+var embedEntries [MaxEmbedFiles]EmbedEntry
+var embedCount u32
+var nodeEmbedID [MaxNodes]u32  // 1-based index into embedEntries (0 = none)
+var nodeEmbedErr [MaxNodes]u8  // 1 = diagnostic already emitted by loadEmbeds
+
+func embedInit() {
+	embedUsed = 0
+	embedCount = 0
+}
+
+func embedResetEmitted() {
+	for i := u32(0); i < embedCount; i++ {
+		embedEntries[i].emitted = false
+	}
+}
+
+func isValidEmbedPath(p []byte) bool {
+	n := len(p)
+	if n == 0 || p[0] == '/' {
+		return false
+	}
+	segStart := usize(0)
+	limit := n + 1
+	for i := usize(0); i < limit; i++ {
+		if i < n && (p[i] == '\\' || p[i] == 0) {
+			return false
+		}
+		if i == n || p[i] == '/' {
+			segLen := i - segStart
+			if segLen == 2 && p[segStart] == '.' && p[segStart+1] == '.' {
+				return false
+			}
+			segStart = i + 1
+		}
+	}
+	return true
+}
+
+func resolveEmbedPath(dst []byte, srcFilePath []byte, relPath []byte) usize {
+	// Find directory prefix of srcFilePath (up to and including last '/').
+	dirLen := usize(0)
+	for i := usize(0); i < len(srcFilePath); i++ {
+		if srcFilePath[i] == '/' {
+			dirLen = i + 1
+		}
+	}
+	pos := usize(0)
+	if dirLen > 0 {
+		pos = bufAppend(dst, pos, srcFilePath[:dirLen])
+	}
+	pos = bufAppend(dst, pos, relPath)
+	return pos
+}
+
+func findPkgForFile(fid u32) u32 {
+	for i := u32(0); i < pkgOrderCount; i++ {
+		pid := pkgOrder[i]
+		p := pkgs[pid]
+		for fi := u32(0); fi < p.fileCount; fi++ {
+			if pkgFiles[p.fileStart+fi] == fid {
+				return pid
+			}
+		}
+	}
+	return 0
+}
+
+func findEmbedByPath(pathStr u32) u32 {
+	for i := u32(0); i < embedCount; i++ {
+		if embedEntries[i].pathStr == pathStr {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+driver func loadEmbeds(fs FS) {
+	strEmbed := internStr("embed")
+	strEmbedBytes := internStr("embedBytes")
+	var fullBuf [512]byte
+
+	nc := nodeCount
+	for nid := u32(1); nid < nc; nid++ {
+		nd := nodes[nid]
+		if nd.kind != NKCall {
+			continue
+		}
+		callee := nodes[nd.a]
+		if callee.kind != NKIdent {
+			continue
+		}
+		if callee.a != strEmbed && callee.a != strEmbedBytes {
+			continue
+		}
+		// Skip if shadowed by a package-level symbol of the same name.
+		pid := findPkgForFile(nd.fileID)
+		if lookupPkgSym(pid, callee.a) != 0 {
+			continue
+		}
+		if nd.c != 1 {
+			continue
+		}
+		arg := listPool[nd.b]
+		if nodes[arg].kind != NKStrLit {
+			continue
+		}
+		rel := strSlice(nodes[arg].a)
+		if !isValidEmbedPath(rel) {
+			addDiagStr(E2001, nd.fileID, nodes[arg].off, "embed path must be relative and cannot contain '..'")
+			nodeEmbedErr[nid] = 1
+			continue
+		}
+		srcPath := strSlice(files[nd.fileID].pathID)
+		fl := resolveEmbedPath(fullBuf[:], srcPath, rel)
+		pathStr := internBytes(fullBuf[:fl])
+		if existing := findEmbedByPath(pathStr); existing != 0 {
+			nodeEmbedID[nid] = existing
+			continue
+		}
+		if embedCount >= MaxEmbedFiles {
+			addDiagStr(E2001, nd.fileID, nd.off, "too many embedded files (max 128)")
+			nodeEmbedErr[nid] = 1
+			continue
+		}
+		fullStr := bytesToStr(fullBuf[:fl])
+		if fs.IsDir(fullStr) {
+			addDiagStr(E2001, nd.fileID, nodes[arg].off, "embed target is a directory, not a file")
+			nodeEmbedErr[nid] = 1
+			continue
+		}
+		if usize(embedUsed) >= MaxEmbedBytes {
+			addDiagStr(E2001, nd.fileID, nodes[arg].off, "embedded files exceed 2MB compiler limit")
+			nodeEmbedErr[nid] = 1
+			continue
+		}
+		n, err := fs.ReadFileInto(fullStr, embedData[usize(embedUsed):])
+		if err != nil {
+			if err == ErrArenaFull {
+				addDiagStr(E2001, nd.fileID, nodes[arg].off, "embedded files exceed 2MB compiler limit")
+			} else {
+				addDiagStr(E2001, nd.fileID, nodes[arg].off, "embedded file not found")
+			}
+			nodeEmbedErr[nid] = 1
+			continue
+		}
+		eid := embedCount + 1
+		embedEntries[embedCount] = EmbedEntry{
+			pathStr: pathStr,
+			off:     embedUsed,
+			length:  u32(n),
+			emitted: false,
+		}
+		embedCount++
+		embedUsed += u32(n)
+		nodeEmbedID[nid] = eid
+	}
+}
+
+// emitEmbedRodata emits `.L_emb_<eid>:` into SecStrAsm once per unique embedded file.
+func emitEmbedRodata(eid u32) {
+	if eid == 0 || eid > embedCount {
+		return
+	}
+	idx := eid - 1
+	if embedEntries[idx].emitted {
+		return
+	}
+	embedEntries[idx].emitted = true
+	secWriteStr(SecStrAsm, ".L_emb_")
+	secWriteU64(SecStrAsm, u64(eid))
+	secWriteStr(SecStrAsm, ":\n")
+	off := usize(embedEntries[idx].off)
+	n := usize(embedEntries[idx].length)
+	if n == 0 {
+		secWriteStr(SecStrAsm, "    .byte 0\n")
+		return
+	}
+	raw := embedData[off : off+n]
+	// Emit 8-byte little-endian .quad words for compact & fast GAS assembly.
+	qCount := n / 8
+	for qi := usize(0); qi < qCount; qi++ {
+		base := qi * 8
+		w := u64(raw[base]) |
+			(u64(raw[base+1]) << 8) |
+			(u64(raw[base+2]) << 16) |
+			(u64(raw[base+3]) << 24) |
+			(u64(raw[base+4]) << 32) |
+			(u64(raw[base+5]) << 40) |
+			(u64(raw[base+6]) << 48) |
+			(u64(raw[base+7]) << 56)
+		if (qi & 3) == 0 {
+			secWriteStr(SecStrAsm, "    .quad ")
+		} else {
+			secWriteStr(SecStrAsm, ", ")
+		}
+		secWriteU64(SecStrAsm, w)
+		if (qi&3) == 3 || qi+1 == qCount {
+			secWriteByte(SecStrAsm, '\n')
+		}
+	}
+	remOff := qCount * 8
+	if remOff < n {
+		emitRawBytesSec(SecStrAsm, raw[remOff:n])
+	}
+}

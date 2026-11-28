@@ -154,6 +154,8 @@ func initUniverse() {
 	addUniBuiltin("FiberYield", BFFiberYield)
 	addUniBuiltin("NewArena", BFNewArena)
 	addUniBuiltin("strView", BFStrView)
+	addUniBuiltin("embed", BFEmbed)
+	addUniBuiltin("embedBytes", BFEmbedBytes)
 	addUniBuiltin("panic", BFPanic)
 	addUniBuiltin("formatTo", BFFormatTo)
 	addUniBuiltin("CodeBool", BFCodeBool)
@@ -228,6 +230,8 @@ driver func loadProgram(fs FS, target []byte) error {
 	for i := u32(0); i < poc; i++ {
 		registerPkgDecls(pkgOrder[i])
 	}
+	// Load compile-time embedded files (`embed` / `embedBytes`) before const eval
+	loadEmbeds(fs)
 	// Resolve all type declarations & function signatures in topological order
 	for i := u32(0); i < poc; i++ {
 		resolvePkgSignatures(pkgOrder[i])

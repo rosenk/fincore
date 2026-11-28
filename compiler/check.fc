@@ -2413,6 +2413,23 @@ driver func (c *Checker) checkBuiltinCall(en u32, bid u16) u32 {
 			_ = c.checkExpr(listPool[n.b], TYString)
 		}
 		retTy = makeConstSliceType(TYU8)
+	} else if bid == BFEmbed || bid == BFEmbedBytes {
+		if n.c != 1 {
+			addDiagStr(E2003, n.fileID, n.off, "embed requires 1 argument (string literal path)")
+		} else {
+			arg := listPool[n.b]
+			_ = c.checkExpr(arg, TYString)
+			if nodes[arg].kind != NKStrLit {
+				addDiagStr(E2002, n.fileID, nodes[arg].off, "embed path must be a string literal")
+			} else if nodeEmbedID[en] == 0 && nodeEmbedErr[en] == 0 {
+				addDiagStr(E2001, n.fileID, nodes[arg].off, "embedded file not loaded")
+			}
+		}
+		if bid == BFEmbed {
+			retTy = TYString
+		} else {
+			retTy = makeConstSliceType(TYU8)
+		}
 	} else if bid == BFPanic {
 		if c.fnEff != EffDriver {
 			addDiagStr(E5001, n.fileID, n.off, "panic is only allowed in driver functions")

@@ -23,6 +23,7 @@ const (
 	VKCode   u8 = 9 // a=codeKind, b=level, c=extra1, d=extra2, u64Val=len
 	VKField  u8 = 10 // a=nameStrID, b=codeValID (FieldCode)
 	VKFloat  u8 = 11 // u64Val = IEEE-754 f64 bit pattern
+	VKEmbed  u8 = 12 // a=embedID (1-based into embedEntries)
 )
 
 // Code kinds (for VKCode).
@@ -160,7 +161,7 @@ driver func valEqual(a u32, b u32) bool {
 	if va.kind == VKInt {
 		return va.u64Val == vb.u64Val
 	}
-	if va.kind == VKBool || va.kind == VKErr {
+	if va.kind == VKBool || va.kind == VKErr || va.kind == VKEmbed {
 		return va.a == vb.a
 	}
 	if va.kind == VKStr {
@@ -666,6 +667,14 @@ driver func (ct *CTFrame) evalExpr(n u32) u32 {
 			}
 			return makeIntVal(u64(sb[usize(idx)]), false, TYU8)
 		}
+		if vals[xv].kind == VKEmbed {
+			eid := vals[xv].a
+			if eid == 0 || eid > embedCount || idx >= u64(embedEntries[eid-1].length) {
+				ct.failed = true
+				return 0
+			}
+			return makeIntVal(u64(embedData[usize(embedEntries[eid-1].off)+usize(idx)]), false, TYU8)
+		}
 		ct.failed = true
 		return 0
 	}
@@ -712,17 +721,19 @@ driver func (ct *CTFrame) evalExpr(n u32) u32 {
 			return 0
 		}
 		z := ctZeroVal(types[u].a)
-		start := valListUsed
 		arrLen := types[u].lenVal
+		if usize(valListUsed)+usize(arrLen) > MaxValList {
+			ct.failed = true
+			return 0
+		}
+		start := valListUsed
+		valListUsed += u32(arrLen)
 		for i := u64(0); i < arrLen; i++ {
 			v := z
 			if i < u64(nd.c) {
 				v = ct.evalExpr(listPool[nd.b+u32(i)])
 			}
-			if valListUsed < MaxValList {
-				valList[valListUsed] = v
-				valListUsed++
-			}
+			valList[start+u32(i)] = v
 		}
 		if ct.failed {
 			return 0
@@ -868,6 +879,18 @@ driver func (ct *CTFrame) evalCall(n u32) u32 {
 		return newVal(Val{kind: VKEnum, typeID: ci.varType, a: ci.varIdx, b: ps, c: pc})
 	}
 	if ci.kind == CKBuiltin {
+		if ci.builtinID == BFEmbed || ci.builtinID == BFEmbedBytes {
+			eid := nodeEmbedID[n]
+			if eid == 0 {
+				ct.failed = true
+				return 0
+			}
+			var ty u32 = TYString
+			if ci.builtinID == BFEmbedBytes {
+				ty = makeConstSliceType(TYU8)
+			}
+			return newVal(Val{kind: VKEmbed, typeID: ty, a: eid})
+		}
 		return ct.evalBuiltin(ci.builtinID, nd.b, nd.c, nd.fileID, nd.off)
 	}
 	if ci.kind == CKFunc && ci.calleeSym != 0 {
@@ -962,6 +985,19 @@ driver func (ct *CTFrame) evalBuiltin(bid u16, argStart u32, argCount u32, fileI
 		}
 		if vals[v].kind == VKStr {
 			return makeIntVal(u64(len(strSlice(vals[v].a))), false, TYUsize)
+		}
+		if vals[v].kind == VKEmbed {
+			eid := vals[v].a
+			if eid > 0 && eid <= embedCount {
+				return makeIntVal(u64(embedEntries[eid-1].length), false, TYUsize)
+			}
+			return makeIntVal(0, false, TYUsize)
+		}
+	}
+	if bid == BFStrView && argCount == 1 {
+		v := ct.evalExpr(listPool[argStart])
+		if v != 0 && vals[v].kind == VKEmbed {
+			return newVal(Val{kind: VKEmbed, typeID: makeConstSliceType(TYU8), a: vals[v].a})
 		}
 	}
 	if bid == BFFormatTo && argCount >= 2 {

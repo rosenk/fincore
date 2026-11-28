@@ -127,7 +127,9 @@ const (
 	BFStrView     u16 = 14
 	BFNewFiberScope u16 = 15
 	BFFiberYield    u16 = 16
-	BFCodeBool    u16 = 20
+	BFEmbed         u16 = 17
+	BFEmbedBytes    u16 = 18
+	BFCodeBool      u16 = 20
 	BFCodeU8      u16 = 21
 	BFCodeU16     u16 = 22
 	BFCodeU32     u16 = 23

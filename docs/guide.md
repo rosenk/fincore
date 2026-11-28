@@ -61,8 +61,13 @@ func at[n usize, T any](a *[n]T, i usize where i < n) T {
 }
 ```
 
-### Immutable Views, Bounded `Arena`, `f32`/`f64`, `Atomic[T]`, Generic Constraints
+### Immutable Views, Compile-Time `embed`, Bounded `Arena`, `f32`/`f64`, `Atomic[T]`, Generic Constraints
 - `const []T`, `const *T`, zero-copy `strView(s string) const []byte`
+- Compile-time file embedding directly into `.rodata` (FinCore's equivalent of Go `//go:embed`, zero heap, zero syscalls, relative paths only — `..` and `/...` rejected at compile time):
+  ```go
+  const indexHTML = embed("assets/index.html")       // string (works in comptime len/index & const structs)
+  const favicon   = embedBytes("assets/favicon.ico") // const []byte (zero-copy .rodata view)
+  ```
 - `scope a := NewArena(65536) { buf, err := a.AllocBytes(256); ... }` (O(1) bump + O(1) `munmap`)
 - Hardware SSE2 `f32`/`f64` + `%f` formatting
 - Lock-free `Atomic[T]` (`Load`, `Store`, `Add`, `Swap`, `CompareAndSwap`)

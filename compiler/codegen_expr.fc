@@ -795,6 +795,20 @@ driver func (f *FnGen) emitConstVal(vid u32, dstOff i64, ty u32) {
 			return
 		}
 		if u == TYString || u == TYUntypedStr {
+			if vals[vid].kind == VKEmbed {
+				eid := vals[vid].a
+				emitEmbedRodata(eid)
+				em("    leaq .L_emb_")
+				emU(u64(eid))
+				em("(%rip), %rax\n    movq %rax, ")
+				emI(dstOff)
+				em("(%rbp)\n    movq $")
+				emU(u64(embedEntries[eid-1].length))
+				em(", ")
+				emI(dstOff + 8)
+				em("(%rbp)\n")
+				return
+			}
 			sid := vals[vid].a
 			sb := strSlice(sid)
 			if len(sb) == 0 {
@@ -853,6 +867,25 @@ driver func (f *FnGen) emitConstVal(vid u32, dstOff i64, ty u32) {
 		return
 	}
 	if t.kind == TKindSlice {
+		if vals[vid].kind == VKEmbed {
+			eid := vals[vid].a
+			emLen := u64(embedEntries[eid-1].length)
+			emitEmbedRodata(eid)
+			em("    leaq .L_emb_")
+			emU(u64(eid))
+			em("(%rip), %rax\n    movq %rax, ")
+			emI(dstOff)
+			em("(%rbp)\n    movq $")
+			emU(emLen)
+			em(", ")
+			emI(dstOff + 8)
+			em("(%rbp)\n    movq $")
+			emU(emLen)
+			em(", ")
+			emI(dstOff + 16)
+			em("(%rbp)\n")
+			return
+		}
 		if vals[vid].kind == VKStr {
 			f.emitStrBytesConst(vals[vid].a, dstOff)
 			return

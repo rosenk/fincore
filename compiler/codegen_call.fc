@@ -703,6 +703,31 @@ driver func (f *FnGen) emitBuiltinCall(en u32, ci CallInfo, dsts []i64, dts []u3
 		return
 	}
 
+	if bid == BFEmbed || bid == BFEmbedBytes {
+		eid := nodeEmbedID[en]
+		if eid > 0 && eid <= embedCount && dst0 != 0 {
+			emLen := u64(embedEntries[eid-1].length)
+			emitEmbedRodata(eid)
+			em("    leaq .L_emb_")
+			emU(u64(eid))
+			em("(%rip), %rax\n    movq %rax, ")
+			emI(dst0)
+			em("(%rbp)\n    movq $")
+			emU(emLen)
+			em(", ")
+			emI(dst0 + 8)
+			em("(%rbp)\n")
+			if bid == BFEmbedBytes {
+				em("    movq $")
+				emU(emLen)
+				em(", ")
+				emI(dst0 + 16)
+				em("(%rbp)\n")
+			}
+		}
+		return
+	}
+
 	if bid == BFPanic {
 		sSlot := f.allocLocal(16, 8)
 		f.emitExprTo(listPool[n.b], sSlot, TYString)

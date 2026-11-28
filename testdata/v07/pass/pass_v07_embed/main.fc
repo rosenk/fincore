@@ -1,0 +1,101 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/crypto/sha256"
+	"std/encoding/hex"
+	"std/http"
+	"std/strings"
+)
+
+type Asset struct {
+	Path        string
+	ContentType string
+	Data        string
+}
+
+const greeting = embed("assets/hello.txt")
+const greetingLen = len(embed("assets/hello.txt"))
+const firstByte = embed("assets/hello.txt")[0]
+const rawPage = embedBytes("assets/page.html")
+
+const staticAssets = [2]Asset{
+	Asset{Path: "/", ContentType: "text/html; charset=utf-8", Data: embed("assets/page.html")},
+	Asset{Path: "/hello.txt", ContentType: "text/plain; charset=utf-8", Data: embed("assets/hello.txt")},
+}
+
+// Proves embedBytes has static lifetime (depth 0) and can be returned directly without E3002.
+func getPage() const []byte {
+	return embedBytes("assets/page.html")
+}
+
+func assetHandler(req const *http.Request, w *http.ResponseWriter) {
+	for i := usize(0); i < len(staticAssets); i++ {
+		if req.PathIs(staticAssets[i].Path) {
+			w.WriteBytes(http.StatusOK, staticAssets[i].ContentType, strView(staticAssets[i].Data))
+			return
+		}
+	}
+	w.WriteText(http.StatusNotFound, "not found")
+}
+
+driver func main(io Stdio, net Net) error {
+	// 1. Check compile-time const embed + comptime len/index + embedBytes
+	strOk := strings.EqualStr(strView(greeting), "Hello from FinCore embed!\n")
+	metaOk := greetingLen == 26 && firstByte == 'H'
+	pageOk := strings.EqualStr(rawPage, "<h1>FinCore Embedded</h1>") &&
+		strings.EqualStr(getPage(), "<h1>FinCore Embedded</h1>")
+
+	// 2. Check SHA-256 directly over embedBytes (zero copy!)
+	s1 := sha256.Sum256(embedBytes("assets/hello.txt"))
+	s2 := sha256.Sum256(strView("Hello from FinCore embed!\n"))
+	var h1 [64]byte
+	var h2 [64]byte
+	_, _ = hex.Encode(h1[:], s1[:])
+	_, _ = hex.Encode(h2[:], s2[:])
+	hashOk := strings.Equal(h1[:], h2[:])
+
+	// 3. Serve embedded staticAssets over std/http and fetch with http.Get
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr()
+
+	srvCtx, stopSrv := NewContext()
+	defer stopSrv()
+
+	var srv http.Server
+	srv.Workers = 2
+	srv.MaxConns = 16
+	srvPtr := &srv
+
+	var httpOk Atomic[u64]
+
+	scope bg := NewFiberScope(2, 16) {
+		_ = bg.Spawn(srvCtx, driver func() {
+			_ = srvPtr.Serve(srvCtx, ln, assetHandler)
+		})
+
+		cCtx, cancelC := NewContext()
+		defer cancelC()
+
+		var r1 http.ClientResponse
+		e1 := http.Get(cCtx, net, addr, "/", &r1)
+		var r2 http.ClientResponse
+		e2 := http.Get(cCtx, net, addr, "/hello.txt", &r2)
+		if e1 == nil && r1.StatusCode == http.StatusOK &&
+			strings.EqualStr(r1.Body(), "<h1>FinCore Embedded</h1>") &&
+			e2 == nil && r2.StatusCode == http.StatusOK &&
+			strings.EqualStr(r2.Body(), "Hello from FinCore embed!\n") {
+			_ = httpOk.Add(1)
+		}
+
+		stopSrv()
+		bg.Wait()
+	}
+
+	var out [128]byte
+	n := formatTo(out[:], "embed=%v,%v,%v hash=%v http=%d\n", strOk, metaOk, pageOk, hashOk, httpOk.Load())
+	return io.WriteStdout(out[:n])
+}

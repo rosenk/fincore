@@ -73,6 +73,7 @@ func codegenInit() {
 	for i := usize(0); i < usize(strCount); i++ {
 		strRodataID[i] = 0
 	}
+	embedResetEmitted()
 	monoCount = 0
 }
 
@@ -400,6 +401,9 @@ driver func isZeroVal(vid u32) bool {
 	if v.kind == VKStr {
 		return v.a == 0 || len(strSlice(v.a)) == 0
 	}
+	if v.kind == VKEmbed {
+		return false
+	}
 	if v.kind == VKArray || v.kind == VKStruct {
 		for i := u32(0); i < v.b; i++ {
 			if !isZeroVal(valList[v.a+i]) {
@@ -519,6 +523,16 @@ driver func emitStaticVal(sec u8, ty u32, vid u32) {
 			return
 		}
 		if u == TYString {
+			if vid != 0 && vals[vid].kind == VKEmbed {
+				eid := vals[vid].a
+				emitEmbedRodata(eid)
+				secWriteStr(sec, "    .quad .L_emb_")
+				secWriteU64(sec, u64(eid))
+				secWriteStr(sec, ", ")
+				secWriteU64(sec, u64(embedEntries[eid-1].length))
+				secWriteByte(sec, '\n')
+				return
+			}
 			if vid == 0 || vals[vid].a == 0 || len(strSlice(vals[vid].a)) == 0 {
 				secWriteStr(sec, "    .quad 0, 0\n")
 			} else {
@@ -531,6 +545,25 @@ driver func emitStaticVal(sec u8, ty u32, vid u32) {
 			}
 			return
 		}
+	}
+	if t.kind == TKindSlice {
+		if vid != 0 && vals[vid].kind == VKEmbed {
+			eid := vals[vid].a
+			emLen := u64(embedEntries[eid-1].length)
+			emitEmbedRodata(eid)
+			secWriteStr(sec, "    .quad .L_emb_")
+			secWriteU64(sec, u64(eid))
+			secWriteStr(sec, ", ")
+			secWriteU64(sec, emLen)
+			secWriteStr(sec, ", ")
+			secWriteU64(sec, emLen)
+			secWriteByte(sec, '\n')
+			return
+		}
+		secWriteStr(sec, "    .skip ")
+		secWriteU64(sec, sz)
+		secWriteByte(sec, '\n')
+		return
 	}
 	if t.kind == TKindArray {
 		if vid == 0 || vals[vid].kind != VKArray {

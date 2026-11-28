@@ -97,6 +97,7 @@ func poolInit() {
 	}
 	diagCount = 0
 	diagMsgUsed = 0
+	embedInit()
 }
 
 func fnv1a(b []byte) u32 {

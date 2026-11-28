@@ -137,6 +137,8 @@ func newNode(kind u8, fileID u32, off u32) u32 {
 	sigEffStart[id] = 0
 	sigEffCount[id] = 0
 	paramWhere[id] = 0
+	nodeEmbedID[id] = 0
+	nodeEmbedErr[id] = 0
 	return id
 }
 
