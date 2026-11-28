@@ -1,0 +1,187 @@
+// Package sha256 implements FIPS 180-4 SHA-256 hashing in 100% Layer-2 total,
+// allocation-free FinCore (both one-shot Sum256 and streaming Hasher).
+package sha256
+
+const (
+	Size      usize = 32
+	BlockSize usize = 64
+)
+
+const kTable [64]u32 = [64]u32{
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+	0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+	0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+	0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+	0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+	0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+	0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+	0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+	0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+}
+
+func rotr32(x u32, n u32) u32 {
+	return (x >> n) | (x << (32 - n))
+}
+
+func readBE32(b const []byte, off usize) u32 {
+	return (u32(b[off]) << 24) | (u32(b[off+1]) << 16) | (u32(b[off+2]) << 8) | u32(b[off+3])
+}
+
+func writeBE32(dst []byte, off usize, v u32) {
+	dst[off] = byte((v >> 24) & 0xff)
+	dst[off+1] = byte((v >> 16) & 0xff)
+	dst[off+2] = byte((v >> 8) & 0xff)
+	dst[off+3] = byte(v & 0xff)
+}
+
+// Hasher holds streaming SHA-256 state as a pure Value struct (zero heap).
+type Hasher struct {
+	h      [8]u32
+	block  [64]byte
+	bufLen usize
+	total  u64
+}
+
+// New returns an initialized SHA-256 Hasher.
+func New() Hasher {
+	var d Hasher
+	d.Reset()
+	return d
+}
+
+func (d *Hasher) Reset() {
+	d.h[0] = 0x6a09e667
+	d.h[1] = 0xbb67ae85
+	d.h[2] = 0x3c6ef372
+	d.h[3] = 0xa54ff53a
+	d.h[4] = 0x510e527f
+	d.h[5] = 0x9b05688c
+	d.h[6] = 0x1f83d9ab
+	d.h[7] = 0x5be0cd19
+	d.bufLen = 0
+	d.total = 0
+}
+
+func (d *Hasher) compress(blk const []byte) {
+	var w [64]u32
+	for i := usize(0); i < 16; i++ {
+		w[i] = readBE32(blk, i*4)
+	}
+	for i := usize(16); i < 64; i++ {
+		s0 := rotr32(w[i-15], 7) ^ rotr32(w[i-15], 18) ^ (w[i-15] >> 3)
+		s1 := rotr32(w[i-2], 17) ^ rotr32(w[i-2], 19) ^ (w[i-2] >> 10)
+		w[i] = w[i-16] + s0 + w[i-7] + s1
+	}
+
+	a := d.h[0]
+	b := d.h[1]
+	c := d.h[2]
+	dv := d.h[3]
+	e := d.h[4]
+	f := d.h[5]
+	g := d.h[6]
+	hv := d.h[7]
+
+	for i := usize(0); i < 64; i++ {
+		s1 := rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+		ch := (e & f) ^ ((^e) & g)
+		t1 := hv + s1 + ch + kTable[i] + w[i]
+		s0 := rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+		maj := (a & b) ^ (a & c) ^ (b & c)
+		t2 := s0 + maj
+
+		hv = g
+		g = f
+		f = e
+		e = dv + t1
+		dv = c
+		c = b
+		b = a
+		a = t1 + t2
+	}
+
+	d.h[0] += a
+	d.h[1] += b
+	d.h[2] += c
+	d.h[3] += dv
+	d.h[4] += e
+	d.h[5] += f
+	d.h[6] += g
+	d.h[7] += hv
+}
+
+// Write absorbs data into the running hash.
+func (d *Hasher) Write(data const []byte) {
+	d.total += u64(len(data))
+	pos := usize(0)
+	n := len(data)
+	if d.bufLen > 0 {
+		for step := usize(0); step < 64; step++ {
+			if pos >= n || d.bufLen >= 64 {
+				break
+			}
+			d.block[d.bufLen] = data[pos]
+			d.bufLen++
+			pos++
+		}
+		if d.bufLen == 64 {
+			d.compress(d.block[:])
+			d.bufLen = 0
+		}
+	}
+	for step := usize(0); step < n; step++ {
+		if pos+64 > n {
+			break
+		}
+		d.compress(data[pos : pos+64])
+		pos += 64
+	}
+	for step := usize(0); step < 64; step++ {
+		if pos >= n {
+			break
+		}
+		d.block[d.bufLen] = data[pos]
+		d.bufLen++
+		pos++
+	}
+}
+
+// Sum finalizes a copy of the state and returns the 32-byte SHA-256 digest
+// without mutating d (so you can continue writing if desired).
+func (d const *Hasher) Sum() [32]byte {
+	tmp := *d
+	bitLen := tmp.total * 8
+	var pad [128]byte
+	pad[0] = 0x80
+	var padLen usize = 0
+	if tmp.bufLen < 56 {
+		padLen = 56 - tmp.bufLen
+	} else {
+		padLen = 120 - tmp.bufLen
+	}
+	tmp.Write(pad[:padLen])
+	var lenBuf [8]byte
+	writeBE32(lenBuf[:], 0, u32(bitLen>>32))
+	writeBE32(lenBuf[:], 4, u32(bitLen&0xffffffff))
+	tmp.Write(lenBuf[:])
+
+	var out [32]byte
+	for i := usize(0); i < 8; i++ {
+		writeBE32(out[:], i*4, tmp.h[i])
+	}
+	return out
+}
+
+// Sum256 returns the SHA-256 checksum of data in a single call.
+func Sum256(data const []byte) [32]byte {
+	h := New()
+	h.Write(data)
+	return h.Sum()
+}

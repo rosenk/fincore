@@ -343,13 +343,44 @@ driver func (f *FnGen) emitAddr(en u32) {
 			em("(%rip), %rax\n")
 			return
 		}
+		if syms[sym].kind == SymConst && syms[sym].valID != 0 {
+			ty := syms[sym].typeID
+			_, al := layoutOf(ty)
+			lbl := freshLabel()
+			secWriteStr(SecRodata, ".balign ")
+			secWriteU64(SecRodata, al)
+			secWriteStr(SecRodata, "\n.L_cval_")
+			secWriteU64(SecRodata, u64(lbl))
+			secWriteStr(SecRodata, ":\n")
+			emitStaticVal(SecRodata, ty, syms[sym].valID)
+			em("    leaq .L_cval_")
+			emU(u64(lbl))
+			em("(%rip), %rax\n")
+			return
+		}
 		return
 	}
 	if n.kind == NKSelector {
-		// Package-qualified global `pkg.Var`
+		// Package-qualified global `pkg.Var` or `pkg.Const`
 		if nodeSym[en] != 0 && syms[nodeSym[en]].kind == SymVar {
 			em("    leaq ")
 			emitGlobalSymLabel(SecFnBody, nodeSym[en])
+			em("(%rip), %rax\n")
+			return
+		}
+		if nodeSym[en] != 0 && syms[nodeSym[en]].kind == SymConst && syms[nodeSym[en]].valID != 0 {
+			cs := nodeSym[en]
+			ty := syms[cs].typeID
+			_, al := layoutOf(ty)
+			lbl := freshLabel()
+			secWriteStr(SecRodata, ".balign ")
+			secWriteU64(SecRodata, al)
+			secWriteStr(SecRodata, "\n.L_cval_")
+			secWriteU64(SecRodata, u64(lbl))
+			secWriteStr(SecRodata, ":\n")
+			emitStaticVal(SecRodata, ty, syms[cs].valID)
+			em("    leaq .L_cval_")
+			emU(u64(lbl))
 			em("(%rip), %rax\n")
 			return
 		}

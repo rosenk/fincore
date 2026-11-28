@@ -1,0 +1,144 @@
+// Package base64 implements RFC 4648 standard base64 encoding and decoding
+// (zero allocation, Layer-2 provably total).
+package base64
+
+const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// EncodedLen returns the base64-encoded byte length for n raw bytes.
+func EncodedLen(n usize) usize {
+	return ((n + 2) / 3) * 4
+}
+
+// DecodedLen returns the maximum decoded byte length for n base64 bytes.
+func DecodedLen(n usize) usize {
+	return (n / 4) * 3
+}
+
+func decodeChar(c byte) (u8, bool) {
+	if c >= 'A' && c <= 'Z' {
+		return c - 'A', true
+	}
+	if c >= 'a' && c <= 'z' {
+		return c - 'a' + 26, true
+	}
+	if c >= '0' && c <= '9' {
+		return c - '0' + 52, true
+	}
+	if c == '+' {
+		return 62, true
+	}
+	if c == '/' {
+		return 63, true
+	}
+	return 0, false
+}
+
+// Encode writes standard RFC 4648 base64 of src into dst.
+func Encode(dst []byte, src const []byte) (usize, error) {
+	need := EncodedLen(len(src))
+	if len(dst) < need {
+		return 0, ErrArenaFull
+	}
+	ab := strView(alphabet)
+	si := usize(0)
+	di := usize(0)
+	n := len(src)
+	for step := usize(0); step < n; step++ {
+		if si+3 > n {
+			break
+		}
+		v := (u32(src[si]) << 16) | (u32(src[si+1]) << 8) | u32(src[si+2])
+		dst[di] = ab[usize((v>>18)&63)]
+		dst[di+1] = ab[usize((v>>12)&63)]
+		dst[di+2] = ab[usize((v>>6)&63)]
+		dst[di+3] = ab[usize(v&63)]
+		si += 3
+		di += 4
+	}
+	rem := n - si
+	if rem == 1 {
+		v := u32(src[si]) << 16
+		dst[di] = ab[usize((v>>18)&63)]
+		dst[di+1] = ab[usize((v>>12)&63)]
+		dst[di+2] = '='
+		dst[di+3] = '='
+		di += 4
+	} else if rem == 2 {
+		v := (u32(src[si]) << 16) | (u32(src[si+1]) << 8)
+		dst[di] = ab[usize((v>>18)&63)]
+		dst[di+1] = ab[usize((v>>12)&63)]
+		dst[di+2] = ab[usize((v>>6)&63)]
+		dst[di+3] = '='
+		di += 4
+	}
+	return di, nil
+}
+
+// Decode decodes standard RFC 4648 base64 bytes from src into dst.
+func Decode(dst []byte, src const []byte) (usize, error) {
+	n := len(src)
+	if n == 0 {
+		return 0, nil
+	}
+	if (n & 3) != 0 {
+		return 0, ErrParse
+	}
+	pad := usize(0)
+	if src[n-1] == '=' {
+		pad++
+		if src[n-2] == '=' {
+			pad++
+		}
+	}
+	outLen := (n/4)*3 - pad
+	if len(dst) < outLen {
+		return 0, ErrArenaFull
+	}
+	si := usize(0)
+	di := usize(0)
+	groups := n / 4
+	for g := usize(0); g < groups; g++ {
+		c0 := src[si]
+		c1 := src[si+1]
+		c2 := src[si+2]
+		c3 := src[si+3]
+		v0, ok0 := decodeChar(c0)
+		v1, ok1 := decodeChar(c1)
+		if !ok0 || !ok1 {
+			return 0, ErrParse
+		}
+		if c2 == '=' {
+			if c3 != '=' || g+1 != groups {
+				return 0, ErrParse
+			}
+			v := (u32(v0) << 18) | (u32(v1) << 12)
+			dst[di] = byte((v >> 16) & 0xff)
+			di++
+		} else if c3 == '=' {
+			if g+1 != groups {
+				return 0, ErrParse
+			}
+			v2, ok2 := decodeChar(c2)
+			if !ok2 {
+				return 0, ErrParse
+			}
+			v := (u32(v0) << 18) | (u32(v1) << 12) | (u32(v2) << 6)
+			dst[di] = byte((v >> 16) & 0xff)
+			dst[di+1] = byte((v >> 8) & 0xff)
+			di += 2
+		} else {
+			v2, ok2 := decodeChar(c2)
+			v3, ok3 := decodeChar(c3)
+			if !ok2 || !ok3 {
+				return 0, ErrParse
+			}
+			v := (u32(v0) << 18) | (u32(v1) << 12) | (u32(v2) << 6) | u32(v3)
+			dst[di] = byte((v >> 16) & 0xff)
+			dst[di+1] = byte((v >> 8) & 0xff)
+			dst[di+2] = byte(v & 0xff)
+			di += 3
+		}
+		si += 4
+	}
+	return di, nil
+}

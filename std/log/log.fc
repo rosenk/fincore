@@ -1,0 +1,75 @@
+// Package log provides a zero-allocation structured logger over Stdio + Clock.
+package log
+
+const (
+	LevelDebug u8 = 0
+	LevelInfo  u8 = 1
+	LevelWarn  u8 = 2
+	LevelError u8 = 3
+)
+
+func levelName(lvl u8) string {
+	if lvl == LevelDebug {
+		return "DEBUG"
+	}
+	if lvl == LevelInfo {
+		return "INFO"
+	}
+	if lvl == LevelWarn {
+		return "WARN"
+	}
+	return "ERROR"
+}
+
+type Logger struct {
+	minLevel u8
+	startNs  u64
+}
+
+func New(clock Clock, minLevel u8) Logger {
+	return Logger{minLevel: minLevel, startNs: clock.Now()}
+}
+
+func (l const *Logger) writeLine(io Stdio, clock Clock, lvl u8, msg string) {
+	if lvl < l.minLevel {
+		return
+	}
+	elapsedMs := (clock.Now() - l.startNs) / 1_000_000
+	var buf [512]byte
+	n := formatTo(buf[:], "[+%dms] %s %s\n", elapsedMs, levelName(lvl), msg)
+	_ = io.WriteStderr(buf[:n])
+}
+
+func (l const *Logger) writeKV(io Stdio, clock Clock, lvl u8, msg string, key string, val u64) {
+	if lvl < l.minLevel {
+		return
+	}
+	elapsedMs := (clock.Now() - l.startNs) / 1_000_000
+	var buf [512]byte
+	n := formatTo(buf[:], "[+%dms] %s %s %s=%d\n", elapsedMs, levelName(lvl), msg, key, val)
+	_ = io.WriteStderr(buf[:n])
+}
+
+func (l const *Logger) Debug(io Stdio, clock Clock, msg string) {
+	l.writeLine(io, clock, LevelDebug, msg)
+}
+
+func (l const *Logger) Info(io Stdio, clock Clock, msg string) {
+	l.writeLine(io, clock, LevelInfo, msg)
+}
+
+func (l const *Logger) Warn(io Stdio, clock Clock, msg string) {
+	l.writeLine(io, clock, LevelWarn, msg)
+}
+
+func (l const *Logger) Error(io Stdio, clock Clock, msg string) {
+	l.writeLine(io, clock, LevelError, msg)
+}
+
+func (l const *Logger) InfoKV(io Stdio, clock Clock, msg string, key string, val u64) {
+	l.writeKV(io, clock, LevelInfo, msg, key, val)
+}
+
+func (l const *Logger) ErrorKV(io Stdio, clock Clock, msg string, key string, val u64) {
+	l.writeKV(io, clock, LevelError, msg, key, val)
+}

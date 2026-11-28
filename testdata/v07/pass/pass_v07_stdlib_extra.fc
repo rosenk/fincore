@@ -1,0 +1,172 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/crypto/sha256"
+	"std/encoding/base64"
+	"std/encoding/hex"
+	"std/http"
+	"std/log"
+	"std/strings"
+)
+
+func checkB64Vec(plain string, want string) bool {
+	var enc [64]byte
+	en, err := base64.Encode(enc[:], strView(plain))
+	if err != nil {
+		return false
+	}
+	if !strings.EqualStr(enc[:en], want) {
+		return false
+	}
+	var dec [64]byte
+	dn, derr := base64.Decode(dec[:], enc[:en])
+	if derr != nil {
+		return false
+	}
+	return strings.EqualStr(dec[:dn], plain)
+}
+
+func shaHexEq(data const []byte, wantHex string) bool {
+	sum := sha256.Sum256(data)
+	var out [64]byte
+	n, err := hex.Encode(out[:], sum[:])
+	if err != nil || n != 64 {
+		return false
+	}
+	return strings.EqualStr(out[:64], wantHex)
+}
+
+func extraHandler(req const *http.Request, w *http.ResponseWriter) {
+	if req.MethodIs("GET") && req.PathIs("/api/hash") {
+		sum := sha256.Sum256(strView("abc"))
+		var hbuf [64]byte
+		hn, err := hex.Encode(hbuf[:], sum[:])
+		if err != nil {
+			w.WriteText(http.StatusInternalServerError, "hex fail")
+			return
+		}
+		w.SetHeader("X-Hash", "sha256")
+		w.WriteBytes(http.StatusOK, "text/plain", hbuf[:hn])
+		return
+	}
+	if req.MethodIs("POST") && req.PathIs("/api/b64") {
+		var bbuf [256]byte
+		bn, err := base64.Encode(bbuf[:], req.Body())
+		if err != nil {
+			w.WriteText(http.StatusBadRequest, "b64 fail")
+			return
+		}
+		w.WriteBytes(http.StatusCreated, "text/plain", bbuf[:bn])
+		return
+	}
+	w.WriteText(http.StatusNotFound, "not found")
+}
+
+driver func main(io Stdio, net Net, clock Clock) error {
+	// 1. std/encoding/hex
+	raw := [4]byte{0x00, 0x0f, 0xab, 0xff}
+	var hbuf [16]byte
+	hn, herr := hex.Encode(hbuf[:], raw[:])
+	hexEncOk := herr == nil && hn == 8 && strings.EqualStr(hbuf[:hn], "000fabff")
+
+	var hdec [8]byte
+	dn, derr := hex.Decode(hdec[:], strView("000FABff"))
+	hexDecOk := derr == nil && dn == 4 && hdec[0] == 0x00 && hdec[1] == 0x0f && hdec[2] == 0xab && hdec[3] == 0xff
+
+	_, oddErr := hex.Decode(hdec[:], strView("abc"))
+	_, badHexErr := hex.Decode(hdec[:], strView("zz"))
+	var tiny [2]byte
+	_, smallErr := hex.Encode(tiny[:], raw[:])
+	hexErrOk := oddErr == ErrParse && badHexErr == ErrParse && smallErr == ErrArenaFull
+
+	// 2. std/encoding/base64 (RFC 4648 vectors + errors)
+	b64Ok := checkB64Vec("", "") &&
+		checkB64Vec("f", "Zg==") &&
+		checkB64Vec("fo", "Zm8=") &&
+		checkB64Vec("foo", "Zm9v") &&
+		checkB64Vec("foobar", "Zm9vYmFy")
+	var bdec [16]byte
+	_, b64BadLen := base64.Decode(bdec[:], strView("abc"))
+	_, b64BadChar := base64.Decode(bdec[:], strView("!!!!"))
+	b64ErrOk := b64BadLen == ErrParse && b64BadChar == ErrParse
+
+	// 3. std/crypto/sha256 (NIST FIPS 180-4 vectors + streaming Hasher)
+	shaEmpty := shaHexEq(strView(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	shaAbc := shaHexEq(strView("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+	sha56 := shaHexEq(
+		strView("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+		"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+	)
+
+	h := sha256.New()
+	h.Write(strView("abcdbcdecdefdefgefghfghighijhijk"))
+	_ = h.Sum() // non-destructive mid-stream Sum
+	h.Write(strView("ijkljklmklmnlmnomnopnopq"))
+	streamSum := h.Sum()
+	var shbuf [64]byte
+	shn, sherr := hex.Encode(shbuf[:], streamSum[:])
+	shaStream := sherr == nil && shn == 64 &&
+		strings.EqualStr(shbuf[:64], "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+
+	// 4. std/log (writes structured line to stderr)
+	logger := log.New(clock, log.LevelInfo)
+	logger.Debug(io, clock, "filtered-debug")
+	logger.Info(io, clock, "stdlib-extra-start")
+	logger.InfoKV(io, clock, "sha256-ready", "digest_bytes", u64(sha256.Size))
+
+	// 5. std/http Client (Get + Post) against std/http Server
+	ln, err := net.ListenTCP("127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	addr := ln.Addr()
+
+	srvCtx, stopSrv := NewContext()
+	defer stopSrv()
+
+	var srv http.Server
+	srv.Workers = 2
+	srv.MaxConns = 32
+	srvPtr := &srv
+
+	var getOk Atomic[u64]
+	var postOk Atomic[u64]
+
+	scope bg := NewFiberScope(2, 16) {
+		_ = bg.Spawn(srvCtx, driver func() {
+			_ = srvPtr.Serve(srvCtx, ln, extraHandler)
+		})
+
+		cCtx, cancelC := NewContext()
+		defer cancelC()
+
+		var resp1 http.ClientResponse
+		gerr := http.Get(cCtx, net, addr, "/api/hash", &resp1)
+		if gerr == nil && resp1.StatusCode == http.StatusOK {
+			hv, hok := resp1.Header("x-hash")
+			if hok && strings.EqualStr(hv, "sha256") &&
+				strings.EqualStr(resp1.Body(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+				_ = getOk.Add(1)
+			}
+		}
+
+		var resp2 http.ClientResponse
+		perr := http.Post(cCtx, net, addr, "/api/b64", "text/plain", strView("foobar"), &resp2)
+		if perr == nil && resp2.StatusCode == http.StatusCreated &&
+			strings.EqualStr(resp2.Body(), "Zm9vYmFy") {
+			_ = postOk.Add(1)
+		}
+
+		stopSrv()
+		bg.Wait()
+	}
+
+	var out [256]byte
+	n := formatTo(out[:], "hex=%v,%v,%v b64=%v,%v sha=%v,%v,%v,%v client=%d,%d\n",
+		hexEncOk, hexDecOk, hexErrOk,
+		b64Ok, b64ErrOk,
+		shaEmpty, shaAbc, sha56, shaStream,
+		getOk.Load(), postOk.Load())
+	return io.WriteStdout(out[:n])
+}

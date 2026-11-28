@@ -515,3 +515,223 @@ driver func (s *Server) ListenAndServe(
 
 	return s.Serve(drainCtx, ln, handler)
 }
+
+// ---------------------------------------------------------------------------
+// Zero-GC HTTP/1.1 Client (Get / Post / Do)
+
+// ClientResponse holds a parsed HTTP/1.1 client response in a bounded stack buffer.
+type ClientResponse struct {
+	buf        [MaxRespBuf]byte
+	bufLen     usize
+	StatusCode u16
+	bodyOff    u16
+	bodyLen    u16
+	headers    [MaxHeaders]HeaderSpan
+	nHeaders   u32
+}
+
+func (r const *ClientResponse) Body() const []byte {
+	s := usize(r.bodyOff)
+	return r.buf[s : s+usize(r.bodyLen)]
+}
+
+func (r const *ClientResponse) Header(name string) (const []byte, bool) {
+	target := strView(name)
+	for i := u32(0); i < r.nHeaders; i++ {
+		h := r.headers[i]
+		ns := usize(h.nameOff)
+		if strings.EqualFold(r.buf[ns:ns+usize(h.nameLen)], target) {
+			vs := usize(h.valOff)
+			return r.buf[vs : vs+usize(h.valLen)], true
+		}
+	}
+	return r.buf[:0], false
+}
+
+func parseClientResponse(r *ClientResponse) (bool, bool) {
+	data := r.buf[:r.bufLen]
+	hdrEnd, found := strings.Index(data, strView("\r\n\r\n"))
+	if !found {
+		if r.bufLen >= MaxRespBuf {
+			return false, false
+		}
+		return false, true
+	}
+	bodyStart := hdrEnd + 4
+
+	lineEnd, okLine := strings.Index(data[:hdrEnd], strView("\r\n"))
+	if !okLine {
+		lineEnd = hdrEnd
+	}
+	statusLine := data[:lineEnd]
+	sp1, ok1 := strings.IndexByte(statusLine, ' ')
+	if !ok1 || sp1+4 > len(statusLine) {
+		return false, false
+	}
+	rest := statusLine[sp1+1:]
+	sp2, ok2 := strings.IndexByte(rest, ' ')
+	var codeSlice const []byte
+	if ok2 {
+		codeSlice = rest[:sp2]
+	} else {
+		codeSlice = rest
+	}
+	code, okCode := strings.ParseUint(codeSlice)
+	if !okCode || code > 999 {
+		return false, false
+	}
+	r.StatusCode = u16(code)
+	r.nHeaders = 0
+
+	hasCL := false
+	var contentLen usize = 0
+	pos := lineEnd + 2
+	for step := usize(0); step < MaxHeaders+4; step++ {
+		if pos >= hdrEnd {
+			break
+		}
+		rem := data[pos:hdrEnd]
+		relEnd, hasCRLF := strings.Index(rem, strView("\r\n"))
+		var hl usize = len(rem)
+		if hasCRLF {
+			hl = relEnd
+		}
+		hline := rem[:hl]
+		if colon, hasC := strings.IndexByte(hline, ':'); hasC && colon > 0 {
+			nameOff := pos
+			nameLen := colon
+			vLo := pos + colon + 1
+			vHi := pos + hl
+			for ws := usize(0); ws < hl; ws++ {
+				if vLo < vHi && (data[vLo] == ' ' || data[vLo] == '\t') {
+					vLo++
+				} else {
+					break
+				}
+			}
+			for ws := usize(0); ws < hl; ws++ {
+				if vHi > vLo && (data[vHi-1] == ' ' || data[vHi-1] == '\t') {
+					vHi--
+				} else {
+					break
+				}
+			}
+			if usize(r.nHeaders) < MaxHeaders {
+				r.headers[r.nHeaders] = HeaderSpan{
+					nameOff: u16(nameOff),
+					nameLen: u16(nameLen),
+					valOff:  u16(vLo),
+					valLen:  u16(vHi - vLo),
+				}
+				r.nHeaders++
+			}
+			if strings.EqualFoldStr(data[nameOff:nameOff+nameLen], "Content-Length") {
+				if cl, okCL := strings.ParseUint(data[vLo:vHi]); okCL {
+					hasCL = true
+					contentLen = usize(cl)
+				}
+			}
+		}
+		pos += hl + 2
+	}
+
+	if hasCL {
+		if bodyStart+contentLen > MaxRespBuf {
+			return false, false
+		}
+		if r.bufLen < bodyStart+contentLen {
+			return false, true
+		}
+		r.bodyOff = u16(bodyStart)
+		r.bodyLen = u16(contentLen)
+		return true, true
+	}
+	r.bodyOff = u16(bodyStart)
+	r.bodyLen = u16(r.bufLen - bodyStart)
+	return false, true
+}
+
+// Do executes a single HTTP/1.1 request to addr (e.g. "127.0.0.1:8080") and populates out.
+driver func Do(
+	ctx Context,
+	net Net,
+	method string,
+	addr string,
+	path string,
+	contentType string,
+	body const []byte,
+	out *ClientResponse,
+) error {
+	out.bufLen = 0
+	out.StatusCode = 0
+	out.bodyOff = 0
+	out.bodyLen = 0
+	out.nHeaders = 0
+
+	conn, err := net.DialTCP(ctx, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var reqHdr [1024]byte
+	var hn usize = 0
+	if len(body) > 0 {
+		hn = formatTo(reqHdr[:], "%s %s HTTP/1.1\r\nHost: %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+			method, path, addr, contentType, len(body))
+	} else {
+		hn = formatTo(reqHdr[:], "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+			method, path, addr)
+	}
+	if err := writeAll(ctx, conn, reqHdr[:hn]); err != nil {
+		return err
+	}
+	if len(body) > 0 {
+		var bodyTmp [MaxReqBuf]byte
+		bl := len(body)
+		if bl > MaxReqBuf {
+			return ErrArenaFull
+		}
+		for i := usize(0); i < bl; i++ {
+			bodyTmp[i] = body[i]
+		}
+		if err := writeAll(ctx, conn, bodyTmp[:bl]); err != nil {
+			return err
+		}
+	}
+
+	driver for {
+		complete, ok := parseClientResponse(out)
+		if !ok {
+			return ErrParse
+		}
+		if complete {
+			return nil
+		}
+		if out.bufLen >= MaxRespBuf {
+			return ErrArenaFull
+		}
+		n, rerr := conn.Read(ctx, out.buf[out.bufLen:])
+		if rerr == ErrEOF || n == 0 {
+			_, okFinal := parseClientResponse(out)
+			if okFinal && out.StatusCode != 0 {
+				return nil
+			}
+			return ErrParse
+		}
+		if rerr != nil {
+			return rerr
+		}
+		out.bufLen += n
+	}
+}
+
+// Get performs an HTTP/1.1 GET request.
+driver func Get(ctx Context, net Net, addr string, path string, out *ClientResponse) error {
+	return Do(ctx, net, "GET", addr, path, "", strView(""), out)
+}
+
+// Post performs an HTTP/1.1 POST request with the given Content-Type and body.
+driver func Post(ctx Context, net Net, addr string, path string, contentType string, body const []byte, out *ClientResponse) error {
+	return Do(ctx, net, "POST", addr, path, contentType, body, out)
+}

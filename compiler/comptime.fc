@@ -703,6 +703,9 @@ driver func (ct *CTFrame) evalExpr(n u32) u32 {
 	}
 	if nd.kind == NKArrayLit {
 		arrTy := nodeType[n]
+		if arrTy == 0 {
+			arrTy = resolveTypeNode(ct.pkgID, nd.a)
+		}
 		u := under(arrTy)
 		if types[u].kind != TKindArray || types[u].lenVal > 4096 {
 			ct.failed = true
