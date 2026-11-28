@@ -1,0 +1,130 @@
+// Package chan provides bounded, zero-GC, MPMC CSP channels (`Chan[N, T]`)
+// coordinated via lock-free Atomic CAS and cooperative FiberYield() over NewFiberScope.
+// Inspired by Go & Flix scoped channels — zero heap allocation, zero goroutine leaks.
+package chan
+
+// Chan[N, T] is a bounded FIFO channel of capacity N holding values of type T.
+// Zero-value is ready to use immediately (no Init required).
+type Chan[N usize, T any] struct {
+	buf    [N]T
+	head   usize
+	tail   usize
+	count  usize
+	closed bool
+	lock   Atomic[u64]
+}
+
+driver func (ch *Chan[N, T]) acquire() {
+	driver for {
+		if ch.lock.CompareAndSwap(0, 1) {
+			return
+		}
+		FiberYield()
+	}
+}
+
+func (ch *Chan[N, T]) release() {
+	ch.lock.Store(0)
+}
+
+func (ch const *Chan[N, T]) Cap() usize {
+	return N
+}
+
+driver func (ch *Chan[N, T]) Len() usize {
+	ch.acquire()
+	n := ch.count
+	ch.release()
+	return n
+}
+
+driver func (ch *Chan[N, T]) IsClosed() bool {
+	ch.acquire()
+	c := ch.closed
+	ch.release()
+	return c
+}
+
+// Close marks the channel as closed (idempotent). Subsequent Send calls return
+// ErrClosed; Recv continues draining buffered items until empty, then returns (zero, false).
+driver func (ch *Chan[N, T]) Close() {
+	ch.acquire()
+	ch.closed = true
+	ch.release()
+}
+
+// TrySend attempts to enqueue val without blocking.
+// Returns (true, nil) if enqueued, (false, nil) if full, or (false, ErrClosed) if closed.
+driver func (ch *Chan[N, T]) TrySend(val T) (bool, error) {
+	ch.acquire()
+	if ch.closed {
+		ch.release()
+		return false, ErrClosed
+	}
+	if ch.count >= N {
+		ch.release()
+		return false, nil
+	}
+	ch.buf[ch.tail] = val
+	ch.tail++
+	if ch.tail == N {
+		ch.tail = 0
+	}
+	ch.count++
+	ch.release()
+	return true, nil
+}
+
+// TryRecv attempts to dequeue one value without blocking.
+// Returns (val, got, stillOpen).
+driver func (ch *Chan[N, T]) TryRecv() (T, bool, bool) {
+	var zero T
+	ch.acquire()
+	if ch.count == 0 {
+		open := !ch.closed
+		ch.release()
+		return zero, false, open
+	}
+	val := ch.buf[ch.head]
+	ch.head++
+	if ch.head == N {
+		ch.head = 0
+	}
+	ch.count--
+	ch.release()
+	return val, true, true
+}
+
+// Send blocks cooperatively (via FiberYield) until val is enqueued, ch is closed,
+// or ctx is cancelled.
+driver func (ch *Chan[N, T]) Send(ctx Context, val T) error {
+	driver for {
+		sent, err := ch.TrySend(val)
+		if err != nil {
+			return err
+		}
+		if sent {
+			return nil
+		}
+		if ctx.Done() {
+			return ctx.Err()
+		}
+		FiberYield()
+	}
+}
+
+// Recv blocks cooperatively until a value is available, ch is closed & drained,
+// or ctx is cancelled. Returns (val, true) on receipt or (zero, false) on close/cancel.
+driver func (ch *Chan[N, T]) Recv(ctx Context) (T, bool) {
+	var zero T
+	driver for {
+		val, got, open := ch.TryRecv()
+		if got {
+			return val, true
+		}
+		if !open || ctx.Done() {
+			return zero, false
+		}
+		FiberYield()
+	}
+}

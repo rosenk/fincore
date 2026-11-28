@@ -104,4 +104,5 @@ scope conns := NewFiberScope(4, 4096) {
 | `std/encoding/base64` | Zero-alloc RFC 4648 base64 `Encode` / `Decode` (`EncodedLen`, `DecodedLen`) |
 | `std/crypto/sha256` | Layer-2 total FIPS 180-4 SHA-256 (`Sum256` one-shot + streaming `Hasher`) |
 | `std/log` | Zero-alloc structured logger over `Stdio` + `Clock` (`Debug`/`Info`/`Warn`/`Error`/`InfoKV`/`ErrorKV`) |
-| `std/datalog` | Finitist stratified Datalog engine (`Unary`, `Binary`, `Join`, `TransitiveClosure`, `AntiJoin`, `Emit`) |
+| `std/chan` | Bounded zero-GC MPMC CSP channels (`Chan[N, T]`: `Send`, `Recv`, `TrySend`, `TryRecv`, `Close` over `NewFiberScope`) |
+| `std/datalog` | Finitist stratified & Flix-style Lattice Datalog (`Unary`, `Binary`, `Join`, `TransitiveClosure`, `AntiJoin`, `LatticeMap`, `ShortestPaths`, `PropagateBits`) |

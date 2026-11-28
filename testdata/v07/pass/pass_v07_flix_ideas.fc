@@ -1,0 +1,146 @@
+// SINCE: v0.7
+package main
+
+import (
+	"std/chan"
+	"std/datalog"
+)
+
+func maxU32(a u32, b u32) u32 {
+	if b > a {
+		return b
+	}
+	return a
+}
+
+func eqU32(a u32, b u32) bool {
+	return a == b
+}
+
+driver func main(io Stdio) error {
+	// 1. Bounded lock-free CSP Channels (std/chan) over NewFiberScope
+	// 2 producers send 1..20 and 21..40 through a small capacity-8 channel (exercising backpressure),
+	// 2 workers square nothing—just double and forward to results channel; main sums all 40 values.
+	var jobs chan.Chan[8, u64]
+	var results chan.Chan[8, u64]
+	jobsPtr := &jobs
+	resPtr := &results
+	var prodDone Atomic[u64]
+	var workDone Atomic[u64]
+
+	ctx, cancel := NewContext()
+	defer cancel()
+
+	var totalSum u64 = 0
+	var recvCount u64 = 0
+
+	scope fg := NewFiberScope(4, 16) {
+		// Producer 1: 1..20
+		_ = fg.Spawn(ctx, driver func() {
+			for i := u64(1); i <= 20; i++ {
+				_ = jobsPtr.Send(ctx, i)
+			}
+			if prodDone.Add(1) == 2 {
+				jobsPtr.Close()
+			}
+		})
+		// Producer 2: 21..40
+		_ = fg.Spawn(ctx, driver func() {
+			for i := u64(21); i <= 40; i++ {
+				_ = jobsPtr.Send(ctx, i)
+			}
+			if prodDone.Add(1) == 2 {
+				jobsPtr.Close()
+			}
+		})
+		// 2 Workers: drain jobs, double each value, push to results
+		for w := u32(0); w < 2; w++ {
+			_ = fg.Spawn(ctx, driver func() {
+				driver for {
+					v, ok := jobsPtr.Recv(ctx)
+					if !ok {
+						break
+					}
+					_ = resPtr.Send(ctx, v*2)
+				}
+				if workDone.Add(1) == 2 {
+					resPtr.Close()
+				}
+			})
+		}
+
+		// Consumer in main fiber: drain results until closed
+		driver for {
+			v, ok := resPtr.Recv(ctx)
+			if !ok {
+				break
+			}
+			totalSum += v
+			recvCount++
+		}
+		fg.Wait()
+	}
+
+	// Verify Send on closed channel returns ErrClosed and Recv on cancelled context stops cleanly.
+	closedErr := jobs.Send(ctx, 99)
+	cCtx, cancelNow := NewContext()
+	cancelNow()
+	var emptyCh chan.Chan[4, u64]
+	_, gotCancelled := emptyCh.Recv(cCtx)
+	// Sum of 2*(1..40) = 2 * 820 = 1640
+	chanOk := recvCount == 40 && totalSum == 1640 && closedErr == ErrClosed && !gotCancelled && jobs.Cap() == 8
+
+	// 2. Flix-Style Lattice Datalog: ShortestPaths (Min-Lattice Fixpoint)
+	var wg datalog.WeightedGraph[16, u32, u32]
+	_ = wg.Add(0, 1, 10)
+	_ = wg.Add(0, 2, 3)
+	_ = wg.Add(2, 1, 2)  // cheaper route 0->2->1 = 5 < 10
+	_ = wg.Add(1, 3, 4)  // 0->2->1->3 = 9
+	_ = wg.Add(2, 3, 12) // 0->2->3 = 15 (loses to 9)
+	_ = wg.Add(3, 4, 1)  // 0->2->1->3->4 = 10
+
+	var dist datalog.LatticeMap[16, u32, u32]
+	_ = datalog.ShortestPaths[16, 16, u32, u32](0, 0, &wg, &dist)
+	d0, ok0 := dist.Get(0)
+	d1, ok1 := dist.Get(1)
+	d2, ok2 := dist.Get(2)
+	d3, ok3 := dist.Get(3)
+	d4, ok4 := dist.Get(4)
+	spOk := ok0 && d0 == 0 && ok1 && d1 == 5 && ok2 && d2 == 3 && ok3 && d3 == 9 && ok4 && d4 == 10
+
+	// 3. Flix-Style Lattice Datalog: BitOr-Lattice RBAC / Taint Propagation
+	const (
+		PermRead   u64 = 1
+		PermWrite  u64 = 2
+		PermAudit  u64 = 4
+		PermDeploy u64 = 8
+	)
+	var roles datalog.Binary[16, u32, u32]
+	// Role 1 (admin) -> Role 2 (dev) -> Role 3 (ci); Role 4 (sec) -> Role 2 (dev)
+	_ = roles.Insert(1, 2)
+	_ = roles.Insert(2, 3)
+	_ = roles.Insert(4, 2)
+
+	var perms datalog.LatticeMap[16, u32, u64]
+	_ = datalog.JoinBitOr[16, u32](&perms, 1, PermRead|PermWrite)
+	_ = datalog.JoinBitOr[16, u32](&perms, 4, PermAudit)
+	_ = datalog.JoinBitOr[16, u32](&perms, 3, PermDeploy)
+	_ = datalog.PropagateBits[16, 16, u32](&roles, &perms)
+
+	p2, okP2 := perms.Get(2)
+	p3, okP3 := perms.Get(3)
+	rbacOk := okP2 && p2 == (PermRead|PermWrite|PermAudit) &&
+		okP3 && p3 == (PermRead|PermWrite|PermAudit|PermDeploy)
+
+	// 4. Custom JoinWith & JoinMax lattice
+	var mx datalog.LatticeMap[8, u32, u32]
+	c1 := mx.JoinWith(7, 10, maxU32, eqU32)
+	c2 := mx.JoinWith(7, 5, maxU32, eqU32) // no change
+	c3 := datalog.JoinMax[8, u32, u32](&mx, 7, 25)
+	mv, mok := mx.Get(7)
+	latOk := c1 && !c2 && c3 && mok && mv == 25
+
+	var out [128]byte
+	n := formatTo(out[:], "chan=%v sp=%v rbac=%v lat=%v\n", chanOk, spOk, rbacOk, latOk)
+	return io.WriteStdout(out[:n])
+}

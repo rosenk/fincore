@@ -211,3 +211,200 @@ func StreamUnary[N usize, T Equal](u const *Unary[N, T]) with Emit[T] {
 		emit(u.data[i])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Flix-Style Lattice Datalog (Monotone Finite Lattices — Layer-2 Total, Zero-GC)
+//
+// Each key maps to a value in a finite join-semilattice (L, lub).
+// Updates only advance monotonically upward in the lattice, guaranteeing
+// least-fixed-point convergence for shortest-path, max-capacity, taint,
+// and RBAC permission-propagation analyses.
+
+type LatticeEntry[K Equal, V any] struct {
+	Key K
+	Val V
+}
+
+// LatticeMap[N, K, V] stores at most N (Key -> LatticeValue) facts with zero heap allocation.
+type LatticeMap[N usize, K Equal, V any] struct {
+	data [N]LatticeEntry[K, V]
+	n    usize
+}
+
+func (m const *LatticeMap[N, K, V]) Len() usize {
+	return m.n
+}
+
+func (m const *LatticeMap[N, K, V]) Slice() const []LatticeEntry[K, V] {
+	return m.data[:m.n]
+}
+
+func (m const *LatticeMap[N, K, V]) Get(k K) (V, bool) {
+	var zero V
+	for i := usize(0); i < m.n; i++ {
+		if m.data[i].Key == k {
+			return m.data[i].Val, true
+		}
+	}
+	return zero, false
+}
+
+// JoinWith inserts (k, v) if absent, or merges existing value via least-upper-bound `lub(cur, v)`.
+// Returns true iff the lattice entry strictly changed.
+func (m *LatticeMap[N, K, V]) JoinWith(k K, v V, lub func(V, V) V, eq func(V, V) bool) bool {
+	for i := usize(0); i < m.n; i++ {
+		if m.data[i].Key == k {
+			next := lub(m.data[i].Val, v)
+			if eq(m.data[i].Val, next) {
+				return false
+			}
+			m.data[i].Val = next
+			return true
+		}
+	}
+	if m.n >= N {
+		return false
+	}
+	m.data[m.n] = LatticeEntry[K, V]{Key: k, Val: v}
+	m.n++
+	return true
+}
+
+// JoinMin updates key k with the Min lattice (smaller values are higher in the lattice).
+func JoinMin[N usize, K Equal, V Ordered](m *LatticeMap[N, K, V], k K, v V) bool {
+	for i := usize(0); i < m.n; i++ {
+		if m.data[i].Key == k {
+			if v < m.data[i].Val {
+				m.data[i].Val = v
+				return true
+			}
+			return false
+		}
+	}
+	if m.n >= N {
+		return false
+	}
+	m.data[m.n] = LatticeEntry[K, V]{Key: k, Val: v}
+	m.n++
+	return true
+}
+
+// JoinMax updates key k with the Max lattice (larger values are higher in the lattice).
+func JoinMax[N usize, K Equal, V Ordered](m *LatticeMap[N, K, V], k K, v V) bool {
+	for i := usize(0); i < m.n; i++ {
+		if m.data[i].Key == k {
+			if v > m.data[i].Val {
+				m.data[i].Val = v
+				return true
+			}
+			return false
+		}
+	}
+	if m.n >= N {
+		return false
+	}
+	m.data[m.n] = LatticeEntry[K, V]{Key: k, Val: v}
+	m.n++
+	return true
+}
+
+// JoinBitOr updates key k with the BitSet Union lattice (bitwise OR — ideal for taint & RBAC).
+func JoinBitOr[N usize, K Equal](m *LatticeMap[N, K, u64], k K, mask u64) bool {
+	for i := usize(0); i < m.n; i++ {
+		if m.data[i].Key == k {
+			next := m.data[i].Val | mask
+			if next == m.data[i].Val {
+				return false
+			}
+			m.data[i].Val = next
+			return true
+		}
+	}
+	if m.n >= N {
+		return false
+	}
+	m.data[m.n] = LatticeEntry[K, u64]{Key: k, Val: mask}
+	m.n++
+	return true
+}
+
+type WeightedEdge[T Equal, W any] struct {
+	From   T
+	To     T
+	Weight W
+}
+
+// WeightedGraph[N, T, W] stores up to N directed weighted edges.
+type WeightedGraph[N usize, T Equal, W any] struct {
+	data [N]WeightedEdge[T, W]
+	n    usize
+}
+
+func (g *WeightedGraph[N, T, W]) Add(from T, to T, weight W) bool {
+	if g.n >= N {
+		return false
+	}
+	g.data[g.n] = WeightedEdge[T, W]{From: from, To: to, Weight: weight}
+	g.n++
+	return true
+}
+
+func (g const *WeightedGraph[N, T, W]) Len() usize {
+	return g.n
+}
+
+// ShortestPaths computes the Flix Min-Lattice least fixed point:
+//   Dist(src; zero).
+//   Dist(v; d + w) :- Dist(u; d), Edge(u, v, w).
+// Layer-2 provably total (terminates in at most NV relaxation rounds).
+func ShortestPaths[NE usize, NV usize, T Equal, W Numeric](
+	src T,
+	zero W,
+	g const *WeightedGraph[NE, T, W],
+	dist *LatticeMap[NV, T, W],
+) u32 {
+	_ = JoinMin[NV, T, W](dist, src, zero)
+	var rounds u32 = 1
+	for step := usize(0); step < NV; step++ {
+		changed := false
+		for i := usize(0); i < g.n; i++ {
+			e := g.data[i]
+			if d, ok := dist.Get(e.From); ok {
+				if JoinMin[NV, T, W](dist, e.To, d+e.Weight) {
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+		rounds++
+	}
+	return rounds
+}
+
+// PropagateBits computes the Flix BitOr-Lattice least fixed point:
+//   Perm(y; p) :- Perm(x; p), Edge(x, y).
+// Ideal for RBAC permission inheritance, taint tracking, and compiler dataflow.
+func PropagateBits[NE usize, NV usize, T Equal](
+	edges const *Binary[NE, T, T],
+	perms *LatticeMap[NV, T, u64],
+) u32 {
+	var rounds u32 = 1
+	for step := usize(0); step < NV; step++ {
+		changed := false
+		for i := usize(0); i < edges.n; i++ {
+			e := edges.data[i]
+			if mask, ok := perms.Get(e.a); ok {
+				if JoinBitOr[NV, T](perms, e.b, mask) {
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+		rounds++
+	}
+	return rounds
+}
